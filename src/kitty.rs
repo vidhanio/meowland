@@ -26,6 +26,27 @@ const Z_ABOVE_TEXT: i32 = 1;
 /// Where a shared memory object lives, and what it is called.
 const SHM_DIRECTORY: &str = "/dev/shm";
 
+/// Remove every object this run put in shared memory that nobody took.
+///
+/// The terminal takes one per transfer and unlinks it, so anything left is from
+/// a terminal that stopped reading - and an object is the size of the pixels it
+/// holds. The names carry this process's id, so nothing belonging to another
+/// compositor is at risk.
+pub fn discard_shared_memory() {
+    let prefix = format!("meowland-{}-", std::process::id());
+    let Ok(entries) = std::fs::read_dir(SHM_DIRECTORY) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix)
+            && let Err(err) = std::fs::remove_file(entry.path())
+        {
+            tracing::debug!(?err, "could not remove a shared memory object");
+        }
+    }
+}
+
 /// The id the startup probe uses for the tile it sends out of shared memory, so
 /// that its answer can be told from the one the graphics query gives.
 pub const SHARED_PROBE_ID: u32 = 78;
@@ -76,10 +97,11 @@ impl Shared {
     fn write(sequence: u64, payload: &[u8]) -> std::io::Result<Self> {
         use std::io::Write as _;
 
-        // The name is the object's path under `/dev/shm`, and has to be
-        // something no other compositor on this machine is using.
-        let name = format!("meowland-{}-{sequence}", std::process::id());
-        let path = format!("{SHM_DIRECTORY}/{name}");
+        // A POSIX shared memory name, which has to begin with a slash: kitty
+        // refuses anything else outright ("POSIX SHM names must start with /"),
+        // even though `shm_open` itself would accept it.
+        let name = format!("/meowland-{}-{sequence}", std::process::id());
+        let path = format!("{SHM_DIRECTORY}{name}");
         let file = rustix::fs::open(
             path.as_str(),
             rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL | rustix::fs::OFlags::RDWR,
@@ -106,7 +128,7 @@ impl Shared {
 
     /// Remove it, for a terminal that turned out not to read it.
     fn unlink(self) {
-        let path = format!("{SHM_DIRECTORY}/{}", self.name);
+        let path = format!("{SHM_DIRECTORY}{}", self.name);
         if let Err(err) = std::fs::remove_file(&path) {
             tracing::debug!(?err, path, "could not remove a shared memory object");
         }
@@ -692,7 +714,7 @@ mod tests {
 
     #[test]
     fn a_shared_memory_transfer_names_the_object_in_its_payload() {
-        let name = "meowland-0-1";
+        let name = "/meowland-0-1";
         let object = Shared {
             name: name.to_owned(),
         };
@@ -722,6 +744,9 @@ mod tests {
             .split_once(';')
             .expect("the escape separates control data from its payload");
         assert!(head.contains("t=s"), "{head}");
+        // A POSIX shared memory name begins with a slash, and a terminal that
+        // checks will refuse one that does not.
+        assert!(name.starts_with('/'), "{name}");
         // The name travels base64'd, like every other payload in this protocol.
         assert_eq!(
             payload,

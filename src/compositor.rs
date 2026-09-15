@@ -22,7 +22,7 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     os::unix::net::UnixStream,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use smithay::{
@@ -91,6 +91,25 @@ pub const BINDING_MODIFIER: crossterm::event::KeyModifiers = crossterm::event::K
 /// Backdrop behind the window, for the moment before a client has drawn
 /// anything.
 const BACKDROP: [u8; 3] = [0x14, 0x16, 0x1b];
+
+/// What one presented frame cost, and how much of it went to the terminal.
+///
+/// Split this way because that is the question a slow frame asks: the
+/// compositor can answer for the first three, and only the terminal can answer
+/// for the last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// Tiles re-sent, out of the grid the frame is divided into.
+    pub tiles: usize,
+    /// Bytes handed to the terminal.
+    pub bytes: usize,
+    /// Composing the frame buffer and finding what changed.
+    pub compose: Duration,
+    /// Compressing and encoding what changed.
+    pub encode: Duration,
+    /// Waiting for the terminal to take it.
+    pub write: Duration,
+}
 
 /// Why meowland could not be set up.
 #[derive(Debug, thiserror::Error)]
@@ -353,13 +372,21 @@ impl Meowland {
 
     /// Fill the frame with the current state of the window and hand the changes
     /// to the terminal.
-    pub fn present(&mut self, terminal: &mut Terminal) -> std::io::Result<()> {
+    pub fn present(&mut self, terminal: &mut Terminal) -> std::io::Result<Cost> {
+        let phase = Instant::now();
         if self.needs_redraw {
             self.compose();
             self.tiles.diff(&self.frame, &mut self.dirty);
         } else {
             self.dirty.clear();
         }
+        let mut cost = Cost {
+            tiles: self.dirty.len(),
+            compose: phase.elapsed(),
+            ..Cost::default()
+        };
+
+        let phase = Instant::now();
         {
             let out = terminal.frame();
             kitty::begin_sync(out);
@@ -369,8 +396,13 @@ impl Meowland {
             }
             self.draw_pointer_shape(terminal);
             kitty::end_sync(terminal.frame());
+            cost.bytes = terminal.frame().len();
         }
+        cost.encode = phase.elapsed();
+
+        let phase = Instant::now();
         terminal.present()?;
+        cost.write = phase.elapsed();
 
         self.needs_redraw = false;
         self.pointer_dirty = false;
@@ -385,7 +417,7 @@ impl Meowland {
                 send_frame_callbacks(popup.wl_surface(), time);
             }
         }
-        Ok(())
+        Ok(cost)
     }
 
     /// Write one dirty tile to the terminal: address its first cell, transmit,

@@ -13,6 +13,13 @@ use std::{
 use rustix::event::{PollFd, PollFlags, poll};
 
 /// What the terminal told us it can do.
+///
+/// A bag of answers rather than a state machine: each is something the terminal
+/// either does or does not, and they vary independently of one another.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each of these is an independent thing a terminal can do"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     /// Size of one character cell in pixels.
@@ -30,6 +37,9 @@ pub struct Capabilities {
     /// Whether mouse reporting can be done in pixels (`SGR-Pixels`) rather than
     /// cells.
     pub pixel_mouse: bool,
+    /// Whether the terminal reads tiles out of a shared memory object, which is
+    /// what keeps their pixels off the pty.
+    pub shared_memory: bool,
 }
 
 /// Cell size assumed when the terminal does not report one. Only affects
@@ -192,6 +202,8 @@ struct Probe {
     pixels: Option<(u32, u32)>,
     terminal: Option<String>,
     graphics: bool,
+    /// Whether the terminal read the tile sent out of shared memory.
+    shared_memory: bool,
     keyboard: bool,
     /// Whether the terminal answered the `SGR-Pixels` mode query.
     pixel_mouse: Option<bool>,
@@ -211,6 +223,12 @@ fn probe() -> io::Result<Probe> {
           \x1b[?1016$p\
           \x1b[c",
     )?;
+    // Whether tiles can come out of shared memory is not something a terminal
+    // announces: it has to be asked, by sending a tile that way and seeing
+    // whether it says it read it. The object goes with the answer.
+    let mut shared_probe = Vec::new();
+    let shared = crate::kitty::shared_memory_probe(&mut shared_probe);
+    stdout.write_all(&shared_probe)?;
     stdout.flush()?;
 
     let mut input = io::stdin();
@@ -246,7 +264,20 @@ fn probe() -> io::Result<Probe> {
             break;
         }
     }
-    Ok(parse_responses(&responses).probe)
+    let mut probe = parse_responses(&responses).probe;
+    // The tile sent above is either read and unlinked by the terminal, or still
+    // sitting in shared memory with nobody having looked at it.
+    // By id, not by shape: the graphics query answers "OK" too, and it is the
+    // tile that has to have been read.
+    let expected = format!("\x1b_Gi={};OK\x1b\\", crate::kitty::SHARED_PROBE_ID);
+    probe.shared_memory = shared
+        && responses
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes());
+    if !probe.shared_memory {
+        crate::kitty::discard_shared_probe();
+    }
+    Ok(probe)
 }
 
 /// The parsed subset of the probe answers we care about.
@@ -399,6 +430,7 @@ fn resolve_capabilities(probe: &Probe, window: Option<(u32, u32, u32, u32)>) -> 
         pixels,
         terminal,
         graphics: probe.graphics,
+        shared_memory: probe.shared_memory,
         keyboard: probe.keyboard,
         pixel_mouse,
     }
@@ -420,6 +452,7 @@ mod tests {
         assert_eq!(
             parsed.probe,
             Probe {
+                shared_memory: false,
                 cell: Some((10, 20)),
                 pixels: Some((1240, 1340)),
                 terminal: Some("kitty(0.48.2)".to_owned()),

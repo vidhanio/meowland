@@ -42,7 +42,10 @@ use smithay::{
 };
 use tracing_subscriber::EnvFilter;
 
-use crate::{compositor::Meowland, tty::Terminal};
+use crate::{
+    compositor::{Cost, Meowland},
+    tty::Terminal,
+};
 
 /// How often the compositor considers drawing a frame. Frame callbacks are what
 /// pace clients, so this only bounds how long a client can be kept waiting for
@@ -76,7 +79,8 @@ fn main() -> anyhow::Result<()> {
         spawned: 0,
         quitting: false,
         frame_scheduled: false,
-        last_frame: None,
+        last_frame_started: None,
+        frames: FrameStats::default(),
         signal: None,
     };
 
@@ -235,16 +239,28 @@ struct App {
     signal: Option<LoopSignal>,
     /// Whether a one-shot frame timer is already armed.
     frame_scheduled: bool,
-    /// Completion time of the last successfully presented frame.
-    last_frame: Option<Instant>,
+    /// When the last successfully presented frame *began*, which is the clock
+    /// the frame cap runs from.
+    last_frame_started: Option<Instant>,
+    /// What the frames of the last second cost, so that a slow frame rate can
+    /// be told apart from a slow terminal.
+    frames: FrameStats,
 }
 
 impl App {
     /// Draw a scheduled frame and flush protocol replies.
     fn present_frame(&mut self) {
         if self.state.needs_frame() {
+            let started = Instant::now();
             match self.state.present(&mut self.terminal) {
-                Ok(()) => self.last_frame = Some(Instant::now()),
+                // The cap runs from when the frame began rather than when it
+                // finished: the work happens *inside* the interval, so counting
+                // it as well would put the compositor's own cost on the
+                // client's latency and drop the frame rate with it.
+                Ok(cost) => {
+                    self.last_frame_started = Some(started);
+                    self.frames.record(&cost);
+                }
                 Err(err) => tracing::warn!(?err, "could not present a frame"),
             }
         }
@@ -469,11 +485,70 @@ fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<File
     tracing::info!(path = %path.display(), "logging to file");
     Ok(client_log)
 }
+/// What the frames of one second cost, logged so that a slow frame rate can be
+/// told apart from a slow terminal.
+///
+/// The compositor can answer for everything but the last number: a frame that
+/// spends its time in `write` is waiting for the terminal, and one that spends
+/// it in `encode` is waiting for itself.
+#[derive(Debug, Default)]
+struct FrameStats {
+    since: Option<Instant>,
+    frames: u32,
+    tiles: u64,
+    bytes: u64,
+    compose: Duration,
+    encode: Duration,
+    write: Duration,
+}
+
+impl FrameStats {
+    fn record(&mut self, cost: &Cost) {
+        use std::time::Duration;
+
+        self.frames += 1;
+        self.tiles += cost.tiles as u64;
+        self.bytes += cost.bytes as u64;
+        self.compose += cost.compose;
+        self.encode += cost.encode;
+        self.write += cost.write;
+
+        let now = Instant::now();
+        let since = *self.since.get_or_insert(now);
+        let elapsed = now - since;
+        if elapsed < Duration::from_secs(1) || self.frames == 0 {
+            return;
+        }
+        let frames = f64::from(self.frames);
+        let per_frame = |total: Duration| total.as_secs_f64() * 1e3 / frames;
+        tracing::debug!(
+            fps = frames / elapsed.as_secs_f64(),
+            tiles = self.tiles / u64::from(self.frames),
+            kib = self.bytes / u64::from(self.frames) / 1024,
+            compose_ms = per_frame(self.compose),
+            encode_ms = per_frame(self.encode),
+            write_ms = per_frame(self.write),
+            "frames presented"
+        );
+        self.since = Some(now);
+        self.frames = 0;
+        self.tiles = 0;
+        self.bytes = 0;
+        self.compose = Duration::ZERO;
+        self.encode = Duration::ZERO;
+        self.write = Duration::ZERO;
+    }
+}
+
 /// The earliest deadline that preserves the frame cap without adding idle
 /// latency.
-fn frame_deadline(now: Instant, last_frame: Option<Instant>) -> Instant {
-    last_frame
-        .and_then(|last| last.checked_add(FRAME_INTERVAL))
+///
+/// `last_frame_started` is when the previous frame *began*: a frame that takes
+/// longer than the interval is late, but the next one is not pushed out by the
+/// work it already paid for.
+fn frame_deadline(now: Instant, last_frame_started: Option<Instant>) -> Instant {
+    last_frame_started
+        .and_then(|started| started.checked_add(FRAME_INTERVAL))
         .map_or(now, |deadline| deadline.max(now))
 }
 
@@ -484,7 +559,7 @@ fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
     }
     app.frame_scheduled = true;
     let next_loop = handle.clone();
-    let deadline = frame_deadline(Instant::now(), app.last_frame);
+    let deadline = frame_deadline(Instant::now(), app.last_frame_started);
     if let Err(err) = handle.insert_source(
         Timer::from_deadline(deadline),
         move |_, (), app: &mut App| {
@@ -566,8 +641,20 @@ mod tests {
 
     #[test]
     fn an_active_compositor_preserves_the_frame_cap() {
-        let last = Instant::now();
-        let now = last + Duration::from_millis(1);
-        assert_eq!(frame_deadline(now, Some(last)), last + FRAME_INTERVAL);
+        let started = Instant::now();
+        let now = started + Duration::from_millis(1);
+        assert_eq!(frame_deadline(now, Some(started)), started + FRAME_INTERVAL);
+    }
+
+    #[test]
+    fn a_slow_frame_does_not_push_the_next_one_out() {
+        // A frame that took longer than the interval has already paid for its
+        // own time: the next one goes as soon as there is something to show,
+        // rather than a further interval after the work finished.
+        let now = Instant::now();
+        let started = now
+            .checked_sub(FRAME_INTERVAL + Duration::from_millis(10))
+            .expect("the monotonic clock has advanced past startup");
+        assert_eq!(frame_deadline(now, Some(started)), now);
     }
 }

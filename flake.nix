@@ -48,6 +48,11 @@
               pkgs.libxkbcommon
             ];
 
+            runtimeInputs = [
+              pkgs.xwayland
+              pkgs.xwayland-satellite
+            ];
+
             commonArgs = {
               inherit
                 src
@@ -66,11 +71,20 @@
                 inherit cargoArtifacts;
                 meta.mainProgram = "meowland";
 
-                nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
+                nativeBuildInputs = nativeBuildInputs ++ [
+                  pkgs.installShellFiles
+                  pkgs.makeWrapper
+                ];
 
                 postInstall = ''
                   wrapProgram $out/bin/meowland \
-                    --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]}
+                    --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]} \
+                    --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
+
+                  installShellCompletion --cmd meowland \
+                    --bash <($out/bin/meowland completions bash) \
+                    --fish <($out/bin/meowland completions fish) \
+                    --zsh <($out/bin/meowland completions zsh)
                 '';
               }
             );
@@ -113,7 +127,8 @@
 
               packages = [
                 config.treefmt.build.wrapper
-              ];
+              ]
+              ++ runtimeInputs;
 
               inherit buildInputs nativeBuildInputs;
             };

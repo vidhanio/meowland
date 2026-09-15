@@ -16,20 +16,18 @@ mod shm;
 mod tty;
 
 use std::{
+    ffi::OsString,
     fs::File,
     process::{Child, Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
+use calloop::signals::{Signal, Signals};
 use smithay::{
     reexports::{
         calloop::{
-            EventLoop as Calloop, Interest, LoopSignal, Mode, PostAction,
+            EventLoop as Calloop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
             channel::{Event as ChannelEvent, Sender, channel},
             generic::Generic,
             timer::{TimeoutAction, Timer},
@@ -49,33 +47,19 @@ use crate::{compositor::Meowland, tty::Terminal};
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 fn main() -> anyhow::Result<()> {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(flag) = arguments.first()
-        && matches!(flag.as_str(), "-h" | "--help")
-    {
-        println!("{USAGE}");
-        return Ok(());
-    }
-    if let Some(flag) = arguments.first()
-        && matches!(flag.as_str(), "-V" | "--version")
-    {
-        println!("meowland {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+    let arguments = Cli::parse().command;
 
     let log = init_logging()?;
-    let signal = install_signal_handler();
 
     let terminal = Terminal::new().context("could not take over the terminal")?;
-    let capabilities = terminal.capabilities().clone();
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
-    tracing::info!(socket = %socket_name, ?capabilities, "meowland starting");
+    tracing::info!(socket = %socket_name, capabilities = ?terminal.capabilities(), "meowland starting");
 
     let display: Display<Meowland> =
         Display::new().context("could not create a Wayland display")?;
-    let state = Meowland::new(&display.handle(), socket_name.clone(), &capabilities)?;
+    let state = Meowland::new(&display.handle(), terminal.capabilities())?;
 
     let mut app = App {
         display,
@@ -87,6 +71,8 @@ fn main() -> anyhow::Result<()> {
         log,
         spawned: 0,
         quitting: false,
+        frame_scheduled: false,
+        last_frame: None,
         signal: None,
     };
 
@@ -96,7 +82,23 @@ fn main() -> anyhow::Result<()> {
     app.signal = Some(signal_handle);
 
     let handle = event_loop.handle();
+    install_sources(&handle, &mut app, socket)?;
 
+    let result = if app.quitting {
+        Ok(())
+    } else {
+        event_loop.run(None, &mut app, |_| {})
+    };
+    app.shutdown();
+    result.context("the event loop failed")?;
+    Ok(())
+}
+
+fn install_sources(
+    handle: &LoopHandle<'_, App>,
+    app: &mut App,
+    socket: ListeningSocketSource,
+) -> anyhow::Result<()> {
     handle
         .insert_source(socket, |stream, (), app| {
             if let Err(err) = app.state.insert_client(stream) {
@@ -107,77 +109,86 @@ fn main() -> anyhow::Result<()> {
 
     let poll_fd = rustix::io::dup(app.display.backend().poll_fd())
         .context("could not take the display socket")?;
+    let display_loop = handle.clone();
     handle
         .insert_source(
             Generic::new(poll_fd, Interest::READ, Mode::Level),
-            |_, _, app: &mut App| {
-                // Clients have requests waiting: answer them, then push the
-                // answers out.
+            move |_, _, app: &mut App| {
                 let dispatched = app.display.dispatch_clients(&mut app.state);
                 if let Err(err) = dispatched {
                     tracing::warn!(?err, "dispatching to clients failed");
                 }
-                if let Err(err) = app.display.flush_clients() {
-                    tracing::warn!(?err, "flushing to clients failed");
-                }
+                app.flush_clients();
+                app.check_quit();
+                schedule_frame(&display_loop, app);
                 Ok(PostAction::Continue)
             },
         )
         .context("could not watch the display")?;
 
     let (sender, channel) = channel();
+    let terminal_loop = handle.clone();
     handle
-        .insert_source(channel, |event, (), app: &mut App| match event {
-            ChannelEvent::Msg(TerminalEvent::Input(event)) => app.on_terminal_event(event),
-            ChannelEvent::Msg(TerminalEvent::Closed) => {
-                tracing::info!("the terminal went away");
-                app.quit();
+        .insert_source(channel, move |event, (), app: &mut App| {
+            match event {
+                ChannelEvent::Msg(TerminalEvent::Input(event)) => app.on_terminal_event(event),
+                ChannelEvent::Msg(TerminalEvent::Closed) => {
+                    tracing::info!("the terminal went away");
+                    app.quit();
+                }
+                ChannelEvent::Closed => app.quit(),
             }
-            ChannelEvent::Closed => app.quit(),
+            app.flush_clients();
+            app.check_quit();
+            schedule_frame(&terminal_loop, app);
         })
         .map_err(|err| anyhow::anyhow!("could not watch terminal input: {err:?}"))?;
-    std::thread::spawn(move || read_terminal(&sender));
-
-    handle
-        .insert_source(
-            Timer::from_duration(FRAME_INTERVAL),
-            |_, (), app: &mut App| {
-                app.tick();
-                TimeoutAction::ToDuration(FRAME_INTERVAL)
-            },
-        )
-        .map_err(|err| anyhow::anyhow!("could not install the frame timer: {err:?}"))?;
 
     if !app.command.is_empty() {
         app.spawn_client();
     }
 
-    let result = event_loop.run(None, &mut app, |app| {
-        if signal.load(Ordering::Relaxed) {
-            app.quit();
-        }
-    });
-    app.shutdown();
-    result.context("the event loop failed")?;
+    let signals = Signals::new(&[
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGHUP,
+        Signal::SIGCHLD,
+    ])
+    .context("could not listen for process signals")?;
+    handle
+        .insert_source(signals, |event, (), app: &mut App| match event.signal() {
+            Signal::SIGCHLD => {
+                app.reap();
+                app.check_quit();
+            }
+            _ => app.quit(),
+        })
+        .context("could not watch process signals")?;
+    // Close the spawn-to-signalfd race for a client that exited immediately.
+    app.reap();
+    app.check_quit();
+
+    std::thread::spawn(move || read_terminal(&sender));
+    schedule_frame(handle, app);
     Ok(())
 }
 
-const USAGE: &str = "\
-meowland: run one Wayland client in your terminal
-
-Usage: meowland [COMMAND [ARGS...]]
-
-  COMMAND    the client to run (foot, for instance). Without one, meowland waits for a
-             client to connect to the socket it prints on startup.
-
-The client fills the terminal: meowland draws no decorations and keeps no window list, and
-its only key binding is
-
-  Alt+Q      leave (the client goes with it).
-
-Clients have to render into shared memory: meowland advertises wl_shm, xdg-shell, wl_seat,
-wl_output and the cursor shape protocol, but nothing that would let a GPU client hand its
-buffers over. Logs go to $XDG_RUNTIME_DIR/meowland.log (override with MEOWLAND_LOG).";
+/// Run one Wayland client in a terminal.
+#[derive(usage::Cli)]
+#[usage(
+    bin = "meowland",
+    version = env!("CARGO_PKG_VERSION"),
+    after_help = "The client fills the terminal. Alt+Q leaves and stops the client.\n\nClients must render into shared memory. Logs go to $XDG_RUNTIME_DIR/meowland.log; override the path with MEOWLAND_LOG."
+)]
+struct Cli {
+    /// Client command and arguments. Without one, wait for a client to connect.
+    #[usage(
+        value_name = "COMMAND",
+        value_hint = usage::ValueHint::CommandWithArguments,
+        double_dash = "automatic"
+    )]
+    command: Vec<OsString>,
+}
 
 /// Everything the event loop owns.
 struct App {
@@ -187,7 +198,7 @@ struct App {
     terminal: Terminal,
     socket_name: String,
     /// The client command from the command line.
-    command: Vec<String>,
+    command: Vec<OsString>,
     children: Vec<Child>,
     log: File,
     /// How many clients were started, so that "none left" can be told from
@@ -195,27 +206,40 @@ struct App {
     spawned: usize,
     quitting: bool,
     signal: Option<LoopSignal>,
+    /// Whether a one-shot frame timer is already armed.
+    frame_scheduled: bool,
+    /// Completion time of the last successfully presented frame.
+    last_frame: Option<Instant>,
 }
 
 impl App {
-    /// A frame is due: draw whatever changed, and stop when the client is gone.
-    fn tick(&mut self) {
-        self.reap();
-        if self.state.needs_frame()
-            && let Err(err) = self.state.present(&mut self.terminal)
-        {
-            tracing::warn!(?err, "could not present a frame");
+    /// Draw a scheduled frame and flush protocol replies.
+    fn present_frame(&mut self) {
+        if self.state.needs_frame() {
+            match self.state.present(&mut self.terminal) {
+                Ok(()) => self.last_frame = Some(Instant::now()),
+                Err(err) => tracing::warn!(?err, "could not present a frame"),
+            }
         }
+        self.flush_clients();
+    }
+
+    /// Push queued protocol events to clients without waiting for client input.
+    fn flush_clients(&mut self) {
         if let Err(err) = self.display.flush_clients() {
             tracing::warn!(?err, "flushing to clients failed");
         }
+    }
+
+    /// Stop once either the launched client or the quit binding says to.
+    fn check_quit(&mut self) {
+        if self.quitting {
+            return;
+        }
         if self.spawned > 0 && self.children.is_empty() {
-            // The client meowland was started for is gone: there is nothing
-            // left to show.
             tracing::info!("the client is gone");
             self.quit();
-        }
-        if self.state.quitting() {
+        } else if self.state.quitting() {
             tracing::info!("the quit binding was used");
             self.quit();
         }
@@ -255,11 +279,13 @@ impl App {
             .spawn();
         match child {
             Ok(child) => {
-                tracing::info!(program, pid = child.id(), "client started");
+                tracing::info!(program = %program.to_string_lossy(), pid = child.id(), "client started");
                 self.children.push(child);
                 self.spawned += 1;
             }
-            Err(err) => tracing::warn!(?err, program, "could not start the client"),
+            Err(err) => {
+                tracing::warn!(?err, program = %program.to_string_lossy(), "could not start the client");
+            }
         }
     }
 
@@ -407,30 +433,84 @@ fn init_logging() -> anyhow::Result<File> {
         File::create(&path).with_context(|| format!("could not log to {}", path.display()))?;
     let filter = EnvFilter::try_from_env("MEOWLAND_LOG_LEVEL")
         .unwrap_or_else(|_| EnvFilter::new("meowland=info,warn"));
+    let client_log = file.try_clone()?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer({
-            let file = file.try_clone()?;
-            move || file.try_clone().expect("log file is clonable")
-        })
+        .with_writer(file)
         .with_ansi(false)
         .init();
     tracing::info!(path = %path.display(), "logging to file");
-    Ok(file)
+    Ok(client_log)
+}
+/// The earliest deadline that preserves the frame cap without adding idle
+/// latency.
+fn frame_deadline(now: Instant, last_frame: Option<Instant>) -> Instant {
+    last_frame
+        .and_then(|last| last.checked_add(FRAME_INTERVAL))
+        .map_or(now, |deadline| deadline.max(now))
 }
 
-/// Turn the signals a terminal sends into a flag the event loop polls, so the
-/// terminal gets restored on the way out.
-fn install_signal_handler() -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ] {
-        if let Err(err) = signal_hook::flag::register(signal, flag.clone()) {
-            tracing::warn!(?err, signal, "could not install a signal handler");
-        }
+/// Arm one frame deadline when new compositor state needs presentation.
+fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
+    if app.frame_scheduled || !app.state.needs_frame() {
+        return;
     }
-    flag
+    app.frame_scheduled = true;
+    let next_loop = handle.clone();
+    let deadline = frame_deadline(Instant::now(), app.last_frame);
+    if let Err(err) = handle.insert_source(
+        Timer::from_deadline(deadline),
+        move |_, (), app: &mut App| {
+            app.frame_scheduled = false;
+            app.present_frame();
+            app.check_quit();
+            schedule_frame(&next_loop, app);
+            TimeoutAction::Drop
+        },
+    ) {
+        app.frame_scheduled = false;
+        tracing::warn!(?err, "could not schedule a frame");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::{OsStr, OsString},
+        time::{Duration, Instant},
+    };
+
+    use super::{Cli, FRAME_INTERVAL, frame_deadline};
+
+    #[test]
+    fn client_flags_are_forwarded_after_the_command() {
+        let parsed = Cli::parse_from(
+            ["foot", "--server", "-T", "meowland"]
+                .map(OsStr::new)
+                .as_slice(),
+        )
+        .expect("client arguments should parse");
+
+        assert_eq!(
+            parsed.command,
+            ["foot", "--server", "-T", "meowland"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn an_idle_compositor_schedules_the_next_frame_immediately() {
+        let now = Instant::now();
+        let old = now
+            .checked_sub(FRAME_INTERVAL + Duration::from_millis(1))
+            .expect("the monotonic clock has advanced past startup");
+        assert_eq!(frame_deadline(now, None), now);
+        assert_eq!(frame_deadline(now, Some(old)), now);
+    }
+
+    #[test]
+    fn an_active_compositor_preserves_the_frame_cap() {
+        let last = Instant::now();
+        let now = last + Duration::from_millis(1);
+        assert_eq!(frame_deadline(now, Some(last)), last + FRAME_INTERVAL);
+    }
 }

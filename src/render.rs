@@ -269,27 +269,25 @@ impl Tiles {
         }
     }
 
-    /// Rectangles covering the parts of `frame` that differ from the previous
-    /// one.
-    pub fn diff(&mut self, frame: &Frame) -> Vec<Rect> {
+    /// Fill `changed` with rectangles covering the parts of `frame` that differ
+    /// from the previous one.
+    pub fn diff(&mut self, frame: &Frame, changed: &mut Vec<Rect>) {
         if self.previous.len() != frame.pixels.len() {
             self.stale = true;
-            self.previous = vec![0; frame.pixels.len()];
+            self.previous.resize(frame.pixels.len(), 0);
         }
-        let mut changed = Vec::new();
+        changed.clear();
+        changed.reserve(self.grid.0 as usize * self.grid.1 as usize);
         for grid_y in 0..self.grid.1 {
             for grid_x in 0..self.grid.0 {
                 let tile = self.tile(frame, grid_x, grid_y);
                 if self.stale || self.tile_differs(frame, tile) {
                     changed.push(tile);
+                    self.update_previous(frame, tile);
                 }
             }
         }
         self.stale = false;
-        if !changed.is_empty() {
-            self.previous.copy_from_slice(frame.pixels());
-        }
-        changed
     }
 
     /// The rectangle covered by one tile, clipped to the frame.
@@ -314,6 +312,15 @@ impl Tiles {
             }
         }
         false
+    }
+
+    fn update_previous(&mut self, frame: &Frame, tile: Rect) {
+        for row in 0..tile.height {
+            let start =
+                (tile.y as usize + row as usize) * frame.width as usize * 4 + tile.x as usize * 4;
+            let end = start + tile.width as usize * 4;
+            self.previous[start..end].copy_from_slice(&frame.pixels()[start..end]);
+        }
     }
 }
 
@@ -452,27 +459,25 @@ mod tests {
         let mut frame = Frame::new(64, 64);
         frame.clear([0, 0, 0]);
         let mut tiles = Tiles::new(&frame, (32, 32));
-        assert_eq!(
-            tiles.diff(&frame).len(),
-            4,
-            "the first diff is a full repaint"
-        );
-        assert!(
-            tiles.diff(&frame).is_empty(),
-            "an unchanged frame is not sent"
-        );
+        let mut changed = Vec::new();
+        tiles.diff(&frame, &mut changed);
+        assert_eq!(changed.len(), 4, "the first diff is a full repaint");
+        tiles.diff(&frame, &mut changed);
+        assert!(changed.is_empty(), "an unchanged frame is not sent");
         let red = argb(&[[255, 0, 0, 255]; 4], 2, 2);
         frame.draw(
             &image(&red, 2, 2),
             Rect::new(0, 0, 2, 2),
             Rect::new(40, 40, 2, 2),
         );
+        tiles.diff(&frame, &mut changed);
         assert_eq!(
-            tiles.diff(&frame),
+            changed,
             vec![Rect::new(32, 32, 32, 32)],
             "only the tile holding the change"
         );
-        assert_eq!(tiles.diff(&frame), Vec::<Rect>::new());
+        tiles.diff(&frame, &mut changed);
+        assert_eq!(changed, []);
     }
 
     #[test]
@@ -480,9 +485,11 @@ mod tests {
         let mut frame = Frame::new(64, 64);
         frame.clear([0, 0, 0]);
         let mut tiles = Tiles::new(&frame, (32, 32));
-        let _ = tiles.diff(&frame);
+        let mut changed = Vec::new();
+        tiles.diff(&frame, &mut changed);
         frame.resize(32, 32);
         tiles = Tiles::new(&frame, (32, 32));
-        assert_eq!(tiles.diff(&frame).len(), 1);
+        tiles.diff(&frame, &mut changed);
+        assert_eq!(changed.len(), 1);
     }
 }

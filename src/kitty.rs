@@ -23,6 +23,33 @@ const CHUNK: usize = 4096;
 /// text, so window content covers whatever the terminal last wrote in those
 /// cells.
 const Z_ABOVE_TEXT: i32 = 1;
+/// Reusable compression and base64 storage for tile transmissions.
+#[derive(Debug)]
+pub struct Encoder {
+    zlib: ZlibEncoder<Vec<u8>>,
+    payload: Vec<u8>,
+    finished: bool,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self {
+            zlib: ZlibEncoder::new(Vec::new(), Compression::fast()),
+            payload: Vec::new(),
+            finished: false,
+        }
+    }
+}
+
+/// Image identity and terminal-cell placement for one transmission.
+#[derive(Debug, Clone, Copy)]
+pub struct Placement {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub cols: u32,
+    pub rows: u32,
+}
 
 /// Start a synchronized update. The terminal buffers everything until
 /// [`end_sync`], which is what keeps a frame from tearing.
@@ -110,48 +137,76 @@ pub fn delete_all(out: &mut Vec<u8>) {
 /// data), so a tile can be re-sent while it is on screen. `C=1` keeps the
 /// cursor where it is, so placing an image never scrolls the terminal and never
 /// moves the anchor the next tile is addressed from.
-pub fn transmit_and_place(
+impl Encoder {
+    /// Compress and transmit `pixels` as image `id`, placing it at the cursor.
+    pub fn transmit_and_place(&mut self, out: &mut Vec<u8>, pixels: &[u8], placement: Placement) {
+        let Placement {
+            id,
+            width,
+            height,
+            cols,
+            rows,
+        } = placement;
+        debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        if self.finished {
+            let mut compressed = self
+                .zlib
+                .reset(Vec::new())
+                .expect("resetting a Vec encoder cannot fail");
+            compressed.clear();
+            *self.zlib.get_mut() = compressed;
+            self.finished = false;
+        }
+        self.zlib.get_mut().reserve(pixels.len() / 8);
+
+        // Compositor output is mostly flat color, so compressing it typically
+        // shrinks a tile by an order of magnitude; that ratio is what keeps the
+        // pty from becoming the bottleneck.
+        self.zlib
+            .write_all(pixels)
+            .expect("writing to a Vec cannot fail");
+        self.zlib.try_finish().expect("finishing a Vec cannot fail");
+        self.finished = true;
+
+        let compressed = self.zlib.get_ref();
+        let encoded_len =
+            base64::encoded_len(compressed.len(), true).expect("a tile fits in address space");
+        self.payload.resize(encoded_len, 0);
+        let payload_len = BASE64
+            .encode_slice(compressed, &mut self.payload)
+            .expect("the payload buffer has the exact encoded size");
+        chunked(
+            out,
+            id,
+            width,
+            height,
+            cols,
+            rows,
+            &self.payload[..payload_len],
+        );
+    }
+}
+
+fn chunked(
     out: &mut Vec<u8>,
     id: u32,
-    pixels: &[u8],
     width: u32,
     height: u32,
     cols: u32,
     rows: u32,
+    payload: &[u8],
 ) {
-    debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
-    // Compositor output is mostly flat color, so compressing it typically
-    // shrinks a tile by an order of magnitude; that ratio is what keeps the
-    // pty from becoming the bottleneck.
-    let mut encoder = ZlibEncoder::new(Vec::with_capacity(pixels.len() / 8), Compression::fast());
-    encoder
-        .write_all(pixels)
-        .expect("writing to a Vec cannot fail");
-    let compressed = encoder.finish().expect("finishing a Vec cannot fail");
-    let payload = BASE64.encode(&compressed);
-    let header = format!(
-        "a=T,f=32,o=z,s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2"
-    );
-    chunked(out, &header, &payload);
-}
-
-/// Write a graphics command, splitting its base64 payload into protocol-legal
-/// chunks.
-fn chunked(out: &mut Vec<u8>, header: &str, payload: &str) {
-    let mut chunks = payload.as_bytes().chunks(CHUNK).peekable();
-    // An empty payload still needs one escape code carrying the control data.
-    if chunks.peek().is_none() {
-        let _ = write!(out, "\x1b_G{header},m=0;\x1b\\");
-        return;
-    }
+    let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         out.extend_from_slice(b"\x1b_G");
         // Only the first escape of a multi-part transmission carries the
         // control data.
         if first {
-            out.extend_from_slice(header.as_bytes());
-            out.push(b',');
+            let _ = write!(
+                out,
+                "a=T,f=32,o=z,s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
+            );
             first = false;
         }
         out.extend_from_slice(if chunks.peek().is_some() {
@@ -306,7 +361,17 @@ mod tests {
         let (width, height) = (64, 48);
         let pixels = test_pixels(width, height);
         let mut out = Vec::new();
-        transmit_and_place(&mut out, 7, &pixels, width, height, 6, 4);
+        Encoder::default().transmit_and_place(
+            &mut out,
+            &pixels,
+            Placement {
+                id: 7,
+                width,
+                height,
+                cols: 6,
+                rows: 4,
+            },
+        );
 
         assert_eq!(
             decode(&out),
@@ -330,6 +395,55 @@ mod tests {
     }
 
     #[test]
+    fn an_encoder_can_be_reused() {
+        let mut encoder = Encoder::default();
+        let mut out = Vec::new();
+        encoder.transmit_and_place(
+            &mut out,
+            &[1, 2, 3, 255],
+            Placement {
+                id: 1,
+                width: 1,
+                height: 1,
+                cols: 1,
+                rows: 1,
+            },
+        );
+        out.clear();
+        encoder.transmit_and_place(
+            &mut out,
+            &[4, 5, 6, 255],
+            Placement {
+                id: 2,
+                width: 1,
+                height: 1,
+                cols: 1,
+                rows: 1,
+            },
+        );
+
+        assert_eq!(
+            decode(&out),
+            vec![
+                Command::Transmit {
+                    id: 2,
+                    width: 1,
+                    height: 1,
+                    compressed: true,
+                    pixels: vec![4, 5, 6, 255],
+                },
+                Command::Put {
+                    id: 2,
+                    placement: 2,
+                    cols: 1,
+                    rows: 1,
+                    moves_cursor: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn every_chunk_is_a_whole_base64_line() {
         // Noise, so zlib cannot shrink the payload below one chunk.
         let (width, height) = (256, 256);
@@ -340,7 +454,17 @@ mod tests {
             pixels.extend_from_slice(&state.to_le_bytes());
         }
         let mut out = Vec::new();
-        transmit_and_place(&mut out, 1, &pixels, width, height, 20, 10);
+        Encoder::default().transmit_and_place(
+            &mut out,
+            &pixels,
+            Placement {
+                id: 1,
+                width,
+                height,
+                cols: 20,
+                rows: 10,
+            },
+        );
 
         let mut rest = std::str::from_utf8(&out).unwrap();
         let mut chunks = 0;

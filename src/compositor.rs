@@ -18,7 +18,12 @@
 //! drawn something is the one on screen" - which keeps dialogs and popups
 //! working without a window manager in between.
 
-use std::{collections::HashMap, os::unix::net::UnixStream, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    os::unix::net::UnixStream,
+    sync::Arc,
+    time::Instant,
+};
 
 use smithay::{
     backend::input::{ButtonState, KeyState},
@@ -103,7 +108,6 @@ pub struct Meowland {
 
     // Core.
     display_handle: DisplayHandle,
-    socket_name: String,
     start: Instant,
     output: Output,
     keyboard: KeyboardHandle<Self>,
@@ -127,8 +131,12 @@ pub struct Meowland {
     snapshots: HashMap<ObjectId, Snapshot>,
     frame: Frame,
     tiles: Tiles,
+    dirty: Vec<Rect>,
+    plan: Vec<(WlSurface, Point<i32, Logical>)>,
     scratch: Vec<u8>,
+    encoder: kitty::Encoder,
     needs_redraw: bool,
+    pointer_dirty: bool,
     /// Set by the quit binding and by the main loop's own reasons to stop.
     quitting: bool,
     cell: (u32, u32),
@@ -137,7 +145,6 @@ pub struct Meowland {
 impl std::fmt::Debug for Meowland {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Meowland")
-            .field("socket_name", &self.socket_name)
             .field("toplevels", &self.toplevels.len())
             .field("presented", &self.presented)
             .finish_non_exhaustive()
@@ -146,11 +153,7 @@ impl std::fmt::Debug for Meowland {
 
 impl Meowland {
     /// Advertise the initial state to clients.
-    pub fn new(
-        display: &DisplayHandle,
-        socket_name: String,
-        capabilities: &Capabilities,
-    ) -> anyhow::Result<Self> {
+    pub fn new(display: &DisplayHandle, capabilities: &Capabilities) -> anyhow::Result<Self> {
         let compositor_state = CompositorState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, []);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
@@ -213,7 +216,6 @@ impl Meowland {
             cursor_shape_state,
             popup_manager: PopupManager::default(),
             display_handle: display.clone(),
-            socket_name,
             start: Instant::now(),
             output,
             keyboard,
@@ -227,8 +229,12 @@ impl Meowland {
             snapshots: HashMap::new(),
             frame,
             tiles,
+            dirty: Vec::new(),
+            plan: Vec::new(),
             scratch: Vec::new(),
+            encoder: kitty::Encoder::default(),
             needs_redraw: true,
+            pointer_dirty: true,
             quitting: false,
             cell: capabilities.cell,
         })
@@ -303,12 +309,17 @@ impl Meowland {
     /// Fill the frame with the current state of the window and hand the changes
     /// to the terminal.
     pub fn present(&mut self, terminal: &mut Terminal) -> anyhow::Result<()> {
-        self.compose();
-        let dirty = self.tiles.diff(&self.frame);
+        if self.needs_redraw {
+            self.compose();
+            self.tiles.diff(&self.frame, &mut self.dirty);
+        } else {
+            self.dirty.clear();
+        }
         {
             let out = terminal.frame();
             kitty::begin_sync(out);
-            for tile in &dirty {
+            for index in 0..self.dirty.len() {
+                let tile = self.dirty[index];
                 self.encode_tile(out, tile);
             }
             self.draw_pointer_shape(terminal);
@@ -317,6 +328,7 @@ impl Meowland {
         terminal.present()?;
 
         self.needs_redraw = false;
+        self.pointer_dirty = false;
         // Everything just composed is on screen, so the clients owning those
         // surfaces may start their next frame. Popups live outside the
         // parent's tree, so they are walked separately.
@@ -333,7 +345,7 @@ impl Meowland {
 
     /// Write one dirty tile to the terminal: address its first cell, transmit,
     /// place.
-    fn encode_tile(&mut self, out: &mut Vec<u8>, tile: &Rect) {
+    fn encode_tile(&mut self, out: &mut Vec<u8>, tile: Rect) {
         let (cell_width, cell_height) = self.cell;
         let columns = tile.width.div_ceil(cell_width.max(1)).max(1);
         let rows = tile.height.div_ceil(cell_height.max(1)).max(1);
@@ -358,14 +370,16 @@ impl Meowland {
             tile.x as u32 / self.tiles.size.0.max(1),
             tile.y as u32 / self.tiles.size.1.max(1),
         );
-        kitty::transmit_and_place(
+        self.encoder.transmit_and_place(
             out,
-            id,
             &self.scratch,
-            tile.width,
-            tile.height,
-            columns,
-            rows,
+            kitty::Placement {
+                id,
+                width: tile.width,
+                height: tile.height,
+                cols: columns,
+                rows,
+            },
         );
     }
 
@@ -394,21 +408,17 @@ impl Meowland {
     fn compose(&mut self) {
         self.frame.clear(BACKDROP);
 
-        let mut plan = Vec::new();
+        self.plan.clear();
         if let Some(toplevel) = self.presented.and_then(|index| self.toplevels.get(index)) {
             let surface = toplevel.wl_surface().clone();
             if self.snapshots.contains_key(&surface.id()) {
-                plan.push((surface.clone(), Point::from((0, 0))));
+                self.plan.push((surface.clone(), Point::from((0, 0))));
                 // Popups live outside the parent's surface tree, at a position
-                // the parent's commit computed for them,
-                // relative to the window's geometry.
+                // the parent's commit computed for them, relative to the
+                // window's geometry.
                 let geometry = geometry_offset(&surface);
                 for (popup, location) in PopupManager::popups_for_surface(&surface) {
-                    // The manager hands out the popup's own surface position;
-                    // the client's geometry is what its
-                    // visible content starts at, so the difference is the
-                    // content offset.
-                    plan.push((
+                    self.plan.push((
                         popup.wl_surface().clone(),
                         geometry + location - popup.geometry().loc,
                     ));
@@ -416,8 +426,8 @@ impl Meowland {
             }
         }
 
-        for (surface, position) in plan {
-            draw_tree(&mut self.frame, &self.snapshots, &surface, position);
+        for (surface, position) in &self.plan {
+            draw_tree(&mut self.frame, &self.snapshots, surface, *position);
         }
     }
 
@@ -637,7 +647,6 @@ impl Meowland {
             pointer.motion(self, None, &event);
         }
         pointer.frame(self);
-        self.needs_redraw = true;
     }
 
     /// Handle a mouse button.
@@ -676,7 +685,7 @@ impl Meowland {
 
     /// Whether anything changed that the terminal should be told about.
     pub const fn needs_frame(&self) -> bool {
-        self.needs_redraw
+        self.needs_redraw || self.pointer_dirty
     }
 }
 
@@ -933,13 +942,29 @@ impl Meowland {
         });
         match committed {
             Some((BufferAssignment::NewBuffer(buffer), scale)) => {
-                match crate::shm::snapshot(&buffer, scale, (limit.width, limit.height)) {
-                    Some(snapshot) => {
-                        self.snapshots.insert(surface.id(), snapshot);
+                let copied = match self.snapshots.entry(surface.id()) {
+                    Entry::Occupied(mut entry) => crate::shm::snapshot(
+                        &buffer,
+                        scale,
+                        (limit.width, limit.height),
+                        entry.get_mut(),
+                    ),
+                    Entry::Vacant(entry) => {
+                        let mut snapshot = Snapshot::empty();
+                        let copied = crate::shm::snapshot(
+                            &buffer,
+                            scale,
+                            (limit.width, limit.height),
+                            &mut snapshot,
+                        );
+                        if copied {
+                            entry.insert(snapshot);
+                        }
+                        copied
                     }
-                    None => {
-                        tracing::debug!(format = ?buffer, "buffer is not one we can composite");
-                    }
+                };
+                if !copied {
+                    tracing::debug!(format = ?buffer, "buffer is not one we can composite");
                 }
                 buffer.release();
             }
@@ -1053,7 +1078,7 @@ impl SeatHandler for Meowland {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor = image;
-        self.needs_redraw = true;
+        self.pointer_dirty = true;
     }
 }
 

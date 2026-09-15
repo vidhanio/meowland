@@ -22,7 +22,8 @@ use smithay::{
     backend::allocator::{
         Buffer as _, Format as DmabufFormat, Fourcc, Modifier,
         dmabuf::{
-            Dmabuf, DmabufMappingFailed, DmabufMappingMode, DmabufSyncFailed, DmabufSyncFlags,
+            Dmabuf, DmabufMapping, DmabufMappingFailed, DmabufMappingMode, DmabufSyncFailed,
+            DmabufSyncFlags,
         },
     },
     reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_shm::Format as ShmFormat},
@@ -340,56 +341,64 @@ fn read_plane<T>(dmabuf: &Dmabuf, read: impl FnOnce(&[u8], u32) -> T) -> Result<
     let rows = (height.saturating_sub(1) as usize).saturating_mul(stride as usize);
     let last = rows.saturating_add(width as usize * 4);
 
-    // The bracket has to be held until the mapping is gone, which is what
-    // dropping in reverse order below does.
-    let reading = PlaneRead::start(dmabuf).map_err(Unreadable::Sync)?;
-    let mapping = dmabuf
-        .map_plane(0, DmabufMappingMode::READ)
-        .map_err(Unreadable::Map)?;
-    if last > mapping.length() {
+    let plane = MappedPlane::new(dmabuf)?;
+    if last > plane.mapping.length() {
         return Err(Unreadable::Short {
             claimed: last,
-            mapped: mapping.length(),
+            mapped: plane.mapping.length(),
         });
     }
-    // SAFETY: the mapping is valid for `mapping.length()` bytes until it is
-    // dropped, `last` was just checked against that length, and the slice does
-    // not outlive the mapping. A client writing concurrently - without the
-    // synchronization bracket this is inside - can only cost us a torn copy.
+    // SAFETY: the mapping is valid for `plane.mapping.length()` bytes until it
+    // is dropped, `last` was just checked against that length, and the slice
+    // does not outlive the mapping. A client writing concurrently - without
+    // the synchronization bracket this is inside - can only cost us a torn
+    // copy.
     #[expect(
         unsafe_code,
         reason = "a mapped buffer is only reachable as a raw pointer; the slice is bounded by the mapping and is copied out at once"
     )]
-    let pixels = unsafe { std::slice::from_raw_parts(mapping.ptr().cast::<u8>(), last) };
-    let read = read(pixels, stride);
-    // Order matters: the bracket has to close while the mapping is still there.
-    drop(reading);
-    drop(mapping);
-    Ok(read)
+    let pixels = unsafe { std::slice::from_raw_parts(plane.mapping.ptr().cast::<u8>(), last) };
+    Ok(read(pixels, stride))
 }
 
-/// A mapped plane, bracketed for reading.
+/// A mapped plane and the synchronization bracket that makes it readable.
 ///
-/// Memory a client's GPU has just written is not necessarily the memory its CPU
-/// would read; the bracket is how the compositor asks the driver for a
-/// consistent view. Guarding it keeps the two halves paired, including on the
-/// paths that give up early.
+/// Field order is significant: Rust drops fields in declaration order, so the
+/// bracket closes while the mapping is still valid, including during unwind.
 #[derive(Debug)]
-struct PlaneRead<'a> {
-    dmabuf: &'a Dmabuf,
+struct MappedPlane<'a> {
+    _reading: PlaneRead<'a>,
+    mapping: DmabufMapping,
 }
+
+impl<'a> MappedPlane<'a> {
+    fn new(dmabuf: &'a Dmabuf) -> Result<Self, Unreadable> {
+        let reading = PlaneRead::start(dmabuf).map_err(Unreadable::Sync)?;
+        let mapping = dmabuf
+            .map_plane(0, DmabufMappingMode::READ)
+            .map_err(Unreadable::Map)?;
+        Ok(Self {
+            _reading: reading,
+            mapping,
+        })
+    }
+}
+
+/// One open DMA buffer CPU-access bracket.
+#[derive(Debug)]
+struct PlaneRead<'a>(&'a Dmabuf);
 
 impl<'a> PlaneRead<'a> {
     fn start(dmabuf: &'a Dmabuf) -> Result<Self, DmabufSyncFailed> {
         dmabuf.sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ)?;
-        Ok(Self { dmabuf })
+        Ok(Self(dmabuf))
     }
 }
 
 impl Drop for PlaneRead<'_> {
     fn drop(&mut self) {
         if let Err(err) = self
-            .dmabuf
+            .0
             .sync_plane(0, DmabufSyncFlags::END | DmabufSyncFlags::READ)
         {
             tracing::warn!(?err, "could not finish reading a client's GPU buffer");

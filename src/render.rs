@@ -186,7 +186,7 @@ impl Frame {
         let scale_x = f64::from(src.width) / f64::from(dst.width);
         let scale_y = f64::from(src.height) / f64::from(dst.height);
         let offset = [
-            f64::from(clipped.x - dst.x) * scale_x,
+            f64::mul_add(f64::from(clipped.x - dst.x), scale_x, f64::from(src.x)),
             f64::from(clipped.y - dst.y) * scale_y,
         ];
         for row in 0..clipped.height {
@@ -194,7 +194,7 @@ impl Frame {
             if image_y < 0 || image_y as u32 >= image.height {
                 continue;
             }
-            let source_row = image_y as usize * image.stride + src.x as usize * BYTES4;
+            let source_row = image_y as usize * image.stride;
             let frame_row = (clipped.y + row as i32) as usize * self.width as usize * BYTES
                 + clipped.x as usize * BYTES;
             self.blend_row(
@@ -236,30 +236,34 @@ impl Frame {
             [red, green, blue, alpha]
         };
 
-        // An exactly one-to-one, fully opaque row is a memcpy: this is the
-        // common case for a client that renders at the output's scale
-        // with an opaque buffer format.
-        if image.format.opaque()
-            && (scale_x - 1.0).abs() < f64::EPSILON
-            && offset_x == 0.0
-            && count as usize * BYTES <= self.pixels.len() - frame_row
-            && count as usize * BYTES4 <= image.pixels.len() - source_row
-        {
-            for index in 0..count as usize {
-                let start = source_row + index * BYTES4;
-                let Some(pixel) = image
-                    .pixels
-                    .get(start..start + 4)
-                    .and_then(<[u8]>::first_chunk::<4>)
-                else {
-                    break;
-                };
-                let [red, green, blue] = image.format.rgb(*pixel);
-                let destination =
-                    &mut self.pixels[frame_row + index * BYTES..frame_row + index * BYTES + BYTES];
-                destination.copy_from_slice(&[red, green, blue]);
+        // An exactly one-to-one, fully opaque row only needs its channels
+        // copied into the three-byte frame. Choose the layout once for
+        // the whole row; this is the common case for a client rendering
+        // at the output's scale.
+        if image.format.opaque() && (scale_x - 1.0).abs() < f64::EPSILON && offset_x >= 0.0 {
+            let source_start = source_row + offset_x as usize * BYTES4;
+            let source_length = count as usize * BYTES4;
+            let frame_length = count as usize * BYTES;
+            if let (Some(source), Some(destination)) = (
+                image.pixels.get(source_start..source_start + source_length),
+                self.pixels.get_mut(frame_row..frame_row + frame_length),
+            ) {
+                let source = source.as_chunks::<BYTES4>().0;
+                let destination = destination.as_chunks_mut::<BYTES>().0;
+                match image.format {
+                    SourceFormat::Argb8888 | SourceFormat::Xrgb8888 => {
+                        for (source, destination) in source.iter().zip(destination) {
+                            *destination = [source[2], source[1], source[0]];
+                        }
+                    }
+                    SourceFormat::Abgr8888 | SourceFormat::Xbgr8888 => {
+                        for (source, destination) in source.iter().zip(destination) {
+                            destination.copy_from_slice(&source[..BYTES]);
+                        }
+                    }
+                }
+                return;
             }
-            return;
         }
 
         for index in 0..count {
@@ -333,21 +337,30 @@ impl Tiles {
             self.previous.resize(frame.pixels.len(), 0);
         }
         changed.clear();
-        changed.reserve(self.grid.0 as usize * self.grid.1 as usize);
-        for grid_y in 0..self.grid.1 {
-            for grid_x in 0..self.grid.0 {
-                let tile = self.tile(frame, grid_x, grid_y);
-                if self.stale || self.tile_differs(frame, tile) {
-                    changed.push(tile);
-                    self.update_previous(frame, tile);
-                }
+        changed.reserve(self.tile_count());
+        for index in 0..self.tile_count() {
+            let tile = self.tile(frame, index);
+            if self.stale || self.tile_differs(frame, tile) {
+                changed.push(tile);
+                self.update_previous(frame, tile);
             }
         }
         self.stale = false;
     }
 
+    pub const fn tile_count(&self) -> usize {
+        self.grid.0 as usize * self.grid.1 as usize
+    }
+
+    pub fn index(&self, tile: Rect) -> usize {
+        (tile.y as u32 / self.size.1.max(1)) as usize * self.grid.0 as usize
+            + (tile.x as u32 / self.size.0.max(1)) as usize
+    }
+
     /// The rectangle covered by one tile, clipped to the frame.
-    fn tile(&self, frame: &Frame, grid_x: u32, grid_y: u32) -> Rect {
+    pub fn tile(&self, frame: &Frame, index: usize) -> Rect {
+        let grid_x = index as u32 % self.grid.0;
+        let grid_y = index as u32 / self.grid.0;
         let x = grid_x * self.size.0;
         let y = grid_y * self.size.1;
         Rect::new(
@@ -517,6 +530,20 @@ mod tests {
         assert_eq!(sample(&frame, 0, 0), Some([255, 255, 255]));
         assert_eq!(sample(&frame, 1, 0), Some([0, 0, 0]));
         assert_eq!(sample(&frame, 0, 1), Some([0, 0, 0]));
+    }
+
+    #[test]
+    fn drawing_is_clipped_to_the_image() {
+        let mut frame = Frame::new(2, 1);
+        frame.clear([1, 2, 3]);
+        let bytes = argb(&[[10, 20, 30, 255], [40, 50, 60, 255]], 2, 1);
+        frame.draw(
+            &image(&bytes, 2, 1),
+            Rect::new(-1, 0, 2, 1),
+            Rect::new(0, 0, 2, 1),
+        );
+        assert_eq!(sample(&frame, 0, 0), Some([1, 2, 3]));
+        assert_eq!(sample(&frame, 1, 0), Some([10, 20, 30]));
     }
 
     #[test]

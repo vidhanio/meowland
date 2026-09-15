@@ -14,7 +14,7 @@
 //! the worker gets carries everything the terminal has not seen yet.
 
 use std::{
-    sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, sync_channel},
+    sync::mpsc::{Receiver, Sender, channel},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -23,7 +23,7 @@ use crate::kitty::{self, Encoder, Placement};
 
 /// One frame on its way to the terminal: the pixels of the tiles that changed,
 /// laid end to end, and where each of them goes.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Frame {
     /// Tile pixels, in the order the tiles are listed.
     pub pixels: Vec<u8>,
@@ -42,11 +42,11 @@ enum Message {
 #[derive(Debug)]
 pub struct Presenter {
     /// Held rather than sent through: dropping it ends the worker.
-    messages: Option<SyncSender<Message>>,
-    /// Buffers the worker has finished with, so that a steady stream of frames
-    /// does not allocate one per frame.
-    recycled: Receiver<Vec<u8>>,
-    free: Vec<Vec<u8>>,
+    messages: Option<Sender<Message>>,
+    /// The frame the worker has finished with. Recycling its two vectors keeps
+    /// a steady stream from allocating either pixels or placements per frame.
+    recycled: Receiver<Frame>,
+    free: Option<Frame>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -56,8 +56,11 @@ impl Presenter {
     pub fn new(shared_memory: bool) -> Self {
         // One frame in flight at a time: a backlog of frames is a backlog of
         // latency, and the newest frame supersedes the ones before it.
-        let (messages, queue) = sync_channel::<Message>(1);
-        let (recycle, recycled) = std::sync::mpsc::channel();
+        // Frames are bounded by the single recyclable frame below. The channel
+        // itself stays unbounded so control escapes are never discarded merely
+        // because the worker is writing a frame.
+        let (messages, queue) = channel();
+        let (recycle, recycled) = channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
             .spawn(move || run(queue, recycle, shared_memory))
@@ -65,49 +68,45 @@ impl Presenter {
         Self {
             messages: Some(messages),
             recycled,
-            // One to start with: the worker only returns buffers it has been
-            // given, so a pool that begins empty has nothing to hand over.
-            free: vec![Vec::new()],
+            free: Some(Frame::default()),
             handle: Some(handle),
         }
     }
 
-    /// A buffer to fill with the tiles of a frame, if there is one to be had.
+    /// A recycled frame to fill, if the worker has finished with it.
     ///
     /// `None` means the worker is still busy and this frame is being dropped -
     /// dropping is the point, so it is not an error.
-    pub fn buffer(&mut self) -> Option<Vec<u8>> {
-        self.free.extend(self.recycled.try_iter());
-        self.free.pop()
+    pub fn frame(&mut self) -> Option<Frame> {
+        self.free.take().or_else(|| self.recycled.try_recv().ok())
     }
 
-    /// Give back a buffer that was taken but not filled.
-    pub fn reuse(&mut self, buffer: Vec<u8>) {
-        self.free.push(buffer);
+    /// Give back a frame that was taken but not handed to the worker.
+    pub fn reuse(&mut self, frame: Frame) {
+        debug_assert!(self.free.is_none());
+        self.free = Some(frame);
     }
 
-    /// Hand over a frame, or take it back if the worker is not ready for one.
+    /// Hand over a frame, or take it back if the worker has stopped.
     ///
     /// The caller keeps the tiles it could not hand over: they are still due,
     /// and the next frame carries them along with its own.
     pub fn present(&self, frame: Frame) -> Result<(), Frame> {
         let Some(messages) = &self.messages else {
-            return Ok(());
+            return Err(frame);
         };
-        match messages.try_send(Message::Frame(frame)) {
-            // A frame the worker is too busy for is dropped, and goes back to
-            // the caller to be copied again from a newer one later.
-            Err(TrySendError::Full(Message::Frame(frame))) => Err(frame),
-            // Handed over, or the worker is gone: either way there is nothing
-            // left to do with it.
-            _ => Ok(()),
-        }
+        messages
+            .send(Message::Frame(frame))
+            .map_err(|error| match error.0 {
+                Message::Frame(frame) => frame,
+                Message::Raw(_) => unreachable!("sent a frame"),
+            })
     }
 
     /// Show an escape in its turn, after the frames already handed over.
     pub fn raw(&self, bytes: Vec<u8>) {
         if let Some(messages) = &self.messages {
-            let _ = messages.try_send(Message::Raw(bytes));
+            let _ = messages.send(Message::Raw(bytes));
         }
     }
 
@@ -128,13 +127,13 @@ impl Presenter {
     clippy::needless_pass_by_value,
     reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
 )]
-fn run(queue: Receiver<Message>, recycle: Sender<Vec<u8>>, shared_memory: bool) {
+fn run(queue: Receiver<Message>, recycle: Sender<Frame>, shared_memory: bool) {
     let mut encoder = Encoder::default();
     encoder.shared_memory = shared_memory;
     let mut out = Vec::new();
     let mut stats = Stats::default();
     while let Ok(message) = queue.recv() {
-        let frame = match message {
+        let mut frame = match message {
             Message::Frame(frame) => frame,
             Message::Raw(bytes) => {
                 if let Err(err) = write(&bytes) {
@@ -166,7 +165,9 @@ fn run(queue: Receiver<Message>, recycle: Sender<Vec<u8>>, shared_memory: bool) 
         }
 
         // The buffer goes back for the next frame to be filled in.
-        let _ = recycle.send(frame.pixels);
+        frame.pixels.clear();
+        frame.tiles.clear();
+        let _ = recycle.send(frame);
         stats.record(tiles, out.len(), spent_encoding, written);
     }
 
@@ -206,7 +207,7 @@ impl Stats {
         let now = Instant::now();
         let since = *self.since.get_or_insert(now);
         let elapsed = now - since;
-        if elapsed < Duration::from_secs(1) || self.frames == 0 {
+        if elapsed < Duration::from_secs(1) {
             return;
         }
         let frames = f64::from(self.frames);

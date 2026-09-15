@@ -278,7 +278,7 @@ impl Meowland {
 
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
         let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
-        let grid_tiles = tiles.grid.0 as usize * tiles.grid.1 as usize;
+        let grid_tiles = tiles.tile_count();
 
         let (gpu, dmabuf_global) = match bring_up_renderer(nodes) {
             Some((renderer, node)) => {
@@ -454,11 +454,9 @@ impl Meowland {
     /// presenter is still busy with the frame before them - in which case they
     /// stay due and the next frame carries them.
     fn hand_over(&mut self, presenter: &mut Presenter, cost: &mut Cost) {
-        let tile_size = self.tiles.size;
-        let grid = self.tiles.grid;
         let mut due_count = self.due_count;
         for tile in self.dirty.drain(..) {
-            let index = tile_index(tile, tile_size, grid);
+            let index = self.tiles.index(tile);
             if !self.due[index] {
                 self.due[index] = true;
                 due_count += 1;
@@ -468,42 +466,42 @@ impl Meowland {
         if self.due_count == 0 {
             return;
         }
-        let Some(mut pixels) = presenter.buffer() else {
+        let Some(mut frame) = presenter.frame() else {
             return;
         };
 
         // The tiles are copied out of the frame in the order they are listed,
         // so the presenter can cut them apart again without knowing the frame.
-        pixels.clear();
+        frame.pixels.clear();
+        frame.tiles.clear();
+        frame.tiles.reserve(self.due_count);
         let stride = self.frame.width as usize * BYTES;
-        let mut tiles = Vec::with_capacity(self.due_count);
         for index in 0..self.due.len() {
             if !self.due[index] {
                 continue;
             }
-            let tile = self.tile_of(index, tile_size);
+            let tile = self.tiles.tile(&self.frame, index);
             for row in 0..tile.height {
                 let start = (tile.y as usize + row as usize) * stride + tile.x as usize * BYTES;
-                pixels.extend_from_slice(
+                frame.pixels.extend_from_slice(
                     &self.frame.pixels()[start..start + tile.width as usize * BYTES],
                 );
             }
-            tiles.push(self.placement(tile));
+            frame.tiles.push(self.placement(tile));
         }
 
-        cost.sent = tiles.len();
-        match presenter.present(crate::presenter::Frame { pixels, tiles }) {
+        cost.sent = frame.tiles.len();
+        match presenter.present(frame) {
             Ok(()) => {
                 self.due.fill(false);
                 self.due_count = 0;
                 self.count_frame();
             }
             // Not taken: the tiles stay due, so nothing is lost by the wait.
-            Err(frame) => presenter.reuse(frame.pixels),
+            Err(frame) => presenter.reuse(frame),
         }
     }
 
-    /// The tile a grid index stands for.
     /// Count a frame that reached the presenter.
     fn count_frame(&mut self) {
         self.fps_window.get_or_insert_with(Instant::now);
@@ -529,29 +527,13 @@ impl Meowland {
         }
     }
 
-    fn tile_of(&self, index: usize, tile_size: (u32, u32)) -> Rect {
-        let grid_x = index as u32 % self.tiles.grid.0;
-        let grid_y = index as u32 / self.tiles.grid.0;
-        let (x, y) = (grid_x * tile_size.0, grid_y * tile_size.1);
-        Rect::new(
-            x as i32,
-            y as i32,
-            tile_size.0.min(self.frame.width - x),
-            tile_size.1.min(self.frame.height - y),
-        )
-    }
-
     /// Where one tile goes and what it is called.
     fn placement(&self, tile: Rect) -> kitty::Placement {
         let (cell_width, cell_height) = self.cell;
         let columns = tile.width.div_ceil(cell_width.max(1)).max(1);
         let rows = tile.height.div_ceil(cell_height.max(1)).max(1);
         kitty::Placement {
-            id: tile_id(
-                &self.tiles,
-                tile.x as u32 / self.tiles.size.0.max(1),
-                tile.y as u32 / self.tiles.size.1.max(1),
-            ),
+            id: self.tiles.index(tile) as u32 + 1,
             width: tile.width,
             height: tile.height,
             cols: columns,
@@ -637,7 +619,7 @@ impl Meowland {
         self.frame
             .resize(capabilities.pixels.0, capabilities.pixels.1);
         self.tiles = Tiles::new(&self.frame, tile_size(capabilities.cell));
-        self.due = vec![false; self.tiles.grid.0 as usize * self.tiles.grid.1 as usize];
+        self.due = vec![false; self.tiles.tile_count()];
         self.due_count = 0;
         let mode = output_mode(capabilities);
         self.output.set_preferred(mode);
@@ -886,12 +868,6 @@ const fn tile_size(cell: (u32, u32)) -> (u32, u32) {
     (cell.0 * TILE_CELLS.0, cell.1 * TILE_CELLS.1)
 }
 
-/// The image id of a tile: stable across frames, so a tile's image can be
-/// replaced in place.
-const fn tile_id(tiles: &Tiles, x: u32, y: u32) -> u32 {
-    y * tiles.grid.0 + x + 1
-}
-
 /// xdg-shell state names, spelled out once.
 mod xdg_state {
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -960,12 +936,6 @@ fn draw_surface(
         Rect::new(0, 0, snapshot.width, snapshot.height),
         Rect::new(location.x, location.y, width as u32, height as u32),
     );
-}
-
-/// Where a tile sits in the grid of flags.
-fn tile_index(tile: Rect, tile_size: (u32, u32), grid: (u32, u32)) -> usize {
-    (tile.y as u32 / tile_size.1.max(1)) as usize * grid.0 as usize
-        + (tile.x as u32 / tile_size.0.max(1)) as usize
 }
 
 /// Where a sub-surface sits relative to its parent (zero for a toplevel).

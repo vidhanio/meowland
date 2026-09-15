@@ -142,23 +142,6 @@ impl Frame {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    /// Paint a rectangle with a colour, clipped to the frame.
-    pub fn fill(&mut self, rect: Rect, color: [u8; 3]) {
-        let Some(clipped) = rect.intersect(self.bounds()) else {
-            return;
-        };
-        for row in 0..clipped.height {
-            let start = (clipped.y as usize + row as usize) * self.width as usize * BYTES
-                + clipped.x as usize * BYTES;
-            for pixel in self.pixels[start..start + clipped.width as usize * BYTES]
-                .as_chunks_mut::<3>()
-                .0
-            {
-                pixel.copy_from_slice(&color);
-            }
-        }
-    }
-
     /// Paint the whole frame with a colour, the backdrop everything else blends
     /// onto.
     pub fn clear(&mut self, color: [u8; 3]) {

@@ -12,7 +12,6 @@ mod buffer;
 mod compositor;
 mod dmabuf;
 mod gpu;
-mod hud;
 mod keys;
 mod kitty;
 mod presenter;
@@ -24,6 +23,11 @@ use std::{
     fs::File,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -33,7 +37,7 @@ use smithay::{
     reexports::{
         calloop::{
             EventLoop as Calloop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
-            channel::{Event as ChannelEvent, Sender, channel},
+            channel::{Channel, Event as ChannelEvent, Sender, channel},
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
@@ -46,14 +50,16 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     compositor::{Cost, Meowland},
-    presenter::Presenter,
+    presenter::{Event as PresenterEvent, Presenter},
     tty::Terminal,
 };
 
-/// How often the compositor considers drawing a frame. Frame callbacks are what
-/// pace clients, so this only bounds how long a client can be kept waiting for
-/// its buffer to appear.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// The refresh rate advertised to clients, in the Wayland protocol's mHz.
+const REFRESH_MILLIHZ: i32 = 60_000;
+
+/// How often the compositor considers drawing a frame. Derived from the same
+/// rate clients see, so their pacing and ours cannot drift apart.
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_000 / REFRESH_MILLIHZ as u64);
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -61,7 +67,6 @@ fn main() -> anyhow::Result<()> {
     let log = init_logging(cli.log.as_deref(), cli.log_level.as_deref())?;
 
     let terminal = Terminal::new()?;
-    let terminal_capabilities = terminal.capabilities().clone();
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
@@ -70,13 +75,15 @@ fn main() -> anyhow::Result<()> {
     let display: Display<Meowland> =
         Display::new().context("could not create a Wayland display")?;
     let nodes = cli.gpu_buffers.nodes(cli.render_node.as_deref())?;
-    let state = Meowland::new(&display.handle(), terminal.capabilities(), &nodes, cli.fps)?;
+    let state = Meowland::new(&display.handle(), terminal.capabilities(), &nodes)?;
+    let (presenter_sender, presenter_events) = channel();
+    let presenter = Presenter::new(terminal, presenter_sender)?;
 
     let mut app = App {
         display,
         state,
-        terminal,
-        presenter: Presenter::new(terminal_capabilities.shared_memory),
+        terminal_input: None,
+        presenter,
         socket_name,
         command: cli.command,
         children: Vec::new(),
@@ -95,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     app.signal = Some(signal_handle);
 
     let handle = event_loop.handle();
-    install_sources(&handle, &mut app, socket)?;
+    install_sources(&handle, &mut app, socket, presenter_events)?;
 
     let result = if app.quitting {
         Ok(())
@@ -111,6 +118,7 @@ fn install_sources(
     handle: &LoopHandle<'_, App>,
     app: &mut App,
     socket: ListeningSocketSource,
+    presenter_events: Channel<PresenterEvent>,
 ) -> anyhow::Result<()> {
     handle
         .insert_source(socket, |stream, (), app| {
@@ -157,9 +165,21 @@ fn install_sources(
         })
         .map_err(|err| anyhow::anyhow!("could not watch terminal input: {err:?}"))?;
 
-    if !app.command.is_empty() {
-        app.spawn_client();
-    }
+    let presenter_loop = handle.clone();
+    handle
+        .insert_source(presenter_events, move |event, (), app: &mut App| {
+            match event {
+                ChannelEvent::Msg(PresenterEvent::Ready(frame)) => app.presenter.recycle(frame),
+                ChannelEvent::Msg(PresenterEvent::Failed(error)) => {
+                    tracing::error!(%error, "terminal presentation failed");
+                    app.quit();
+                }
+                ChannelEvent::Closed => app.quit(),
+            }
+            app.check_quit();
+            schedule_frame(&presenter_loop, app);
+        })
+        .map_err(|err| anyhow::anyhow!("could not watch terminal presentation: {err:?}"))?;
 
     let signals = Signals::new(&[
         Signal::SIGTERM,
@@ -177,11 +197,15 @@ fn install_sources(
             _ => app.quit(),
         })
         .context("could not watch process signals")?;
+
+    app.terminal_input =
+        Some(TerminalInput::start(sender).context("could not start the terminal input thread")?);
+    if !app.command.is_empty() {
+        app.spawn_client();
+    }
     // Close the spawn-to-signalfd race for a client that exited immediately.
     app.reap();
     app.check_quit();
-
-    std::thread::spawn(move || read_terminal(&sender));
     schedule_frame(handle, app);
     Ok(())
 }
@@ -217,10 +241,6 @@ struct Cli {
     #[usage(long, env = "MEOWLAND_LOG_LEVEL", value_name = "FILTER")]
     log_level: Option<String>,
 
-    /// Show how many frames a second the terminal is being sent, in the corner
-    #[usage(long, env = "MEOWLAND_FPS")]
-    fps: bool,
-
     /// Client command and arguments. Without one, wait for a client to connect.
     #[usage(
         value_name = "COMMAND",
@@ -235,7 +255,9 @@ struct App {
     /// Kept separate from `state`: dispatching needs both at once.
     display: Display<Meowland>,
     state: Meowland,
-    terminal: Terminal,
+    /// Declared before the presenter so unwinding stops input before restoring
+    /// the terminal, just as normal shutdown does.
+    terminal_input: Option<TerminalInput>,
     presenter: Presenter,
     socket_name: String,
     /// The client command from the command line.
@@ -260,16 +282,14 @@ struct App {
 impl App {
     /// Draw a scheduled frame and flush protocol replies.
     fn present_frame(&mut self) {
-        if self.state.needs_frame() {
-            let started = Instant::now();
-            let cost = self.state.present(&mut self.presenter);
-            // The cap runs from when the frame began rather than when it
-            // finished: the work happens *inside* the interval, so counting it
-            // as well would put the compositor's own cost on the client's
-            // latency and drop the frame rate with it.
-            self.last_frame_started = Some(started);
-            self.frames.record(&cost);
-        }
+        let started = Instant::now();
+        let cost = self.state.present(&mut self.presenter);
+        // The cap runs from when the frame began rather than when it
+        // finished: the work happens *inside* the interval, so counting it
+        // as well would put the compositor's own cost on the client's
+        // latency and drop the frame rate with it.
+        self.last_frame_started = Some(started);
+        self.frames.record(&cost);
         self.flush_clients();
     }
 
@@ -359,10 +379,10 @@ impl App {
         match event {
             Event::Key(key) => self.state.key(key),
             Event::Mouse(mouse) => {
-                let position: Point<f64, Logical> = if self.terminal.capabilities().pixel_mouse {
+                let position: Point<f64, Logical> = if self.presenter.capabilities().pixel_mouse {
                     (f64::from(mouse.column), f64::from(mouse.row)).into()
                 } else {
-                    let (cell_width, cell_height) = self.terminal.capabilities().cell;
+                    let (cell_width, cell_height) = self.presenter.capabilities().cell;
                     (
                         f64::mul_add(
                             f64::from(mouse.column),
@@ -400,12 +420,12 @@ impl App {
                 }
             }
             Event::Resize(_, _) => {
-                let capabilities = self.terminal.refresh().clone();
+                let capabilities = self.presenter.refresh().clone();
                 self.state.resize(&capabilities);
                 // Whatever the terminal kept from before the resize is not ours
                 // any more, and this has to land after the frames already
                 // handed over for the same reason.
-                self.presenter.raw(Terminal::clear());
+                self.presenter.clear();
             }
             Event::Paste(text) => self.state.paste(&text),
             Event::FocusGained | Event::FocusLost => {}
@@ -425,6 +445,9 @@ impl App {
 
     /// Restore the terminal and stop the clients.
     fn shutdown(&mut self) {
+        if let Some(mut input) = self.terminal_input.take() {
+            input.stop();
+        }
         for child in &mut self.children {
             let _ = child.kill();
             let _ = child.wait();
@@ -442,10 +465,54 @@ enum TerminalEvent {
     Closed,
 }
 
+/// The blocking terminal reader and its shutdown signal.
+struct TerminalInput {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TerminalInput {
+    fn start(sender: Sender<TerminalEvent>) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("meowland-input".into())
+            .spawn(move || read_terminal(&sender, &reader_stop))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("the terminal input thread panicked");
+        }
+    }
+}
+
+impl Drop for TerminalInput {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Read terminal events forever. crossterm parses the escape sequences,
 /// including the kitty keyboard protocol extensions meowland asks for.
-fn read_terminal(sender: &Sender<TerminalEvent>) {
-    loop {
+fn read_terminal(sender: &Sender<TerminalEvent>, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        match crossterm::event::poll(Duration::from_millis(100)) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(err) => {
+                tracing::debug!(?err, "terminal input ended");
+                let _ = sender.send(TerminalEvent::Closed);
+                return;
+            }
+        }
         match crossterm::event::read() {
             Ok(event) => {
                 tracing::debug!(?event, "terminal input");
@@ -552,7 +619,7 @@ fn frame_deadline(now: Instant, last_frame_started: Option<Instant>) -> Instant 
 
 /// Arm one frame deadline when new compositor state needs presentation.
 fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
-    if app.frame_scheduled || !app.state.needs_frame() {
+    if app.frame_scheduled || !app.state.should_present(app.presenter.is_ready()) {
         return;
     }
     app.frame_scheduled = true;

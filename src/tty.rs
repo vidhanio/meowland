@@ -1,8 +1,7 @@
 //! The terminal we draw into: capability probing, mode setup and raw escape
 //! output.
 //!
-//! Everything meowland shows goes through here, either as terminal text (the
-//! status line) or as kitty graphics escapes (window pixels, see
+//! Everything meowland shows goes through here as kitty graphics escapes (see
 //! [`crate::kitty`]).
 
 use std::{
@@ -54,6 +53,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// report all keys as escape codes, report associated text.
 const KEYBOARD_FLAGS: u32 = 1 | 2 | 8 | 16;
 
+#[derive(Debug)]
 pub struct Terminal {
     capabilities: Capabilities,
     entered: bool,
@@ -68,6 +68,9 @@ pub enum Error {
     /// The terminal would not let go of line-based input.
     #[error("could not put the terminal into raw mode")]
     RawMode(#[source] io::Error),
+    /// The terminal stopped accepting output during setup.
+    #[error("could not initialize terminal output")]
+    Output(#[source] io::Error),
     /// The terminal does not implement the protocol the pixels go out through.
     #[error(
         "this terminal does not support the kitty graphics protocol (meowland needs kitty, \
@@ -84,7 +87,10 @@ impl Terminal {
             return Err(Error::NotATerminal);
         }
         crossterm::terminal::enable_raw_mode().map_err(Error::RawMode)?;
-        let probe = probe().unwrap_or_default();
+        let probe = probe().unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not probe terminal capabilities");
+            Probe::default()
+        });
         let capabilities = resolve_capabilities(&probe, window_size());
         if !capabilities.graphics {
             let _ = crossterm::terminal::disable_raw_mode();
@@ -95,7 +101,10 @@ impl Terminal {
             capabilities,
             entered: false,
         };
-        terminal.enter();
+        if let Err(error) = terminal.enter() {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(Error::Output(error));
+        }
         Ok(terminal)
     }
 
@@ -144,7 +153,7 @@ impl Terminal {
 
     /// Take over the terminal: alternate screen, no autowrap, mouse and pointer
     /// shapes.
-    fn enter(&mut self) {
+    fn enter(&mut self) -> io::Result<()> {
         let mut out = Vec::with_capacity(64);
         // Alternate screen keeps the user's scrollback intact and clears images
         // on the way out.
@@ -167,8 +176,9 @@ impl Terminal {
         // Clear the screen *before* the first placement: `CSI 2J` also deletes
         // images.
         out.extend_from_slice(b"\x1b[2J\x1b[H");
-        let _ = Self::write(&out);
+        Self::write(&out)?;
         self.entered = true;
+        Ok(())
     }
 
     /// Undo everything [`Terminal::enter`] did.
@@ -214,21 +224,23 @@ struct Probe {
 fn probe() -> io::Result<Probe> {
     let mut stdout = io::stdout().lock();
     // Cell size and text area, terminal identity, graphics support, keyboard
-    // protocol, and finally primary device attributes as the "everything is
-    // answered now" marker.
+    // protocol and pixel mouse support. The completion marker is written only
+    // after the shared-memory probe below.
     stdout.write_all(
         b"\x1b[16t\x1b[14t\x1b[>q\
           \x1b_Gi=77,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
           \x1b[?u\
-          \x1b[?1016$p\
-          \x1b[c",
+          \x1b[?1016$p",
     )?;
     // Whether tiles can come out of shared memory is not something a terminal
     // announces: it has to be asked, by sending a tile that way and seeing
     // whether it says it read it. The object goes with the answer.
-    let mut shared_probe = Vec::new();
-    let shared = crate::kitty::shared_memory_probe(&mut shared_probe);
-    stdout.write_all(&shared_probe)?;
+    let mut shared_probe_bytes = Vec::new();
+    let shared_probe = crate::kitty::shared_memory_probe(&mut shared_probe_bytes);
+    stdout.write_all(&shared_probe_bytes)?;
+    // Primary device attributes come last, so their response cannot overtake
+    // the shared-memory answer and end the handshake early.
+    stdout.write_all(b"\x1b[c")?;
     stdout.flush()?;
 
     let mut input = io::stdin();
@@ -270,13 +282,10 @@ fn probe() -> io::Result<Probe> {
     // By id, not by shape: the graphics query answers "OK" too, and it is the
     // tile that has to have been read.
     let expected = format!("\x1b_Gi={};OK\x1b\\", crate::kitty::SHARED_PROBE_ID);
-    probe.shared_memory = shared
+    probe.shared_memory = shared_probe.is_some()
         && responses
             .windows(expected.len())
             .any(|window| window == expected.as_bytes());
-    if !probe.shared_memory {
-        crate::kitty::discard_shared_probe();
-    }
     Ok(probe)
 }
 

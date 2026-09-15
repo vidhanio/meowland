@@ -54,33 +54,28 @@ pub const SHARED_PROBE_ID: u32 = 78;
 /// Send a one-pixel tile out of shared memory, to find out whether the terminal
 /// can read one there.
 ///
-/// Returns whether the tile was written at all; what the terminal makes of it
-/// comes back on stdin with the rest of the probe's answers, and
-/// [`discard_shared_probe`] cleans up after a terminal that did not read it.
-pub fn shared_memory_probe(out: &mut Vec<u8>) -> bool {
+/// The returned guard removes the object if the terminal did not take it.
+pub fn shared_memory_probe(out: &mut Vec<u8>) -> Option<SharedProbe> {
     let object = Shared::new(0);
     if object.write(&[0, 0, 0, 255]).is_err() {
-        return false;
+        return None;
     }
     out.extend_from_slice(b"\x1b_G");
     let _ = write!(out, "a=q,f=32,t=s,i={SHARED_PROBE_ID},s=1,v=1;");
     out.extend_from_slice(&object.encoded_name);
     out.extend_from_slice(b"\x1b\\");
-    // Kept in the module so the cleanup below can find it by name.
-    *PROBE_OBJECT.lock().expect("no poison") = Some(object);
-    true
+    Some(SharedProbe(object))
 }
 
-/// Remove the probe's object, for a terminal that turned out not to read it.
-pub fn discard_shared_probe() {
-    let taken = PROBE_OBJECT.lock().expect("no poison").take();
-    if let Some(object) = taken {
-        object.unlink();
+/// Owns the startup probe object until the terminal has answered.
+#[derive(Debug)]
+pub struct SharedProbe(Shared);
+
+impl Drop for SharedProbe {
+    fn drop(&mut self) {
+        self.0.unlink();
     }
 }
-
-/// The probe object's name, until its fate is known.
-static PROBE_OBJECT: std::sync::Mutex<Option<Shared>> = std::sync::Mutex::new(None);
 
 /// One tile's payload, in a shared memory object the terminal reads for itself.
 ///
@@ -109,22 +104,16 @@ impl Shared {
 
     /// Write `payload` into the object named after `slot`.
     ///
-    /// A name per tile rather than per transfer, which bounds what a terminal
-    /// that has stopped reading can leave behind - the size of the screen, not
-    /// the length of the session - and keeps the names to a handful rather than
-    /// a counter's worth. The trade is that a terminal reading late is handed
-    /// what was written most recently instead of what was written for it, which
-    /// is also the newest row of pixels it could be showing. mpv's `--vo=kitty`
-    /// makes the same trade, with one object for a whole frame.
+    /// A name per tile bounds what a terminal that stopped reading can leave
+    /// behind to the size of one screen. A name still owned by the terminal is
+    /// never overwritten: creation then fails and that update travels directly
+    /// through the pty, preserving the order and contents of both updates.
     fn write(&self, payload: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
-        // Not `EXCL`: the name is one this process has used before, and either
-        // the terminal has unlinked it by now or it still holds what it failed
-        // to read, which is about to be replaced either way.
         let file = rustix::fs::open(
             self.path.as_str(),
-            rustix::fs::OFlags::CREATE | rustix::fs::OFlags::RDWR,
+            rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL | rustix::fs::OFlags::RDWR,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
         .map_err(std::io::Error::from)?;
@@ -136,8 +125,11 @@ impl Shared {
     }
 
     /// Remove it, for a terminal that turned out not to read it.
-    fn unlink(self) {
+    fn unlink(&self) {
         if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return;
+            }
             tracing::debug!(
                 ?err,
                 path = self.path,

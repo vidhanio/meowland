@@ -179,7 +179,11 @@ impl std::fmt::Debug for Meowland {
 
 impl Meowland {
     /// Advertise the initial state to clients.
-    pub fn new(display: &DisplayHandle, capabilities: &Capabilities) -> Result<Self, Error> {
+    pub fn new(
+        display: &DisplayHandle,
+        capabilities: &Capabilities,
+        nodes: &[crate::dmabuf::RenderNode],
+    ) -> Result<Self, Error> {
         let compositor_state = CompositorState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, []);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
@@ -235,8 +239,14 @@ impl Meowland {
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
         let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
 
-        let gpu = bring_up_renderer();
-        let dmabuf_global = advertise_render_nodes(display, &mut dmabuf_state, gpu.as_ref())?;
+        let (gpu, dmabuf_global) = match bring_up_renderer(nodes) {
+            Some((renderer, node)) => {
+                let global =
+                    advertise_render_nodes(display, &mut dmabuf_state, Some((&renderer, &node)))?;
+                (Some(renderer), global)
+            }
+            None => (None, None),
+        };
 
         Ok(Self {
             compositor_state,
@@ -1171,15 +1181,20 @@ impl DataDeviceHandler for Meowland {
     }
 }
 
-/// Bring up a renderer on the first render node that has one.
+/// Bring up a renderer on the first render node that has one, and say which
+/// node that was.
 ///
 /// Without a renderer there is no way to read a buffer the CPU cannot map, and
 /// a client that hands one over would have nothing to show, so this is what
-/// decides whether clients are offered GPU buffers at all.
-fn bring_up_renderer() -> Option<crate::gpu::Renderer> {
-    for node in crate::dmabuf::nodes().ok()? {
+/// decides whether clients are offered GPU buffers at all - and it decides on
+/// which device, since a device no renderer can be built on is one whose
+/// buffers could not be read back.
+fn bring_up_renderer(
+    nodes: &[crate::dmabuf::RenderNode],
+) -> Option<(crate::gpu::Renderer, crate::dmabuf::RenderNode)> {
+    for node in nodes {
         match crate::gpu::Renderer::new(&node.path) {
-            Ok(renderer) => return Some(renderer),
+            Ok(renderer) => return Some((renderer, node.clone())),
             Err(err) => tracing::info!(?err, "no renderer on this render node"),
         }
     }
@@ -1200,9 +1215,9 @@ fn bring_up_renderer() -> Option<crate::gpu::Renderer> {
 fn advertise_render_nodes(
     display: &DisplayHandle,
     state: &mut DmabufState,
-    gpu: Option<&crate::gpu::Renderer>,
+    gpu: Option<(&crate::gpu::Renderer, &crate::dmabuf::RenderNode)>,
 ) -> Result<Option<DmabufGlobal>, Error> {
-    let (Some(gpu), Some(node)) = (gpu, crate::dmabuf::nodes()?.into_iter().next()) else {
+    let Some((gpu, node)) = gpu else {
         return Ok(None);
     };
     let formats = gpu.formats();

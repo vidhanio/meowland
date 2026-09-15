@@ -277,6 +277,16 @@ impl Encoder {
             self.transfers += 1;
             self.transfers
         });
+        // Whether compressing pays is a decision about the pty: with shared
+        // memory the pixels never travel through it, so the answer is no - it
+        // would be our time against the terminal's, and reading pixels costs
+        // the terminal less than inflating them.
+        if self.shared_memory {
+            self.compressed_last_frame = false;
+            self.compress = Some(false);
+            transmit(out, &mut self.payload, pixels, placement, false, shared);
+            return;
+        }
         let Some(compress) = self.compress else {
             // Compressed before being asked whether to: one tile of work is
             // what it costs to find out.

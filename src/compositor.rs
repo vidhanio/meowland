@@ -137,9 +137,17 @@ pub struct Meowland {
     /// The renderer a client's GPU buffers are brought back through, when
     /// there is a device to have one on.
     gpu: Option<crate::gpu::Renderer>,
-    /// Tiles that have changed and have not been handed to the presenter yet,
-    /// because it was busy with the frame before them.
-    due: std::collections::VecDeque<Rect>,
+    /// Which tiles have changed and have not reached the terminal yet, one flag
+    /// per cell of the tile grid, because the presenter was busy with the frame
+    /// before them.
+    /// A set rather than a queue: a tile that changes again while it waits is
+    /// still one tile to send, and it carries its newest pixels when it goes.
+    /// If it were a queue, a client at 60 Hz and a terminal that cannot
+    /// keep up would grow it without bound, and every handover would cost
+    /// more than the one before it until the screen stopped moving.
+    due: Vec<bool>,
+    /// How many of those flags are set, so an empty set costs nothing to spot.
+    due_count: usize,
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -255,6 +263,7 @@ impl Meowland {
 
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
         let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
+        let grid_tiles = tiles.grid.0 as usize * tiles.grid.1 as usize;
 
         let (gpu, dmabuf_global) = match bring_up_renderer(nodes) {
             Some((renderer, node)) => {
@@ -273,7 +282,8 @@ impl Meowland {
             dmabuf_state,
             dmabuf_global,
             gpu,
-            due: std::collections::VecDeque::new(),
+            due: vec![false; grid_tiles],
+            due_count: 0,
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -413,8 +423,18 @@ impl Meowland {
     /// presenter is still busy with the frame before them - in which case they
     /// stay due and the next frame carries them.
     fn hand_over(&mut self, presenter: &mut Presenter, cost: &mut Cost) {
-        self.due.extend(self.dirty.drain(..));
-        if self.due.is_empty() {
+        let tile_size = self.tiles.size;
+        let grid = self.tiles.grid;
+        let mut due_count = self.due_count;
+        for tile in self.dirty.drain(..) {
+            let index = tile_index(tile, tile_size, grid);
+            if !self.due[index] {
+                self.due[index] = true;
+                due_count += 1;
+            }
+        }
+        self.due_count = due_count;
+        if self.due_count == 0 {
             return;
         }
         let Some(mut pixels) = presenter.buffer() else {
@@ -425,23 +445,43 @@ impl Meowland {
         // so the presenter can cut them apart again without knowing the frame.
         pixels.clear();
         let stride = self.frame.width as usize * 4;
-        let mut tiles = Vec::with_capacity(self.due.len());
-        for tile in &self.due {
+        let mut tiles = Vec::with_capacity(self.due_count);
+        for index in 0..self.due.len() {
+            if !self.due[index] {
+                continue;
+            }
+            let tile = self.tile_of(index, tile_size);
             for row in 0..tile.height {
                 let start = (tile.y as usize + row as usize) * stride + tile.x as usize * 4;
                 pixels.extend_from_slice(
                     &self.frame.pixels()[start..start + tile.width as usize * 4],
                 );
             }
-            tiles.push(self.placement(*tile));
+            tiles.push(self.placement(tile));
         }
 
         cost.sent = tiles.len();
         match presenter.present(crate::presenter::Frame { pixels, tiles }) {
-            Ok(()) => self.due.clear(),
+            Ok(()) => {
+                self.due.fill(false);
+                self.due_count = 0;
+            }
             // Not taken: the tiles stay due, so nothing is lost by the wait.
             Err(frame) => presenter.reuse(frame.pixels),
         }
+    }
+
+    /// The tile a grid index stands for.
+    fn tile_of(&self, index: usize, tile_size: (u32, u32)) -> Rect {
+        let grid_x = index as u32 % self.tiles.grid.0;
+        let grid_y = index as u32 / self.tiles.grid.0;
+        let (x, y) = (grid_x * tile_size.0, grid_y * tile_size.1);
+        Rect::new(
+            x as i32,
+            y as i32,
+            tile_size.0.min(self.frame.width - x),
+            tile_size.1.min(self.frame.height - y),
+        )
     }
 
     /// Where one tile goes and what it is called.
@@ -540,6 +580,8 @@ impl Meowland {
         self.frame
             .resize(capabilities.pixels.0, capabilities.pixels.1);
         self.tiles = Tiles::new(&self.frame, tile_size(capabilities.cell));
+        self.due = vec![false; self.tiles.grid.0 as usize * self.tiles.grid.1 as usize];
+        self.due_count = 0;
         let mode = output_mode(capabilities);
         self.output.set_preferred(mode);
         self.output.change_current_state(
@@ -861,6 +903,12 @@ fn draw_surface(
         Rect::new(0, 0, snapshot.width, snapshot.height),
         Rect::new(location.x, location.y, width as u32, height as u32),
     );
+}
+
+/// Where a tile sits in the grid of flags.
+fn tile_index(tile: Rect, tile_size: (u32, u32), grid: (u32, u32)) -> usize {
+    (tile.y as u32 / tile_size.1.max(1)) as usize * grid.0 as usize
+        + (tile.x as u32 / tile_size.0.max(1)) as usize
 }
 
 /// Where a sub-surface sits relative to its parent (zero for a toplevel).

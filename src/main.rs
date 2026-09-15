@@ -64,7 +64,7 @@ const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_000 / REFRES
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let log = init_logging(cli.log.as_deref(), cli.log_level.as_deref())?;
+    init_logging(cli.log.as_deref(), cli.log_level.as_deref())?;
 
     let terminal = Terminal::new()?;
 
@@ -87,7 +87,6 @@ fn main() -> anyhow::Result<()> {
         socket_name,
         command: cli.command,
         children: Vec::new(),
-        log,
         spawned: 0,
         quitting: false,
         frame_scheduled: false,
@@ -263,7 +262,6 @@ struct App {
     /// The client command from the command line.
     command: Vec<OsString>,
     children: Vec<Child>,
-    log: File,
     /// How many clients were started, so that "none left" can be told from
     /// "none yet".
     spawned: usize,
@@ -322,13 +320,6 @@ impl App {
             return;
         }
         let (program, arguments) = self.command.split_first().expect("checked above");
-        let log = match self.log.try_clone() {
-            Ok(log) => log,
-            Err(err) => {
-                tracing::warn!(?err, "could not redirect the client's output");
-                return;
-            }
-        };
         let child = Command::new(program)
             .args(arguments)
             .env("WAYLAND_DISPLAY", &self.socket_name)
@@ -340,11 +331,9 @@ impl App {
             .env("SDL_VIDEODRIVER", "wayland")
             .env("MOZ_ENABLE_WAYLAND", "1")
             .env("ELECTRON_OZONE_PLATFORM_HINT", "auto")
-            // The terminal belongs to the compositor: a client writing to it would draw over the
-            // screen we are managing.
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().expect("log file is clonable")))
-            .stderr(Stdio::from(log))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn();
         match child {
             Ok(child) => {
@@ -539,7 +528,7 @@ fn bind_socket() -> anyhow::Result<ListeningSocketSource> {
 }
 
 /// Send logs to a file: stdout is the screen we are drawing on.
-fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<File> {
+fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<()> {
     let path = path.map_or_else(
         || {
             Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()))
@@ -553,15 +542,15 @@ fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<File
         || EnvFilter::new("meowland=info,warn"),
         |level| EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("meowland=info,warn")),
     );
-    let client_log = file.try_clone()?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(file)
         .with_ansi(false)
         .init();
     tracing::info!(path = %path.display(), "logging to file");
-    Ok(client_log)
+    Ok(())
 }
+
 /// What the frames of one second cost this thread, logged so that a slow frame
 /// rate can be attributed rather than guessed at: this is the thread that reads
 /// input, so time spent here is time a keystroke waits.

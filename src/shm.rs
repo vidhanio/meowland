@@ -30,6 +30,20 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Empty storage used until a surface commits its first valid buffer.
+    pub const fn empty() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            stride: 0,
+            scale: 1,
+            format: SourceFormat::Xrgb8888,
+            pixels: Vec::new(),
+        }
+    }
+}
+
+impl Snapshot {
     /// The size the client laid this buffer out against, in logical
     /// coordinates.
     pub fn logical_size(&self) -> (i32, i32) {
@@ -70,12 +84,19 @@ pub const fn source_format(format: Format) -> Option<SourceFormat> {
 /// protocol meowland does not advertise), for formats it cannot composite, and
 /// for buffers whose advertised geometry does not fit into the pool the client
 /// handed over.
-pub fn snapshot(buffer: &WlBuffer, scale: i32, limit: (u32, u32)) -> Option<Snapshot> {
-    let copied = with_buffer_contents::<_, Option<Snapshot>>(buffer, |pointer, length, data| {
+pub fn snapshot(
+    buffer: &WlBuffer,
+    scale: i32,
+    limit: (u32, u32),
+    destination: &mut Snapshot,
+) -> bool {
+    let copied = with_buffer_contents::<_, bool>(buffer, |pointer, length, data| {
         if data.offset < 0 || data.width <= 0 || data.height <= 0 || data.stride <= 0 {
-            return None;
+            return false;
         }
-        let format = source_format(data.format)?;
+        let Some(format) = source_format(data.format) else {
+            return false;
+        };
         let (width, height, stride) = (data.width as u32, data.height as u32, data.stride as usize);
         // Twice the screen is generous room for a window that grew before the
         // compositor caught up; past that the client is asking for
@@ -83,14 +104,14 @@ pub fn snapshot(buffer: &WlBuffer, scale: i32, limit: (u32, u32)) -> Option<Snap
         let scale_factor = scale.max(1) as u32;
         if width / scale_factor > limit.0 * 2 || height / scale_factor > limit.1 * 2 {
             tracing::debug!(width, height, ?limit, "refusing an oversized client buffer");
-            return None;
+            return false;
         }
         // The rows are only required to be `stride` apart, so the last byte we
         // read decides whether the client's advertisement is consistent
         // with the pool it gave us.
         let last = (height as usize - 1) * stride + width as usize * 4;
         if data.offset as usize + last > length {
-            return None;
+            return false;
         }
         // SAFETY: the pointer is valid for `length` bytes for the duration of
         // this closure (the contract of `with_buffer_contents`), we
@@ -102,31 +123,28 @@ pub fn snapshot(buffer: &WlBuffer, scale: i32, limit: (u32, u32)) -> Option<Snap
             reason = "shared memory is only reachable as a raw pointer; the slice is bounded and is copied out at once"
         )]
         let source = unsafe { std::slice::from_raw_parts(pointer.add(data.offset as usize), last) };
-        let pixels = source.to_vec();
-        let non_zero = pixels.iter().filter(|byte| **byte != 0).count();
+        destination.pixels.clear();
+        destination.pixels.extend_from_slice(source);
+        destination.width = width;
+        destination.height = height;
+        destination.stride = stride as u32;
+        destination.scale = scale;
+        destination.format = format;
         tracing::debug!(
             width,
             height,
             stride,
             ?format,
             scale,
-            non_zero,
             "copied a client buffer"
         );
-        Some(Snapshot {
-            width,
-            height,
-            stride: stride as u32,
-            scale,
-            format,
-            pixels,
-        })
+        true
     });
     match copied {
-        Ok(snapshot) => snapshot,
+        Ok(copied) => copied,
         Err(err) => {
             tracing::debug!(?err, "could not copy a client buffer");
-            None
+            false
         }
     }
 }

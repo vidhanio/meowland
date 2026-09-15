@@ -1,16 +1,15 @@
-//! The socket a running server is commanded on.
+//! The sockets a server is reached on.
 //!
-//! meowland owns the terminal it was started in, so the way to reach it from
-//! anywhere else is a local socket: a CLI connects, sends one command, reads
-//! one reply, and exits, while the server answers from the event loop thread
-//! that owns the windows.
+//! A server has no terminal of its own, so everything said to it and shown by
+//! it goes through `$XDG_RUNTIME_DIR`: a CLI connects to the control socket,
+//! sends one command, reads one reply and exits, and a terminal connects to the
+//! display socket to be shown the server (`src/display.rs`). Both are bound by
+//! the server, and both are named here because this is the only place that
+//! knows where they live and what a socket file with nothing behind it means.
 //!
 //! `$XDG_RUNTIME_DIR` is per-user and reachable only by its owner, which is the
-//! whole of the access control here - and it has to be, because one of these
+//! whole of the access control - and it has to be, because one of these
 //! commands starts a process.
-//!
-//! One server at a time: the socket name is fixed, and taking it is what says
-//! whether a server is already running.
 
 use std::{
     env,
@@ -25,7 +24,10 @@ use std::{
 };
 
 /// The socket a server listens on and a CLI connects to.
-const SOCKET_NAME: &str = "meowland-control";
+pub const CONTROL_SOCKET: &str = "meowland-control";
+
+/// The socket a terminal connects to to be shown the server.
+pub const DISPLAY_SOCKET: &str = "meowland-display";
 
 /// What separates the arguments of a `run` request.
 ///
@@ -53,9 +55,10 @@ pub struct Socket {
 }
 
 impl Socket {
-    /// Take the socket name, or report that a server already holds it.
-    pub fn bind() -> Result<(Self, UnixListener), Error> {
-        let path = path()?;
+    /// Take one of the server's socket names, or report that a server
+    /// already holds it.
+    pub fn bind(name: &str) -> Result<(Self, UnixListener), Error> {
+        let path = path(name)?;
         match UnixStream::connect(&path) {
             // Something answered: a server is running, and it is not this one.
             Ok(_) => return Err(Error::AlreadyRunning),
@@ -88,6 +91,8 @@ pub enum Command {
     Attach(u64),
     /// Start a client as another window of the server.
     Run(Vec<OsString>),
+    /// Stop the server and everything started under it.
+    Quit,
 }
 
 impl Command {
@@ -95,6 +100,7 @@ impl Command {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::List => b"list".to_vec(),
+            Self::Quit => b"quit".to_vec(),
             Self::Attach(id) => format!("attach {id}").into_bytes(),
             Self::Run(argv) => {
                 let mut request = b"run".to_vec();
@@ -111,6 +117,9 @@ impl Command {
     pub fn decode(request: &[u8]) -> Option<Self> {
         if request == b"list" {
             return Some(Self::List);
+        }
+        if request == b"quit" {
+            return Some(Self::Quit);
         }
         if let Some(id) = request.strip_prefix(b"attach ") {
             return std::str::from_utf8(id)
@@ -230,7 +239,7 @@ impl Reply {
 
 /// Ask a running server to carry out a command.
 pub fn request(command: &Command) -> Result<Reply, Error> {
-    let mut stream = connect()?;
+    let mut stream = connect(CONTROL_SOCKET)?;
     stream.write_all(&command.encode())?;
     // The server reads the request to the end, so closing this side of the
     // socket is what says the request is complete.
@@ -240,15 +249,20 @@ pub fn request(command: &Command) -> Result<Reply, Error> {
     Ok(Reply::decode(&response))
 }
 
-fn connect() -> Result<UnixStream, Error> {
-    let path = path()?;
+/// Connect to one of the server's sockets, or say there is no server.
+pub fn connect(name: &str) -> Result<UnixStream, Error> {
+    let path = path(name)?;
     match UnixStream::connect(&path) {
         Ok(stream) => Ok(stream),
-        // A socket file that refuses the connection is a server that is gone.
+        // A socket file that refuses the connection, or was taken out from
+        // under it, is a server that is gone: what is on disk is a name left
+        // behind, not a server.
         Err(error)
             if matches!(
                 error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
             ) =>
         {
             Err(Error::NotRunning)
@@ -257,9 +271,9 @@ fn connect() -> Result<UnixStream, Error> {
     }
 }
 
-fn path() -> Result<PathBuf, Error> {
+fn path(name: &str) -> Result<PathBuf, Error> {
     let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDirectory)?;
-    Ok(PathBuf::from(runtime).join(SOCKET_NAME))
+    Ok(PathBuf::from(runtime).join(name))
 }
 
 #[cfg(test)]
@@ -288,7 +302,7 @@ mod tests {
 
     #[test]
     fn the_other_requests_survive_a_round_trip() {
-        for command in [Command::List, Command::Attach(17)] {
+        for command in [Command::List, Command::Attach(17), Command::Quit] {
             assert_eq!(Command::decode(&command.encode()), Some(command));
         }
         assert_eq!(Command::decode(b"attach 1x"), None);

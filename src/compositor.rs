@@ -69,11 +69,15 @@ use smithay::{
 
 use crate::{
     buffer::Snapshot,
+    display::{self, Key},
     keys, kitty,
     presenter::Presenter,
     render::{BYTES, Frame, Rect, Tiles},
     tty::Capabilities,
 };
+
+/// The refresh rate advertised to clients, in the Wayland protocol's mHz.
+pub const REFRESH_MILLIHZ: i32 = 60_000;
 
 /// Tile size in character cells. Terminals update images whole, so this is the
 /// resolution of a partial repaint: bigger tiles mean fewer images, smaller
@@ -249,8 +253,11 @@ pub struct Meowland {
     /// The client scene changed and must be composited again.
     scene_dirty: bool,
     pointer_dirty: bool,
-    /// Set by the quit binding and by the main loop's own reasons to stop.
-    quitting: bool,
+    /// Set by the key binding that asks to stop being shown on this terminal.
+    ///
+    /// A server outlives the terminal it is drawn on: this ends the showing,
+    /// not the server, and a terminal is shown again by attaching another one.
+    detaching: bool,
     cell: (u32, u32),
 }
 
@@ -369,7 +376,7 @@ impl Meowland {
             plan: Vec::new(),
             scene_dirty: false,
             pointer_dirty: false,
-            quitting: false,
+            detaching: false,
             cell: capabilities.cell,
         })
     }
@@ -387,21 +394,12 @@ impl Meowland {
         Ok(())
     }
 
-    /// Whether the quit binding has been used.
-    pub const fn quitting(&self) -> bool {
-        self.quitting
-    }
-
-    /// Whether a toplevel has committed pixels that can be displayed.
-    ///
-    /// This is what the terminal waits for before it is taken over: with
-    /// nothing to draw, taking it over would wipe the screen for a frame of
-    /// backdrop and then put the user's shell back.
-    pub fn window_ready(&self) -> bool {
-        self.windows.iter().any(|window| {
-            self.snapshots
-                .contains_key(&window.surface.wl_surface().id())
-        })
+    /// Whether the terminal showing this server asked to be let go, taking
+    /// the request with it.
+    pub const fn take_detach_request(&mut self) -> bool {
+        let detaching = self.detaching;
+        self.detaching = false;
+        detaching
     }
 
     fn active_surface(&self) -> Option<WlSurface> {
@@ -678,38 +676,41 @@ impl Meowland {
     /// auto-repeat produce the repeats. Holding a key down is otherwise
     /// indistinguishable from a key that was never let go, and the client would
     /// repeat it forever.
-    pub fn key(&mut self, event: crossterm::event::KeyEvent) {
-        use crossterm::event::{KeyCode, KeyEventKind};
+    ///
+    /// The key arrives already reduced to a code and a shift by the terminal it
+    /// was typed at (`crate::display`), which is the side that has the key
+    /// codes and the keymap.
+    pub fn key(&mut self, key: Key) {
+        use display::KeyKind;
 
-        self.sync_modifiers(event.modifiers);
-        let Some(stroke) = keys::for_key(event.code) else {
-            if let KeyCode::Char(c) = event.code {
-                tracing::debug!(?c, "character has no key code in the advertised keymap");
-            }
-            return;
+        let modifiers = crossterm::event::KeyModifiers::from_bits_truncate(key.modifiers);
+        self.sync_modifiers(modifiers);
+        let stroke = keys::KeyStroke {
+            code: key.code,
+            shift: key.shift,
         };
-        tracing::debug!(?event, code = stroke.code, "key");
+        tracing::debug!(?key, code = stroke.code, "key");
 
         // Modifier keys are the exception: they are *state* for everything
         // typed while they are held, so they follow the terminal's
         // modifier flags rather than a keystroke.
-        if matches!(event.code, KeyCode::Modifier(_)) {
-            match event.kind {
-                KeyEventKind::Press => self.press_modifier(stroke.code),
-                KeyEventKind::Repeat => {}
-                KeyEventKind::Release => self.release_modifier(stroke.code),
+        if key.modifier {
+            match key.kind {
+                KeyKind::Press => self.press_modifier(stroke.code),
+                KeyKind::Repeat => {}
+                KeyKind::Release => self.release_modifier(stroke.code),
             }
             return;
         }
 
-        match event.kind {
-            KeyEventKind::Press | KeyEventKind::Repeat => {
-                if !self.binding(event.modifiers, stroke.code) {
+        match key.kind {
+            KeyKind::Press | KeyKind::Repeat => {
+                if !self.binding(modifiers, stroke.code) {
                     self.type_stroke(stroke);
                 }
             }
             // The press released this key already; there is nothing left to let go of.
-            KeyEventKind::Release => {}
+            KeyKind::Release => {}
         }
     }
 
@@ -738,7 +739,7 @@ impl Meowland {
         }
         match code {
             15 => self.cycle_window(),
-            16 => self.quitting = true,
+            16 => self.detaching = true,
             _ => return false,
         }
         true
@@ -899,7 +900,7 @@ fn output_mode(capabilities: &Capabilities) -> Mode {
     Mode {
         size: (capabilities.pixels.0 as i32, capabilities.pixels.1 as i32).into(),
         // A terminal has no refresh rate; frame callbacks are what pace clients here.
-        refresh: crate::REFRESH_MILLIHZ,
+        refresh: REFRESH_MILLIHZ,
     }
 }
 

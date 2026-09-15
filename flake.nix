@@ -127,6 +127,7 @@
 
               packages = [
                 config.treefmt.build.wrapper
+                self'.packages.default
               ]
               ++ runtimeInputs;
 

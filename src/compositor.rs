@@ -1159,13 +1159,31 @@ impl CompositorHandler for Meowland {
         // the toplevels: sub-surfaces, popups and the client's cursor
         // all arrive here too.
         //
-        // Nothing here moves the focus. A toplevel's first commit carries no
-        // buffer - it is how the client asks to be configured - and a client
-        // that later unmaps one is hiding a window, not closing it: either way
-        // the view the user chose is still the view the user chose, and the
-        // window only leaves the list when it is destroyed.
+        // A window takes the screen when it first has pixels to put on it, and
+        // only if no newer window has already shown something. Nothing else
+        // moves it: a toplevel's first commit carries no buffer - it is how the
+        // client asks to be configured - a client that later unmaps one is
+        // hiding a window rather than closing it, and a window that redraws is
+        // the window that was already showing. The window leaves the list when
+        // it is destroyed, and is chosen again by `attach` or the cycle binding
+        // when the user says so.
+        let drawn = self.snapshots.contains_key(&surface.id());
         self.snapshot(surface);
         self.scene_dirty = true;
+        if !drawn
+            && self.snapshots.contains_key(&surface.id())
+            && let Some(index) = self
+                .windows
+                .iter()
+                .position(|window| window.surface.wl_surface() == surface)
+            && self.active.is_none_or(|active| active < index)
+        {
+            // Whatever the client asked for, a window with nothing on it is not
+            // worth looking at - and some clients open windows they never draw
+            // in at all, which must not leave the screen without the one that
+            // is drawing.
+            self.activate_index(index);
+        }
         tracing::debug!(id = ?surface.id(), "committed");
     }
 

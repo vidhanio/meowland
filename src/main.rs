@@ -12,6 +12,7 @@ mod buffer;
 mod compositor;
 mod dmabuf;
 mod gpu;
+mod hud;
 mod keys;
 mod kitty;
 mod presenter;
@@ -69,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     let display: Display<Meowland> =
         Display::new().context("could not create a Wayland display")?;
     let nodes = cli.gpu_buffers.nodes(cli.render_node.as_deref())?;
-    let state = Meowland::new(&display.handle(), terminal.capabilities(), &nodes)?;
+    let state = Meowland::new(&display.handle(), terminal.capabilities(), &nodes, cli.fps)?;
 
     let mut app = App {
         display,
@@ -215,6 +216,10 @@ struct Cli {
     /// A `tracing` filter, as in `meowland=debug`
     #[usage(long, env = "MEOWLAND_LOG_LEVEL", value_name = "FILTER")]
     log_level: Option<String>,
+
+    /// Show how many frames a second the terminal is being sent, in the corner
+    #[usage(long, env = "MEOWLAND_FPS")]
+    fps: bool,
 
     /// Client command and arguments. Without one, wait for a client to connect.
     #[usage(

@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  - push
+  - pull_request
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  test:
+    name: test
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      # xkbcommon-sys links the system libxkbcommon, which is what the
+      # compositor builds its keymap with.
+      - name: install libraries
+        run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: run tests
+        run: cargo test --all-features --all-targets
+
+  check:
+    name: check
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: install libraries
+        run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
+
+      # Nightly clippy: rustfmt's unstable options and the pedantic/nursery
+      # lints in Cargo.toml are what the flake's checks run too.
+      - name: install rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: check code
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  check-nix:
+    name: check nix
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: setup nix
+        uses: ./.github/actions/setup-nix
+
+      # The flake's checks are the authoritative gates: cargo test, cargo
+      # clippy -D warnings, rustfmt and treefmt (nixfmt, statix, deadnix,
+      # taplo) all run through crane and treefmt-nix.
+      - name: check flake
+        run: nix flake check
+
+  build:
+    name: build
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: setup nix
+        uses: ./.github/actions/setup-nix
+
+      - name: build the compositor
+        run: nix build .#default
+
+      - name: smoke test the binary
+        run: ./result/bin/meowland --help

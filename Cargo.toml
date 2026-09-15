@@ -1,0 +1,44 @@
+[package]
+name = "meowland"
+version = "0.1.0"
+edition = "2024"
+
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+crossterm = "0.29.0"
+flate2 = "1.1.10"
+rustix = "1.1.4"
+signal-hook = "0.3.18"
+smithay = { version = "0.7", default-features = false, features = [
+  "desktop",
+  "wayland_frontend",
+] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints]
+[lints.rust]
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+# missing_docs = "warn"
+# Not `forbid`: reading a client's shared memory buffer needs one `unsafe` slice
+# (`src/shm.rs`), which the lint would make impossible to write down.
+unsafe_code = "deny"
+
+[lints.clippy]
+# Coordinates and pixel values are converted in bulk (pointer positions, tile rectangles, channel
+# arithmetic), where range is known from the surrounding invariants rather than from the type.
+cast_possible_wrap = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

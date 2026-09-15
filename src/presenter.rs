@@ -51,15 +51,16 @@ pub struct Presenter {
 }
 
 impl Presenter {
-    /// Start the worker.
-    pub fn new() -> Self {
+    /// Start the worker, telling it whether the terminal reads tiles out of
+    /// shared memory rather than off the pty.
+    pub fn new(shared_memory: bool) -> Self {
         // One frame in flight at a time: a backlog of frames is a backlog of
         // latency, and the newest frame supersedes the ones before it.
         let (messages, queue) = sync_channel::<Message>(1);
         let (recycle, recycled) = std::sync::mpsc::channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
-            .spawn(move || run(queue, recycle))
+            .spawn(move || run(queue, recycle, shared_memory))
             .expect("the presenter thread could not be started");
         Self {
             messages: Some(messages),
@@ -127,8 +128,9 @@ impl Presenter {
     clippy::needless_pass_by_value,
     reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
 )]
-fn run(queue: Receiver<Message>, recycle: Sender<Vec<u8>>) {
+fn run(queue: Receiver<Message>, recycle: Sender<Vec<u8>>, shared_memory: bool) {
     let mut encoder = Encoder::default();
+    encoder.shared_memory = shared_memory;
     let mut out = Vec::new();
     let mut stats = Stats::default();
     while let Ok(message) = queue.recv() {

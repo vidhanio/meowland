@@ -23,6 +23,96 @@ const CHUNK: usize = 4096;
 /// text, so window content covers whatever the terminal last wrote in those
 /// cells.
 const Z_ABOVE_TEXT: i32 = 1;
+/// Where a shared memory object lives, and what it is called.
+const SHM_DIRECTORY: &str = "/dev/shm";
+
+/// The id the startup probe uses for the tile it sends out of shared memory, so
+/// that its answer can be told from the one the graphics query gives.
+pub const SHARED_PROBE_ID: u32 = 78;
+
+/// Send a one-pixel tile out of shared memory, to find out whether the terminal
+/// can read one there.
+///
+/// Returns whether the tile was written at all; what the terminal makes of it
+/// comes back on stdin with the rest of the probe's answers, and
+/// [`discard_shared_probe`] cleans up after a terminal that did not read it.
+pub fn shared_memory_probe(out: &mut Vec<u8>) -> bool {
+    let Some(object) = Shared::write(0, &[0, 0, 0, 255]).ok() else {
+        return false;
+    };
+    out.extend_from_slice(b"\x1b_G");
+    let _ = write!(out, "a=q,f=32,t=s,i={SHARED_PROBE_ID},s=1,v=1;");
+    out.extend_from_slice(&object.encoded_name());
+    out.extend_from_slice(b"\x1b\\");
+    // Kept in the module so the cleanup below can find it by name.
+    *PROBE_OBJECT.lock().expect("no poison") = Some(object.name);
+    true
+}
+
+/// Remove the probe's object, for a terminal that turned out not to read it.
+pub fn discard_shared_probe() {
+    let taken = PROBE_OBJECT.lock().expect("no poison").take();
+    if let Some(name) = taken {
+        Shared { name }.unlink();
+    }
+}
+
+/// The probe object's name, until its fate is known.
+static PROBE_OBJECT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// One tile's payload, in a shared memory object the terminal reads for itself.
+///
+/// The escape that carries it holds only the object's name, so the pixels never
+/// travel through the pty at all - which is the difference between a few
+/// kilobytes a frame and a few megabytes. The terminal unlinks the object once
+/// it has read it, so this lives exactly as long as the transfer does.
+#[derive(Debug)]
+struct Shared {
+    name: String,
+}
+
+impl Shared {
+    /// Write `payload` into a new object, named after `sequence`.
+    fn write(sequence: u64, payload: &[u8]) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        // The name is the object's path under `/dev/shm`, and has to be
+        // something no other compositor on this machine is using.
+        let name = format!("meowland-{}-{sequence}", std::process::id());
+        let path = format!("{SHM_DIRECTORY}/{name}");
+        let file = rustix::fs::open(
+            path.as_str(),
+            rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL | rustix::fs::OFlags::RDWR,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(std::io::Error::from)?;
+        rustix::fs::ftruncate(&file, payload.len() as u64).map_err(std::io::Error::from)?;
+        let mut file = std::fs::File::from(file);
+        file.write_all(payload)?;
+        file.flush()?;
+        drop(file);
+        Ok(Self { name })
+    }
+
+    /// The name as the escape carries it: base64, like any other payload.
+    fn encoded_name(&self) -> Vec<u8> {
+        let mut encoded = vec![0; base64::encoded_len(self.name.len(), true).expect("name fits")];
+        let length = BASE64
+            .encode_slice(self.name.as_bytes(), &mut encoded)
+            .expect("the buffer has the exact encoded size");
+        encoded.truncate(length);
+        encoded
+    }
+
+    /// Remove it, for a terminal that turned out not to read it.
+    fn unlink(self) {
+        let path = format!("{SHM_DIRECTORY}/{}", self.name);
+        if let Err(err) = std::fs::remove_file(&path) {
+            tracing::debug!(?err, path, "could not remove a shared memory object");
+        }
+    }
+}
+
 /// The smallest saving that makes compressing a frame worth its time, as a
 /// fraction of the pixels: below this the terminal is handed the pixels as they
 /// are, because inflating costs it work and the bytes were never going to
@@ -46,6 +136,11 @@ pub struct Encoder {
     compress: Option<bool>,
     /// Whether the last frame was compressed, for the log.
     pub compressed_last_frame: bool,
+    /// Whether the terminal reads tiles out of shared memory, which is what
+    /// keeps the pixels off the pty.
+    pub shared_memory: bool,
+    /// Names shared memory objects, since a terminal takes one per transfer.
+    transfers: u64,
 }
 
 impl Default for Encoder {
@@ -56,6 +151,8 @@ impl Default for Encoder {
             finished: false,
             compress: None,
             compressed_last_frame: true,
+            shared_memory: false,
+            transfers: 0,
         }
     }
 }
@@ -176,6 +273,10 @@ impl Encoder {
         // The first tile of a frame decides for the rest of it: whether
         // compressing pays is a property of what the frame is *of*, and one
         // tile answers for all of them.
+        let shared = self.shared_memory.then(|| {
+            self.transfers += 1;
+            self.transfers
+        });
         let Some(compress) = self.compress else {
             // Compressed before being asked whether to: one tile of work is
             // what it costs to find out.
@@ -184,16 +285,16 @@ impl Encoder {
             self.compress = Some(worth);
             self.compressed_last_frame = worth;
             let payload = if worth { self.zlib.get_ref() } else { pixels };
-            transmit(out, &mut self.payload, payload, placement, worth);
+            transmit(out, &mut self.payload, payload, placement, worth, shared);
             return;
         };
 
         if compress {
             self.compress(pixels);
             let payload = self.zlib.get_ref();
-            transmit(out, &mut self.payload, payload, placement, true);
+            transmit(out, &mut self.payload, payload, placement, true, shared);
         } else {
-            transmit(out, &mut self.payload, pixels, placement, false);
+            transmit(out, &mut self.payload, pixels, placement, false, shared);
         }
     }
 
@@ -220,8 +321,34 @@ impl Encoder {
     }
 }
 
-/// Base64 `payload` into `encoded` and write the escape that sends it.
+/// Get `payload` to the terminal: in a shared memory object if it reads those,
+/// otherwise base64'd through the pty.
 fn transmit(
+    out: &mut Vec<u8>,
+    encoded: &mut Vec<u8>,
+    payload: &[u8],
+    placement: Placement,
+    compressed: bool,
+    shared: Option<u64>,
+) {
+    if let Some(sequence) = shared {
+        let object = match Shared::write(sequence, payload) {
+            Ok(object) => object,
+            // Out of shared memory, or a name already taken: the pty still
+            // works, so this is not worth failing a frame over.
+            Err(err) => {
+                tracing::debug!(?err, "could not put a tile in shared memory");
+                return direct(out, encoded, payload, placement, compressed);
+            }
+        };
+        placed(out, placement, compressed, "t=s", &object.encoded_name());
+        return;
+    }
+    direct(out, encoded, payload, placement, compressed);
+}
+
+/// The payload base64'd into the escape, in chunks.
+fn direct(
     out: &mut Vec<u8>,
     encoded: &mut Vec<u8>,
     payload: &[u8],
@@ -238,28 +365,17 @@ fn transmit(
 }
 
 fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &[u8]) {
-    let Placement {
-        id,
-        width,
-        height,
-        cols,
-        rows,
-        ..
-    } = placement;
     let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
+        let head = if first {
+            describe(placement, compressed, None)
+        } else {
+            String::new()
+        };
+        first = false;
         out.extend_from_slice(b"\x1b_G");
-        // Only the first escape of a multi-part transmission carries the
-        // control data.
-        if first {
-            let compression = if compressed { "o=z," } else { "" };
-            let _ = write!(
-                out,
-                "a=T,f=32,{compression}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
-            );
-            first = false;
-        }
+        out.extend_from_slice(head.as_bytes());
         out.extend_from_slice(if chunks.peek().is_some() {
             b"m=1;"
         } else {
@@ -268,6 +384,35 @@ fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
     }
+}
+
+/// One escape, whose payload is not pixels but where to find them.
+fn placed(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: &str, payload: &[u8]) {
+    out.extend_from_slice(b"\x1b_G");
+    let head = describe(placement, compressed, Some(medium));
+    out.extend_from_slice(head.as_bytes());
+    // The control data ends where the payload begins, and the payload here is a
+    // name rather than pixels.
+    out.extend_from_slice(b";");
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\x1b\\");
+}
+
+/// The control data every transmission carries, whatever the medium.
+fn describe(placement: Placement, compressed: bool, medium: Option<&str>) -> String {
+    let Placement {
+        id,
+        width,
+        height,
+        cols,
+        rows,
+        ..
+    } = placement;
+    let compression = if compressed { "o=z," } else { "" };
+    let medium = medium.map_or(String::new(), |medium| format!("{medium},"));
+    format!(
+        "a=T,f=32,{compression}{medium}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
+    )
 }
 
 #[cfg(test)]
@@ -536,6 +681,45 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_memory_transfer_names_the_object_in_its_payload() {
+        let name = "meowland-0-1";
+        let object = Shared {
+            name: name.to_owned(),
+        };
+        let mut out = Vec::new();
+        placed(
+            &mut out,
+            Placement {
+                id: 3,
+                width: 160,
+                height: 160,
+                cols: 16,
+                rows: 8,
+                cell: (0, 0),
+            },
+            true,
+            "t=s",
+            &object.encoded_name(),
+        );
+
+        // The name is the payload, so it has to come after the separator and
+        // nothing else - a terminal reading `q=2,name` as control data would
+        // never load the image.
+        let text = std::str::from_utf8(&out).expect("escapes are ascii");
+        let (head, payload) = text
+            .trim_start_matches("\x1b_G")
+            .trim_end_matches("\x1b\\")
+            .split_once(';')
+            .expect("the escape separates control data from its payload");
+        assert!(head.contains("t=s"), "{head}");
+        // The name travels base64'd, like every other payload in this protocol.
+        assert_eq!(
+            payload,
+            String::from_utf8(object.encoded_name()).expect("base64 is ascii")
+        );
+    }
+
+    #[test]
     fn content_that_does_not_shrink_is_sent_as_it_is() {
         // Nothing for zlib to find: compressing would spend milliseconds to
         // save a fraction of what base64 then adds back, so the pixels go as
@@ -646,7 +830,14 @@ mod tests {
                             cell: (0, 0),
                         };
                         let payload = encoder.zlib.get_ref();
-                        transmit(&mut out, &mut encoder.payload, payload, placement, true);
+                        transmit(
+                            &mut out,
+                            &mut encoder.payload,
+                            payload,
+                            placement,
+                            true,
+                            None,
+                        );
                         bytes = out.len();
                         continue;
                     }

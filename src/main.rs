@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
     let log = init_logging(cli.log.as_deref(), cli.log_level.as_deref())?;
 
     let terminal = Terminal::new()?;
+    let terminal_capabilities = terminal.capabilities().clone();
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
@@ -74,7 +75,7 @@ fn main() -> anyhow::Result<()> {
         display,
         state,
         terminal,
-        presenter: Presenter::new(),
+        presenter: Presenter::new(terminal_capabilities.shared_memory),
         socket_name,
         command: cli.command,
         children: Vec::new(),

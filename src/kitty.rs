@@ -86,25 +86,37 @@ static PROBE_OBJECT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(No
 /// The escape that carries it holds only the object's name, so the pixels never
 /// travel through the pty at all - which is the difference between a few
 /// kilobytes a frame and a few megabytes. The terminal unlinks the object once
-/// it has read it, so this lives exactly as long as the transfer does.
+/// it has read it, and the name is made again by the next transfer that wants
+/// it.
 #[derive(Debug)]
 struct Shared {
     name: String,
 }
 
 impl Shared {
-    /// Write `payload` into a new object, named after `sequence`.
-    fn write(sequence: u64, payload: &[u8]) -> std::io::Result<Self> {
+    /// Write `payload` into the object named after `slot`.
+    ///
+    /// A name per tile rather than per transfer, which bounds what a terminal
+    /// that has stopped reading can leave behind - the size of the screen, not
+    /// the length of the session - and keeps the names to a handful rather than
+    /// a counter's worth. The trade is that a terminal reading late is handed
+    /// what was written most recently instead of what was written for it, which
+    /// is also the newest row of pixels it could be showing. mpv's `--vo=kitty`
+    /// makes the same trade, with one object for a whole frame.
+    fn write(slot: u32, payload: &[u8]) -> std::io::Result<Self> {
         use std::io::Write as _;
 
         // A POSIX shared memory name, which has to begin with a slash: kitty
         // refuses anything else outright ("POSIX SHM names must start with /"),
         // even though `shm_open` itself would accept it.
-        let name = format!("/meowland-{}-{sequence}", std::process::id());
+        let name = format!("/meowland-{}-{slot}", std::process::id());
         let path = format!("{SHM_DIRECTORY}{name}");
+        // Not `EXCL`: the name is one this process has used before, and either
+        // the terminal has unlinked it by now or it still holds what it failed
+        // to read, which is about to be replaced either way.
         let file = rustix::fs::open(
             path.as_str(),
-            rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL | rustix::fs::OFlags::RDWR,
+            rustix::fs::OFlags::CREATE | rustix::fs::OFlags::RDWR,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
         .map_err(std::io::Error::from)?;
@@ -161,8 +173,6 @@ pub struct Encoder {
     /// Whether the terminal reads tiles out of shared memory, which is what
     /// keeps the pixels off the pty.
     pub shared_memory: bool,
-    /// Names shared memory objects, since a terminal takes one per transfer.
-    transfers: u64,
 }
 
 impl Default for Encoder {
@@ -174,7 +184,6 @@ impl Default for Encoder {
             compress: None,
             compressed_last_frame: true,
             shared_memory: false,
-            transfers: 0,
         }
     }
 }
@@ -295,10 +304,9 @@ impl Encoder {
         // The first tile of a frame decides for the rest of it: whether
         // compressing pays is a property of what the frame is *of*, and one
         // tile answers for all of them.
-        let shared = self.shared_memory.then(|| {
-            self.transfers += 1;
-            self.transfers
-        });
+        // The tile's own id names its object: a tile keeps one id for as long
+        // as the compositor runs, so this is a fixed set of names.
+        let shared = self.shared_memory.then_some(placement.id);
         // Whether compressing pays is a decision about the pty: with shared
         // memory the pixels never travel through it, so the answer is no - it
         // would be our time against the terminal's, and reading pixels costs
@@ -361,13 +369,13 @@ fn transmit(
     payload: &[u8],
     placement: Placement,
     compressed: bool,
-    shared: Option<u64>,
+    shared: Option<u32>,
 ) {
-    if let Some(sequence) = shared {
-        let object = match Shared::write(sequence, payload) {
+    if let Some(slot) = shared {
+        let object = match Shared::write(slot, payload) {
             Ok(object) => object,
-            // Out of shared memory, or a name already taken: the pty still
-            // works, so this is not worth failing a frame over.
+            // Out of shared memory: the pty still works, so this is not worth
+            // failing a frame over.
             Err(err) => {
                 tracing::debug!(?err, "could not put a tile in shared memory");
                 return direct(out, encoded, payload, placement, compressed);

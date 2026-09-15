@@ -162,20 +162,7 @@ fn run(queue: Receiver<Message>, recycle: Sender<Vec<u8>>, shared_memory: bool) 
         let result = write(&out);
         let written = phase.elapsed();
         if let Err(err) = result {
-            // The terminal is gone or has stopped taking what it is sent. Every
-            // transfer it does not read leaves an object the size of its pixels
-            // in shared memory, so stop making them and go back to what a pty
-            // can carry.
-            if encoder.shared_memory {
-                tracing::warn!(
-                    ?err,
-                    "the terminal is not taking frames; sending them directly"
-                );
-                encoder.shared_memory = false;
-                kitty::discard_shared_memory();
-            } else {
-                tracing::warn!(?err, "could not hand a frame to the terminal");
-            }
+            tracing::warn!(?err, "could not hand a frame to the terminal");
         }
 
         // The buffer goes back for the next frame to be filled in.

@@ -18,7 +18,11 @@ takes the offer and is then refused has no window at all.
 Both paths hand the compositor a `Snapshot` of pixels in main memory, which is
 what it composites, diffs and sends to the terminal: composition stays on the
 CPU, one implementation of it, and the terminal never learns where the pixels
-came from. `Meowland` is the application state and owns the protocol globals,
+came from. Composing happens on the thread that reads input and sending does not
+(`src/presenter.rs`), because compressing a frame and waiting for the terminal to
+take it is milliseconds of work that a keystroke would otherwise queue behind.
+A frame the presenter is too busy for is dropped rather than queued, and the
+tiles it carried stay due until a later frame carries them. `Meowland` is the application state and owns the protocol globals,
 toplevels, input routing and presentation. Pass that one state around rather than
 building a second copy of any part of it.
 
@@ -47,6 +51,11 @@ Ghostty, WezTerm), or inside a pane that passes graphics through. It needs a
 terminal on stdin and stdout, so redirecting its output makes it exit immediately.
 Logs go to `$XDG_RUNTIME_DIR/meowland.log`. Wayland clients connect with
 `WAYLAND_DISPLAY=wayland-meowland`.
+
+Terminals that read tiles out of shared memory get them that way, which keeps
+their pixels off the pty entirely; the startup probe decides, by sending one tile
+that way and seeing whether the terminal says it read it. Everything else goes
+direct, base64'd, as before.
 
 Settings are flags that fall back to environment variables, and the flag wins:
 `--gpu-buffers` (`MEOWLAND_GPU_BUFFERS`, default `auto`), `--render-node`

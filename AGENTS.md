@@ -7,15 +7,20 @@ to a Wayland socket as usual, their windows are composited into a frame buffer t
 compositor owns, and that buffer is drawn with the
 [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 
-Everything is CPU and shared memory. `wl_shm` is the path every client can take.
-`zwp_linux_dmabuf_v1` exists so clients that render on the GPU can hand their
-buffers over, but their pixels are still copied on the CPU, which only works if
-the driver put the buffer somewhere the CPU can reach. Video memory is not such
-a place, and a client that takes the offer and is then refused has no window at
-all, so the offer is opt-in (`MEOWLAND_GPU_BUFFERS`). Only linear layouts are
-advertised, and only when they are. `Meowland` is the application state and owns
-the protocol globals, toplevels, input routing and presentation. Pass that one
-state around rather than building a second copy of any part of it.
+`wl_shm` is the path every client can take. `zwp_linux_dmabuf_v1` exists so
+clients that render on the GPU can hand their buffers over: those pixels are
+brought back through a renderer on the same device (`src/gpu.rs`), because a
+driver is entitled to keep a buffer somewhere the CPU cannot map - video memory
+is exactly that - and such a buffer cannot be read as memory at all. What is
+advertised is what that renderer takes, and nothing else, because a client that
+takes the offer and is then refused has no window at all.
+
+Both paths hand the compositor a `Snapshot` of pixels in main memory, which is
+what it composites, diffs and sends to the terminal: composition stays on the
+CPU, one implementation of it, and the terminal never learns where the pixels
+came from. `Meowland` is the application state and owns the protocol globals,
+toplevels, input routing and presentation. Pass that one state around rather than
+building a second copy of any part of it.
 
 ## Development
 
@@ -30,7 +35,8 @@ cargo build --release
 Clippy runs the nursery and pedantic groups; fix lints rather than allowing them.
 `unsafe_code` is denied crate-wide, with documented exceptions where a client
 buffer is read through a raw pointer: shared memory as a slice, and a mapped GPU
-buffer as a slice bounded by the mapping.
+buffer as a slice bounded by the mapping. Bringing up EGL and GLES is the third,
+because smithay's constructors for both are unsafe and there is no safe way in.
 
 Each module declares its own error type with `thiserror`, so a caller can tell
 its failures apart. `anyhow` belongs to `main.rs` alone - the binary is the one
@@ -44,11 +50,15 @@ Logs go to `$XDG_RUNTIME_DIR/meowland.log`, or wherever `MEOWLAND_LOG` points, w
 `WAYLAND_DISPLAY=wayland-meowland`.
 
 `MEOWLAND_GPU_BUFFERS` decides whether clients are offered GPU buffers at all:
-unset or `off` means they are not, `auto` offers every render node on the
-machine, and any other value is the `/dev/dri/renderD…` node to offer. It is off
-by default because a client that takes the offer and whose buffer the compositor
-then cannot read has no window, which is worse than the slow path it would
-otherwise take. Measure before turning it on.
+unset or `off` means they are not, `auto` offers the first render node that has
+a renderer, and any other value is the `/dev/dri/renderD…` node to offer. It is
+off by default because a client that takes the offer and whose buffer the
+compositor then cannot read has no window, which is worse than the slow path it
+would otherwise take.
+
+A renderer needs `libEGL.so.1` at the loader's search path, which `dlopen` does
+not take from `buildInputs`; the dev shell sets `LD_LIBRARY_PATH` for it. Without
+EGL there is no renderer, so no offer.
 
 Terminals and multiplexers do not reliably report key releases, so a press is
 treated as a whole keystroke: press it, release it, and let the terminal's own

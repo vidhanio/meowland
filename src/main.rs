@@ -11,6 +11,7 @@
 mod buffer;
 mod compositor;
 mod dmabuf;
+mod gpu;
 mod keys;
 mod kitty;
 mod render;

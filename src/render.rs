@@ -54,13 +54,40 @@ impl Rect {
     }
 }
 
-/// Pixel layout of a client buffer.
+/// Pixel layout of a client buffer, or of a buffer brought back from one.
+///
+/// The alpha channel is what the two halves of each name differ in, and the
+/// order of the channels is what the two pairs do: what a name says is the
+/// order of the bytes in memory, so `Argb8888` is the one whose first byte is
+/// blue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
-    /// 32-bit with an alpha channel (`ARGB8888`).
+    /// `ARGB8888`: bytes are blue, green, red, alpha.
     Argb8888,
-    /// 32-bit with the alpha byte ignored (`XRGB8888`): every pixel is opaque.
+    /// `XRGB8888`: bytes are blue, green, red, and the fourth is ignored, so
+    /// every pixel is opaque.
     Xrgb8888,
+    /// `ABGR8888`: bytes are red, green, blue, alpha.
+    Abgr8888,
+    /// `XBGR8888`: bytes are red, green, blue, and the fourth is ignored, so
+    /// every pixel is opaque.
+    Xbgr8888,
+}
+
+impl SourceFormat {
+    /// Whether every pixel of a layout is opaque, whatever its fourth byte
+    /// says.
+    pub const fn opaque(self) -> bool {
+        matches!(self, Self::Xrgb8888 | Self::Xbgr8888)
+    }
+
+    /// The red, green and blue channels of a pixel, in that order.
+    pub const fn rgb(self, pixel: [u8; 4]) -> [u8; 3] {
+        match self {
+            Self::Argb8888 | Self::Xrgb8888 => [pixel[2], pixel[1], pixel[0]],
+            Self::Abgr8888 | Self::Xbgr8888 => [pixel[0], pixel[1], pixel[2]],
+        }
+    }
 }
 
 /// A client buffer's pixels, as read out of shared memory.
@@ -174,34 +201,40 @@ impl Frame {
                 return [0, 0, 0, 0];
             }
             let offset = source_row + image_x as usize * 4;
-            let Some(bytes) = image.pixels.get(offset..offset + 4) else {
+            let Some(pixel) = image
+                .pixels
+                .get(offset..)
+                .and_then(<[u8]>::first_chunk::<4>)
+            else {
                 return [0, 0, 0, 0];
             };
-            let alpha = match image.format {
-                SourceFormat::Xrgb8888 => 255,
-                SourceFormat::Argb8888 => bytes[3],
-            };
-            [bytes[2], bytes[1], bytes[0], alpha]
+            let [red, green, blue] = image.format.rgb(*pixel);
+            let alpha = if image.format.opaque() { 255 } else { pixel[3] };
+            [red, green, blue, alpha]
         };
 
         // An exactly one-to-one, fully opaque row is a memcpy: this is the
         // common case for a client that renders at the output's scale
         // with an opaque buffer format.
-        if image.format == SourceFormat::Xrgb8888
+        if image.format.opaque()
             && (scale_x - 1.0).abs() < f64::EPSILON
             && offset_x == 0.0
             && count as usize * 4 <= self.pixels.len() - frame_row
             && count as usize * 4 <= image.pixels.len() - source_row
-            && source_row + count as usize * 4 <= image.pixels.len()
         {
             for index in 0..count as usize {
-                let source = &image.pixels[source_row + index * 4..source_row + index * 4 + 3];
+                let start = source_row + index * 4;
+                let Some(pixel) = image
+                    .pixels
+                    .get(start..start + 4)
+                    .and_then(<[u8]>::first_chunk::<4>)
+                else {
+                    break;
+                };
+                let [red, green, blue] = image.format.rgb(*pixel);
                 let destination =
                     &mut self.pixels[frame_row + index * 4..frame_row + index * 4 + 4];
-                destination[0] = source[2];
-                destination[1] = source[1];
-                destination[2] = source[0];
-                destination[3] = 255;
+                destination.copy_from_slice(&[red, green, blue, 255]);
             }
             return;
         }
@@ -412,6 +445,40 @@ mod tests {
         buffer.format = SourceFormat::Xrgb8888;
         frame.draw(&buffer, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 1));
         assert_eq!(sample(&frame, 0, 0), Some([9, 8, 7, 255]));
+    }
+
+    #[test]
+    fn a_readback_is_red_green_blue_whichever_way_the_client_had_it() {
+        // Both layouts describe the same color: a client's buffer has it with
+        // blue first, and a buffer brought back through the renderer has it
+        // with red first. The frame has to end up the same either way.
+        let (blue_first, red_first) = ([30, 20, 10, 255], [10, 20, 30, 255]);
+
+        for (format, bytes) in [
+            (SourceFormat::Argb8888, blue_first),
+            (SourceFormat::Abgr8888, red_first),
+        ] {
+            let mut frame = Frame::new(1, 1);
+            frame.clear([0, 0, 0]);
+            let mut buffer = image(&bytes, 1, 1);
+            buffer.format = format;
+            frame.draw(&buffer, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 1));
+            assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30, 255]), "{format:?}");
+        }
+
+        // A layout without an alpha channel is opaque, whatever its fourth byte
+        // happens to hold.
+        for (format, bytes) in [
+            (SourceFormat::Xrgb8888, [30, 20, 10, 0]),
+            (SourceFormat::Xbgr8888, [10, 20, 30, 0]),
+        ] {
+            let mut frame = Frame::new(1, 1);
+            frame.clear([0, 0, 0]);
+            let mut buffer = image(&bytes, 1, 1);
+            buffer.format = format;
+            frame.draw(&buffer, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 1));
+            assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30, 255]), "{format:?}");
+        }
     }
 
     #[test]

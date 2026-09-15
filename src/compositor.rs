@@ -71,8 +71,9 @@ use smithay::{
 use crate::{
     buffer::Snapshot,
     keys, kitty,
+    presenter::Presenter,
     render::{Frame, Rect, Tiles},
-    tty::{Capabilities, Terminal},
+    tty::Capabilities,
 };
 
 /// Tile size in character cells. Terminals update images whole, so this is the
@@ -92,23 +93,19 @@ pub const BINDING_MODIFIER: crossterm::event::KeyModifiers = crossterm::event::K
 /// anything.
 const BACKDROP: [u8; 3] = [0x14, 0x16, 0x1b];
 
-/// What one presented frame cost, and how much of it went to the terminal.
+/// What one presented frame cost *this* thread, which is the thread input
+/// waits on.
 ///
-/// Split this way because that is the question a slow frame asks: the
-/// compositor can answer for the first three, and only the terminal can answer
-/// for the last.
+/// The presenter's own time - compressing and writing - is reported by the
+/// presenter, since none of it happens here any more.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cost {
-    /// Tiles re-sent, out of the grid the frame is divided into.
+    /// Tiles that changed, out of the grid the frame is divided into.
     pub tiles: usize,
-    /// Bytes handed to the terminal.
-    pub bytes: usize,
+    /// Tiles handed to the presenter, which is none of them if it was busy.
+    pub sent: usize,
     /// Composing the frame buffer and finding what changed.
     pub compose: Duration,
-    /// Compressing and encoding what changed.
-    pub encode: Duration,
-    /// Waiting for the terminal to take it.
-    pub write: Duration,
 }
 
 /// Why meowland could not be set up.
@@ -140,6 +137,9 @@ pub struct Meowland {
     /// The renderer a client's GPU buffers are brought back through, when
     /// there is a device to have one on.
     gpu: Option<crate::gpu::Renderer>,
+    /// Tiles that have changed and have not been handed to the presenter yet,
+    /// because it was busy with the frame before them.
+    due: std::collections::VecDeque<Rect>,
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -178,8 +178,6 @@ pub struct Meowland {
     tiles: Tiles,
     dirty: Vec<Rect>,
     plan: Vec<(WlSurface, Point<i32, Logical>)>,
-    scratch: Vec<u8>,
-    encoder: kitty::Encoder,
     needs_redraw: bool,
     pointer_dirty: bool,
     /// Set by the quit binding and by the main loop's own reasons to stop.
@@ -275,6 +273,7 @@ impl Meowland {
             dmabuf_state,
             dmabuf_global,
             gpu,
+            due: std::collections::VecDeque::new(),
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -295,8 +294,6 @@ impl Meowland {
             tiles,
             dirty: Vec::new(),
             plan: Vec::new(),
-            scratch: Vec::new(),
-            encoder: kitty::Encoder::default(),
             needs_redraw: true,
             pointer_dirty: true,
             quitting: false,
@@ -370,9 +367,14 @@ impl Meowland {
         let _ = toplevel.send_configure();
     }
 
-    /// Fill the frame with the current state of the window and hand the changes
-    /// to the terminal.
-    pub fn present(&mut self, terminal: &mut Terminal) -> std::io::Result<Cost> {
+    /// Fill the frame with the current state of the window and hand what
+    /// changed to the presenter.
+    ///
+    /// Nothing here waits for the terminal: composing is this thread's work and
+    /// sending is the presenter's, so a keystroke is never behind a frame. What
+    /// the presenter is too busy to take stays due, and the next frame carries
+    /// it - which is what makes dropping a frame safe.
+    pub fn present(&mut self, presenter: &mut Presenter) -> Cost {
         let phase = Instant::now();
         if self.needs_redraw {
             self.compose();
@@ -386,29 +388,16 @@ impl Meowland {
             ..Cost::default()
         };
 
-        let phase = Instant::now();
-        {
-            let out = terminal.frame();
-            kitty::begin_sync(out);
-            for index in 0..self.dirty.len() {
-                let tile = self.dirty[index];
-                self.encode_tile(out, tile);
-            }
-            self.draw_pointer_shape(terminal);
-            self.encoder.end_frame(terminal.frame());
-            cost.bytes = terminal.frame().len();
-        }
-        cost.encode = phase.elapsed();
-
-        let phase = Instant::now();
-        terminal.present()?;
-        cost.write = phase.elapsed();
-
+        // Everything composed is on screen as far as the clients are concerned;
+        // what the terminal has yet to receive is the presenter's business.
         self.needs_redraw = false;
         self.pointer_dirty = false;
-        // Everything just composed is on screen, so the clients owning those
-        // surfaces may start their next frame. Popups live outside the
-        // parent's tree, so they are walked separately.
+        self.draw_pointer_shape(presenter);
+        self.hand_over(presenter, &mut cost);
+
+        // Whatever became of the frame, the clients that drew it are owed a
+        // callback: without one a client that paces itself by them waits
+        // forever, and the screen stops moving.
         let time = self.time();
         for toplevel in &self.toplevels {
             let surface = toplevel.wl_surface().clone();
@@ -417,47 +406,64 @@ impl Meowland {
                 send_frame_callbacks(popup.wl_surface(), time);
             }
         }
-        Ok(cost)
+        cost
     }
 
-    /// Write one dirty tile to the terminal: address its first cell, transmit,
-    /// place.
-    fn encode_tile(&mut self, out: &mut Vec<u8>, tile: Rect) {
+    /// Copy the tiles that are due into a buffer and pass them on, unless the
+    /// presenter is still busy with the frame before them - in which case they
+    /// stay due and the next frame carries them.
+    fn hand_over(&mut self, presenter: &mut Presenter, cost: &mut Cost) {
+        self.due.extend(self.dirty.drain(..));
+        if self.due.is_empty() {
+            return;
+        }
+        let Some(mut pixels) = presenter.buffer() else {
+            return;
+        };
+
+        // The tiles are copied out of the frame in the order they are listed,
+        // so the presenter can cut them apart again without knowing the frame.
+        pixels.clear();
+        let stride = self.frame.width as usize * 4;
+        let mut tiles = Vec::with_capacity(self.due.len());
+        for tile in &self.due {
+            for row in 0..tile.height {
+                let start = (tile.y as usize + row as usize) * stride + tile.x as usize * 4;
+                pixels.extend_from_slice(
+                    &self.frame.pixels()[start..start + tile.width as usize * 4],
+                );
+            }
+            tiles.push(self.placement(*tile));
+        }
+
+        cost.sent = tiles.len();
+        match presenter.present(crate::presenter::Frame { pixels, tiles }) {
+            Ok(()) => self.due.clear(),
+            // Not taken: the tiles stay due, so nothing is lost by the wait.
+            Err(frame) => presenter.reuse(frame.pixels),
+        }
+    }
+
+    /// Where one tile goes and what it is called.
+    fn placement(&self, tile: Rect) -> kitty::Placement {
         let (cell_width, cell_height) = self.cell;
         let columns = tile.width.div_ceil(cell_width.max(1)).max(1);
         let rows = tile.height.div_ceil(cell_height.max(1)).max(1);
-        kitty::cursor_to(
-            out,
-            tile.x as u32 / cell_width.max(1),
-            tile.y as u32 / cell_height.max(1),
-        );
-        // Terminals take whole images, so any partial repaint is a copy of the
-        // tile's pixels into a contiguous scratch buffer first.
-        let stride = self.frame.width as usize * 4;
-        self.scratch.clear();
-        self.scratch
-            .reserve(tile.width as usize * tile.height as usize * 4);
-        for row in 0..tile.height {
-            let start = (tile.y as usize + row as usize) * stride + tile.x as usize * 4;
-            self.scratch
-                .extend_from_slice(&self.frame.pixels()[start..start + tile.width as usize * 4]);
+        kitty::Placement {
+            id: tile_id(
+                &self.tiles,
+                tile.x as u32 / self.tiles.size.0.max(1),
+                tile.y as u32 / self.tiles.size.1.max(1),
+            ),
+            width: tile.width,
+            height: tile.height,
+            cols: columns,
+            rows,
+            cell: (
+                tile.x as u32 / cell_width.max(1),
+                tile.y as u32 / cell_height.max(1),
+            ),
         }
-        let id = tile_id(
-            &self.tiles,
-            tile.x as u32 / self.tiles.size.0.max(1),
-            tile.y as u32 / self.tiles.size.1.max(1),
-        );
-        self.encoder.transmit_and_place(
-            out,
-            &self.scratch,
-            kitty::Placement {
-                id,
-                width: tile.width,
-                height: tile.height,
-                cols: columns,
-                rows,
-            },
-        );
     }
 
     /// Tell the terminal which pointer shape the focused client asked for.
@@ -465,7 +471,7 @@ impl Meowland {
     /// The shape names come from the clients (`wp_cursor_shape_manager_v1`),
     /// the drawing is the terminal's: its pointer is a real pointer, and it
     /// keeps working while we are not drawing.
-    fn draw_pointer_shape(&mut self, terminal: &mut Terminal) {
+    fn draw_pointer_shape(&mut self, presenter: &Presenter) {
         let shape = match &self.cursor {
             CursorImageStatus::Named(icon) => Some(kitty::pointer_shape(*icon)),
             // A cursor sent as an image cannot be described to the terminal, and the compositor
@@ -473,7 +479,7 @@ impl Meowland {
             CursorImageStatus::Surface(_) | CursorImageStatus::Hidden => None,
         };
         if self.pointer_shape != shape {
-            terminal.pointer_shape(shape);
+            presenter.raw(crate::presenter::pointer_shape_bytes(shape));
             self.pointer_shape = shape;
         }
     }

@@ -61,19 +61,16 @@ impl Default for Encoder {
 }
 
 /// Image identity and terminal-cell placement for one transmission.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     pub id: u32,
     pub width: u32,
     pub height: u32,
     pub cols: u32,
     pub rows: u32,
-}
-
-/// Start a synchronized update. The terminal buffers everything until
-/// [`Encoder::end_frame`], which is what keeps a frame from tearing.
-pub fn begin_sync(out: &mut Vec<u8>) {
-    out.extend_from_slice(b"\x1b[?2026h");
+    /// The cell the tile's first pixel belongs in: the cursor has to be there
+    /// before the image is placed, and whoever writes the escape has to know.
+    pub cell: (u32, u32),
 }
 
 /// Set the terminal's mouse pointer shape, or reset it to the terminal's own
@@ -152,6 +149,15 @@ pub fn delete_all(out: &mut Vec<u8>) {
 /// cursor where it is, so placing an image never scrolls the terminal and never
 /// moves the anchor the next tile is addressed from.
 impl Encoder {
+    /// Start a frame: the terminal buffers everything until
+    /// [`Encoder::end_frame`], which is what keeps a frame from tearing.
+    ///
+    /// Nothing of the encoder's changes here - the frame's own state is what
+    /// the first tile will decide - so this is the frame, not the encoder.
+    pub fn begin_frame(out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[?2026h");
+    }
+
     /// End a frame, with whatever the next one's first tile shows deciding
     /// whether that frame is compressed.
     pub fn end_frame(&mut self, out: &mut Vec<u8>) {
@@ -165,6 +171,7 @@ impl Encoder {
             pixels.len(),
             placement.width as usize * placement.height as usize * 4
         );
+        cursor_to(out, placement.cell.0, placement.cell.1);
 
         // The first tile of a frame decides for the rest of it: whether
         // compressing pays is a property of what the frame is *of*, and one
@@ -237,6 +244,7 @@ fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &
         height,
         cols,
         rows,
+        ..
     } = placement;
     let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
@@ -413,6 +421,7 @@ mod tests {
                 height,
                 cols: 6,
                 rows: 4,
+                cell: (0, 0),
             },
         );
 
@@ -453,6 +462,7 @@ mod tests {
                 height: 4,
                 cols: 1,
                 rows: 1,
+                cell: (0, 0),
             },
         );
         out.clear();
@@ -466,6 +476,7 @@ mod tests {
                 height: 4,
                 cols: 1,
                 rows: 1,
+                cell: (0, 0),
             },
         );
 
@@ -509,6 +520,7 @@ mod tests {
                     height: 4,
                     cols: 1,
                     rows: 1,
+                    cell: (0, 0),
                 },
             );
         }
@@ -549,6 +561,7 @@ mod tests {
                 height: 160,
                 cols: 16,
                 rows: 8,
+                cell: (0, 0),
             },
         );
 
@@ -630,6 +643,7 @@ mod tests {
                             height: 160,
                             cols: 16,
                             rows: 8,
+                            cell: (0, 0),
                         };
                         let payload = encoder.zlib.get_ref();
                         transmit(&mut out, &mut encoder.payload, payload, placement, true);
@@ -655,6 +669,7 @@ mod tests {
                             height: 160,
                             cols: 16,
                             rows: 8,
+                            cell: (0, 0),
                         },
                     );
                     bytes = out.len();
@@ -691,6 +706,7 @@ mod tests {
                 height,
                 cols: 20,
                 rows: 10,
+                cell: (0, 0),
             },
         );
 

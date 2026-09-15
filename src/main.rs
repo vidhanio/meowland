@@ -14,6 +14,7 @@ mod dmabuf;
 mod gpu;
 mod keys;
 mod kitty;
+mod presenter;
 mod render;
 mod tty;
 
@@ -44,6 +45,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     compositor::{Cost, Meowland},
+    presenter::Presenter,
     tty::Terminal,
 };
 
@@ -72,6 +74,7 @@ fn main() -> anyhow::Result<()> {
         display,
         state,
         terminal,
+        presenter: Presenter::new(),
         socket_name,
         command: cli.command,
         children: Vec::new(),
@@ -227,6 +230,7 @@ struct App {
     display: Display<Meowland>,
     state: Meowland,
     terminal: Terminal,
+    presenter: Presenter,
     socket_name: String,
     /// The client command from the command line.
     command: Vec<OsString>,
@@ -252,17 +256,13 @@ impl App {
     fn present_frame(&mut self) {
         if self.state.needs_frame() {
             let started = Instant::now();
-            match self.state.present(&mut self.terminal) {
-                // The cap runs from when the frame began rather than when it
-                // finished: the work happens *inside* the interval, so counting
-                // it as well would put the compositor's own cost on the
-                // client's latency and drop the frame rate with it.
-                Ok(cost) => {
-                    self.last_frame_started = Some(started);
-                    self.frames.record(&cost);
-                }
-                Err(err) => tracing::warn!(?err, "could not present a frame"),
-            }
+            let cost = self.state.present(&mut self.presenter);
+            // The cap runs from when the frame began rather than when it
+            // finished: the work happens *inside* the interval, so counting it
+            // as well would put the compositor's own cost on the client's
+            // latency and drop the frame rate with it.
+            self.last_frame_started = Some(started);
+            self.frames.record(&cost);
         }
         self.flush_clients();
     }
@@ -397,8 +397,9 @@ impl App {
                 let capabilities = self.terminal.refresh().clone();
                 self.state.resize(&capabilities);
                 // Whatever the terminal kept from before the resize is not ours
-                // any more.
-                self.terminal.clear();
+                // any more, and this has to land after the frames already
+                // handed over for the same reason.
+                self.presenter.raw(Terminal::clear());
             }
             Event::Paste(text) => self.state.paste(&text),
             Event::FocusGained | Event::FocusLost => {}
@@ -422,6 +423,9 @@ impl App {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // Stop writing before the terminal is dropped: what undoes the takeover
+        // has to be the last thing it is sent.
+        self.presenter.finish();
         tracing::info!("meowland stopped");
     }
 }
@@ -485,21 +489,18 @@ fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<File
     tracing::info!(path = %path.display(), "logging to file");
     Ok(client_log)
 }
-/// What the frames of one second cost, logged so that a slow frame rate can be
-/// told apart from a slow terminal.
+/// What the frames of one second cost this thread, logged so that a slow frame
+/// rate can be attributed rather than guessed at: this is the thread that reads
+/// input, so time spent here is time a keystroke waits.
 ///
-/// The compositor can answer for everything but the last number: a frame that
-/// spends its time in `write` is waiting for the terminal, and one that spends
-/// it in `encode` is waiting for itself.
+/// The presenter keeps its own count, of the compressing and the writing.
 #[derive(Debug, Default)]
 struct FrameStats {
     since: Option<Instant>,
     frames: u32,
     tiles: u64,
-    bytes: u64,
+    sent: u64,
     compose: Duration,
-    encode: Duration,
-    write: Duration,
 }
 
 impl FrameStats {
@@ -508,10 +509,8 @@ impl FrameStats {
 
         self.frames += 1;
         self.tiles += cost.tiles as u64;
-        self.bytes += cost.bytes as u64;
+        self.sent += cost.sent as u64;
         self.compose += cost.compose;
-        self.encode += cost.encode;
-        self.write += cost.write;
 
         let now = Instant::now();
         let since = *self.since.get_or_insert(now);
@@ -520,23 +519,18 @@ impl FrameStats {
             return;
         }
         let frames = f64::from(self.frames);
-        let per_frame = |total: Duration| total.as_secs_f64() * 1e3 / frames;
         tracing::debug!(
             fps = frames / elapsed.as_secs_f64(),
             tiles = self.tiles / u64::from(self.frames),
-            kib = self.bytes / u64::from(self.frames) / 1024,
-            compose_ms = per_frame(self.compose),
-            encode_ms = per_frame(self.encode),
-            write_ms = per_frame(self.write),
-            "frames presented"
+            sent = self.sent / u64::from(self.frames),
+            compose_ms = self.compose.as_secs_f64() * 1e3 / frames,
+            "frames composed"
         );
         self.since = Some(now);
         self.frames = 0;
         self.tiles = 0;
-        self.bytes = 0;
+        self.sent = 0;
         self.compose = Duration::ZERO;
-        self.encode = Duration::ZERO;
-        self.write = Duration::ZERO;
     }
 }
 

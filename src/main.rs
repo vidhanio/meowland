@@ -28,7 +28,7 @@ mod xwayland;
 
 use std::{
     ffi::OsString,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read as _, Write as _},
     os::unix::net::UnixListener,
     path::{Path, PathBuf},
@@ -76,6 +76,11 @@ const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000_000 / REFRES
 /// which says nothing does not hold up frames.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How often the terminal is checked for having gone away. A second is short
+/// enough that a session does not outlive its window by anything a user would
+/// notice, and long enough to cost nothing.
+const TERMINAL_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.action {
@@ -115,7 +120,7 @@ fn run_server(run: Run) -> anyhow::Result<()> {
         log_level,
         command,
     } = run;
-    init_logging(log.as_deref(), log_level.as_deref())?;
+    let log = init_logging(log.as_deref(), log_level.as_deref())?;
 
     // Taken before anything else, so that a second `run` is told a server is
     // already running rather than being told about the terminal it is not
@@ -163,6 +168,7 @@ fn run_server(run: Run) -> anyhow::Result<()> {
         presenter,
         xwayland,
         socket_name,
+        log,
         quit_when_empty: !command.is_empty(),
         command,
         _control: control,
@@ -277,6 +283,19 @@ fn install_sources(
     signals: Signals,
     control_listener: UnixListener,
 ) -> anyhow::Result<()> {
+    watch_clients(handle, socket)?;
+    watch_display(handle, &mut app.display)?;
+    watch_terminal(handle, terminal_events, presenter_events)?;
+    watch_session(handle, signals, control_listener)?;
+    schedule_frame(handle, app);
+    Ok(())
+}
+
+/// Watch the socket clients connect to.
+fn watch_clients(
+    handle: &LoopHandle<'_, App>,
+    socket: ListeningSocketSource,
+) -> anyhow::Result<()> {
     handle
         .insert_source(socket, |stream, (), app| {
             if let Err(err) = app.state.insert_client(stream) {
@@ -284,8 +303,16 @@ fn install_sources(
             }
         })
         .context("could not watch the Wayland socket")?;
+    Ok(())
+}
 
-    let poll_fd = rustix::io::dup(app.display.backend().poll_fd())
+/// Watch the display: dispatching what clients sent, answering them, and
+/// arming a frame when that leaves something to draw.
+fn watch_display(
+    handle: &LoopHandle<'_, App>,
+    display: &mut Display<Meowland>,
+) -> anyhow::Result<()> {
+    let poll_fd = rustix::io::dup(display.backend().poll_fd())
         .context("could not take the display socket")?;
     let display_loop = handle.clone();
     handle
@@ -303,7 +330,15 @@ fn install_sources(
             },
         )
         .context("could not watch the display")?;
+    Ok(())
+}
 
+/// Watch what the terminal says, and what the presenter reports about it.
+fn watch_terminal(
+    handle: &LoopHandle<'_, App>,
+    terminal_events: Channel<TerminalEvent>,
+    presenter_events: Channel<PresenterEvent>,
+) -> anyhow::Result<()> {
     let terminal_loop = handle.clone();
     handle
         .insert_source(terminal_events, move |event, (), app: &mut App| {
@@ -336,7 +371,16 @@ fn install_sources(
             schedule_frame(&presenter_loop, app);
         })
         .map_err(|err| anyhow::anyhow!("could not watch terminal presentation: {err:?}"))?;
+    Ok(())
+}
 
+/// Watch the things that end or command a session rather than feed it: process
+/// signals, the terminal itself, and the control socket.
+fn watch_session(
+    handle: &LoopHandle<'_, App>,
+    signals: Signals,
+    control_listener: UnixListener,
+) -> anyhow::Result<()> {
     handle
         .insert_source(signals, |event, (), app: &mut App| match event.signal() {
             Signal::SIGCHLD => {
@@ -346,6 +390,23 @@ fn install_sources(
             _ => app.quit(),
         })
         .context("could not watch process signals")?;
+
+    // A terminal that is closed under us leaves nothing to draw on and no way
+    // to be told so, so the compositor asks. Without this, a session outlives
+    // the window it was started in: it keeps the socket other `run` commands
+    // then talk to, holds the clients it started, and burns a core doing it.
+    handle
+        .insert_source(
+            Timer::from_duration(TERMINAL_CHECK_INTERVAL),
+            |_, (), app: &mut App| {
+                if crate::tty::hung_up() {
+                    tracing::info!("the terminal went away");
+                    app.quit();
+                }
+                TimeoutAction::ToDuration(TERMINAL_CHECK_INTERVAL)
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("could not watch the terminal: {err:?}"))?;
 
     handle
         .insert_source(
@@ -376,8 +437,6 @@ fn install_sources(
             },
         )
         .context("could not watch the control socket")?;
-
-    schedule_frame(handle, app);
     Ok(())
 }
 
@@ -504,6 +563,9 @@ struct App {
     presenter: Presenter,
     xwayland: Option<xwayland::Server>,
     socket_name: String,
+    /// The log file, shared with every client this server starts: their own
+    /// output cannot go to the terminal, which the compositor is drawing on.
+    log: File,
     /// Whether to leave once the clients it started are gone.
     ///
     /// A server started to run a command gives the terminal back when that
@@ -663,7 +725,7 @@ impl App {
     }
 
     /// Run a client, with the environment a Wayland client expects inside
-    /// meowland.
+    /// meowland and its output going where the compositor's own does.
     fn spawn_client(&mut self, command: &[OsString]) -> std::io::Result<()> {
         let Some((program, arguments)) = command.split_first() else {
             return Ok(());
@@ -679,8 +741,8 @@ impl App {
             .env("MOZ_ENABLE_WAYLAND", "1")
             .env("ELECTRON_OZONE_PLATFORM_HINT", "auto")
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdout(self.client_output())
+            .stderr(self.client_output());
         // meowland is not an X11 server. Without a satellite there is no X
         // display to give a client, and inheriting one would put its window on
         // a display outside this terminal.
@@ -692,6 +754,23 @@ impl App {
         tracing::info!(program = %program.to_string_lossy(), pid = child.id(), "client started");
         self.children.push(child);
         Ok(())
+    }
+
+    /// Where a client's own output goes.
+    ///
+    /// Not the terminal. The compositor owns it and is drawing on it, so text
+    /// written there lands in the cells the frame is placed on - and a newline
+    /// among them scrolls the whole frame out from under itself. The log is
+    /// where the compositor's own output goes, so a client that prints why it
+    /// failed can still be read about afterwards.
+    fn client_output(&self) -> Stdio {
+        match self.log.try_clone() {
+            Ok(file) => Stdio::from(file),
+            Err(error) => {
+                tracing::warn!(%error, "could not send a client's output to the log");
+                Stdio::null()
+            }
+        }
     }
 
     /// Collect children that exited.
@@ -842,9 +921,18 @@ impl TerminalInput {
 
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take()
-            && handle.join().is_err()
-        {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // A reader inside a terminal that has hung up never comes back - it is
+        // spinning in the terminal library's read of it - so waiting for it
+        // would be waiting forever. There is nothing left for it to read, and
+        // it holds nothing the rest of the shutdown needs, so it is left to the
+        // end of the process.
+        if crate::tty::hung_up() {
+            return;
+        }
+        if handle.join().is_err() {
             tracing::error!("the terminal input thread panicked");
         }
     }
@@ -895,7 +983,13 @@ fn bind_socket() -> anyhow::Result<ListeningSocketSource> {
 }
 
 /// Send logs to a file: stdout is the screen we are drawing on.
-fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<()> {
+///
+/// A handle on the same file comes back, because it is also where a client's
+/// own output has to go: the compositor owns the terminal, so a client that
+/// writes to it writes into the screen it is being drawn on. The file is opened
+/// for appending, so that every writer - the compositor and every client it
+/// starts - writes at the end of it and none of them can overwrite another's.
+fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<File> {
     let path = path.map_or_else(
         || {
             Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()))
@@ -903,8 +997,17 @@ fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<()> 
         },
         Path::to_path_buf,
     );
-    let file =
-        File::create(&path).with_context(|| format!("could not log to {}", path.display()))?;
+    // Emptied at startup, then reopened for appending, which is how every
+    // writer after this sends its output to the end of the file rather than to
+    // wherever its own idea of the file ends.
+    File::create(&path).with_context(|| format!("could not log to {}", path.display()))?;
+    let file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("could not log to {}", path.display()))?;
+    let clients = file
+        .try_clone()
+        .with_context(|| format!("could not log to {}", path.display()))?;
     let filter = level.map_or_else(
         || EnvFilter::new("meowland=info,warn"),
         |level| EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("meowland=info,warn")),
@@ -915,7 +1018,7 @@ fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<()> 
         .with_ansi(false)
         .init();
     tracing::info!(path = %path.display(), "logging to file");
-    Ok(())
+    Ok(clients)
 }
 
 /// What the frames of one second cost this thread, logged so that a slow frame

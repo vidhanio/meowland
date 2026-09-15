@@ -45,16 +45,21 @@ place that only has to report what went wrong, not handle it.
 Run the binary from a terminal that speaks the kitty graphics protocol (kitty,
 Ghostty, WezTerm), or inside a pane that passes graphics through. It needs a
 terminal on stdin and stdout, so redirecting its output makes it exit immediately.
-Logs go to `$XDG_RUNTIME_DIR/meowland.log`, or wherever `MEOWLAND_LOG` points, with
-`MEOWLAND_LOG_LEVEL` as the filter. Wayland clients connect with
+Logs go to `$XDG_RUNTIME_DIR/meowland.log`. Wayland clients connect with
 `WAYLAND_DISPLAY=wayland-meowland`.
 
-`MEOWLAND_GPU_BUFFERS` decides how clients are offered GPU buffers: unset or
-`auto` offers the first render node that has a renderer, `off` offers nothing,
-and any other value is the `/dev/dri/renderD…` node to offer. The offer is only
-made where a renderer can bring buffers back, which is what makes it safe to
-make unasked - a compositor that advertises GPU buffers and then refuses the ones
-a client produces leaves that client with no window at all.
+Settings are flags that fall back to environment variables, and the flag wins:
+`--gpu-buffers` (`MEOWLAND_GPU_BUFFERS`, default `auto`), `--render-node`
+(`MEOWLAND_RENDER_NODE`), `--log` (`MEOWLAND_LOG`) and `--log-level`
+(`MEOWLAND_LOG_LEVEL`). The resolving is the CLI's job - a module is handed what
+was decided, not an environment to look up.
+
+`--gpu-buffers off` stops clients being offered GPU buffers at all; `auto` offers
+the first render node a renderer can be built on, and `--render-node` picks that
+node instead of taking the first. The offer is only made where a renderer can
+bring buffers back, which is what makes it safe to make unasked - a compositor
+that advertises GPU buffers and then refuses the ones a client produces leaves
+that client with no window at all.
 
 A renderer needs `libEGL.so.1` at the loader's search path, which `dlopen` does
 not take from `buildInputs`: the package wraps the binary with an

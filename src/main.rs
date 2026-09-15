@@ -20,6 +20,7 @@ mod tty;
 use std::{
     ffi::OsString,
     fs::File,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -49,9 +50,9 @@ use crate::{compositor::Meowland, tty::Terminal};
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 fn main() -> anyhow::Result<()> {
-    let arguments = Cli::parse().command;
+    let cli = Cli::parse();
 
-    let log = init_logging()?;
+    let log = init_logging(cli.log.as_deref(), cli.log_level.as_deref())?;
 
     let terminal = Terminal::new()?;
 
@@ -61,14 +62,15 @@ fn main() -> anyhow::Result<()> {
 
     let display: Display<Meowland> =
         Display::new().context("could not create a Wayland display")?;
-    let state = Meowland::new(&display.handle(), terminal.capabilities())?;
+    let nodes = cli.gpu_buffers.nodes(cli.render_node.as_deref())?;
+    let state = Meowland::new(&display.handle(), terminal.capabilities(), &nodes)?;
 
     let mut app = App {
         display,
         state,
         terminal,
         socket_name,
-        command: arguments,
+        command: cli.command,
         children: Vec::new(),
         log,
         spawned: 0,
@@ -180,9 +182,32 @@ fn install_sources(
 #[usage(
     bin = "meowland",
     version = env!("CARGO_PKG_VERSION"),
-    after_help = "The client fills the terminal. Alt+Q leaves and stops the client.\n\nClients must render into shared memory. Logs go to $XDG_RUNTIME_DIR/meowland.log; override the path with MEOWLAND_LOG."
+    after_help = "The client fills the terminal. Alt+Q leaves and stops the client.\n\nEvery setting has a command line flag and an environment variable; the flag wins."
 )]
 struct Cli {
+    /// How clients are offered GPU buffers
+    #[usage(
+        long,
+        value_enum,
+        value_name = "WHEN",
+        env = "MEOWLAND_GPU_BUFFERS",
+        default = "auto"
+    )]
+    gpu_buffers: dmabuf::Offer,
+
+    /// The node clients are told to render on, instead of the first one a
+    /// renderer can be built on
+    #[usage(long, env = "MEOWLAND_RENDER_NODE", value_name = "PATH")]
+    render_node: Option<PathBuf>,
+
+    /// Where to write logs, instead of `$XDG_RUNTIME_DIR/meowland.log`
+    #[usage(long, env = "MEOWLAND_LOG", value_name = "PATH")]
+    log: Option<PathBuf>,
+
+    /// A `tracing` filter, as in `meowland=debug`
+    #[usage(long, env = "MEOWLAND_LOG_LEVEL", value_name = "FILTER")]
+    log_level: Option<String>,
+
     /// Client command and arguments. Without one, wait for a client to connect.
     #[usage(
         value_name = "COMMAND",
@@ -421,20 +446,20 @@ fn bind_socket() -> anyhow::Result<ListeningSocketSource> {
 }
 
 /// Send logs to a file: stdout is the screen we are drawing on.
-fn init_logging() -> anyhow::Result<File> {
-    let path = std::env::var_os("MEOWLAND_LOG").map_or_else(
+fn init_logging(path: Option<&Path>, level: Option<&str>) -> anyhow::Result<File> {
+    let path = path.map_or_else(
         || {
-            std::path::Path::new(
-                &std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()),
-            )
-            .join("meowland.log")
+            Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into()))
+                .join("meowland.log")
         },
-        std::path::PathBuf::from,
+        Path::to_path_buf,
     );
     let file =
         File::create(&path).with_context(|| format!("could not log to {}", path.display()))?;
-    let filter = EnvFilter::try_from_env("MEOWLAND_LOG_LEVEL")
-        .unwrap_or_else(|_| EnvFilter::new("meowland=info,warn"));
+    let filter = level.map_or_else(
+        || EnvFilter::new("meowland=info,warn"),
+        |level| EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("meowland=info,warn")),
+    );
     let client_log = file.try_clone()?;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -479,10 +504,40 @@ fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
 mod tests {
     use std::{
         ffi::{OsStr, OsString},
+        path::PathBuf,
         time::{Duration, Instant},
     };
 
     use super::{Cli, FRAME_INTERVAL, frame_deadline};
+
+    #[test]
+    fn settings_are_flags_before_the_command() {
+        let parsed = Cli::parse_from(
+            [
+                "--gpu-buffers",
+                "off",
+                "--render-node",
+                "/dev/dri/renderD129",
+                "foot",
+                "-T",
+                "meowland",
+            ]
+            .map(OsStr::new)
+            .as_slice(),
+        )
+        .expect("settings and a client command should parse");
+
+        assert_eq!(parsed.gpu_buffers, crate::dmabuf::Offer::Off);
+        assert_eq!(
+            parsed.render_node,
+            Some(PathBuf::from("/dev/dri/renderD129"))
+        );
+        // The client's own flags are not the compositor's to read.
+        assert_eq!(
+            parsed.command,
+            ["foot", "-T", "meowland"].map(OsString::from)
+        );
+    }
 
     #[test]
     fn client_flags_are_forwarded_after_the_command() {

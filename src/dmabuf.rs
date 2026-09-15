@@ -28,30 +28,33 @@
 //! access was begun first, and reading the descriptor fails with `EINVAL`. That
 //! is the reason the renderer exists.
 //!
-//! `MEOWLAND_GPU_BUFFERS=off` is the way out if a client turns out to be worse
-//! off with the offer than without it.
+//! [`Offer::Off`] is the way out if a client turns out to be worse off with the
+//! offer than without it.
 //!
 //! # Choosing a device
 //!
 //! On a machine with more than one GPU every render node is offered and the
 //! client picks the one it renders on. The order is a hint, not a rule.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
 /// How clients are offered GPU buffers.
 ///
-/// Unset or [`AUTO`] offers the first render node that has a renderer to read
-/// buffers back through, [`OFF`] offers nothing, and any other value is the
-/// path of the one render node to offer.
-pub const VARIABLE: &str = "MEOWLAND_GPU_BUFFERS";
-
-/// The value of [`VARIABLE`] that offers GPU buffers on every render node.
-pub const AUTO: &str = "auto";
-
-/// The value of [`VARIABLE`] that stops clients being offered GPU buffers.
-pub const OFF: &str = "off";
+/// Read from a command line flag that falls back to an environment variable
+/// (see `Cli` in `main.rs`); what this module knows is the values, not where
+/// they came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, usage::ValueEnum)]
+pub enum Offer {
+    /// Offer clients the render nodes this machine has.
+    Auto,
+    /// Offer nothing: clients draw into shared memory.
+    Off,
+}
 
 /// Where render nodes live.
 const DEVICE_DIRECTORY: &str = "/dev/dri";
@@ -97,21 +100,31 @@ pub enum Error {
     },
 }
 
-/// The render nodes clients may be told to allocate on.
-///
-/// A machine without any - no GPU, a container without the device, a session
-/// over the network - simply has none, which is not an error: clients then draw
-/// into shared memory, which is what they do by default anyway.
-pub fn nodes() -> Result<Vec<RenderNode>, Error> {
-    match std::env::var_os(VARIABLE) {
-        None => Ok(find()),
-        Some(setting) if setting == AUTO => Ok(find()),
-        Some(setting) if setting == OFF => Ok(Vec::new()),
-        Some(setting) => {
-            let path = PathBuf::from(setting);
-            let node = RenderNode::open(path.clone())
-                .map_err(|source| Error::Unusable { path, source })?;
-            Ok(vec![node])
+impl Offer {
+    /// The render nodes clients may be told to allocate on, most preferred
+    /// first.
+    ///
+    /// `pinned` names one node to use instead of looking for any, which is what
+    /// a machine with more than one GPU needs: the order the kernel numbers
+    /// render nodes in is not a statement about which of them is worth
+    /// rendering on.
+    ///
+    /// A machine without a render node - no GPU, a container without the
+    /// device, a session over the network - simply has none, which is not an
+    /// error: clients then draw into shared memory, which is what they do by
+    /// default anyway.
+    pub fn nodes(self, pinned: Option<&Path>) -> Result<Vec<RenderNode>, Error> {
+        match (self, pinned) {
+            (Self::Off, _) => Ok(Vec::new()),
+            (Self::Auto, None) => Ok(find()),
+            (Self::Auto, Some(path)) => {
+                let node =
+                    RenderNode::open(path.to_path_buf()).map_err(|source| Error::Unusable {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                Ok(vec![node])
+            }
         }
     }
 }
@@ -156,6 +169,19 @@ fn number_of(path: &std::path::Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offering_nothing_offers_no_nodes() {
+        assert!(
+            matches!(Offer::Off.nodes(None), Ok(nodes) if nodes.is_empty()),
+            "a client that takes an offer we cannot serve has no window at all"
+        );
+        // Even a node that was asked for by name: `off` is `off`.
+        assert!(matches!(
+            Offer::Off.nodes(Some(std::path::Path::new("/dev/dri/renderD128"))),
+            Ok(nodes) if nodes.is_empty()
+        ));
+    }
 
     #[test]
     fn only_render_nodes_are_numbered() {

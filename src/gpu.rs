@@ -15,7 +15,8 @@
 //!
 //! None of this is needed for a buffer that can be mapped, which is cheaper. It
 //! is the answer for the ones that cannot be, which is what a client rendering
-//! into video memory hands over.
+//! into video memory hands over - and having an answer is what lets clients be
+//! offered GPU buffers at all.
 
 use std::path::{Path, PathBuf};
 

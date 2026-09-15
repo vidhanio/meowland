@@ -1192,8 +1192,8 @@ fn bring_up_renderer() -> Option<crate::gpu::Renderer> {
 /// A client that renders on the GPU only keeps doing so if it is told where to
 /// put the memory, and can only hand that memory over if meowland can read it
 /// back - so what is advertised here is what the renderer takes, and the device
-/// it is on, and nothing else. See [`crate::dmabuf`] for why that is not
-/// something to offer unasked.
+/// it is on, and nothing else. See [`crate::dmabuf`] for what keeps that offer
+/// honest.
 ///
 /// Not offering it is not an error: the global is simply never advertised, and
 /// clients draw into shared memory.

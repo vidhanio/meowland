@@ -49,16 +49,18 @@ Logs go to `$XDG_RUNTIME_DIR/meowland.log`, or wherever `MEOWLAND_LOG` points, w
 `MEOWLAND_LOG_LEVEL` as the filter. Wayland clients connect with
 `WAYLAND_DISPLAY=wayland-meowland`.
 
-`MEOWLAND_GPU_BUFFERS` decides whether clients are offered GPU buffers at all:
-unset or `off` means they are not, `auto` offers the first render node that has
-a renderer, and any other value is the `/dev/dri/renderD…` node to offer. It is
-off by default because a client that takes the offer and whose buffer the
-compositor then cannot read has no window, which is worse than the slow path it
-would otherwise take.
+`MEOWLAND_GPU_BUFFERS` decides how clients are offered GPU buffers: unset or
+`auto` offers the first render node that has a renderer, `off` offers nothing,
+and any other value is the `/dev/dri/renderD…` node to offer. The offer is only
+made where a renderer can bring buffers back, which is what makes it safe to
+make unasked - a compositor that advertises GPU buffers and then refuses the ones
+a client produces leaves that client with no window at all.
 
 A renderer needs `libEGL.so.1` at the loader's search path, which `dlopen` does
-not take from `buildInputs`; the dev shell sets `LD_LIBRARY_PATH` for it. Without
-EGL there is no renderer, so no offer.
+not take from `buildInputs`: the package wraps the binary with an
+`LD_LIBRARY_PATH`, and the dev shell sets one. Run outside both and, on a machine
+with a render node but no loadable EGL, startup panics inside the EGL bindings -
+the bindings' own behaviour, and the reason `off` exists.
 
 Terminals and multiplexers do not reliably report key releases, so a press is
 treated as a whole keystroke: press it, release it, and let the terminal's own

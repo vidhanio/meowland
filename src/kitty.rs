@@ -877,6 +877,111 @@ mod tests {
         }
     }
 
+    /// One image of the whole screen against the tiles that make it up, for the
+    /// dense frame a film or a game produces.
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn cost_of_one_image_against_many_tiles() {
+        use std::time::Instant;
+
+        const SCREEN: (u32, u32) = (1000, 600);
+        const TILE: (u32, u32) = (160, 160);
+        let grid = (SCREEN.0.div_ceil(TILE.0), SCREEN.1.div_ceil(TILE.1));
+        let whole = film(SCREEN);
+        let mut encoder = Encoder::default();
+        let mut out = Vec::new();
+
+        let before = Instant::now();
+        for _ in 0..30 {
+            out.clear();
+            encoder.transmit_and_place(&mut out, &whole, whole_screen(SCREEN));
+        }
+        let one = before.elapsed().as_secs_f64() * 1e3 / 30.0;
+        let one_bytes = out.len();
+
+        let mut tile_pixels = Vec::new();
+        let before = Instant::now();
+        for _ in 0..30 {
+            out.clear();
+            for gy in 0..grid.1 {
+                for gx in 0..grid.0 {
+                    let placement = tile_placement(SCREEN, TILE, grid, (gx, gy));
+                    cut_out(&whole, SCREEN, placement, &mut tile_pixels);
+                    encoder.transmit_and_place(&mut out, &tile_pixels, placement);
+                }
+            }
+        }
+        let many = before.elapsed().as_secs_f64() * 1e3 / 30.0;
+        let many_bytes = out.len();
+
+        println!(
+            "one image: {one:>5.2} ms, {one_bytes:>7} bytes    {} tiles: {many:>5.2} ms, {many_bytes:>7} bytes",
+            grid.0 * grid.1,
+        );
+    }
+
+    /// Film-like pixels: gradients with a little grain, which is what makes a
+    /// frame expensive.
+    fn film(size: (u32, u32)) -> Vec<u8> {
+        let mut state = 0x5eed_1234u32;
+        (0..size.0 * size.1 * 4)
+            .map(|i| {
+                let pixel = i / 4;
+                let (x, y) = (pixel % size.0, pixel / size.0);
+                if i % 4 == 3 {
+                    255
+                } else {
+                    let base = ((x / 4 + y / 4) % 64) as u8;
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    0x20 + base + (state % 8) as u8
+                }
+            })
+            .collect()
+    }
+
+    fn whole_screen(size: (u32, u32)) -> Placement {
+        Placement {
+            id: 0,
+            width: size.0,
+            height: size.1,
+            cols: size.0.div_ceil(10),
+            rows: size.1.div_ceil(20),
+            cell: (0, 0),
+        }
+    }
+
+    fn tile_placement(
+        size: (u32, u32),
+        tile: (u32, u32),
+        grid: (u32, u32),
+        at: (u32, u32),
+    ) -> Placement {
+        let (x, y) = (at.0 * tile.0, at.1 * tile.1);
+        Placement {
+            id: at.1 * grid.0 + at.0 + 1,
+            width: tile.0.min(size.0 - x),
+            height: tile.1.min(size.1 - y),
+            cols: TILE_CELLS.0,
+            rows: TILE_CELLS.1,
+            cell: (x / 10, y / 20),
+        }
+    }
+
+    /// The pixels of one tile, row by row, out of the frame it is part of.
+    fn cut_out(frame: &[u8], size: (u32, u32), placement: Placement, into: &mut Vec<u8>) {
+        into.clear();
+        for row in 0..placement.height {
+            let start =
+                ((placement.cell.1 * 20 + row) * size.0 + placement.cell.0 * 10) as usize * 4;
+            into.extend_from_slice(&frame[start..start + placement.width as usize * 4]);
+        }
+    }
+
+    /// The grid a frame is divided into, in cells rather than pixels.
+    const TILE_CELLS: (u32, u32) = (16, 8);
+
     #[test]
     fn every_chunk_is_a_whole_base64_line() {
         // Noise, so zlib cannot shrink the payload below one chunk.

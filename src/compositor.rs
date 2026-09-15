@@ -10,13 +10,11 @@
 //! into a frame buffer every frame, and the frame is diffed tile by tile before
 //! being encoded as terminal graphics.
 //!
-//! # One window, terminal sized
+//! # One window per view
 //!
-//! meowland runs one client, in one window, filling the terminal: no tiling, no
-//! focus ring, no decorations, no other key bindings than the one that leaves.
-//! The toplevels it knows about are therefore just "the newest one that has
-//! drawn something is the one on screen" - which keeps dialogs and popups
-//! working without a window manager in between.
+//! Every toplevel is an independent, terminal-sized view. Exactly one view is
+//! visible and receives input; `Alt+Tab` cycles between them. Popups remain
+//! attached to their parent view.
 
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -31,7 +29,7 @@ use smithay::{
         input::{ButtonState, KeyState},
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -62,9 +60,10 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
-            XdgShellState,
+            XdgShellState, XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
+        viewporter::{ViewportCachedState, ViewporterState, ensure_viewport_valid},
     },
 };
 
@@ -164,6 +163,24 @@ pub enum Error {
     Feedback(#[source] std::io::Error),
 }
 
+#[derive(Debug)]
+struct Window {
+    /// The ID this window is known by outside the compositor, which is what
+    /// `attach` takes and what the shell completes.
+    id: u64,
+    surface: ToplevelSurface,
+    /// What the client calls itself: its app ID, or its title without one.
+    label: Option<String>,
+}
+
+/// A window exposed through the local control socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub id: u64,
+    pub label: String,
+    pub active: bool,
+}
+
 /// The compositor.
 pub struct Meowland {
     // Protocol state.
@@ -197,6 +214,8 @@ pub struct Meowland {
     /// cursor image.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
     cursor_shape_state: CursorShapeManagerState,
+    #[expect(dead_code, reason = "the state object is what keeps the global alive")]
+    viewporter_state: ViewporterState,
     popup_manager: PopupManager,
 
     // Core.
@@ -206,10 +225,11 @@ pub struct Meowland {
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
 
-    // Windows. There is no window management: whatever the client asks for, its toplevel fills the
-    // terminal, and the newest one that has drawn is the one on screen.
-    toplevels: Vec<ToplevelSurface>,
-    presented: Option<usize>,
+    // User-facing IDs are monotonic. Wayland object IDs are scoped to one
+    // client connection and may be reused, so they are not stable handles.
+    windows: Vec<Window>,
+    active: Option<usize>,
+    next_window_id: u64,
 
     // Input.
     /// Keys we currently consider pressed, so modifier state can be diffed.
@@ -237,8 +257,8 @@ pub struct Meowland {
 impl std::fmt::Debug for Meowland {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Meowland")
-            .field("toplevels", &self.toplevels.len())
-            .field("presented", &self.presented)
+            .field("windows", &self.windows.len())
+            .field("active", &self.active)
             .finish_non_exhaustive()
     }
 }
@@ -256,6 +276,7 @@ impl Meowland {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
         let data_device_state = DataDeviceState::new::<Self>(display);
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(display);
+        let viewporter_state = ViewporterState::new::<Self>(display);
         let mut seat_state = SeatState::new();
         let mut dmabuf_state = DmabufState::new();
 
@@ -327,14 +348,16 @@ impl Meowland {
             output_manager_state,
             data_device_state,
             cursor_shape_state,
+            viewporter_state,
             popup_manager: PopupManager::default(),
             display_handle: display.clone(),
             start: Instant::now(),
             output,
             keyboard,
             pointer,
-            toplevels: Vec::new(),
-            presented: None,
+            windows: Vec::new(),
+            active: None,
+            next_window_id: 1,
             pressed: Vec::new(),
             pointer_position: (0.0, 0.0).into(),
             cursor: CursorImageStatus::default_named(),
@@ -370,56 +393,98 @@ impl Meowland {
     }
 
     /// Whether a toplevel has committed pixels that can be displayed.
-    pub const fn window_ready(&self) -> bool {
-        self.presented.is_some()
-    }
-
-    /// The surface the keyboard and pointer events are aimed at: the one on
-    /// screen.
-    fn presented_surface(&self) -> Option<WlSurface> {
-        self.presented
-            .and_then(|index| self.toplevels.get(index))
-            .map(|toplevel| toplevel.wl_surface().clone())
-    }
-
-    /// Make the newest toplevel that has drawn something the one on screen.
     ///
-    /// A client's dialogs and popup windows are toplevels too: the one it
-    /// committed to last is the one on top, and when it goes away the
-    /// previous one is still there, with its buffer intact.
-    fn present_newest_window(&mut self) {
-        let newest = self
-            .toplevels
+    /// This is what the terminal waits for before it is taken over: with
+    /// nothing to draw, taking it over would wipe the screen for a frame of
+    /// backdrop and then put the user's shell back.
+    pub fn window_ready(&self) -> bool {
+        self.windows.iter().any(|window| {
+            self.snapshots
+                .contains_key(&window.surface.wl_surface().id())
+        })
+    }
+
+    fn active_surface(&self) -> Option<WlSurface> {
+        self.active
+            .and_then(|index| self.windows.get(index))
+            .map(|window| window.surface.wl_surface().clone())
+    }
+
+    /// Return the stable IDs currently accepted by `attach`.
+    pub fn windows(&self) -> impl Iterator<Item = WindowInfo> + '_ {
+        self.windows
             .iter()
             .enumerate()
-            .rev()
-            .find_map(|(index, toplevel)| {
-                self.snapshots
-                    .contains_key(&toplevel.wl_surface().id())
-                    .then_some(index)
-            });
-        if newest == self.presented {
+            .map(|(index, window)| WindowInfo {
+                id: window.id,
+                label: window.label.clone().unwrap_or_default(),
+                active: self.active == Some(index),
+            })
+    }
+
+    /// Select a view by its server-assigned ID.
+    pub fn activate(&mut self, id: u64) -> bool {
+        let Some(index) = self.windows.iter().position(|window| window.id == id) else {
+            return false;
+        };
+        self.activate_index(index);
+        true
+    }
+
+    fn activate_index(&mut self, index: usize) {
+        if self.active == Some(index) || index >= self.windows.len() {
             return;
         }
-        self.presented = newest;
-        let surface = self.presented_surface();
+        if let Some(surface) = self.active_surface() {
+            self.output.leave(&surface);
+        }
+        self.active = Some(index);
+        let surface = self.active_surface();
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, surface.clone(), SERIAL_COUNTER.next_serial());
         if let Some(surface) = surface {
             self.output.enter(&surface);
         }
+        self.configure_windows();
         self.scene_dirty = true;
     }
 
-    /// Ask a toplevel to fill the terminal.
-    fn maximize(&self, toplevel: &ToplevelSurface) {
+    fn cycle_window(&mut self) {
+        if !self.windows.is_empty() {
+            self.activate_index(
+                self.active
+                    .map_or(0, |index| (index + 1) % self.windows.len()),
+            );
+        }
+    }
+
+    /// Re-read what the client calls this window, after it said so.
+    fn relabel(&mut self, surface: &ToplevelSurface) {
+        let label = window_label(surface);
+        if let Some(window) = self
+            .windows
+            .iter_mut()
+            .find(|window| window.surface.wl_surface() == surface.wl_surface())
+        {
+            window.label = label;
+        }
+    }
+
+    /// Give every toplevel the terminal size and update its activation state.
+    fn configure_windows(&self) {
         let size = (self.frame.width as i32, self.frame.height as i32);
-        toplevel.with_pending_state(|state| {
-            state.size = Some(size.into());
-            state.states.set(xdg_state::MAXIMIZED);
-            state.states.set(xdg_state::ACTIVATED);
-        });
-        let _ = toplevel.send_configure();
+        for (index, window) in self.windows.iter().enumerate() {
+            window.surface.with_pending_state(|state| {
+                state.size = Some(size.into());
+                state.states.set(xdg_state::MAXIMIZED);
+                if self.active == Some(index) {
+                    state.states.set(xdg_state::ACTIVATED);
+                } else {
+                    state.states.unset(xdg_state::ACTIVATED);
+                }
+            });
+            let _ = window.surface.send_configure();
+        }
     }
 
     /// Fill the frame with the current state of the window and hand what
@@ -454,8 +519,8 @@ impl Meowland {
         // callback: without one a client that paces itself by them waits
         // forever, and the screen stops moving.
         let time = self.time();
-        for toplevel in &self.toplevels {
-            let surface = toplevel.wl_surface().clone();
+        for window in &self.windows {
+            let surface = window.surface.wl_surface().clone();
             send_frame_callbacks(&surface, time);
             for (popup, _) in PopupManager::popups_for_surface(&surface) {
                 send_frame_callbacks(popup.wl_surface(), time);
@@ -542,7 +607,7 @@ impl Meowland {
         }
     }
 
-    /// Repaint the window into the frame buffer.
+    /// Repaint the active view into the frame buffer.
     ///
     /// Reading geometry needs `&self` while drawing needs `&mut self.frame`, so
     /// the frame is planned in drawing order first and painted afterwards.
@@ -550,20 +615,16 @@ impl Meowland {
         self.frame.clear(BACKDROP);
 
         self.plan.clear();
-        if let Some(toplevel) = self.presented.and_then(|index| self.toplevels.get(index)) {
-            let surface = toplevel.wl_surface().clone();
-            if self.snapshots.contains_key(&surface.id()) {
-                self.plan.push((surface.clone(), Point::from((0, 0))));
-                // Popups live outside the parent's surface tree, at a position
-                // the parent's commit computed for them, relative to the
-                // window's geometry.
-                let geometry = geometry_offset(&surface);
-                for (popup, location) in PopupManager::popups_for_surface(&surface) {
-                    self.plan.push((
-                        popup.wl_surface().clone(),
-                        geometry + location - popup.geometry().loc,
-                    ));
-                }
+        if let Some(surface) = self.active_surface()
+            && self.snapshots.contains_key(&surface.id())
+        {
+            self.plan.push((surface.clone(), Point::from((0, 0))));
+            let geometry = geometry_offset(&surface);
+            for (popup, location) in PopupManager::popups_for_surface(&surface) {
+                self.plan.push((
+                    popup.wl_surface().clone(),
+                    geometry + location - popup.geometry().loc,
+                ));
             }
         }
 
@@ -573,23 +634,19 @@ impl Meowland {
     }
 
     /// The surface under a point in output coordinates.
-    ///
-    /// Only the presented window can be under the pointer: it is the only thing
-    /// on screen.
     fn surface_at(&self, point: Point<f64, Logical>) -> Option<(WlSurface, Point<i32, Logical>)> {
-        let toplevel = self.presented.and_then(|index| self.toplevels.get(index))?;
-        let surface = toplevel.wl_surface();
         if !self.frame.bounds().contains(point.x as i32, point.y as i32) {
             return None;
         }
-        let geometry = geometry_offset(surface);
-        for (popup, location) in PopupManager::popups_for_surface(surface) {
+        let surface = self.active_surface()?;
+        let geometry = geometry_offset(&surface);
+        for (popup, location) in PopupManager::popups_for_surface(&surface) {
             let origin = geometry + location - popup.geometry().loc;
-            if let Some(under) = surface_under(popup.wl_surface(), point, origin) {
+            if let Some(under) = surface_under(&self.snapshots, popup.wl_surface(), point, origin) {
                 return Some(under);
             }
         }
-        surface_under(surface, point, Point::from((0, 0)))
+        surface_under(&self.snapshots, &surface, point, Point::from((0, 0)))
     }
 
     /// Re-read the terminal geometry after a resize and tell the client.
@@ -607,9 +664,7 @@ impl Meowland {
             Some(Scale::Integer(1)),
             Some((0, 0).into()),
         );
-        for toplevel in &self.toplevels {
-            self.maximize(toplevel);
-        }
+        self.configure_windows();
         self.scene_dirty = true;
     }
 
@@ -672,8 +727,8 @@ impl Meowland {
         }
     }
 
-    /// The one binding: `Alt+Q` leaves, killing the client with it.
-    const fn binding(&mut self, modifiers: crossterm::event::KeyModifiers, code: u32) -> bool {
+    /// Handle compositor bindings before a key reaches the active client.
+    fn binding(&mut self, modifiers: crossterm::event::KeyModifiers, code: u32) -> bool {
         use crossterm::event::KeyModifiers as M;
         if !modifiers.contains(BINDING_MODIFIER)
             || modifiers.contains(M::CONTROL)
@@ -681,11 +736,11 @@ impl Meowland {
         {
             return false;
         }
-        if code != 16 {
-            // Alt+Q is the only shortcut there is.
-            return false;
+        match code {
+            15 => self.cycle_window(),
+            16 => self.quitting = true,
+            _ => return false,
         }
-        self.quitting = true;
         true
     }
 
@@ -827,11 +882,14 @@ impl Meowland {
 
     /// Whether the main loop should present now. A due frame waits without
     /// polling until the presenter reports that its reusable frame is ready.
+    ///
+    /// This is asked only once the terminal is ours, which `main` decides; on
+    /// its own this says whether anything has changed. It must not wait for the
+    /// active window to have pixels: cycling to a window that has not drawn yet
+    /// still has to produce a frame, because that frame is what carries the
+    /// callback the client draws its first one for.
     pub const fn should_present(&self, presenter_ready: bool) -> bool {
-        self.presented.is_some()
-            && (self.scene_dirty
-                || self.pointer_dirty
-                || (!self.pending.is_empty() && presenter_ready))
+        self.scene_dirty || self.pointer_dirty || (!self.pending.is_empty() && presenter_ready)
     }
 }
 
@@ -856,6 +914,31 @@ mod xdg_state {
 
     pub const ACTIVATED: xdg_toplevel::State = xdg_toplevel::State::Activated;
     pub const MAXIMIZED: xdg_toplevel::State = xdg_toplevel::State::Maximized;
+}
+
+/// What a client calls its window: the app ID, which is the name a shell would
+/// have started it by, or the title when the client has no app ID.
+///
+/// This is only ever read to answer `list`, so it is kept in the window rather
+/// than re-read: the label is what a shell offers beside a window ID, and a
+/// title is not worth a lock on the surface for every keystroke of a
+/// completion.
+fn window_label(surface: &ToplevelSurface) -> Option<String> {
+    with_states(surface.wl_surface(), |states| {
+        let label = {
+            let attributes = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()?
+                .lock()
+                .ok()?;
+            attributes
+                .app_id
+                .as_ref()
+                .or(attributes.title.as_ref())?
+                .clone()
+        };
+        (!label.trim().is_empty()).then_some(label)
+    })
 }
 
 /// Where the toplevel's window geometry starts, relative to its surface origin.
@@ -893,6 +976,7 @@ fn draw_tree(
                 frame,
                 snapshots,
                 surface,
+                states,
                 *location + subsurface_offset(states),
             );
         },
@@ -906,16 +990,33 @@ fn draw_surface(
     frame: &mut Frame,
     snapshots: &HashMap<ObjectId, Snapshot>,
     surface: &WlSurface,
+    states: &SurfaceData,
     location: Point<i32, Logical>,
 ) {
     // A surface with nothing committed (or a detached buffer) draws nothing.
     let Some(snapshot) = snapshots.get(&surface.id()) else {
         return;
     };
-    let (width, height) = snapshot.logical_size();
+    let viewport = *states.cached_state.get::<ViewportCachedState>().current();
+    let scale = f64::from(snapshot.scale.max(1));
+    let src = viewport.src.map_or_else(
+        || Rect::new(0, 0, snapshot.width, snapshot.height),
+        |src| {
+            Rect::new(
+                (src.loc.x * scale).floor() as i32,
+                (src.loc.y * scale).floor() as i32,
+                (src.size.w * scale).ceil() as u32,
+                (src.size.h * scale).ceil() as u32,
+            )
+        },
+    );
+    let (width, height) = viewport.size().map_or_else(
+        || snapshot.logical_size(),
+        |size| (size.w.max(1), size.h.max(1)),
+    );
     frame.draw(
         &snapshot.image(),
-        Rect::new(0, 0, snapshot.width, snapshot.height),
+        src,
         Rect::new(location.x, location.y, width as u32, height as u32),
     );
 }
@@ -936,6 +1037,7 @@ fn subsurface_offset(states: &SurfaceData) -> Point<i32, Logical> {
 /// sits on screen. A surface only accepts input inside its input region;
 /// without one set, the whole surface does.
 fn surface_under(
+    snapshots: &HashMap<ObjectId, Snapshot>,
     surface: &WlSurface,
     point: Point<f64, Logical>,
     origin: Point<i32, Logical>,
@@ -954,7 +1056,15 @@ fn surface_under(
                 return;
             }
             let location = *location + subsurface_offset(states);
-            if accepts_input(states, point - location.to_f64()) {
+            let Some(snapshot) = snapshots.get(&surface.id()) else {
+                return;
+            };
+            let viewport = *states.cached_state.get::<ViewportCachedState>().current();
+            let size = viewport.size().map_or_else(
+                || snapshot.logical_size(),
+                |size| (size.w.max(1), size.h.max(1)),
+            );
+            if accepts_input(states, point - location.to_f64(), size) {
                 *found.borrow_mut() = Some((surface.clone(), location));
             }
         },
@@ -973,11 +1083,16 @@ fn surface_under(
     clippy::significant_drop_tightening,
     reason = "the input region is borrowed out of the cached state, so the guard outlives the check"
 )]
-fn accepts_input(states: &SurfaceData, local: Point<f64, Logical>) -> bool {
+fn accepts_input(states: &SurfaceData, local: Point<f64, Logical>, size: (i32, i32)) -> bool {
     let mut state = states.cached_state.get::<SurfaceAttributes>();
     let attributes = state.current();
     attributes.input_region.as_ref().map_or_else(
-        || local.x >= 0.0 && local.y >= 0.0,
+        || {
+            local.x >= 0.0
+                && local.y >= 0.0
+                && local.x < f64::from(size.0)
+                && local.y < f64::from(size.1)
+        },
         |region| region.contains((local.x.floor() as i32, local.y.floor() as i32)),
     )
 }
@@ -1043,17 +1158,15 @@ impl CompositorHandler for Meowland {
         // Every surface that commits has to be copied and handed back, not just
         // the toplevels: sub-surfaces, popups and the client's cursor
         // all arrive here too.
+        //
+        // Nothing here moves the focus. A toplevel's first commit carries no
+        // buffer - it is how the client asks to be configured - and a client
+        // that later unmaps one is hiding a window, not closing it: either way
+        // the view the user chose is still the view the user chose, and the
+        // window only leaves the list when it is destroyed.
         self.snapshot(surface);
         self.scene_dirty = true;
         tracing::debug!(id = ?surface.id(), "committed");
-
-        if self
-            .toplevels
-            .iter()
-            .any(|toplevel| toplevel.wl_surface() == surface)
-        {
-            self.present_newest_window();
-        }
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
@@ -1116,6 +1229,11 @@ impl Meowland {
                 };
                 if !copied {
                     tracing::debug!(format = ?buffer, "buffer is not one we can composite");
+                } else if let Some(snapshot) = self.snapshots.get(&surface.id()) {
+                    let size = snapshot.logical_size();
+                    with_states(surface, |states| {
+                        ensure_viewport_valid(states, size.into());
+                    });
                 }
                 buffer.release();
             }
@@ -1177,11 +1295,12 @@ impl XdgShellHandler for Meowland {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        tracing::debug!(id = ?surface.wl_surface().id(), "new toplevel");
-        // Whatever the client asked for, it gets the terminal - that is the
-        // whole window policy.
-        self.maximize(&surface);
-        self.toplevels.push(surface);
+        let id = self.next_window_id;
+        self.next_window_id = self.next_window_id.saturating_add(1);
+        tracing::info!(id, wayland_id = ?surface.wl_surface().id(), "new window");
+        let label = window_label(&surface);
+        self.windows.push(Window { id, surface, label });
+        self.activate_index(self.windows.len() - 1);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -1224,12 +1343,13 @@ impl XdgShellHandler for Meowland {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        // There is only one size: the terminal's.
-        self.maximize(&surface);
+        let _ = surface;
+        self.configure_windows();
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        self.maximize(&surface);
+        let _ = surface;
+        self.configure_windows();
     }
 
     fn fullscreen_request(
@@ -1237,16 +1357,47 @@ impl XdgShellHandler for Meowland {
         surface: ToplevelSurface,
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
-        self.maximize(&surface);
+        let _ = surface;
+        self.configure_windows();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        self.toplevels
-            .retain(|toplevel| toplevel.wl_surface() != surface.wl_surface());
-        self.present_newest_window();
+        self.output.leave(surface.wl_surface());
+        let Some(removed) = self
+            .windows
+            .iter()
+            .position(|window| window.surface.wl_surface() == surface.wl_surface())
+        else {
+            return;
+        };
+        let was_active = self.active == Some(removed);
+        self.windows.remove(removed);
+        self.active = match self.active {
+            None => None,
+            Some(_) if self.windows.is_empty() => None,
+            Some(active) if active > removed => Some(active - 1),
+            Some(active) if was_active => Some(active.min(self.windows.len() - 1)),
+            active => active,
+        };
+        if was_active {
+            let surface = self.active_surface();
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, surface.clone(), SERIAL_COUNTER.next_serial());
+            if let Some(surface) = surface {
+                self.output.enter(&surface);
+            }
+        }
+        self.configure_windows();
+        self.scene_dirty = true;
     }
 
-    fn title_changed(&mut self, _surface: ToplevelSurface) {}
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        self.relabel(&surface);
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.relabel(&surface);
+    }
 }
 
 impl OutputHandler for Meowland {}
@@ -1350,3 +1501,4 @@ delegate_output!(Meowland);
 delegate_seat!(Meowland);
 delegate_data_device!(Meowland);
 delegate_cursor_shape!(Meowland);
+delegate_viewporter!(Meowland);

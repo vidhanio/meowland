@@ -26,6 +26,50 @@ tiles it carried stay due until a later frame carries them. `Meowland` is the ap
 toplevels, input routing and presentation. Pass that one state around rather than
 building a second copy of any part of it.
 
+Every toplevel is a window of its own: it fills the terminal, one window is on
+screen at a time, and `Alt+Tab` cycles between them. The screen shows the active
+window and nothing else - no tiling, no window list on screen - which is what
+keeps movement and focus simple. A window is named by the ID the server gives it
+when it is created, and that is what `attach` takes.
+`wp_viewporter` is applied while snapshots are drawn; xwayland-satellite needs
+that protocol to expose X11 windows as ordinary xdg-shell surfaces. Meowland
+reserves an X display, passes its listening sockets to xwayland-satellite, and
+sets both `DISPLAY` and `WAYLAND_DISPLAY` for the launched command. The Nix
+package and development shell provide xwayland-satellite and Xwayland; without
+the satellite the compositor still runs, and its clients are given no `DISPLAY`
+at all rather than an X server outside this terminal.
+
+## The server
+
+Meowland is a server that owns the terminal it was started in, so it outlives any
+one client and is commanded from anywhere else on the machine:
+
+```sh
+meowland run foot        # start the server, or run foot as another window of it
+meowland list            # the windows, their labels, and the active one
+meowland attach 2        # show window 2
+```
+
+`run` with a command and no server starts one; with a server already running it
+hands the command over, and that server starts the client - so the client gets
+the *server's* environment, `PATH` included, rather than that of the shell which
+typed the command. `run` with no command at all is just a server, and stays until
+`Alt+Q` or the terminal goes away; a server started with a command gives the
+terminal back when that command's clients are all gone.
+
+The commands go over a socket in `$XDG_RUNTIME_DIR` (`src/control.rs`), which is
+per-user and owner-only - it has to be, since one of the commands starts a
+process. One server runs at a time: the socket name is fixed, and binding it is
+what says whether a server is already there. A client that connects to the
+Wayland socket on its own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another
+window too, and a server started with no command exists to wait for exactly that.
+
+`meowland completions <shell>` prints the completion script `usage` generates for
+this CLI, which calls back into `meowland __complete_word__`; completing `attach`
+asks the running server which windows it has, so what is offered is what exists.
+The Nix package installs the bash, fish and zsh scripts with
+`installShellFiles`, which is why the binary has to run during `postInstall`.
+
 ## Development
 
 ```sh

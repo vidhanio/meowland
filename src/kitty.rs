@@ -23,12 +23,29 @@ const CHUNK: usize = 4096;
 /// text, so window content covers whatever the terminal last wrote in those
 /// cells.
 const Z_ABOVE_TEXT: i32 = 1;
+/// The smallest saving that makes compressing a frame worth its time, as a
+/// fraction of the pixels: below this the terminal is handed the pixels as they
+/// are, because inflating costs it work and the bytes were never going to
+/// shrink.
+///
+/// Compressing film-like content pays (it halves), and text pays enormously;
+/// what does not pay is content that is already compressed or has no structure
+/// to find, where zlib spends milliseconds to save a fraction of what base64
+/// then adds straight back.
+const WORTH_COMPRESSING: f64 = 0.75;
+
 /// Reusable compression and base64 storage for tile transmissions.
 #[derive(Debug)]
 pub struct Encoder {
     zlib: ZlibEncoder<Vec<u8>>,
     payload: Vec<u8>,
     finished: bool,
+    /// Whether the frame being encoded is compressed, decided once its first
+    /// tile has shown what the content does. `None` means the frame has not
+    /// shown anything yet.
+    compress: Option<bool>,
+    /// Whether the last frame was compressed, for the log.
+    pub compressed_last_frame: bool,
 }
 
 impl Default for Encoder {
@@ -37,6 +54,8 @@ impl Default for Encoder {
             zlib: ZlibEncoder::new(Vec::new(), Compression::fast()),
             payload: Vec::new(),
             finished: false,
+            compress: None,
+            compressed_last_frame: true,
         }
     }
 }
@@ -52,14 +71,9 @@ pub struct Placement {
 }
 
 /// Start a synchronized update. The terminal buffers everything until
-/// [`end_sync`], which is what keeps a frame from tearing.
+/// [`Encoder::end_frame`], which is what keeps a frame from tearing.
 pub fn begin_sync(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[?2026h");
-}
-
-/// End a synchronized update, making the buffered frame visible.
-pub fn end_sync(out: &mut Vec<u8>) {
-    out.extend_from_slice(b"\x1b[?2026l");
 }
 
 /// Set the terminal's mouse pointer shape, or reset it to the terminal's own
@@ -138,16 +152,46 @@ pub fn delete_all(out: &mut Vec<u8>) {
 /// cursor where it is, so placing an image never scrolls the terminal and never
 /// moves the anchor the next tile is addressed from.
 impl Encoder {
-    /// Compress and transmit `pixels` as image `id`, placing it at the cursor.
+    /// End a frame, with whatever the next one's first tile shows deciding
+    /// whether that frame is compressed.
+    pub fn end_frame(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[?2026l");
+        self.compress = None;
+    }
+
+    /// Compress, if it pays, and transmit `pixels` as image `id` at the cursor.
     pub fn transmit_and_place(&mut self, out: &mut Vec<u8>, pixels: &[u8], placement: Placement) {
-        let Placement {
-            id,
-            width,
-            height,
-            cols,
-            rows,
-        } = placement;
-        debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        debug_assert_eq!(
+            pixels.len(),
+            placement.width as usize * placement.height as usize * 4
+        );
+
+        // The first tile of a frame decides for the rest of it: whether
+        // compressing pays is a property of what the frame is *of*, and one
+        // tile answers for all of them.
+        let Some(compress) = self.compress else {
+            // Compressed before being asked whether to: one tile of work is
+            // what it costs to find out.
+            let compressed_len = self.compress(pixels);
+            let worth = compressed_len < (pixels.len() as f64 * WORTH_COMPRESSING) as usize;
+            self.compress = Some(worth);
+            self.compressed_last_frame = worth;
+            let payload = if worth { self.zlib.get_ref() } else { pixels };
+            transmit(out, &mut self.payload, payload, placement, worth);
+            return;
+        };
+
+        if compress {
+            self.compress(pixels);
+            let payload = self.zlib.get_ref();
+            transmit(out, &mut self.payload, payload, placement, true);
+        } else {
+            transmit(out, &mut self.payload, pixels, placement, false);
+        }
+    }
+
+    /// Compress `pixels`, leaving the result in the encoder's buffer.
+    fn compress(&mut self, pixels: &[u8]) -> usize {
         if self.finished {
             let mut compressed = self
                 .zlib
@@ -158,44 +202,42 @@ impl Encoder {
             self.finished = false;
         }
         self.zlib.get_mut().reserve(pixels.len() / 8);
-
         // Compositor output is mostly flat color, so compressing it typically
-        // shrinks a tile by an order of magnitude; that ratio is what keeps the
-        // pty from becoming the bottleneck.
+        // shrinks a tile by an order of magnitude.
         self.zlib
             .write_all(pixels)
             .expect("writing to a Vec cannot fail");
         self.zlib.try_finish().expect("finishing a Vec cannot fail");
         self.finished = true;
-
-        let compressed = self.zlib.get_ref();
-        let encoded_len =
-            base64::encoded_len(compressed.len(), true).expect("a tile fits in address space");
-        self.payload.resize(encoded_len, 0);
-        let payload_len = BASE64
-            .encode_slice(compressed, &mut self.payload)
-            .expect("the payload buffer has the exact encoded size");
-        chunked(
-            out,
-            id,
-            width,
-            height,
-            cols,
-            rows,
-            &self.payload[..payload_len],
-        );
+        self.zlib.get_ref().len()
     }
 }
 
-fn chunked(
+/// Base64 `payload` into `encoded` and write the escape that sends it.
+fn transmit(
     out: &mut Vec<u8>,
-    id: u32,
-    width: u32,
-    height: u32,
-    cols: u32,
-    rows: u32,
+    encoded: &mut Vec<u8>,
     payload: &[u8],
+    placement: Placement,
+    compressed: bool,
 ) {
+    let encoded_len =
+        base64::encoded_len(payload.len(), true).expect("a tile fits in address space");
+    encoded.resize(encoded_len, 0);
+    let payload_len = BASE64
+        .encode_slice(payload, encoded)
+        .expect("the payload buffer has the exact encoded size");
+    chunked(out, placement, compressed, &encoded[..payload_len]);
+}
+
+fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &[u8]) {
+    let Placement {
+        id,
+        width,
+        height,
+        cols,
+        rows,
+    } = placement;
     let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
@@ -203,9 +245,10 @@ fn chunked(
         // Only the first escape of a multi-part transmission carries the
         // control data.
         if first {
+            let compression = if compressed { "o=z," } else { "" };
             let _ = write!(
                 out,
-                "a=T,f=32,o=z,s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
+                "a=T,f=32,{compression}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
             );
             first = false;
         }
@@ -396,27 +439,31 @@ mod tests {
 
     #[test]
     fn an_encoder_can_be_reused() {
+        // Flat content, so this is about reusing the encoder and nothing else:
+        // what it decides about compressing is the subject of its own test.
+        let flat: Vec<u8> = [1u8, 2, 3, 255].repeat(16);
         let mut encoder = Encoder::default();
         let mut out = Vec::new();
         encoder.transmit_and_place(
             &mut out,
-            &[1, 2, 3, 255],
+            &flat,
             Placement {
                 id: 1,
-                width: 1,
-                height: 1,
+                width: 4,
+                height: 4,
                 cols: 1,
                 rows: 1,
             },
         );
         out.clear();
+        let flat: Vec<u8> = [4u8, 5, 6, 255].repeat(16);
         encoder.transmit_and_place(
             &mut out,
-            &[4, 5, 6, 255],
+            &flat,
             Placement {
                 id: 2,
-                width: 1,
-                height: 1,
+                width: 4,
+                height: 4,
                 cols: 1,
                 rows: 1,
             },
@@ -427,10 +474,10 @@ mod tests {
             vec![
                 Command::Transmit {
                     id: 2,
-                    width: 1,
-                    height: 1,
+                    width: 4,
+                    height: 4,
                     compressed: true,
-                    pixels: vec![4, 5, 6, 255],
+                    pixels: [4u8, 5, 6, 255].repeat(16),
                 },
                 Command::Put {
                     id: 2,
@@ -441,6 +488,187 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn every_tile_of_a_compressed_frame_carries_its_own_pixels() {
+        // A frame is decided once, but every tile of it is still its own
+        // picture: reusing the decision must not reuse the bytes.
+        let flat: Vec<u8> = [7u8, 8, 9, 255].repeat(16);
+        let other: Vec<u8> = [10u8, 11, 12, 255].repeat(16);
+
+        let mut encoder = Encoder::default();
+        let mut out = Vec::new();
+        for (index, pixels) in [&flat, &other].iter().enumerate() {
+            encoder.transmit_and_place(
+                &mut out,
+                pixels,
+                Placement {
+                    id: index as u32,
+                    width: 4,
+                    height: 4,
+                    cols: 1,
+                    rows: 1,
+                },
+            );
+        }
+
+        let transmitted: Vec<Vec<u8>> = decode(&out)
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Transmit { pixels, .. } => Some(pixels),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transmitted, vec![flat, other]);
+    }
+
+    #[test]
+    fn content_that_does_not_shrink_is_sent_as_it_is() {
+        // Nothing for zlib to find: compressing would spend milliseconds to
+        // save a fraction of what base64 then adds back, so the pixels go as
+        // they are and the decoder has only base64 to undo.
+        let mut state = 0x1234_5678u32;
+        let noise: Vec<u8> = (0..160 * 160 * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+
+        let mut encoder = Encoder::default();
+        let mut out = Vec::new();
+        encoder.transmit_and_place(
+            &mut out,
+            &noise,
+            Placement {
+                id: 1,
+                width: 160,
+                height: 160,
+                cols: 16,
+                rows: 8,
+            },
+        );
+
+        let commands = decode(&out);
+        assert_eq!(
+            commands,
+            vec![
+                Command::Transmit {
+                    id: 1,
+                    width: 160,
+                    height: 160,
+                    compressed: false,
+                    pixels: noise,
+                },
+                Command::Put {
+                    id: 1,
+                    placement: 1,
+                    cols: 16,
+                    rows: 8,
+                    moves_cursor: false,
+                },
+            ]
+        );
+        assert!(!encoder.compressed_last_frame);
+    }
+
+    /// Full-frame cost of each kind of content, for the record in the log.
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn cost_of_a_frame_by_content() {
+        use std::time::Instant;
+
+        let content = |kind: &str| -> Vec<u8> {
+            let mut state = 0x9e37_79b9u32;
+            (0..160 * 160 * 4)
+                .map(|i| match kind {
+                    "text" => {
+                        if (i / 4 / 3 + i / 4 / 160 / 7) % 5 == 0 {
+                            0xd0
+                        } else {
+                            0x18
+                        }
+                    }
+                    "video" => {
+                        let pixel = i / 4;
+                        let (x, y) = (pixel % 160, pixel / 160);
+                        let a = ((x + y) / 4) % 64;
+                        (0x30 + a) as u8
+                    }
+                    _ => {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        (state >> 24) as u8
+                    }
+                })
+                .collect()
+        };
+
+        for kind in ["text", "video", "noise"] {
+            // `None` on every tile is what the encoder always did: compress
+            // everything. `Some(false)` is the other extreme, and `None` once
+            // (the shipped policy) decides from the first tile.
+            for forced in ["always", "as-is", "policy"] {
+                let pixels = content(kind);
+                let mut encoder = Encoder::default();
+                let mut out = Vec::new();
+                let mut bytes = 0;
+                let before = Instant::now();
+                for step in 0..30 {
+                    out.clear();
+                    // `always` is exactly what the encoder used to do: compress
+                    // every tile, whatever the content.
+                    if forced == "always" {
+                        encoder.compress(&pixels);
+                        let placement = Placement {
+                            id: step % 28,
+                            width: 160,
+                            height: 160,
+                            cols: 16,
+                            rows: 8,
+                        };
+                        let payload = encoder.zlib.get_ref();
+                        transmit(&mut out, &mut encoder.payload, payload, placement, true);
+                        bytes = out.len();
+                        continue;
+                    }
+                    encoder.compress = match forced {
+                        "as-is" => Some(false),
+                        _ => {
+                            if step == 0 {
+                                None
+                            } else {
+                                encoder.compress
+                            }
+                        }
+                    };
+                    encoder.transmit_and_place(
+                        &mut out,
+                        &pixels,
+                        Placement {
+                            id: step % 28,
+                            width: 160,
+                            height: 160,
+                            cols: 16,
+                            rows: 8,
+                        },
+                    );
+                    bytes = out.len();
+                }
+                let ms = before.elapsed().as_secs_f64() * 1e3 / 30.0;
+                let mode = format!("{forced:>7}");
+                println!(
+                    "{kind:>5} {mode}: {ms:>5.2} ms/tile  {:>6.1} KiB/tile  (a screen = {:>5.1} ms, {:>5.1} MiB)",
+                    bytes as f64 / 1024.0,
+                    ms * 28.0,
+                    28.0 * bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+        }
     }
 
     #[test]

@@ -405,6 +405,12 @@ impl Meowland {
     /// it - which is what makes dropping a frame safe.
     pub fn present(&mut self, presenter: &mut Presenter) -> Cost {
         let phase = Instant::now();
+        // Before anything decides there is nothing to do: a second in which no
+        // frame was handed over is a rate of zero, and the number on screen has
+        // to be able to say so.
+        if self.fps_counter {
+            self.settle_rate();
+        }
         if self.needs_redraw {
             self.compose();
             if self.fps_counter {
@@ -498,24 +504,28 @@ impl Meowland {
     }
 
     /// The tile a grid index stands for.
-    /// Count a frame that reached the presenter, and settle the rate once a
-    /// second has passed.
+    /// Count a frame that reached the presenter.
     fn count_frame(&mut self) {
-        let now = Instant::now();
-        let since = *self.fps_window.get_or_insert(now);
+        self.fps_window.get_or_insert_with(Instant::now);
         self.fps_frames += 1;
-        let elapsed = now.duration_since(since);
-        if elapsed >= Duration::from_secs(1) {
-            let settled = (f64::from(self.fps_frames) / elapsed.as_secs_f64()).round() as u32;
-            self.fps_window = Some(now);
-            self.fps_frames = 0;
-            // A frame is only drawn when something asks for one, so a client
-            // that has stopped drawing would otherwise leave a number behind
-            // that the screen has outlived.
-            if settled != self.fps {
-                self.fps = settled;
-                self.needs_redraw = true;
-            }
+    }
+
+    /// Turn the frames counted since the last settling into a rate, once a
+    /// second has passed - and ask for a frame of its own when the number
+    /// changes, or a client that has stopped drawing would leave the last rate
+    /// it managed on screen for as long as it stays quiet.
+    fn settle_rate(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(*self.fps_window.get_or_insert(now));
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let settled = (f64::from(self.fps_frames) / elapsed.as_secs_f64()).round() as u32;
+        self.fps_window = Some(now);
+        self.fps_frames = 0;
+        if settled != self.fps {
+            self.fps = settled;
+            self.needs_redraw = true;
         }
     }
 

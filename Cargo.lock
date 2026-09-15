@@ -380,6 +380,7 @@ dependencies = [
  "flate2",
  "rustix",
  "smithay",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "usage-rs",

@@ -8,11 +8,12 @@
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
+mod buffer;
 mod compositor;
+mod dmabuf;
 mod keys;
 mod kitty;
 mod render;
-mod shm;
 mod tty;
 
 use std::{
@@ -51,7 +52,7 @@ fn main() -> anyhow::Result<()> {
 
     let log = init_logging()?;
 
-    let terminal = Terminal::new().context("could not take over the terminal")?;
+    let terminal = Terminal::new()?;
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();

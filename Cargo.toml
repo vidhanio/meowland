@@ -20,6 +20,7 @@ smithay = { version = "0.7", default-features = false, features = [
   "desktop",
   "wayland_frontend",
 ] }
+thiserror = "2.0.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
   "env-filter",
@@ -35,8 +36,10 @@ usage = { package = "usage-rs", version = "6.9.1", default-features = false, fea
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 # missing_docs = "warn"
-# Not `forbid`: reading a client's shared memory buffer needs one `unsafe` slice
-# (`src/shm.rs`), which the lint would make impossible to write down.
+# Not `forbid`: reading a client's buffer means reaching through a raw pointer,
+# whether it is shared memory or a mapping of a GPU buffer, and both need an
+# `unsafe` slice (`src/buffer.rs`) that the lint would make impossible to write
+# down.
 unsafe_code = "deny"
 
 [lints.clippy]

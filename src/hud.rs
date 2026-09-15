@@ -109,7 +109,7 @@ mod tests {
                 for column in 0..3 {
                     let x = left + column * SCALE + SCALE / 2;
                     let y = MARGIN as u32 + row as u32 * SCALE + SCALE / 2;
-                    let pixel = (y * width + x) as usize * 4;
+                    let pixel = (y * width + x) as usize * crate::render::BYTES;
                     // Light pixels are glyph, dark ones are the counter's own
                     // background; everything around it is the client's.
                     if frame.pixels()[pixel] > 0x80 {

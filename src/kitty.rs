@@ -1,7 +1,7 @@
 //! Encoding of the [kitty graphics protocol][spec].
 //!
 //! Everything the compositor needs to put pixels on the terminal screen:
-//! transmitting raw RGBA image data (zlib compressed) and placing it into a
+//! transmitting raw RGB image data (zlib compressed) and placing it into a
 //! cell rectangle in one command, deleting images again, and the handful of
 //! terminal modes the protocol relies on.
 //!
@@ -201,6 +201,17 @@ pub struct Placement {
     pub cell: (u32, u32),
 }
 
+impl Placement {
+    /// How many bytes of the frame's pixels a tile of this shape is.
+    ///
+    /// One definition for both sides of the tile buffer - the compositor cuts
+    /// tiles out with it and the presenter cuts them back up with it - because
+    /// two versions of this is one frame's worth of overrun waiting to happen.
+    pub const fn bytes(self) -> usize {
+        self.width as usize * self.height as usize * crate::render::BYTES
+    }
+}
+
 /// Set the terminal's mouse pointer shape, or reset it to the terminal's own
 /// default.
 ///
@@ -295,10 +306,7 @@ impl Encoder {
 
     /// Compress, if it pays, and transmit `pixels` as image `id` at the cursor.
     pub fn transmit_and_place(&mut self, out: &mut Vec<u8>, pixels: &[u8], placement: Placement) {
-        debug_assert_eq!(
-            pixels.len(),
-            placement.width as usize * placement.height as usize * 4
-        );
+        debug_assert_eq!(pixels.len(), placement.bytes());
         cursor_to(out, placement.cell.0, placement.cell.1);
 
         // The first tile of a frame decides for the rest of it: whether
@@ -451,7 +459,7 @@ fn describe(placement: Placement, compressed: bool, medium: Option<&str>) -> Str
     let compression = if compressed { "o=z," } else { "" };
     let medium = medium.map_or(String::new(), |medium| format!("{medium},"));
     format!(
-        "a=T,f=32,{compression}{medium}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
+        "a=T,f=24,{compression}{medium}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
     )
 }
 
@@ -531,7 +539,7 @@ mod tests {
         let action = field(header, "a");
         let mut commands = Vec::new();
         if matches!(action, Some("t" | "T")) {
-            assert_eq!(field(header, "f"), Some("32"), "we only send RGBA");
+            assert_eq!(field(header, "f"), Some("24"), "we only send RGB");
             let compressed = field(header, "o") == Some("z");
             let (width, height) = (number(header, "s", 0), number(header, "v", 0));
             let raw = BASE64
@@ -544,7 +552,7 @@ mod tests {
             };
             assert_eq!(
                 pixels.len(),
-                width as usize * height as usize * 4,
+                width as usize * height as usize * crate::render::BYTES,
                 "pixel data must match the declared geometry"
             );
             commands.push(Command::Transmit {
@@ -584,7 +592,7 @@ mod tests {
         let mut pixels = Vec::new();
         for y in 0..height {
             for x in 0..width {
-                pixels.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 255]);
+                pixels.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8]);
             }
         }
         pixels
@@ -610,32 +618,44 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            decode(&out),
-            vec![
+        // What the encoder decided about compressing is its own tests'
+        // business; this one is about the pixels surviving the trip.
+        let decoded = decode(&out);
+        let (transmitted, put) = match decoded.as_slice() {
+            [
                 Command::Transmit {
-                    id: 7,
-                    width,
-                    height,
-                    compressed: true,
-                    pixels,
+                    id,
+                    width: sent_width,
+                    height: sent_height,
+                    pixels: sent,
+                    ..
                 },
                 Command::Put {
-                    id: 7,
-                    placement: 7,
-                    cols: 6,
-                    rows: 4,
+                    id: put_id,
+                    placement,
+                    cols,
+                    rows,
                     moves_cursor: false,
                 },
-            ]
+            ] => (
+                (*id, *sent_width, *sent_height, sent),
+                (*put_id, *placement, *cols, *rows),
+            ),
+            other => panic!("expected a transmission and its placement, got {other:?}"),
+        };
+        assert_eq!(
+            (transmitted.0, transmitted.1, transmitted.2),
+            (7, width, height)
         );
+        assert_eq!(put, (7, 7, 6, 4));
+        assert_eq!(transmitted.3, &pixels);
     }
 
     #[test]
     fn an_encoder_can_be_reused() {
         // Flat content, so this is about reusing the encoder and nothing else:
         // what it decides about compressing is the subject of its own test.
-        let flat: Vec<u8> = [1u8, 2, 3, 255].repeat(16);
+        let flat: Vec<u8> = [1u8, 2, 3].repeat(16);
         let mut encoder = Encoder::default();
         let mut out = Vec::new();
         encoder.transmit_and_place(
@@ -651,7 +671,7 @@ mod tests {
             },
         );
         out.clear();
-        let flat: Vec<u8> = [4u8, 5, 6, 255].repeat(16);
+        let flat: Vec<u8> = [4u8, 5, 6].repeat(16);
         encoder.transmit_and_place(
             &mut out,
             &flat,
@@ -673,7 +693,7 @@ mod tests {
                     width: 4,
                     height: 4,
                     compressed: true,
-                    pixels: [4u8, 5, 6, 255].repeat(16),
+                    pixels: [4u8, 5, 6].repeat(16),
                 },
                 Command::Put {
                     id: 2,
@@ -690,8 +710,8 @@ mod tests {
     fn every_tile_of_a_compressed_frame_carries_its_own_pixels() {
         // A frame is decided once, but every tile of it is still its own
         // picture: reusing the decision must not reuse the bytes.
-        let flat: Vec<u8> = [7u8, 8, 9, 255].repeat(16);
-        let other: Vec<u8> = [10u8, 11, 12, 255].repeat(16);
+        let flat: Vec<u8> = [7u8, 8, 9].repeat(16);
+        let other: Vec<u8> = [10u8, 11, 12].repeat(16);
 
         let mut encoder = Encoder::default();
         let mut out = Vec::new();
@@ -768,7 +788,7 @@ mod tests {
         // save a fraction of what base64 then adds back, so the pixels go as
         // they are and the decoder has only base64 to undo.
         let mut state = 0x1234_5678u32;
-        let noise: Vec<u8> = (0..160 * 160 * 4)
+        let noise: Vec<u8> = (0..160 * 160 * crate::render::BYTES)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 17;
@@ -823,7 +843,7 @@ mod tests {
 
         let content = |kind: &str| -> Vec<u8> {
             let mut state = 0x9e37_79b9u32;
-            (0..160 * 160 * 4)
+            (0..160 * 160 * crate::render::BYTES)
                 .map(|i| match kind {
                     "text" => {
                         if (i / 4 / 3 + i / 4 / 160 / 7) % 5 == 0 {
@@ -967,11 +987,11 @@ mod tests {
     /// frame expensive.
     fn film(size: (u32, u32)) -> Vec<u8> {
         let mut state = 0x5eed_1234u32;
-        (0..size.0 * size.1 * 4)
+        (0..size.0 as usize * size.1 as usize * crate::render::BYTES)
             .map(|i| {
-                let pixel = i / 4;
-                let (x, y) = (pixel % size.0, pixel / size.0);
-                if i % 4 == 3 {
+                let pixel = i / 3;
+                let (x, y) = (pixel % size.0 as usize, pixel / size.0 as usize);
+                if i % 3 == 2 {
                     255
                 } else {
                     let base = ((x / 4 + y / 4) % 64) as u8;
@@ -1016,9 +1036,11 @@ mod tests {
     fn cut_out(frame: &[u8], size: (u32, u32), placement: Placement, into: &mut Vec<u8>) {
         into.clear();
         for row in 0..placement.height {
-            let start =
-                ((placement.cell.1 * 20 + row) * size.0 + placement.cell.0 * 10) as usize * 4;
-            into.extend_from_slice(&frame[start..start + placement.width as usize * 4]);
+            let start = ((placement.cell.1 * 20 + row) * size.0 + placement.cell.0 * 10) as usize
+                * crate::render::BYTES;
+            into.extend_from_slice(
+                &frame[start..start + placement.width as usize * crate::render::BYTES],
+            );
         }
     }
 
@@ -1029,11 +1051,12 @@ mod tests {
     fn every_chunk_is_a_whole_base64_line() {
         // Noise, so zlib cannot shrink the payload below one chunk.
         let (width, height) = (256, 256);
-        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        let mut pixels =
+            Vec::with_capacity(width as usize * height as usize * crate::render::BYTES);
         let mut state = 0x1234_5678u32;
         for _ in 0..width * height {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            pixels.extend_from_slice(&state.to_le_bytes());
+            pixels.extend_from_slice(&state.to_le_bytes()[..crate::render::BYTES]);
         }
         let mut out = Vec::new();
         Encoder::default().transmit_and_place(

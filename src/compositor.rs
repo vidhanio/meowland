@@ -395,7 +395,7 @@ impl Meowland {
                 self.encode_tile(out, tile);
             }
             self.draw_pointer_shape(terminal);
-            kitty::end_sync(terminal.frame());
+            self.encoder.end_frame(terminal.frame());
             cost.bytes = terminal.frame().len();
         }
         cost.encode = phase.elapsed();

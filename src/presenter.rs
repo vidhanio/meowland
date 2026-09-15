@@ -14,12 +14,18 @@
 //! the worker gets carries everything the terminal has not seen yet.
 
 use std::{
-    sync::mpsc::{Receiver, Sender, channel},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::mpsc::{Receiver, Sender as MessageSender, channel},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use crate::kitty::{self, Encoder, Placement};
+use calloop::channel::Sender as EventSender;
+
+use crate::{
+    kitty::{self, Encoder, Placement},
+    tty::{Capabilities, Terminal},
+};
 
 /// One frame on its way to the terminal: the pixels of the tiles that changed,
 /// laid end to end, and where each of them goes.
@@ -30,6 +36,17 @@ pub struct Frame {
     pub tiles: Vec<Placement>,
 }
 
+/// Why terminal presentation stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("could not start the presenter thread")]
+    Start(#[source] std::io::Error),
+    #[error("could not write terminal output")]
+    Output(#[source] std::io::Error),
+    #[error("the presenter thread panicked")]
+    Panicked,
+}
+
 /// A frame, or an escape that has to keep its place among frames: wiping the
 /// screen after a resize, or naming the pointer shape.
 #[derive(Debug)]
@@ -38,51 +55,77 @@ enum Message {
     Raw(Vec<u8>),
 }
 
+/// What the writer tells the main loop after processing a message.
+#[derive(Debug)]
+pub enum Event {
+    /// The one reusable frame is available for the next presentation.
+    Ready(Frame),
+    /// Terminal output can no longer continue.
+    Failed(Error),
+}
+
 /// The thread that writes to the terminal.
 #[derive(Debug)]
 pub struct Presenter {
     /// Held rather than sent through: dropping it ends the worker.
-    messages: Option<Sender<Message>>,
-    /// The frame the worker has finished with. Recycling its two vectors keeps
-    /// a steady stream from allocating either pixels or placements per frame.
-    recycled: Receiver<Frame>,
+    messages: Option<MessageSender<Message>>,
+    /// Recycling both vectors keeps a steady stream from allocating either
+    /// pixels or placements per frame.
     free: Option<Frame>,
     handle: Option<JoinHandle<()>>,
+    /// Dropped only after [`Presenter::drop`] has joined the writer.
+    terminal: Terminal,
 }
 
 impl Presenter {
     /// Start the worker, telling it whether the terminal reads tiles out of
     /// shared memory rather than off the pty.
-    pub fn new(shared_memory: bool) -> Self {
+    pub fn new(terminal: Terminal, events: EventSender<Event>) -> Result<Self, Error> {
         // One frame in flight at a time: a backlog of frames is a backlog of
         // latency, and the newest frame supersedes the ones before it.
         // Frames are bounded by the single recyclable frame below. The channel
         // itself stays unbounded so control escapes are never discarded merely
         // because the worker is writing a frame.
+        let shared_memory = terminal.capabilities().shared_memory;
         let (messages, queue) = channel();
-        let (recycle, recycled) = channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
-            .spawn(move || run(queue, recycle, shared_memory))
-            .expect("the presenter thread could not be started");
-        Self {
+            .spawn(move || worker(queue, &events, shared_memory))
+            .map_err(Error::Start)?;
+        Ok(Self {
             messages: Some(messages),
-            recycled,
             free: Some(Frame::default()),
             handle: Some(handle),
-        }
+            terminal,
+        })
+    }
+
+    pub const fn capabilities(&self) -> &Capabilities {
+        self.terminal.capabilities()
+    }
+
+    pub fn refresh(&mut self) -> &Capabilities {
+        self.terminal.refresh()
+    }
+
+    pub fn clear(&self) {
+        self.raw(Terminal::clear());
     }
 
     /// A recycled frame to fill, if the worker has finished with it.
     ///
     /// `None` means the worker is still busy and this frame is being dropped -
     /// dropping is the point, so it is not an error.
-    pub fn frame(&mut self) -> Option<Frame> {
-        self.free.take().or_else(|| self.recycled.try_recv().ok())
+    pub const fn frame(&mut self) -> Option<Frame> {
+        self.free.take()
     }
 
-    /// Give back a frame that was taken but not handed to the worker.
-    pub fn reuse(&mut self, frame: Frame) {
+    pub const fn is_ready(&self) -> bool {
+        self.free.is_some()
+    }
+
+    /// Make a completed or unsent frame available for reuse.
+    pub fn recycle(&mut self, frame: Frame) {
         debug_assert!(self.free.is_none());
         self.free = Some(frame);
     }
@@ -116,10 +159,38 @@ impl Presenter {
     /// what the compositor did to it are the last thing written.
     pub fn finish(&mut self) {
         self.messages = None;
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("the presenter thread panicked");
         }
     }
+}
+
+impl Drop for Presenter {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Keep failures and panics on the worker observable to the event loop.
+fn worker(queue: Receiver<Message>, events: &EventSender<Event>, shared_memory: bool) {
+    struct Cleanup;
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            kitty::discard_shared_memory();
+        }
+    }
+
+    let _cleanup = Cleanup;
+    let result = catch_unwind(AssertUnwindSafe(|| run(queue, events, shared_memory)));
+    let failure = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(err)) => Error::Output(err),
+        Err(_) => Error::Panicked,
+    };
+    let _ = events.send(Event::Failed(failure));
 }
 
 /// The worker: encode frames in the order they arrive and write them out.
@@ -127,7 +198,11 @@ impl Presenter {
     clippy::needless_pass_by_value,
     reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
 )]
-fn run(queue: Receiver<Message>, recycle: Sender<Frame>, shared_memory: bool) {
+fn run(
+    queue: Receiver<Message>,
+    events: &EventSender<Event>,
+    shared_memory: bool,
+) -> std::io::Result<()> {
     let mut encoder = Encoder::default();
     encoder.shared_memory = shared_memory;
     let mut out = Vec::new();
@@ -136,9 +211,7 @@ fn run(queue: Receiver<Message>, recycle: Sender<Frame>, shared_memory: bool) {
         let mut frame = match message {
             Message::Frame(frame) => frame,
             Message::Raw(bytes) => {
-                if let Err(err) = write(&bytes) {
-                    tracing::warn!(?err, "could not hand an escape to the terminal");
-                }
+                write(&bytes)?;
                 continue;
             }
         };
@@ -158,22 +231,17 @@ fn run(queue: Receiver<Message>, recycle: Sender<Frame>, shared_memory: bool) {
         let spent_encoding = phase.elapsed();
 
         let phase = Instant::now();
-        let result = write(&out);
+        write(&out)?;
         let written = phase.elapsed();
-        if let Err(err) = result {
-            tracing::warn!(?err, "could not hand a frame to the terminal");
-        }
 
-        // The buffer goes back for the next frame to be filled in.
         frame.pixels.clear();
         frame.tiles.clear();
-        let _ = recycle.send(frame);
         stats.record(tiles, out.len(), spent_encoding, written);
+        if events.send(Event::Ready(frame)).is_err() {
+            return Ok(());
+        }
     }
-
-    // Nothing is left to show, and nothing is left to read what was waiting:
-    // whatever shared memory the terminal did not take is ours to remove.
-    kitty::discard_shared_memory();
+    Ok(())
 }
 
 fn write(bytes: &[u8]) -> std::io::Result<()> {

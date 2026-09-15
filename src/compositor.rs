@@ -108,6 +108,49 @@ pub struct Cost {
     pub compose: Duration,
 }
 
+/// Tiles whose newest pixels have not yet been accepted by the presenter.
+#[derive(Debug)]
+struct PendingTiles {
+    flags: Vec<bool>,
+    count: usize,
+}
+
+impl PendingTiles {
+    fn new(count: usize) -> Self {
+        Self {
+            flags: vec![false; count],
+            count: 0,
+        }
+    }
+
+    fn mark(&mut self, index: usize) {
+        if !self.flags[index] {
+            self.flags[index] = true;
+            self.count += 1;
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    const fn len(&self) -> usize {
+        self.count
+    }
+
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.flags
+            .iter()
+            .enumerate()
+            .filter_map(|(index, due)| due.then_some(index))
+    }
+
+    fn clear(&mut self) {
+        self.flags.fill(false);
+        self.count = 0;
+    }
+}
+
 /// Why meowland could not be set up.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -123,13 +166,6 @@ pub enum Error {
 }
 
 /// The compositor.
-///
-/// The flags are independent switches rather than a state: whether a frame is
-/// needed, whether the pointer moved, whether the corner carries a counter.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each of these is an independent switch, not a state"
-)]
 pub struct Meowland {
     // Protocol state.
     compositor_state: CompositorState,
@@ -152,16 +188,7 @@ pub struct Meowland {
     /// If it were a queue, a client at 60 Hz and a terminal that cannot
     /// keep up would grow it without bound, and every handover would cost
     /// more than the one before it until the screen stopped moving.
-    due: Vec<bool>,
-    /// How many of those flags are set, so an empty set costs nothing to spot.
-    due_count: usize,
-    /// Whether the corner of the screen carries a frame-rate counter.
-    fps_counter: bool,
-    /// Frames handed to the presenter in the second being counted, the rate the
-    /// last second settled at, and when that second started.
-    fps_window: Option<Instant>,
-    fps_frames: u32,
-    fps: u32,
+    pending: PendingTiles,
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -200,7 +227,8 @@ pub struct Meowland {
     tiles: Tiles,
     dirty: Vec<Rect>,
     plan: Vec<(WlSurface, Point<i32, Logical>)>,
-    needs_redraw: bool,
+    /// The client scene changed and must be composited again.
+    scene_dirty: bool,
     pointer_dirty: bool,
     /// Set by the quit binding and by the main loop's own reasons to stop.
     quitting: bool,
@@ -222,7 +250,6 @@ impl Meowland {
         display: &DisplayHandle,
         capabilities: &Capabilities,
         nodes: &[crate::dmabuf::RenderNode],
-        fps_counter: bool,
     ) -> Result<Self, Error> {
         let compositor_state = CompositorState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, []);
@@ -297,12 +324,7 @@ impl Meowland {
             dmabuf_state,
             dmabuf_global,
             gpu,
-            due: vec![false; grid_tiles],
-            due_count: 0,
-            fps_counter,
-            fps_window: None,
-            fps_frames: 0,
-            fps: 0,
+            pending: PendingTiles::new(grid_tiles),
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -323,7 +345,7 @@ impl Meowland {
             tiles,
             dirty: Vec::new(),
             plan: Vec::new(),
-            needs_redraw: true,
+            scene_dirty: true,
             pointer_dirty: true,
             quitting: false,
             cell: capabilities.cell,
@@ -382,7 +404,7 @@ impl Meowland {
         if let Some(surface) = surface {
             self.output.enter(&surface);
         }
-        self.needs_redraw = true;
+        self.scene_dirty = true;
     }
 
     /// Ask a toplevel to fill the terminal.
@@ -405,20 +427,8 @@ impl Meowland {
     /// it - which is what makes dropping a frame safe.
     pub fn present(&mut self, presenter: &mut Presenter) -> Cost {
         let phase = Instant::now();
-        // Before anything decides there is nothing to do: a second in which no
-        // frame was handed over is a rate of zero, and the number on screen has
-        // to be able to say so.
-        if self.fps_counter {
-            self.settle_rate();
-        }
-        if self.needs_redraw {
+        if self.scene_dirty {
             self.compose();
-            if self.fps_counter {
-                // Drawn into the frame rather than written as terminal text:
-                // the window covers the grid, and images are
-                // drawn over text.
-                crate::hud::draw(&mut self.frame, &format!("{} fps", self.fps));
-            }
             self.tiles.diff(&self.frame, &mut self.dirty);
         } else {
             self.dirty.clear();
@@ -431,7 +441,7 @@ impl Meowland {
 
         // Everything composed is on screen as far as the clients are concerned;
         // what the terminal has yet to receive is the presenter's business.
-        self.needs_redraw = false;
+        self.scene_dirty = false;
         self.pointer_dirty = false;
         self.draw_pointer_shape(presenter);
         self.hand_over(presenter, &mut cost);
@@ -454,16 +464,11 @@ impl Meowland {
     /// presenter is still busy with the frame before them - in which case they
     /// stay due and the next frame carries them.
     fn hand_over(&mut self, presenter: &mut Presenter, cost: &mut Cost) {
-        let mut due_count = self.due_count;
         for tile in self.dirty.drain(..) {
             let index = self.tiles.index(tile);
-            if !self.due[index] {
-                self.due[index] = true;
-                due_count += 1;
-            }
+            self.pending.mark(index);
         }
-        self.due_count = due_count;
-        if self.due_count == 0 {
+        if self.pending.is_empty() {
             return;
         }
         let Some(mut frame) = presenter.frame() else {
@@ -474,12 +479,9 @@ impl Meowland {
         // so the presenter can cut them apart again without knowing the frame.
         frame.pixels.clear();
         frame.tiles.clear();
-        frame.tiles.reserve(self.due_count);
+        frame.tiles.reserve(self.pending.len());
         let stride = self.frame.width as usize * BYTES;
-        for index in 0..self.due.len() {
-            if !self.due[index] {
-                continue;
-            }
+        for index in self.pending.indices() {
             let tile = self.tiles.tile(&self.frame, index);
             for row in 0..tile.height {
                 let start = (tile.y as usize + row as usize) * stride + tile.x as usize * BYTES;
@@ -493,37 +495,10 @@ impl Meowland {
         cost.sent = frame.tiles.len();
         match presenter.present(frame) {
             Ok(()) => {
-                self.due.fill(false);
-                self.due_count = 0;
-                self.count_frame();
+                self.pending.clear();
             }
             // Not taken: the tiles stay due, so nothing is lost by the wait.
-            Err(frame) => presenter.reuse(frame),
-        }
-    }
-
-    /// Count a frame that reached the presenter.
-    fn count_frame(&mut self) {
-        self.fps_window.get_or_insert_with(Instant::now);
-        self.fps_frames += 1;
-    }
-
-    /// Turn the frames counted since the last settling into a rate, once a
-    /// second has passed - and ask for a frame of its own when the number
-    /// changes, or a client that has stopped drawing would leave the last rate
-    /// it managed on screen for as long as it stays quiet.
-    fn settle_rate(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(*self.fps_window.get_or_insert(now));
-        if elapsed < Duration::from_secs(1) {
-            return;
-        }
-        let settled = (f64::from(self.fps_frames) / elapsed.as_secs_f64()).round() as u32;
-        self.fps_window = Some(now);
-        self.fps_frames = 0;
-        if settled != self.fps {
-            self.fps = settled;
-            self.needs_redraw = true;
+            Err(frame) => presenter.recycle(frame),
         }
     }
 
@@ -619,8 +594,7 @@ impl Meowland {
         self.frame
             .resize(capabilities.pixels.0, capabilities.pixels.1);
         self.tiles = Tiles::new(&self.frame, tile_size(capabilities.cell));
-        self.due = vec![false; self.tiles.tile_count()];
-        self.due_count = 0;
+        self.pending = PendingTiles::new(self.tiles.tile_count());
         let mode = output_mode(capabilities);
         self.output.set_preferred(mode);
         self.output.change_current_state(
@@ -632,7 +606,7 @@ impl Meowland {
         for toplevel in &self.toplevels {
             self.maximize(toplevel);
         }
-        self.needs_redraw = true;
+        self.scene_dirty = true;
     }
 
     // ---------------------------------------------------------------- input
@@ -847,9 +821,10 @@ impl Meowland {
         pointer.frame(self);
     }
 
-    /// Whether anything changed that the terminal should be told about.
-    pub const fn needs_frame(&self) -> bool {
-        self.needs_redraw || self.pointer_dirty
+    /// Whether the main loop should present now. A due frame waits without
+    /// polling until the presenter reports that its reusable frame is ready.
+    pub const fn should_present(&self, presenter_ready: bool) -> bool {
+        self.scene_dirty || self.pointer_dirty || (!self.pending.is_empty() && presenter_ready)
     }
 }
 
@@ -859,7 +834,7 @@ fn output_mode(capabilities: &Capabilities) -> Mode {
     Mode {
         size: (capabilities.pixels.0 as i32, capabilities.pixels.1 as i32).into(),
         // A terminal has no refresh rate; frame callbacks are what pace clients here.
-        refresh: 60_000,
+        refresh: crate::REFRESH_MILLIHZ,
     }
 }
 
@@ -1062,7 +1037,7 @@ impl CompositorHandler for Meowland {
         // the toplevels: sub-surfaces, popups and the client's cursor
         // all arrive here too.
         self.snapshot(surface);
-        self.needs_redraw = true;
+        self.scene_dirty = true;
         tracing::debug!(id = ?surface.id(), "committed");
 
         if self
@@ -1094,7 +1069,16 @@ impl Meowland {
             // the copy below happens with no surface lock held.
             let (buffer, scale) = {
                 let mut state = states.cached_state.get::<SurfaceAttributes>();
-                (state.current().buffer.take(), state.current().buffer_scale)
+                let current = state.current();
+                let buffer = current.buffer.take();
+                let scale = current.buffer_scale;
+                // A snapshot copies the complete buffer, so all accumulated
+                // damage has been consumed. Leaving it here would make Smithay
+                // retain every damage rectangle across future commits.
+                current.damage.clear();
+                current.buffer_delta = None;
+                drop(state);
+                (buffer, scale)
             };
             buffer.map(|buffer| (buffer, scale))
         });
@@ -1191,7 +1175,7 @@ impl XdgShellHandler for Meowland {
         // whole window policy.
         self.maximize(&surface);
         self.toplevels.push(surface);
-        self.needs_redraw = true;
+        self.scene_dirty = true;
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {

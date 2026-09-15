@@ -67,10 +67,19 @@ fn main() -> anyhow::Result<()> {
     init_logging(cli.log.as_deref(), cli.log_level.as_deref())?;
 
     let terminal = Terminal::new()?;
+    // Block process signals before starting any worker threads so every thread
+    // inherits the mask and the event-loop signalfd receives them reliably.
+    let signals = Signals::new(&[
+        Signal::SIGTERM,
+        Signal::SIGINT,
+        Signal::SIGHUP,
+        Signal::SIGCHLD,
+    ])
+    .context("could not listen for process signals")?;
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
-    tracing::info!(socket = %socket_name, capabilities = ?terminal.capabilities(), "meowland starting");
+    tracing::info!(socket = %socket_name, "meowland starting");
 
     let display: Display<Meowland> =
         Display::new().context("could not create a Wayland display")?;
@@ -78,10 +87,12 @@ fn main() -> anyhow::Result<()> {
     let state = Meowland::new(&display.handle(), terminal.capabilities(), &nodes)?;
     let (presenter_sender, presenter_events) = channel();
     let presenter = Presenter::new(terminal, presenter_sender)?;
+    let (terminal_sender, terminal_events) = channel();
 
     let mut app = App {
         display,
         state,
+        terminal_sender: Some(terminal_sender),
         terminal_input: None,
         presenter,
         socket_name,
@@ -101,7 +112,14 @@ fn main() -> anyhow::Result<()> {
     app.signal = Some(signal_handle);
 
     let handle = event_loop.handle();
-    install_sources(&handle, &mut app, socket, presenter_events)?;
+    install_sources(
+        &handle,
+        &mut app,
+        socket,
+        terminal_events,
+        presenter_events,
+        signals,
+    )?;
 
     let result = if app.quitting {
         Ok(())
@@ -117,7 +135,9 @@ fn install_sources(
     handle: &LoopHandle<'_, App>,
     app: &mut App,
     socket: ListeningSocketSource,
+    terminal_events: Channel<TerminalEvent>,
     presenter_events: Channel<PresenterEvent>,
+    signals: Signals,
 ) -> anyhow::Result<()> {
     handle
         .insert_source(socket, |stream, (), app| {
@@ -146,10 +166,9 @@ fn install_sources(
         )
         .context("could not watch the display")?;
 
-    let (sender, channel) = channel();
     let terminal_loop = handle.clone();
     handle
-        .insert_source(channel, move |event, (), app: &mut App| {
+        .insert_source(terminal_events, move |event, (), app: &mut App| {
             match event {
                 ChannelEvent::Msg(TerminalEvent::Input(event)) => app.on_terminal_event(event),
                 ChannelEvent::Msg(TerminalEvent::Closed) => {
@@ -180,13 +199,6 @@ fn install_sources(
         })
         .map_err(|err| anyhow::anyhow!("could not watch terminal presentation: {err:?}"))?;
 
-    let signals = Signals::new(&[
-        Signal::SIGTERM,
-        Signal::SIGINT,
-        Signal::SIGHUP,
-        Signal::SIGCHLD,
-    ])
-    .context("could not listen for process signals")?;
     handle
         .insert_source(signals, |event, (), app: &mut App| match event.signal() {
             Signal::SIGCHLD => {
@@ -197,8 +209,6 @@ fn install_sources(
         })
         .context("could not watch process signals")?;
 
-    app.terminal_input =
-        Some(TerminalInput::start(sender).context("could not start the terminal input thread")?);
     if !app.command.is_empty() {
         app.spawn_client();
     }
@@ -254,6 +264,8 @@ struct App {
     /// Kept separate from `state`: dispatching needs both at once.
     display: Display<Meowland>,
     state: Meowland,
+    /// Held until a window appears; before then stdin remains untouched.
+    terminal_sender: Option<Sender<TerminalEvent>>,
     /// Declared before the presenter so unwinding stops input before restoring
     /// the terminal, just as normal shutdown does.
     terminal_input: Option<TerminalInput>,
@@ -278,6 +290,39 @@ struct App {
 }
 
 impl App {
+    /// Enter compositor terminal mode after the first window has pixels.
+    fn activate_terminal(&mut self) -> bool {
+        if self.terminal_input.is_some() {
+            return true;
+        }
+        let capabilities = match self.presenter.activate() {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                tracing::error!(%error, "could not take over the terminal");
+                self.quit();
+                return false;
+            }
+        };
+        tracing::info!(?capabilities, "terminal activated");
+        self.state.resize(&capabilities);
+
+        let Some(sender) = self.terminal_sender.take() else {
+            self.quit();
+            return false;
+        };
+        match TerminalInput::start(sender) {
+            Ok(input) => {
+                self.terminal_input = Some(input);
+                true
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not start the terminal input thread");
+                self.quit();
+                false
+            }
+        }
+    }
+
     /// Draw a scheduled frame and flush protocol replies.
     fn present_frame(&mut self) {
         let started = Instant::now();
@@ -608,6 +653,12 @@ fn frame_deadline(now: Instant, last_frame_started: Option<Instant>) -> Instant 
 
 /// Arm one frame deadline when new compositor state needs presentation.
 fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
+    if app.quitting {
+        return;
+    }
+    if app.state.window_ready() && !app.activate_terminal() {
+        return;
+    }
     if app.frame_scheduled || !app.state.should_present(app.presenter.is_ready()) {
         return;
     }

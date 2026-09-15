@@ -24,7 +24,7 @@ use calloop::channel::Sender as EventSender;
 
 use crate::{
     kitty::{self, Encoder, Placement},
-    tty::{Capabilities, Terminal},
+    tty::{self, Capabilities, Terminal},
 };
 
 /// One frame on its way to the terminal: the pixels of the tiles that changed,
@@ -51,6 +51,7 @@ pub enum Error {
 /// screen after a resize, or naming the pointer shape.
 #[derive(Debug)]
 enum Message {
+    Configure { shared_memory: bool },
     Frame(Frame),
     Raw(Vec<u8>),
 }
@@ -78,19 +79,18 @@ pub struct Presenter {
 }
 
 impl Presenter {
-    /// Start the worker, telling it whether the terminal reads tiles out of
-    /// shared memory rather than off the pty.
+    /// Start the dormant worker. It receives terminal capabilities on
+    /// activation.
     pub fn new(terminal: Terminal, events: EventSender<Event>) -> Result<Self, Error> {
         // One frame in flight at a time: a backlog of frames is a backlog of
         // latency, and the newest frame supersedes the ones before it.
         // Frames are bounded by the single recyclable frame below. The channel
         // itself stays unbounded so control escapes are never discarded merely
         // because the worker is writing a frame.
-        let shared_memory = terminal.capabilities().shared_memory;
         let (messages, queue) = channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
-            .spawn(move || worker(queue, &events, shared_memory))
+            .spawn(move || worker(queue, &events))
             .map_err(Error::Start)?;
         Ok(Self {
             messages: Some(messages),
@@ -102,6 +102,17 @@ impl Presenter {
 
     pub const fn capabilities(&self) -> &Capabilities {
         self.terminal.capabilities()
+    }
+
+    /// Take over the terminal and configure the writer for its transport.
+    pub fn activate(&mut self) -> Result<Capabilities, tty::Error> {
+        let capabilities = self.terminal.activate()?.clone();
+        if let Some(messages) = &self.messages {
+            let _ = messages.send(Message::Configure {
+                shared_memory: capabilities.shared_memory,
+            });
+        }
+        Ok(capabilities)
     }
 
     pub fn refresh(&mut self) -> &Capabilities {
@@ -142,7 +153,7 @@ impl Presenter {
             .send(Message::Frame(frame))
             .map_err(|error| match error.0 {
                 Message::Frame(frame) => frame,
-                Message::Raw(_) => unreachable!("sent a frame"),
+                Message::Configure { .. } | Message::Raw(_) => unreachable!("sent a frame"),
             })
     }
 
@@ -174,7 +185,7 @@ impl Drop for Presenter {
 }
 
 /// Keep failures and panics on the worker observable to the event loop.
-fn worker(queue: Receiver<Message>, events: &EventSender<Event>, shared_memory: bool) {
+fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
     struct Cleanup;
 
     impl Drop for Cleanup {
@@ -184,7 +195,7 @@ fn worker(queue: Receiver<Message>, events: &EventSender<Event>, shared_memory: 
     }
 
     let _cleanup = Cleanup;
-    let result = catch_unwind(AssertUnwindSafe(|| run(queue, events, shared_memory)));
+    let result = catch_unwind(AssertUnwindSafe(|| run(queue, events)));
     let failure = match result {
         Ok(Ok(())) => return,
         Ok(Err(err)) => Error::Output(err),
@@ -198,17 +209,16 @@ fn worker(queue: Receiver<Message>, events: &EventSender<Event>, shared_memory: 
     clippy::needless_pass_by_value,
     reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
 )]
-fn run(
-    queue: Receiver<Message>,
-    events: &EventSender<Event>,
-    shared_memory: bool,
-) -> std::io::Result<()> {
+fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result<()> {
     let mut encoder = Encoder::default();
-    encoder.shared_memory = shared_memory;
     let mut out = Vec::new();
     let mut stats = Stats::default();
     while let Ok(message) = queue.recv() {
         let mut frame = match message {
+            Message::Configure { shared_memory } => {
+                encoder.shared_memory = shared_memory;
+                continue;
+            }
             Message::Frame(frame) => frame,
             Message::Raw(bytes) => {
                 write(&bytes)?;

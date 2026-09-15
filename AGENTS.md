@@ -53,9 +53,9 @@ Logs go to `$XDG_RUNTIME_DIR/meowland.log`. Wayland clients connect with
 `WAYLAND_DISPLAY=wayland-meowland`.
 
 Terminals that read tiles out of shared memory get them that way, which keeps
-their pixels off the pty entirely; the startup probe decides, by sending one tile
-that way and seeing whether the terminal says it read it. Everything else goes
-direct, base64'd, as before.
+their pixels off the pty entirely; the probe run when the first window appears
+decides, by sending one tile that way and seeing whether the terminal says it
+read it. Everything else goes direct, base64'd, as before.
 
 Settings are flags that fall back to environment variables, and the flag wins:
 `--gpu-buffers` (`MEOWLAND_GPU_BUFFERS`, default `auto`), `--render-node`

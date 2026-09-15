@@ -80,11 +80,21 @@ pub enum Error {
 }
 
 impl Terminal {
-    /// Take over the terminal: raw mode, alternate screen, mouse and keyboard
-    /// reporting.
+    /// Inspect the terminal geometry without changing any terminal state.
     pub fn new() -> Result<Self, Error> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(Error::NotATerminal);
+        }
+        Ok(Self {
+            capabilities: resolve_capabilities(&Probe::default(), window_size()),
+            entered: false,
+        })
+    }
+
+    /// Probe and take over the terminal once there is a window to display.
+    pub fn activate(&mut self) -> Result<&Capabilities, Error> {
+        if self.entered {
+            return Ok(&self.capabilities);
         }
         crossterm::terminal::enable_raw_mode().map_err(Error::RawMode)?;
         let probe = probe().unwrap_or_else(|error| {
@@ -97,18 +107,15 @@ impl Terminal {
             return Err(Error::NoGraphics);
         }
 
-        let mut terminal = Self {
-            capabilities,
-            entered: false,
-        };
-        if let Err(error) = terminal.enter() {
+        self.capabilities = capabilities;
+        if let Err(error) = self.enter() {
             let _ = crossterm::terminal::disable_raw_mode();
             return Err(Error::Output(error));
         }
-        Ok(terminal)
+        Ok(&self.capabilities)
     }
 
-    /// Capabilities discovered at startup.
+    /// Current capabilities, initially based only on terminal geometry.
     pub const fn capabilities(&self) -> &Capabilities {
         &self.capabilities
     }
@@ -204,7 +211,7 @@ impl Drop for Terminal {
     }
 }
 
-/// Answer to the startup queries, before defaults and sanity checks are
+/// Answer to the takeover queries, before defaults and sanity checks are
 /// applied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Probe {

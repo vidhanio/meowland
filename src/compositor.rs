@@ -369,6 +369,11 @@ impl Meowland {
         self.quitting
     }
 
+    /// Whether a toplevel has committed pixels that can be displayed.
+    pub const fn window_ready(&self) -> bool {
+        self.presented.is_some()
+    }
+
     /// The surface the keyboard and pointer events are aimed at: the one on
     /// screen.
     fn presented_surface(&self) -> Option<WlSurface> {

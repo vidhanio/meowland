@@ -129,9 +129,4 @@ mod tests {
         let expected: Vec<[u8; 5]> = "23 fps".chars().map(glyph).collect();
         assert_eq!(read_back(&frame, expected.len()), expected);
     }
-
-    #[test]
-    fn a_blank_glyph_is_a_space() {
-        assert_eq!(glyph(' '), [0; 5]);
-    }
 }

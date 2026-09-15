@@ -511,8 +511,6 @@ struct FrameStats {
 
 impl FrameStats {
     fn record(&mut self, cost: &Cost) {
-        use std::time::Duration;
-
         self.frames += 1;
         self.tiles += cost.tiles as u64;
         self.sent += cost.sent as u64;
@@ -521,7 +519,7 @@ impl FrameStats {
         let now = Instant::now();
         let since = *self.since.get_or_insert(now);
         let elapsed = now - since;
-        if elapsed < Duration::from_secs(1) || self.frames == 0 {
+        if elapsed < Duration::from_secs(1) {
             return;
         }
         let frames = f64::from(self.frames);

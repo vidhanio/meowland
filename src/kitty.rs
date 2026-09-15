@@ -58,28 +58,29 @@ pub const SHARED_PROBE_ID: u32 = 78;
 /// comes back on stdin with the rest of the probe's answers, and
 /// [`discard_shared_probe`] cleans up after a terminal that did not read it.
 pub fn shared_memory_probe(out: &mut Vec<u8>) -> bool {
-    let Some(object) = Shared::write(0, &[0, 0, 0, 255]).ok() else {
+    let object = Shared::new(0);
+    if object.write(&[0, 0, 0, 255]).is_err() {
         return false;
-    };
+    }
     out.extend_from_slice(b"\x1b_G");
     let _ = write!(out, "a=q,f=32,t=s,i={SHARED_PROBE_ID},s=1,v=1;");
-    out.extend_from_slice(&object.encoded_name());
+    out.extend_from_slice(&object.encoded_name);
     out.extend_from_slice(b"\x1b\\");
     // Kept in the module so the cleanup below can find it by name.
-    *PROBE_OBJECT.lock().expect("no poison") = Some(object.name);
+    *PROBE_OBJECT.lock().expect("no poison") = Some(object);
     true
 }
 
 /// Remove the probe's object, for a terminal that turned out not to read it.
 pub fn discard_shared_probe() {
     let taken = PROBE_OBJECT.lock().expect("no poison").take();
-    if let Some(name) = taken {
-        Shared { name }.unlink();
+    if let Some(object) = taken {
+        object.unlink();
     }
 }
 
 /// The probe object's name, until its fate is known.
-static PROBE_OBJECT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PROBE_OBJECT: std::sync::Mutex<Option<Shared>> = std::sync::Mutex::new(None);
 
 /// One tile's payload, in a shared memory object the terminal reads for itself.
 ///
@@ -90,10 +91,22 @@ static PROBE_OBJECT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(No
 /// it.
 #[derive(Debug)]
 struct Shared {
-    name: String,
+    path: String,
+    encoded_name: Vec<u8>,
 }
 
 impl Shared {
+    fn new(slot: u32) -> Self {
+        let name = format!("/meowland-{}-{slot}", std::process::id());
+        let path = format!("{SHM_DIRECTORY}{name}");
+        let mut encoded_name = vec![0; base64::encoded_len(name.len(), true).expect("name fits")];
+        let length = BASE64
+            .encode_slice(name.as_bytes(), &mut encoded_name)
+            .expect("the buffer has the exact encoded size");
+        encoded_name.truncate(length);
+        Self { path, encoded_name }
+    }
+
     /// Write `payload` into the object named after `slot`.
     ///
     /// A name per tile rather than per transfer, which bounds what a terminal
@@ -103,19 +116,14 @@ impl Shared {
     /// what was written most recently instead of what was written for it, which
     /// is also the newest row of pixels it could be showing. mpv's `--vo=kitty`
     /// makes the same trade, with one object for a whole frame.
-    fn write(slot: u32, payload: &[u8]) -> std::io::Result<Self> {
+    fn write(&self, payload: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
-        // A POSIX shared memory name, which has to begin with a slash: kitty
-        // refuses anything else outright ("POSIX SHM names must start with /"),
-        // even though `shm_open` itself would accept it.
-        let name = format!("/meowland-{}-{slot}", std::process::id());
-        let path = format!("{SHM_DIRECTORY}{name}");
         // Not `EXCL`: the name is one this process has used before, and either
         // the terminal has unlinked it by now or it still holds what it failed
         // to read, which is about to be replaced either way.
         let file = rustix::fs::open(
-            path.as_str(),
+            self.path.as_str(),
             rustix::fs::OFlags::CREATE | rustix::fs::OFlags::RDWR,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
@@ -124,25 +132,17 @@ impl Shared {
         let mut file = std::fs::File::from(file);
         file.write_all(payload)?;
         file.flush()?;
-        drop(file);
-        Ok(Self { name })
-    }
-
-    /// The name as the escape carries it: base64, like any other payload.
-    fn encoded_name(&self) -> Vec<u8> {
-        let mut encoded = vec![0; base64::encoded_len(self.name.len(), true).expect("name fits")];
-        let length = BASE64
-            .encode_slice(self.name.as_bytes(), &mut encoded)
-            .expect("the buffer has the exact encoded size");
-        encoded.truncate(length);
-        encoded
+        Ok(())
     }
 
     /// Remove it, for a terminal that turned out not to read it.
     fn unlink(self) {
-        let path = format!("{SHM_DIRECTORY}{}", self.name);
-        if let Err(err) = std::fs::remove_file(&path) {
-            tracing::debug!(?err, path, "could not remove a shared memory object");
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            tracing::debug!(
+                ?err,
+                path = self.path,
+                "could not remove a shared memory object"
+            );
         }
     }
 }
@@ -156,7 +156,7 @@ impl Shared {
 /// what does not pay is content that is already compressed or has no structure
 /// to find, where zlib spends milliseconds to save a fraction of what base64
 /// then adds straight back.
-const WORTH_COMPRESSING: f64 = 0.75;
+const COMPRESSION_RATIO: (usize, usize) = (3, 4);
 
 /// Reusable compression and base64 storage for tile transmissions.
 #[derive(Debug)]
@@ -168,11 +168,12 @@ pub struct Encoder {
     /// tile has shown what the content does. `None` means the frame has not
     /// shown anything yet.
     compress: Option<bool>,
-    /// Whether the last frame was compressed, for the log.
-    pub compressed_last_frame: bool,
     /// Whether the terminal reads tiles out of shared memory, which is what
     /// keeps the pixels off the pty.
     pub shared_memory: bool,
+    /// Stable names and encoded names for each tile, made once rather than on
+    /// every frame.
+    shared_objects: Vec<Shared>,
 }
 
 impl Default for Encoder {
@@ -182,8 +183,8 @@ impl Default for Encoder {
             payload: Vec::new(),
             finished: false,
             compress: None,
-            compressed_last_frame: true,
             shared_memory: false,
+            shared_objects: Vec::new(),
         }
     }
 }
@@ -312,37 +313,43 @@ impl Encoder {
         // The first tile of a frame decides for the rest of it: whether
         // compressing pays is a property of what the frame is *of*, and one
         // tile answers for all of them.
-        // The tile's own id names its object: a tile keeps one id for as long
-        // as the compositor runs, so this is a fixed set of names.
-        let shared = self.shared_memory.then_some(placement.id);
         // Whether compressing pays is a decision about the pty: with shared
         // memory the pixels never travel through it, so the answer is no - it
         // would be our time against the terminal's, and reading pixels costs
         // the terminal less than inflating them.
         if self.shared_memory {
-            self.compressed_last_frame = false;
-            self.compress = Some(false);
-            transmit(out, &mut self.payload, pixels, placement, false, shared);
+            let slot = placement.id as usize;
+            while self.shared_objects.len() <= slot {
+                self.shared_objects
+                    .push(Shared::new(self.shared_objects.len() as u32));
+            }
+            transmit(
+                out,
+                &mut self.payload,
+                pixels,
+                placement,
+                false,
+                Some(&self.shared_objects[slot]),
+            );
             return;
         }
         let Some(compress) = self.compress else {
             // Compressed before being asked whether to: one tile of work is
             // what it costs to find out.
             let compressed_len = self.compress(pixels);
-            let worth = compressed_len < (pixels.len() as f64 * WORTH_COMPRESSING) as usize;
+            let worth = compressed_len * COMPRESSION_RATIO.1 < pixels.len() * COMPRESSION_RATIO.0;
             self.compress = Some(worth);
-            self.compressed_last_frame = worth;
             let payload = if worth { self.zlib.get_ref() } else { pixels };
-            transmit(out, &mut self.payload, payload, placement, worth, shared);
+            transmit(out, &mut self.payload, payload, placement, worth, None);
             return;
         };
 
         if compress {
             self.compress(pixels);
             let payload = self.zlib.get_ref();
-            transmit(out, &mut self.payload, payload, placement, true, shared);
+            transmit(out, &mut self.payload, payload, placement, true, None);
         } else {
-            transmit(out, &mut self.payload, pixels, placement, false, shared);
+            transmit(out, &mut self.payload, pixels, placement, false, None);
         }
     }
 
@@ -377,19 +384,19 @@ fn transmit(
     payload: &[u8],
     placement: Placement,
     compressed: bool,
-    shared: Option<u32>,
+    shared: Option<&Shared>,
 ) {
-    if let Some(slot) = shared {
-        let object = match Shared::write(slot, payload) {
-            Ok(object) => object,
+    if let Some(object) = shared {
+        match object.write(payload) {
+            Ok(()) => {}
             // Out of shared memory: the pty still works, so this is not worth
             // failing a frame over.
             Err(err) => {
                 tracing::debug!(?err, "could not put a tile in shared memory");
                 return direct(out, encoded, payload, placement, compressed);
             }
-        };
-        placed(out, placement, compressed, "t=s", &object.encoded_name());
+        }
+        placed(out, placement, compressed, "t=s", &object.encoded_name);
         return;
     }
     direct(out, encoded, payload, placement, compressed);
@@ -403,27 +410,29 @@ fn direct(
     placement: Placement,
     compressed: bool,
 ) {
+    let payload = encode_base64(encoded, payload);
+    chunked(out, placement, compressed, payload);
+}
+
+fn encode_base64<'a>(encoded: &'a mut Vec<u8>, payload: &[u8]) -> &'a [u8] {
     let encoded_len =
         base64::encoded_len(payload.len(), true).expect("a tile fits in address space");
     encoded.resize(encoded_len, 0);
-    let payload_len = BASE64
+    let length = BASE64
         .encode_slice(payload, encoded)
         .expect("the payload buffer has the exact encoded size");
-    chunked(out, placement, compressed, &encoded[..payload_len]);
+    &encoded[..length]
 }
 
 fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &[u8]) {
     let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
-        let head = if first {
-            describe(placement, compressed, None)
-        } else {
-            String::new()
-        };
-        first = false;
         out.extend_from_slice(b"\x1b_G");
-        out.extend_from_slice(head.as_bytes());
+        if first {
+            describe(out, placement, compressed, None);
+            first = false;
+        }
         out.extend_from_slice(if chunks.peek().is_some() {
             b"m=1;"
         } else {
@@ -437,8 +446,7 @@ fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &
 /// One escape, whose payload is not pixels but where to find them.
 fn placed(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: &str, payload: &[u8]) {
     out.extend_from_slice(b"\x1b_G");
-    let head = describe(placement, compressed, Some(medium));
-    out.extend_from_slice(head.as_bytes());
+    describe(out, placement, compressed, Some(medium));
     // The control data ends where the payload begins, and the payload here is a
     // name rather than pixels.
     out.extend_from_slice(b";");
@@ -447,7 +455,7 @@ fn placed(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: &st
 }
 
 /// The control data every transmission carries, whatever the medium.
-fn describe(placement: Placement, compressed: bool, medium: Option<&str>) -> String {
+fn describe(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: Option<&str>) {
     let Placement {
         id,
         width,
@@ -457,10 +465,12 @@ fn describe(placement: Placement, compressed: bool, medium: Option<&str>) -> Str
         ..
     } = placement;
     let compression = if compressed { "o=z," } else { "" };
-    let medium = medium.map_or(String::new(), |medium| format!("{medium},"));
-    format!(
-        "a=T,f=24,{compression}{medium}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
-    )
+    let medium = medium.unwrap_or("");
+    let separator = if medium.is_empty() { "" } else { "," };
+    let _ = write!(
+        out,
+        "a=T,f=24,{compression}{medium}{separator}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
+    );
 }
 
 #[cfg(test)]
@@ -742,10 +752,8 @@ mod tests {
 
     #[test]
     fn a_shared_memory_transfer_names_the_object_in_its_payload() {
-        let name = "/meowland-0-1";
-        let object = Shared {
-            name: name.to_owned(),
-        };
+        let name = format!("/meowland-{}-1", std::process::id());
+        let object = Shared::new(1);
         let mut out = Vec::new();
         placed(
             &mut out,
@@ -759,7 +767,7 @@ mod tests {
             },
             true,
             "t=s",
-            &object.encoded_name(),
+            &object.encoded_name,
         );
 
         // The name is the payload, so it has to come after the separator and
@@ -778,7 +786,7 @@ mod tests {
         // The name travels base64'd, like every other payload in this protocol.
         assert_eq!(
             payload,
-            String::from_utf8(object.encoded_name()).expect("base64 is ascii")
+            String::from_utf8(object.encoded_name).expect("base64 is ascii")
         );
     }
 
@@ -832,7 +840,6 @@ mod tests {
                 },
             ]
         );
-        assert!(!encoder.compressed_last_frame);
     }
 
     /// Full-frame cost of each kind of content, for the record in the log.

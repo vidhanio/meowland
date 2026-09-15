@@ -6,24 +6,30 @@
 //! to be a device the client can render on *and* the compositor can read, or
 //! the client is better off drawing into shared memory.
 //!
-//! # Why this is not offered by default
+//! # What keeps the offer honest
 //!
-//! A driver is entitled to keep a buffer somewhere the CPU cannot reach - that
-//! is what video memory is - and a buffer like that is not merely slow to read,
-//! it is unreadable: `mmap` fails with `EPERM` whether or not CPU access was
-//! begun first, and reading the descriptor instead fails with `EINVAL`.
+//! The offer is what a client chooses on: Mesa's Wayland WSI takes GPU buffers
+//! when a compositor advertises them and has no window at all when the buffers
+//! it produces are then refused. So an offer that cannot be honoured is worse
+//! than no offer, and three things keep this one inside what the compositor can
+//! actually read:
 //!
-//! Those pixels are still reachable *as pixels*: the device that wrote them can
-//! read them, which is what [`crate::gpu`] is for. But that needs a renderer on
-//! the device, and it is the renderer - not this module - that decides what can
-//! be offered, so the offer exists only where there is one to read buffers
-//! back through.
+//! - No renderer, no offer. The device is only named when there is a renderer
+//!   on it to bring buffers back through ([`crate::gpu`]), and a machine with
+//!   no render node at all simply never advertises the global.
+//! - What is advertised is what that renderer takes, not what the protocol
+//!   allows.
+//! - Every buffer is read once before the client is told it is good, so a
+//!   layout that imports but cannot be copied out of is refused while the
+//!   client can still fall back to shared memory.
 //!
-//! Even then it is not offered unasked. The offer is what a client chooses on:
-//! Mesa's Wayland WSI takes GPU buffers when a compositor advertises them and
-//! has no window at all when the buffers it produces are then refused. A
-//! compositor that cannot serve what it advertised makes such a client worse
-//! off than one that never made the offer.
+//! A driver keeping a buffer where the CPU cannot reach it is expected, not
+//! exceptional: `mmap` of such a buffer fails with `EPERM` whether or not CPU
+//! access was begun first, and reading the descriptor fails with `EINVAL`. That
+//! is the reason the renderer exists.
+//!
+//! `MEOWLAND_GPU_BUFFERS=off` is the way out if a client turns out to be worse
+//! off with the offer than without it.
 //!
 //! # Choosing a device
 //!
@@ -36,10 +42,9 @@ use rustix::fs::{FileType, Mode, OFlags};
 
 /// How clients are offered GPU buffers.
 ///
-/// [`OFF`] is the default, because a client that takes the offer and cannot be
-/// served is worse off than one that never saw it. [`AUTO`] offers every render
-/// node on the machine, and any other value is the path of the one render node
-/// to offer.
+/// Unset or [`AUTO`] offers the first render node that has a renderer to read
+/// buffers back through, [`OFF`] offers nothing, and any other value is the
+/// path of the one render node to offer.
 pub const VARIABLE: &str = "MEOWLAND_GPU_BUFFERS";
 
 /// The value of [`VARIABLE`] that offers GPU buffers on every render node.
@@ -98,18 +103,17 @@ pub enum Error {
 /// over the network - simply has none, which is not an error: clients then draw
 /// into shared memory, which is what they do by default anyway.
 pub fn nodes() -> Result<Vec<RenderNode>, Error> {
-    let Some(setting) = std::env::var_os(VARIABLE) else {
-        return Ok(Vec::new());
-    };
-    if setting == OFF {
-        return Ok(Vec::new());
+    match std::env::var_os(VARIABLE) {
+        None => Ok(find()),
+        Some(setting) if setting == AUTO => Ok(find()),
+        Some(setting) if setting == OFF => Ok(Vec::new()),
+        Some(setting) => {
+            let path = PathBuf::from(setting);
+            let node = RenderNode::open(path.clone())
+                .map_err(|source| Error::Unusable { path, source })?;
+            Ok(vec![node])
+        }
     }
-    if setting == AUTO {
-        return Ok(find());
-    }
-    let path = PathBuf::from(setting);
-    let node = RenderNode::open(path.clone()).map_err(|source| Error::Unusable { path, source })?;
-    Ok(vec![node])
 }
 
 /// Every render node on the machine, in the order the kernel numbers them.

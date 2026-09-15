@@ -46,8 +46,6 @@ const KEYBOARD_FLAGS: u32 = 1 | 2 | 8 | 16;
 
 pub struct Terminal {
     capabilities: Capabilities,
-    /// Escape sequences buffered for the frame currently being built.
-    frame: Vec<u8>,
     entered: bool,
 }
 
@@ -85,7 +83,6 @@ impl Terminal {
 
         let mut terminal = Self {
             capabilities,
-            frame: Vec::with_capacity(1 << 16),
             entered: false,
         };
         terminal.enter();
@@ -97,20 +94,14 @@ impl Terminal {
         &self.capabilities
     }
 
-    /// Escape buffer for the frame being built. Call [`Terminal::present`] when
-    /// it is complete.
-    pub const fn frame(&mut self) -> &mut Vec<u8> {
-        &mut self.frame
-    }
-
-    /// Push the buffered frame to the terminal in one atomic, tear-free write.
-    pub fn present(&mut self) -> io::Result<()> {
-        let mut out = std::mem::take(&mut self.frame);
+    /// Write escapes to the terminal in one atomic, tear-free write.
+    ///
+    /// Frames do not go through here - the presenter writes those - so this is
+    /// for the escapes that bracket the compositor's life and for wiping the
+    /// screen, both of which happen when nothing else is being written.
+    fn write(out: &[u8]) -> io::Result<()> {
         let mut stdout = io::stdout().lock();
-        let result = stdout.write_all(&out).and_then(|()| stdout.flush());
-        out.clear();
-        self.frame = out;
-        result
+        stdout.write_all(out).and_then(|()| stdout.flush())
     }
 
     /// Re-read the terminal size after a resize. Returns the new capabilities.
@@ -126,63 +117,61 @@ impl Terminal {
         &self.capabilities
     }
 
-    /// Wipe the screen: every image and every cell. Used when the terminal
-    /// changed size, where stale pixels and stale cell contents cannot be
-    /// told apart from live ones.
-    pub fn clear(&mut self) {
-        crate::kitty::delete_all(&mut self.frame);
+    /// The escapes that wipe the screen: every image and every cell.
+    ///
+    /// Used when the terminal changed size, where stale pixels and stale cell
+    /// contents cannot be told apart from live ones. Built rather than written
+    /// because the presenter sends it, so that it lands after the frames the
+    /// terminal has already been promised.
+    pub fn clear() -> Vec<u8> {
+        let mut out = Vec::new();
+        crate::kitty::delete_all(&mut out);
         // `CSI 2J` also drops any images the terminal still holds, and homes
         // the cursor.
-        self.frame.extend_from_slice(b"\x1b[2J\x1b[H");
-        let _ = self.present();
-    }
-
-    /// Tell the terminal which mouse pointer shape to show, or reset it to its
-    /// own default.
-    pub fn pointer_shape(&mut self, shape: Option<&str>) {
-        crate::kitty::set_pointer_shape(&mut self.frame, shape);
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        out
     }
 
     /// Take over the terminal: alternate screen, no autowrap, mouse and pointer
     /// shapes.
     fn enter(&mut self) {
-        let frame = &mut self.frame;
+        let mut out = Vec::with_capacity(64);
         // Alternate screen keeps the user's scrollback intact and clears images
         // on the way out.
-        frame.extend_from_slice(b"\x1b[?1049h");
+        out.extend_from_slice(b"\x1b[?1049h");
         // No autowrap: a stray write at the last column must never scroll the
         // screen, because scrolling would drag our placements along
         // with the text.
-        frame.extend_from_slice(b"\x1b[?7l");
-        frame.extend_from_slice(b"\x1b[?25l");
-        frame.extend_from_slice(b"\x1b[?1003h\x1b[?1006h");
+        out.extend_from_slice(b"\x1b[?7l");
+        out.extend_from_slice(b"\x1b[?25l");
+        out.extend_from_slice(b"\x1b[?1003h\x1b[?1006h");
         // Bracketed paste: pasted text arrives as a paste, not as a burst of
         // held keys.
-        frame.extend_from_slice(b"\x1b[?2004h");
+        out.extend_from_slice(b"\x1b[?2004h");
         if self.capabilities.pixel_mouse {
-            frame.extend_from_slice(b"\x1b[?1016h");
+            out.extend_from_slice(b"\x1b[?1016h");
         }
         if self.capabilities.keyboard {
-            let _ = write!(frame, "\x1b[>{KEYBOARD_FLAGS}u");
+            let _ = write!(out, "\x1b[>{KEYBOARD_FLAGS}u");
         }
         // Clear the screen *before* the first placement: `CSI 2J` also deletes
         // images.
-        frame.extend_from_slice(b"\x1b[2J\x1b[H");
-        let _ = self.present();
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        let _ = Self::write(&out);
         self.entered = true;
     }
 
     /// Undo everything [`Terminal::enter`] did.
-    fn leave(&mut self) {
-        let frame = &mut self.frame;
-        crate::kitty::delete_all(frame);
-        crate::kitty::set_pointer_shape(frame, None);
+    fn leave(&self) {
+        let mut out = Vec::with_capacity(64);
+        crate::kitty::delete_all(&mut out);
+        crate::kitty::set_pointer_shape(&mut out, None);
         if self.capabilities.keyboard {
-            frame.extend_from_slice(b"\x1b[<u");
+            out.extend_from_slice(b"\x1b[<u");
         }
-        frame.extend_from_slice(b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?2004l");
-        frame.extend_from_slice(b"\x1b[?7h\x1b[?25h\x1b[?1049l");
-        let _ = self.present();
+        out.extend_from_slice(b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?2004l");
+        out.extend_from_slice(b"\x1b[?7h\x1b[?25h\x1b[?1049l");
+        let _ = Self::write(&out);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }

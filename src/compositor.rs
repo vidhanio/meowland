@@ -89,8 +89,7 @@ const TILE_CELLS: (u32, u32) = (16, 8);
 /// `Alt`.
 pub const BINDING_MODIFIER: crossterm::event::KeyModifiers = crossterm::event::KeyModifiers::ALT;
 
-/// Backdrop behind the window, for the moment before a client has drawn
-/// anything.
+/// Backdrop behind client surfaces.
 const BACKDROP: [u8; 3] = [0x14, 0x16, 0x1b];
 
 /// What one presented frame cost *this* thread, which is the thread input
@@ -345,8 +344,8 @@ impl Meowland {
             tiles,
             dirty: Vec::new(),
             plan: Vec::new(),
-            scene_dirty: true,
-            pointer_dirty: true,
+            scene_dirty: false,
+            pointer_dirty: false,
             quitting: false,
             cell: capabilities.cell,
         })
@@ -824,7 +823,10 @@ impl Meowland {
     /// Whether the main loop should present now. A due frame waits without
     /// polling until the presenter reports that its reusable frame is ready.
     pub const fn should_present(&self, presenter_ready: bool) -> bool {
-        self.scene_dirty || self.pointer_dirty || (!self.pending.is_empty() && presenter_ready)
+        self.presented.is_some()
+            && (self.scene_dirty
+                || self.pointer_dirty
+                || (!self.pending.is_empty() && presenter_ready))
     }
 }
 
@@ -1175,7 +1177,6 @@ impl XdgShellHandler for Meowland {
         // whole window policy.
         self.maximize(&surface);
         self.toplevels.push(surface);
-        self.scene_dirty = true;
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {

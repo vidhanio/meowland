@@ -46,7 +46,8 @@ use rustix::fs::{FileType, Mode, OFlags};
 /// How clients are offered GPU buffers.
 ///
 /// Read from a command line flag that falls back to an environment variable
-/// (see `Cli` in `main.rs`); what this module knows is the values, not where
+/// (see `Settings` in `cli.rs`); what this module knows is the values, not
+/// where
 /// they came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage::ValueEnum)]
 pub enum Offer {
@@ -101,6 +102,14 @@ pub enum Error {
 }
 
 impl Offer {
+    /// How this offer is written on a command line (`--gpu-buffers`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
     /// The render nodes clients may be told to allocate on, most preferred
     /// first.
     ///

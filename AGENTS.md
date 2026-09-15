@@ -45,43 +45,59 @@ at all rather than an X server outside this terminal.
 
 ## The server
 
-Meowland is a server that owns the terminal it was started in, so it outlives any
-one client and is commanded from anywhere else on the machine:
+Meowland is a server with no terminal of its own (`src/server.rs`). It owns the
+compositor, the windows and the clients started in it, and it draws on whichever
+terminal is attached to it at the time - a terminal being a separate process
+(`src/client.rs`), so the one it is being looked at in can be closed, or another
+one can take over, without the server or its windows going anywhere:
 
 ```sh
-meowland run foot        # start the server, or run foot as another window of it
+meowland run foot        # run foot in the server, starting and showing one if there is none
 meowland list            # the windows, their labels, and the active one
-meowland attach 2        # show window 2
+meowland attach 2        # show window 2 here
+meowland quit            # stop the server and everything started in it
 ```
 
-`run` with a command and no server starts one; with a server already running it
-hands the command over, and that server starts the client - so the client gets
-the *server's* environment, `PATH` included, rather than that of the shell which
-typed the command. `run` with no command at all is just a server, and stays until
-`Alt+Q` or the terminal goes away; a server started with a command gives the
-terminal back when that command's clients are all gone.
+`run` starts a server if there is none and hands the command over, and a server
+already running starts the client - so the client gets the *server's*
+environment, `PATH` included, rather than that of the shell which typed the
+command. A server started for a command is one that exists for it: it stops once
+the clients it started are gone, so `meowland run foot` gives the terminal back
+when foot exits. One that is already running was started by something still
+using it and outlives the command it was handed.
 
-The commands go over a socket in `$XDG_RUNTIME_DIR` (`src/control.rs`), which is
-per-user and owner-only - it has to be, since one of the commands starts a
-process. One server runs at a time: the socket name is fixed, and binding it is
-what says whether a server is already there. A client that connects to the
-Wayland socket on its own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another
-window too, and a server started with no command exists to wait for exactly that.
+Both `run` and `attach` show the server in the terminal they were typed in, and
+they differ in what they do about a server that is already shown: `run` leaves
+it alone, so a command typed elsewhere appears in the terminal that has the
+server, while `attach` takes it over. `Alt+Q` stops showing the server without
+stopping it; `meowland quit` stops the server. Showing a server takes a terminal
+and running a command does not, so a `run` with no terminal to draw on - a
+script, or output redirected - gives the server its command and exits.
 
-A client's own stdout and stderr are not the terminal: the compositor owns it and
-is drawing on it, so text written there lands in the cells the frame is placed on
-and a newline among it scrolls the frame out from under itself. They are given
-the log instead, which is opened for appending so that the compositor and its
-clients write to one file in the order they wrote. Client output that reads as
-"why did no window appear" is found there.
+The server is reached over two sockets in `$XDG_RUNTIME_DIR`, commands on one
+(`src/control.rs`) and terminals on the other (`src/display.rs`, and the
+vocabulary both ends speak). Their names are fixed and binding them is what says
+whether a server is already there: they are per-user and owner-only, since one
+of the commands starts a process. A client that connects to the Wayland socket
+on its own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another window too.
 
-A terminal that is closed has to end the session, because there is nothing left
-to draw on and the socket it holds is the one the next `run` command would talk
-to. Nothing reports that on its own: the reader is inside the terminal library's
-read of a descriptor that fails and spins rather than returning. So the event
-loop asks (`tty::hung_up`), and the reader thread is abandoned rather than joined
-when it is inside that read. A session that outlives its window keeps the
-terminal-less clients it started, and burns a core doing it.
+A terminal says hello with what it can do and what it wants, and is answered by
+being drawn on or by being told why not - a version this server does not speak,
+a window ID that no window has, or another terminal already showing it. What it
+is sent is frames and escapes in the order they were made, and a frame is the
+one message it answers: the server keeps one frame on its way at a time, so what
+a terminal is behind on is one screen rather than a queue of stale ones. The
+terminal side writes and reads in threads of its own, and asks whether the
+terminal has hung up, because a closed terminal fails reads in a way the
+terminal library spins on instead of reporting.
+
+A client's own stdout and stderr are not the terminal: the server is drawing on
+it through the terminal side, so text written there lands in the cells the frame
+is placed on and a newline among it scrolls the frame out from under itself.
+They are given the log instead, which is opened for appending so that the server
+and its clients write to one file in the order they wrote. Client output that
+reads as "why did no window appear" is found there. A server with no terminal
+attached keeps running and keeps its windows, and draws nothing.
 
 `meowland completions <shell>` prints the completion script `usage` generates for
 this CLI, which calls back into `meowland __complete_word__`; completing `attach`
@@ -106,20 +122,22 @@ buffer as a slice bounded by the mapping. Bringing up EGL and GLES is the third,
 because smithay's constructors for both are unsafe and there is no safe way in.
 
 Each module declares its own error type with `thiserror`, so a caller can tell
-its failures apart. `anyhow` belongs to `main.rs` alone - the binary is the one
-place that only has to report what went wrong, not handle it.
+its failures apart. `anyhow` belongs to the command layer - `src/lib.rs` and the
+startup `src/server.rs` does before its event loop - because that is where a
+failure is reported rather than handled. `src/main.rs` only says where to start.
 
-Run the binary from a terminal that speaks the kitty graphics protocol (kitty,
-Ghostty, WezTerm), or inside a pane that passes graphics through. It needs a
-terminal on stdin and stdout, so redirecting its output makes it exit immediately.
-Logs go to `$XDG_RUNTIME_DIR/meowland.log`, and a client's own output goes there
-too - see [the server](#the-server). Wayland clients connect with
-`WAYLAND_DISPLAY=wayland-meowland`.
+The commands that draw need a terminal on stdin and stdout that speaks the kitty
+graphics protocol (kitty, Ghostty, WezTerm, or a pane that passes graphics
+through); redirecting their output makes them exit immediately. `meowland
+server` needs no terminal at all, which is what lets a server outlive the one it
+was started from. Logs go to `$XDG_RUNTIME_DIR/meowland.log`, and a client's own
+output goes there too - see [the server](#the-server). Wayland clients connect
+with `WAYLAND_DISPLAY=wayland-meowland`.
 
 Terminals that read tiles out of shared memory get them that way, which keeps
-their pixels off the pty entirely; the probe run when the first window appears
-decides, by sending one tile that way and seeing whether the terminal says it
-read it. Everything else goes direct, base64'd, as before.
+their pixels off the pty entirely; the probe the terminal side runs when it
+attaches decides, by sending one tile that way and seeing whether the terminal
+says it read it. Everything else goes direct, base64'd, as before.
 
 Settings are flags that fall back to environment variables, and the flag wins:
 `--gpu-buffers` (`MEOWLAND_GPU_BUFFERS`, default `auto`), `--render-node`

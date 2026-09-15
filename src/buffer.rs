@@ -91,14 +91,11 @@ pub const fn shm_format(format: ShmFormat) -> Option<SourceFormat> {
 
 /// Translate a GPU buffer's layout into the one the renderer understands.
 ///
-/// Linear is the only layout a mapping can be interpreted without the driver
-/// that allocated it: rows of pixels, one after another. Anything else - a
-/// tiled or compressed layout, or a modifier the client did not state - would
-/// be read as rows and painted as noise.
+/// This is about color order and alpha, which is what the compositor has to
+/// know; it is not about the modifier, which decides only whether the pixels
+/// can be reached by mapping them or have to go through the renderer
+/// ([`crate::gpu`]).
 pub const fn dmabuf_format(format: DmabufFormat) -> Option<SourceFormat> {
-    if !matches!(format.modifier, Modifier::Linear) {
-        return None;
-    }
     match format.code {
         Fourcc::Argb8888 => Some(SourceFormat::Argb8888),
         Fourcc::Xrgb8888 => Some(SourceFormat::Xrgb8888),
@@ -120,8 +117,9 @@ pub fn snapshot(
     scale: i32,
     limit: (u32, u32),
     destination: &mut Snapshot,
+    gpu: Option<&mut crate::gpu::Renderer>,
 ) -> bool {
-    if let Some(copied) = copy_dmabuf(buffer, scale, limit, destination) {
+    if let Some(copied) = copy_dmabuf(buffer, scale, limit, destination, gpu) {
         return copied;
     }
     copy_shm(buffer, scale, limit, destination)
@@ -132,11 +130,20 @@ pub fn snapshot(
 /// This is what decides whether a client is told its buffer is good, and it is
 /// asked before the client draws into it, so that a buffer meowland could not
 /// composite is refused while the client can still fall back to shared memory.
-pub fn dmabuf_readable(dmabuf: &Dmabuf) -> Result<(), Unreadable> {
+pub fn dmabuf_readable(
+    dmabuf: &Dmabuf,
+    gpu: Option<&mut crate::gpu::Renderer>,
+) -> Result<(), Unreadable> {
     if dmabuf_format(dmabuf.format()).is_none() {
         return Err(Unreadable::Layout(dmabuf.format()));
     }
-    read_plane(dmabuf, |_, _| ())
+    // A buffer the CPU can map is one the compositor can already read, modifier
+    // or not; anything else has to go through the renderer.
+    if dmabuf.format().modifier == Modifier::Linear && read_plane(dmabuf, |_, _| ()).is_ok() {
+        return Ok(());
+    }
+    let gpu = gpu.ok_or(Unreadable::NoRenderer)?;
+    gpu.can_read(dmabuf).map_err(Unreadable::Renderer)
 }
 
 /// Why a GPU buffer cannot be read.
@@ -155,6 +162,10 @@ pub enum Unreadable {
     Short { claimed: usize, mapped: usize },
     /// The buffer could not be mapped into this process.
     Map(DmabufMappingFailed),
+    /// There is no renderer to bring the buffer back through.
+    NoRenderer,
+    /// The renderer could not bring the buffer back.
+    Renderer(crate::gpu::Error),
     /// Reading the buffer could not be bracketed for the driver.
     Sync(DmabufSyncFailed),
 }
@@ -172,6 +183,8 @@ impl std::fmt::Display for Unreadable {
                 "the buffer claims {claimed} bytes of pixels but maps {mapped}"
             ),
             Self::Map(err) => write!(f, "the buffer could not be mapped: {err}"),
+            Self::NoRenderer => write!(f, "there is no renderer to read it through"),
+            Self::Renderer(err) => write!(f, "the renderer could not read it: {err}"),
             Self::Sync(err) => write!(f, "the buffer could not be synchronized: {err}"),
         }
     }
@@ -198,6 +211,7 @@ fn copy_dmabuf(
     scale: i32,
     limit: (u32, u32),
     destination: &mut Snapshot,
+    gpu: Option<&mut crate::gpu::Renderer>,
 ) -> Option<bool> {
     let dmabuf = get_dmabuf(buffer).ok()?;
     let Some(format) = dmabuf_format(dmabuf.format()) else {
@@ -212,7 +226,12 @@ fn copy_dmabuf(
         tracing::debug!(width, height, ?limit, "refusing an oversized client buffer");
         return Some(false);
     }
-    let copied = match read_plane(dmabuf, |pixels, stride| {
+
+    // Mapping the buffer is the cheap path - no GPU work, no readback - so it
+    // is tried first, and only for the layout it can interpret. A buffer that
+    // cannot be mapped is not a lost cause: the device that wrote it can still
+    // read it.
+    let copy = |pixels: &[u8], stride: u32, destination: &mut Snapshot| {
         destination.pixels.clear();
         destination.pixels.extend_from_slice(pixels);
         destination.width = width;
@@ -220,24 +239,27 @@ fn copy_dmabuf(
         destination.stride = stride;
         destination.scale = scale;
         destination.format = format;
-    }) {
-        Ok(()) => {
-            tracing::debug!(
-                width,
-                height,
-                stride = destination.stride,
-                ?format,
-                scale,
-                "copied a client buffer from the GPU"
-            );
-            true
-        }
-        Err(reason) => {
-            tracing::debug!(reason = %reason, ?format, "could not read a client's GPU buffer");
-            false
-        }
     };
-    Some(copied)
+    let mapped = dmabuf.format().modifier == Modifier::Linear
+        && read_plane(dmabuf, |pixels, stride| copy(pixels, stride, destination)).is_ok();
+    if mapped {
+        tracing::debug!(width, height, ?format, scale, "mapped a client buffer");
+        return Some(true);
+    }
+
+    let Some(gpu) = gpu else {
+        return Some(false);
+    };
+    match gpu.read(dmabuf, format, scale, destination) {
+        Ok(()) => {
+            tracing::debug!(width, height, ?format, scale, "read a client buffer back");
+            Some(true)
+        }
+        Err(err) => {
+            tracing::debug!(?err, ?format, "could not read a client's GPU buffer");
+            Some(false)
+        }
+    }
 }
 
 /// Copy out the pixels of a shared memory buffer.
@@ -407,8 +429,9 @@ mod tests {
         assert_eq!(dmabuf_format(argb), Some(SourceFormat::Argb8888));
         assert_eq!(dmabuf_format(xrgb), Some(SourceFormat::Xrgb8888));
 
-        // A modifier the client did not state, and one it did: neither can be
-        // read as rows of pixels.
+        // The modifier decides how the pixels are reached, not whether they can
+        // be: a tiled buffer is read through the renderer rather than mapped,
+        // and its color order is the same either way.
         let unstated = DmabufFormat {
             code: Fourcc::Argb8888,
             modifier: Modifier::Invalid,
@@ -417,8 +440,8 @@ mod tests {
             code: Fourcc::Argb8888,
             modifier: Modifier::Unrecognized(0x42),
         };
-        assert_eq!(dmabuf_format(unstated), None);
-        assert_eq!(dmabuf_format(tiled), None);
+        assert_eq!(dmabuf_format(unstated), Some(SourceFormat::Argb8888));
+        assert_eq!(dmabuf_format(tiled), Some(SourceFormat::Argb8888));
 
         let rgb565 = DmabufFormat {
             code: Fourcc::Rgb565,

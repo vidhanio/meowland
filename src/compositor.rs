@@ -114,10 +114,13 @@ pub struct Meowland {
     xdg_shell_state: XdgShellState,
     seat_state: SeatState<Self>,
     dmabuf_state: DmabufState,
-    /// Kept alive so that the platform's render nodes are described to clients;
-    /// never read once it has been created.
+    /// Kept alive so that the render node clients may allocate on stays
+    /// described to them; never read once it has been created.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
     dmabuf_global: Option<DmabufGlobal>,
+    /// The renderer a client's GPU buffers are brought back through, when
+    /// there is a device to have one on.
+    gpu: Option<crate::gpu::Renderer>,
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -232,7 +235,8 @@ impl Meowland {
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
         let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
 
-        let dmabuf_global = advertise_render_nodes(display, &mut dmabuf_state)?;
+        let gpu = bring_up_renderer();
+        let dmabuf_global = advertise_render_nodes(display, &mut dmabuf_state, gpu.as_ref())?;
 
         Ok(Self {
             compositor_state,
@@ -241,6 +245,7 @@ impl Meowland {
             seat_state,
             dmabuf_state,
             dmabuf_global,
+            gpu,
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -978,6 +983,7 @@ impl Meowland {
                         scale,
                         (limit.width, limit.height),
                         entry.get_mut(),
+                        self.gpu.as_mut(),
                     ),
                     Entry::Vacant(entry) => {
                         let mut snapshot = Snapshot::empty();
@@ -986,6 +992,7 @@ impl Meowland {
                             scale,
                             (limit.width, limit.height),
                             &mut snapshot,
+                            self.gpu.as_mut(),
                         );
                         if copied {
                             entry.insert(snapshot);
@@ -1033,7 +1040,7 @@ impl DmabufHandler for Meowland {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        match crate::buffer::dmabuf_readable(&dmabuf) {
+        match crate::buffer::dmabuf_readable(&dmabuf, self.gpu.as_mut()) {
             Ok(()) => {
                 if let Err(err) = notifier.successful::<Self>() {
                     tracing::debug!(?err, "the client that offered a GPU buffer is gone");
@@ -1164,12 +1171,28 @@ impl DataDeviceHandler for Meowland {
     }
 }
 
-/// Offer clients the machine's render nodes, if any were asked for.
+/// Bring up a renderer on the first render node that has one.
+///
+/// Without a renderer there is no way to read a buffer the CPU cannot map, and
+/// a client that hands one over would have nothing to show, so this is what
+/// decides whether clients are offered GPU buffers at all.
+fn bring_up_renderer() -> Option<crate::gpu::Renderer> {
+    for node in crate::dmabuf::nodes().ok()? {
+        match crate::gpu::Renderer::new(&node.path) {
+            Ok(renderer) => return Some(renderer),
+            Err(err) => tracing::info!(?err, "no renderer on this render node"),
+        }
+    }
+    None
+}
+
+/// Offer clients the device their GPU buffers are read back through, if one was
+/// asked for.
 ///
 /// A client that renders on the GPU only keeps doing so if it is told where to
 /// put the memory, and can only hand that memory over if meowland can read it
-/// back - so what is advertised here is exactly what [`crate::buffer`] knows
-/// how to read, and nothing else. See [`crate::dmabuf`] for why that is not
+/// back - so what is advertised here is what the renderer takes, and the device
+/// it is on, and nothing else. See [`crate::dmabuf`] for why that is not
 /// something to offer unasked.
 ///
 /// Not offering it is not an error: the global is simply never advertised, and
@@ -1177,23 +1200,25 @@ impl DataDeviceHandler for Meowland {
 fn advertise_render_nodes(
     display: &DisplayHandle,
     state: &mut DmabufState,
+    gpu: Option<&crate::gpu::Renderer>,
 ) -> Result<Option<DmabufGlobal>, Error> {
-    let nodes = crate::dmabuf::nodes()?;
-    let Some((main, rest)) = nodes.split_first() else {
+    let (Some(gpu), Some(node)) = (gpu, crate::dmabuf::nodes()?.into_iter().next()) else {
         return Ok(None);
     };
-    for node in &nodes {
-        tracing::info!(
-            path = %node.path.display(),
-            device = node.device,
-            "offering a render node to clients"
-        );
+    let formats = gpu.formats();
+    if formats.is_empty() {
+        tracing::info!("the renderer takes no layouts meowland can composite");
+        return Ok(None);
     }
-    let mut feedback = DmabufFeedbackBuilder::new(main.device, crate::dmabuf::FORMATS);
-    for node in rest {
-        feedback = feedback.add_preference_tranche(node.device, None, crate::dmabuf::FORMATS);
-    }
-    let feedback = feedback.build().map_err(Error::Feedback)?;
+    tracing::info!(
+        path = %node.path.display(),
+        device = node.device,
+        formats = formats.len(),
+        "offering GPU buffers to clients"
+    );
+    let feedback = DmabufFeedbackBuilder::new(node.device, formats)
+        .build()
+        .map_err(Error::Feedback)?;
     Ok(Some(state.create_global_with_default_feedback::<Meowland>(
         display, &feedback,
     )))

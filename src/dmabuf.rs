@@ -8,23 +8,22 @@
 //!
 //! # Why this is not offered by default
 //!
-//! Meowland reads client buffers on the CPU (see [`crate::buffer`]), and a
-//! driver is entitled to keep a buffer somewhere the CPU cannot reach - that is
-//! what video memory is. A buffer like that is not merely slow to read, it is
-//! unreadable: `mmap` fails with `EPERM` whether or not CPU access was begun
-//! first, and reading the descriptor instead fails with `EINVAL`.
+//! A driver is entitled to keep a buffer somewhere the CPU cannot reach - that
+//! is what video memory is - and a buffer like that is not merely slow to read,
+//! it is unreadable: `mmap` fails with `EPERM` whether or not CPU access was
+//! begun first, and reading the descriptor instead fails with `EINVAL`.
 //!
-//! That would only be a lost opportunity if a client could carry on without the
-//! offer, but the offer is what a client chooses on: Mesa's Wayland WSI takes
-//! GPU buffers when a compositor advertises them and has no window at all when
-//! the buffers it produces are then refused. So a client that renders into
-//! video memory - Zed on RADV, for one - goes from slow to broken, which is why
-//! the offer has to be asked for.
+//! Those pixels are still reachable *as pixels*: the device that wrote them can
+//! read them, which is what [`crate::gpu`] is for. But that needs a renderer on
+//! the device, and it is the renderer - not this module - that decides what can
+//! be offered, so the offer exists only where there is one to read buffers
+//! back through.
 //!
-//! Clients whose buffers are readable do exist: software renderers run in
-//! system memory, and so do drivers that allocate for CPU access. Those are
-//! what this is for until the compositor can import a buffer by device instead
-//! of reading it back.
+//! Even then it is not offered unasked. The offer is what a client chooses on:
+//! Mesa's Wayland WSI takes GPU buffers when a compositor advertises them and
+//! has no window at all when the buffers it produces are then refused. A
+//! compositor that cannot serve what it advertised makes such a client worse
+//! off than one that never made the offer.
 //!
 //! # Choosing a device
 //!
@@ -34,7 +33,6 @@
 use std::{fs, path::PathBuf};
 
 use rustix::fs::{FileType, Mode, OFlags};
-use smithay::backend::allocator::{Format, Fourcc, Modifier};
 
 /// How clients are offered GPU buffers.
 ///
@@ -52,23 +50,6 @@ pub const OFF: &str = "off";
 
 /// Where render nodes live.
 const DEVICE_DIRECTORY: &str = "/dev/dri";
-
-/// The layouts a client may hand over.
-///
-/// Only linear ones: a buffer the compositor cannot interpret is worse than one
-/// it never asked for, because by then the client has stopped drawing into
-/// shared memory. Two formats are enough for the clients that ask - it is the
-/// same pair `wl_shm` offers, with the same byte layout.
-pub const FORMATS: [Format; 2] = [
-    Format {
-        code: Fourcc::Argb8888,
-        modifier: Modifier::Linear,
-    },
-    Format {
-        code: Fourcc::Xrgb8888,
-        modifier: Modifier::Linear,
-    },
-];
 
 /// A device clients can render on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,15 +162,5 @@ mod tests {
         assert_eq!(number_of(std::path::Path::new("/dev/dri/card0")), None);
         assert_eq!(number_of(std::path::Path::new("/dev/dri/renderD")), None);
         assert_eq!(number_of(std::path::Path::new("/dev/dri/by-path/x")), None);
-    }
-
-    #[test]
-    fn only_linear_layouts_are_offered() {
-        assert!(
-            FORMATS
-                .iter()
-                .all(|format| format.modifier == Modifier::Linear),
-            "a client that allocates a tiled buffer would get noise on screen"
-        );
     }
 }

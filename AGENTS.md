@@ -30,7 +30,11 @@ Every toplevel is a window of its own: it fills the terminal, one window is on
 screen at a time, and `Alt+Tab` cycles between them. The screen shows the active
 window and nothing else - no tiling, no window list on screen - which is what
 keeps movement and focus simple. A window is named by the ID the server gives it
-when it is created, and that is what `attach` takes.
+when it is created, and that is what `attach` takes. A window takes the screen
+when it first has pixels to put on it - the newest one that does, so what was
+just started is what is being looked at. Nothing else moves it: clients open
+windows they never draw in, and taking the screen for one of those would leave
+nothing on it at all.
 `wp_viewporter` is applied while snapshots are drawn; xwayland-satellite needs
 that protocol to expose X11 windows as ordinary xdg-shell surfaces. Meowland
 reserves an X display, passes its listening sockets to xwayland-satellite, and
@@ -64,6 +68,21 @@ what says whether a server is already there. A client that connects to the
 Wayland socket on its own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another
 window too, and a server started with no command exists to wait for exactly that.
 
+A client's own stdout and stderr are not the terminal: the compositor owns it and
+is drawing on it, so text written there lands in the cells the frame is placed on
+and a newline among it scrolls the frame out from under itself. They are given
+the log instead, which is opened for appending so that the compositor and its
+clients write to one file in the order they wrote. Client output that reads as
+"why did no window appear" is found there.
+
+A terminal that is closed has to end the session, because there is nothing left
+to draw on and the socket it holds is the one the next `run` command would talk
+to. Nothing reports that on its own: the reader is inside the terminal library's
+read of a descriptor that fails and spins rather than returning. So the event
+loop asks (`tty::hung_up`), and the reader thread is abandoned rather than joined
+when it is inside that read. A session that outlives its window keeps the
+terminal-less clients it started, and burns a core doing it.
+
 `meowland completions <shell>` prints the completion script `usage` generates for
 this CLI, which calls back into `meowland __complete_word__`; completing `attach`
 asks the running server which windows it has, so what is offered is what exists.
@@ -93,7 +112,8 @@ place that only has to report what went wrong, not handle it.
 Run the binary from a terminal that speaks the kitty graphics protocol (kitty,
 Ghostty, WezTerm), or inside a pane that passes graphics through. It needs a
 terminal on stdin and stdout, so redirecting its output makes it exit immediately.
-Logs go to `$XDG_RUNTIME_DIR/meowland.log`. Wayland clients connect with
+Logs go to `$XDG_RUNTIME_DIR/meowland.log`, and a client's own output goes there
+too - see [the server](#the-server). Wayland clients connect with
 `WAYLAND_DISPLAY=wayland-meowland`.
 
 Terminals that read tiles out of shared memory get them that way, which keeps

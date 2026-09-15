@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 /// What the terminal told us it can do.
 ///
@@ -45,6 +45,26 @@ pub struct Capabilities {
 /// crispness: images are always scaled into a cell rectangle, so a wrong guess
 /// distorts pixels but not layout.
 const FALLBACK_CELL: (u32, u32) = (10, 20);
+
+/// Whether the terminal has gone away.
+///
+/// A closed terminal hangs its file descriptors up and fails every read on
+/// them, and that is the one thing the thread reading input cannot report:
+/// `crossterm`'s event source answers that error by spinning on it rather than
+/// by returning from the read, so the reader never comes back to say what
+/// happened. Asking the descriptor directly is how the compositor finds out
+/// instead, and it takes nothing out of the input, which is what makes it safe
+/// to ask while the reader is still there.
+pub fn hung_up() -> bool {
+    let stdin = io::stdin();
+    let mut descriptors = [PollFd::new(&stdin, PollFlags::IN)];
+    if let Err(error) = poll(&mut descriptors, Some(&Timespec::default())) {
+        tracing::debug!(%error, "could not poll the terminal");
+        return true;
+    }
+    let flags = descriptors[0].revents();
+    flags.contains(PollFlags::HUP) || flags.contains(PollFlags::ERR)
+}
 
 /// How long to wait for the terminal to answer the capability queries.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);

@@ -72,7 +72,7 @@ use crate::{
     buffer::Snapshot,
     keys, kitty,
     presenter::Presenter,
-    render::{Frame, Rect, Tiles},
+    render::{BYTES, Frame, Rect, Tiles},
     tty::Capabilities,
 };
 
@@ -469,7 +469,7 @@ impl Meowland {
         // The tiles are copied out of the frame in the order they are listed,
         // so the presenter can cut them apart again without knowing the frame.
         pixels.clear();
-        let stride = self.frame.width as usize * 4;
+        let stride = self.frame.width as usize * BYTES;
         let mut tiles = Vec::with_capacity(self.due_count);
         for index in 0..self.due.len() {
             if !self.due[index] {
@@ -477,9 +477,9 @@ impl Meowland {
             }
             let tile = self.tile_of(index, tile_size);
             for row in 0..tile.height {
-                let start = (tile.y as usize + row as usize) * stride + tile.x as usize * 4;
+                let start = (tile.y as usize + row as usize) * stride + tile.x as usize * BYTES;
                 pixels.extend_from_slice(
-                    &self.frame.pixels()[start..start + tile.width as usize * 4],
+                    &self.frame.pixels()[start..start + tile.width as usize * BYTES],
                 );
             }
             tiles.push(self.placement(tile));

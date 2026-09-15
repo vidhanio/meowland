@@ -6,12 +6,20 @@
 //! alpha blended into this frame buffer, and the result is then diffed tile by
 //! tile so only what changed is re-sent to the terminal (see [`crate::kitty`]).
 //!
-//! Pixels are stored **premultiplied** RGBA, which is also the format Wayland
-//! clients deliver (`wl_shm` says the alpha channel is premultiplied into the
-//! color channels), so compositing a buffer into the frame is one multiply-add
-//! per channel with no conversion. With an opaque backdrop - what
-//! [`Frame::clear`] paints - the alpha channel stays 255 everywhere, which is
-//! what lets the frame be handed to the terminal untouched.
+//! Client pixels are **premultiplied** RGBA, which is what Wayland's `wl_shm`
+//! says they are, so compositing a buffer into the frame is one multiply-add
+//! per channel with no conversion. The frame itself is RGB: everything is
+//! blended onto an opaque backdrop ([`Frame::clear`] paints it), so no alpha
+//! survives, and a channel that is 255 in every pixel is a channel the diff,
+//! the copy to the terminal and the terminal itself would each carry a quarter
+//! more bytes for. It is also the format the terminal is sent (`f=24`).
+
+/// Bytes a pixel takes in a client buffer: four channels, the last of which the
+/// frame does not keep.
+pub const BYTES4: usize = 4;
+
+/// Bytes a pixel takes in the frame.
+pub const BYTES: usize = 3;
 
 /// A rectangle in framebuffer pixels. Signed, because sub-surface offsets can
 /// be negative and clipping is easier this way.
@@ -113,7 +121,7 @@ impl Frame {
         Self {
             width,
             height,
-            pixels: vec![0; width as usize * height as usize * 4],
+            pixels: vec![0; width as usize * height as usize * BYTES],
         }
     }
 
@@ -121,7 +129,8 @@ impl Frame {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
-        self.pixels.resize(width as usize * height as usize * 4, 0);
+        self.pixels
+            .resize(width as usize * height as usize * BYTES, 0);
         self.pixels.fill(0);
     }
 
@@ -133,31 +142,28 @@ impl Frame {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    /// Paint a rectangle with an opaque colour, clipped to the frame.
+    /// Paint a rectangle with a colour, clipped to the frame.
     pub fn fill(&mut self, rect: Rect, color: [u8; 3]) {
         let Some(clipped) = rect.intersect(self.bounds()) else {
             return;
         };
         for row in 0..clipped.height {
-            let start = (clipped.y as usize + row as usize) * self.width as usize * 4
-                + clipped.x as usize * 4;
-            for pixel in self.pixels[start..start + clipped.width as usize * 4]
-                .as_chunks_mut::<4>()
+            let start = (clipped.y as usize + row as usize) * self.width as usize * BYTES
+                + clipped.x as usize * BYTES;
+            for pixel in self.pixels[start..start + clipped.width as usize * BYTES]
+                .as_chunks_mut::<3>()
                 .0
             {
-                pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
+                pixel.copy_from_slice(&color);
             }
         }
     }
 
-    /// Paint the whole frame with an opaque color, the backdrop everything else
-    /// blends onto.
+    /// Paint the whole frame with a colour, the backdrop everything else blends
+    /// onto.
     pub fn clear(&mut self, color: [u8; 3]) {
-        // The backdrop is opaque, which is what keeps the frame's alpha channel
-        // at 255 everywhere and therefore keeps premultiplied ==
-        // straight for the terminal.
-        for pixel in self.pixels.as_chunks_mut::<4>().0 {
-            pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
+        for pixel in self.pixels.as_chunks_mut::<3>().0 {
+            pixel.copy_from_slice(&color);
         }
     }
 
@@ -188,9 +194,9 @@ impl Frame {
             if image_y < 0 || image_y as u32 >= image.height {
                 continue;
             }
-            let source_row = image_y as usize * image.stride + src.x as usize * 4;
-            let frame_row = (clipped.y + row as i32) as usize * self.width as usize * 4
-                + clipped.x as usize * 4;
+            let source_row = image_y as usize * image.stride + src.x as usize * BYTES4;
+            let frame_row = (clipped.y + row as i32) as usize * self.width as usize * BYTES
+                + clipped.x as usize * BYTES;
             self.blend_row(
                 image,
                 source_row,
@@ -212,12 +218,12 @@ impl Frame {
         scale_x: f64,
         offset_x: f64,
     ) {
-        let sample = |index: u32| -> [u8; 4] {
+        let sample = |index: u32| -> [u8; BYTES4] {
             let image_x = f64::mul_add(f64::from(index), scale_x, offset_x) as i64;
             if image_x < 0 || image_x as u32 >= image.width {
                 return [0, 0, 0, 0];
             }
-            let offset = source_row + image_x as usize * 4;
+            let offset = source_row + image_x as usize * BYTES4;
             let Some(pixel) = image
                 .pixels
                 .get(offset..)
@@ -236,11 +242,11 @@ impl Frame {
         if image.format.opaque()
             && (scale_x - 1.0).abs() < f64::EPSILON
             && offset_x == 0.0
-            && count as usize * 4 <= self.pixels.len() - frame_row
-            && count as usize * 4 <= image.pixels.len() - source_row
+            && count as usize * BYTES <= self.pixels.len() - frame_row
+            && count as usize * BYTES4 <= image.pixels.len() - source_row
         {
             for index in 0..count as usize {
-                let start = source_row + index * 4;
+                let start = source_row + index * BYTES4;
                 let Some(pixel) = image
                     .pixels
                     .get(start..start + 4)
@@ -250,8 +256,8 @@ impl Frame {
                 };
                 let [red, green, blue] = image.format.rgb(*pixel);
                 let destination =
-                    &mut self.pixels[frame_row + index * 4..frame_row + index * 4 + 4];
-                destination.copy_from_slice(&[red, green, blue, 255]);
+                    &mut self.pixels[frame_row + index * BYTES..frame_row + index * BYTES + BYTES];
+                destination.copy_from_slice(&[red, green, blue]);
             }
             return;
         }
@@ -261,8 +267,8 @@ impl Frame {
             if source[3] == 0 {
                 continue;
             }
-            let offset = frame_row + index as usize * 4;
-            let Some(destination) = self.pixels.get_mut(offset..offset + 4) else {
+            let offset = frame_row + index as usize * BYTES;
+            let Some(destination) = self.pixels.get_mut(offset..offset + BYTES) else {
                 return;
             };
             blend(destination, source);
@@ -273,20 +279,19 @@ impl Frame {
 /// Blend a premultiplied source over the destination: `dst = src + dst * (1 -
 /// alpha)`.
 ///
-/// Both sides are premultiplied, so the source is used as-is; the result stays
-/// opaque because the destination (the backdrop) is.
-fn blend(destination: &mut [u8], source: [u8; 4]) {
+/// The source is premultiplied, so it is used as-is; the destination is the
+/// frame, which is opaque, so the result is too and the alpha is done with.
+fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     let alpha = u32::from(source[3]);
     if alpha == 255 {
-        destination.copy_from_slice(&[source[0], source[1], source[2], 255]);
+        destination.copy_from_slice(&source[..BYTES]);
         return;
     }
     let inverse = 255 - alpha;
-    for channel in 0..3 {
+    for channel in 0..BYTES {
         destination[channel] =
             (u32::from(source[channel]) + u32::from(destination[channel]) * inverse / 255) as u8;
     }
-    destination[3] = 255;
 }
 
 /// Splits the frame into a grid of tiles and reports which of them changed
@@ -355,9 +360,9 @@ impl Tiles {
 
     fn tile_differs(&self, frame: &Frame, tile: Rect) -> bool {
         for row in 0..tile.height {
-            let start =
-                (tile.y as usize + row as usize) * frame.width as usize * 4 + tile.x as usize * 4;
-            let end = start + tile.width as usize * 4;
+            let start = (tile.y as usize + row as usize) * frame.width as usize * BYTES
+                + tile.x as usize * BYTES;
+            let end = start + tile.width as usize * BYTES;
             if frame.pixels()[start..end] != self.previous[start..end] {
                 return true;
             }
@@ -367,9 +372,9 @@ impl Tiles {
 
     fn update_previous(&mut self, frame: &Frame, tile: Rect) {
         for row in 0..tile.height {
-            let start =
-                (tile.y as usize + row as usize) * frame.width as usize * 4 + tile.x as usize * 4;
-            let end = start + tile.width as usize * 4;
+            let start = (tile.y as usize + row as usize) * frame.width as usize * BYTES
+                + tile.x as usize * BYTES;
+            let end = start + tile.width as usize * BYTES;
             self.previous[start..end].copy_from_slice(&frame.pixels()[start..end]);
         }
     }
@@ -379,16 +384,16 @@ impl Tiles {
 mod tests {
     use super::*;
 
-    /// The pixel at a position, as (r, g, b, a) in premultiplied form.
-    fn sample(frame: &Frame, x: i32, y: i32) -> Option<[u8; 4]> {
+    /// The colour at a position, as the terminal would see it.
+    fn sample(frame: &Frame, x: i32, y: i32) -> Option<[u8; BYTES]> {
         if !frame.bounds().contains(x, y) {
             return None;
         }
-        let offset = (y as usize * frame.width as usize + x as usize) * 4;
+        let offset = (y as usize * frame.width as usize + x as usize) * BYTES;
         frame
             .pixels()
-            .get(offset..offset + 4)
-            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .get(offset..offset + BYTES)
+            .and_then(|pixel| <[u8; BYTES]>::try_from(pixel).ok())
     }
 
     fn rgba(image: &Image<'_>, x: u32, y: u32) -> [u8; 4] {
@@ -428,8 +433,8 @@ mod tests {
             Rect::new(0, 0, 2, 2),
             Rect::new(1, 1, 2, 2),
         );
-        assert_eq!(sample(&frame, 1, 1), Some([10, 20, 30, 255]));
-        assert_eq!(sample(&frame, 0, 0), Some([0, 0, 0, 255]));
+        assert_eq!(sample(&frame, 1, 1), Some([10, 20, 30]));
+        assert_eq!(sample(&frame, 0, 0), Some([0, 0, 0]));
     }
 
     #[test]
@@ -446,7 +451,6 @@ mod tests {
             Rect::new(0, 0, 1, 1),
         );
         let pixel = sample(&frame, 0, 0).unwrap();
-        assert_eq!(pixel[3], 255, "the frame stays opaque");
         assert_eq!(pixel[0], 128);
         assert!((177..=178).contains(&pixel[1]), "got {pixel:?}");
         assert!((227..=228).contains(&pixel[2]), "got {pixel:?}");
@@ -461,7 +465,7 @@ mod tests {
         let mut buffer = image(&bytes, 1, 1);
         buffer.format = SourceFormat::Xrgb8888;
         frame.draw(&buffer, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 1));
-        assert_eq!(sample(&frame, 0, 0), Some([9, 8, 7, 255]));
+        assert_eq!(sample(&frame, 0, 0), Some([9, 8, 7]));
     }
 
     #[test]
@@ -480,7 +484,7 @@ mod tests {
             let mut buffer = image(&bytes, 1, 1);
             buffer.format = format;
             frame.draw(&buffer, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 1));
-            assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30, 255]), "{format:?}");
+            assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30]), "{format:?}");
         }
 
         // A layout without an alpha channel is opaque, whatever its fourth byte
@@ -494,7 +498,7 @@ mod tests {
             let mut buffer = image(&bytes, 1, 1);
             buffer.format = format;
             frame.draw(&buffer, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 1, 1));
-            assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30, 255]), "{format:?}");
+            assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30]), "{format:?}");
         }
     }
 
@@ -510,9 +514,9 @@ mod tests {
             Rect::new(0, 0, 2, 2),
             Rect::new(-1, -1, 2, 2),
         );
-        assert_eq!(sample(&frame, 0, 0), Some([255, 255, 255, 255]));
-        assert_eq!(sample(&frame, 1, 0), Some([0, 0, 0, 255]));
-        assert_eq!(sample(&frame, 0, 1), Some([0, 0, 0, 255]));
+        assert_eq!(sample(&frame, 0, 0), Some([255, 255, 255]));
+        assert_eq!(sample(&frame, 1, 0), Some([0, 0, 0]));
+        assert_eq!(sample(&frame, 0, 1), Some([0, 0, 0]));
     }
 
     #[test]
@@ -533,9 +537,9 @@ mod tests {
         let mut frame_image = image(&bytes, 2, 2);
         frame_image.stride = 8;
         frame.draw(&frame_image, Rect::new(0, 0, 2, 2), Rect::new(0, 0, 4, 4));
-        assert_eq!(sample(&frame, 0, 0), Some([0, 0, 0, 255]));
-        assert_eq!(sample(&frame, 2, 2), Some([255, 255, 255, 255]));
-        assert_eq!(sample(&frame, 3, 3), Some([255, 255, 255, 255]));
+        assert_eq!(sample(&frame, 0, 0), Some([0, 0, 0]));
+        assert_eq!(sample(&frame, 2, 2), Some([255, 255, 255]));
+        assert_eq!(sample(&frame, 3, 3), Some([255, 255, 255]));
         assert_eq!(rgba(&frame_image, 1, 1), [255, 255, 255, 255]);
     }
 

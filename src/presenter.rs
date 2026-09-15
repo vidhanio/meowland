@@ -150,7 +150,7 @@ fn run(queue: Receiver<Message>, recycle: Sender<Vec<u8>>, shared_memory: bool) 
         Encoder::begin_frame(&mut out);
         let mut offset = 0;
         for placement in &frame.tiles {
-            let length = placement.width as usize * placement.height as usize * 4;
+            let length = placement.bytes();
             let tile = &frame.pixels[offset..offset + length];
             offset += length;
             encoder.transmit_and_place(&mut out, tile, *placement);

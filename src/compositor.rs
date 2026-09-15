@@ -464,31 +464,57 @@ impl Meowland {
     // ---------------------------------------------------------------- input
 
     /// Handle a key the terminal reported.
+    ///
+    /// Terminals are not required to report key releases - multiplexers and
+    /// every legacy encoding do not - so a key press is treated as a whole
+    /// keystroke: press it, release it, and let the terminal's own
+    /// auto-repeat produce the repeats. Holding a key down is otherwise
+    /// indistinguishable from a key that was never let go, and the client would
+    /// repeat it forever.
     pub fn key(&mut self, event: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyEventKind;
+        use crossterm::event::{KeyCode, KeyEventKind};
 
         self.sync_modifiers(event.modifiers);
         let Some(stroke) = keys::for_key(event.code) else {
-            if let crossterm::event::KeyCode::Char(c) = event.code {
+            if let KeyCode::Char(c) = event.code {
                 tracing::debug!(?c, "character has no key code in the advertised keymap");
             }
             return;
         };
+        tracing::debug!(?event, code = stroke.code, "key");
+
+        // Modifier keys are the exception: they are *state* for everything
+        // typed while they are held, so they follow the terminal's
+        // modifier flags rather than a keystroke.
+        if matches!(event.code, KeyCode::Modifier(_)) {
+            match event.kind {
+                KeyEventKind::Press => self.press_modifier(stroke.code),
+                KeyEventKind::Repeat => {}
+                KeyEventKind::Release => self.release_modifier(stroke.code),
+            }
+            return;
+        }
+
+        match event.kind {
+            KeyEventKind::Press | KeyEventKind::Repeat => {
+                if !self.binding(event.modifiers, stroke.code) {
+                    self.type_stroke(stroke);
+                }
+            }
+            // The press released this key already; there is nothing left to let go of.
+            KeyEventKind::Release => {}
+        }
+    }
+
+    /// Press a key and let it go, holding shift for as long as its symbol needs
+    /// it.
+    fn type_stroke(&mut self, stroke: keys::KeyStroke) {
         let synthesized_shift = stroke.shift && !self.is_pressed(keys::modifier::LEFT_SHIFT);
         if synthesized_shift {
             self.press_modifier(keys::modifier::LEFT_SHIFT);
         }
-        match event.kind {
-            KeyEventKind::Press | KeyEventKind::Repeat => {
-                if self.binding(event.modifiers, stroke.code) {
-                    // The compositor consumed it: the client must not see the
-                    // press.
-                } else {
-                    self.forward_key(stroke.code, KeyState::Pressed);
-                }
-            }
-            KeyEventKind::Release => self.forward_key(stroke.code, KeyState::Released),
-        }
+        self.forward_key(stroke.code, KeyState::Pressed);
+        self.forward_key(stroke.code, KeyState::Released);
         if synthesized_shift {
             self.release_modifier(keys::modifier::LEFT_SHIFT);
         }
@@ -515,26 +541,17 @@ impl Meowland {
     ///
     /// Text arrives as characters (from the terminal's paste), while clients
     /// want key presses, so each character is matched to the stroke that
-    /// produces it - with a press *and* a release,
-    /// because a pressed-but-never-released key would start repeating.
+    /// produces it.
     pub fn paste(&mut self, text: &str) {
         for c in text.chars() {
             let stroke = match c {
                 '\n' | '\r' => keys::for_key(crossterm::event::KeyCode::Enter),
                 _ => keys::for_char(c),
             };
-            let Some(stroke) = stroke else {
+            if let Some(stroke) = stroke {
+                self.type_stroke(stroke);
+            } else {
                 tracing::debug!(?c, "character has no key code in the advertised keymap");
-                continue;
-            };
-            let synthesized_shift = stroke.shift && !self.is_pressed(keys::modifier::LEFT_SHIFT);
-            if synthesized_shift {
-                self.press_modifier(keys::modifier::LEFT_SHIFT);
-            }
-            self.forward_key(stroke.code, KeyState::Pressed);
-            self.forward_key(stroke.code, KeyState::Released);
-            if synthesized_shift {
-                self.release_modifier(keys::modifier::LEFT_SHIFT);
             }
         }
     }

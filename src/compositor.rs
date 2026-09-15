@@ -123,6 +123,13 @@ pub enum Error {
 }
 
 /// The compositor.
+///
+/// The flags are independent switches rather than a state: whether a frame is
+/// needed, whether the pointer moved, whether the corner carries a counter.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each of these is an independent switch, not a state"
+)]
 pub struct Meowland {
     // Protocol state.
     compositor_state: CompositorState,
@@ -148,6 +155,13 @@ pub struct Meowland {
     due: Vec<bool>,
     /// How many of those flags are set, so an empty set costs nothing to spot.
     due_count: usize,
+    /// Whether the corner of the screen carries a frame-rate counter.
+    fps_counter: bool,
+    /// Frames handed to the presenter in the second being counted, the rate the
+    /// last second settled at, and when that second started.
+    fps_window: Option<Instant>,
+    fps_frames: u32,
+    fps: u32,
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -208,6 +222,7 @@ impl Meowland {
         display: &DisplayHandle,
         capabilities: &Capabilities,
         nodes: &[crate::dmabuf::RenderNode],
+        fps_counter: bool,
     ) -> Result<Self, Error> {
         let compositor_state = CompositorState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, []);
@@ -284,6 +299,10 @@ impl Meowland {
             gpu,
             due: vec![false; grid_tiles],
             due_count: 0,
+            fps_counter,
+            fps_window: None,
+            fps_frames: 0,
+            fps: 0,
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -388,6 +407,12 @@ impl Meowland {
         let phase = Instant::now();
         if self.needs_redraw {
             self.compose();
+            if self.fps_counter {
+                // Drawn into the frame rather than written as terminal text:
+                // the window covers the grid, and images are
+                // drawn over text.
+                crate::hud::draw(&mut self.frame, &format!("{} fps", self.fps));
+            }
             self.tiles.diff(&self.frame, &mut self.dirty);
         } else {
             self.dirty.clear();
@@ -465,6 +490,7 @@ impl Meowland {
             Ok(()) => {
                 self.due.fill(false);
                 self.due_count = 0;
+                self.count_frame();
             }
             // Not taken: the tiles stay due, so nothing is lost by the wait.
             Err(frame) => presenter.reuse(frame.pixels),
@@ -472,6 +498,27 @@ impl Meowland {
     }
 
     /// The tile a grid index stands for.
+    /// Count a frame that reached the presenter, and settle the rate once a
+    /// second has passed.
+    fn count_frame(&mut self) {
+        let now = Instant::now();
+        let since = *self.fps_window.get_or_insert(now);
+        self.fps_frames += 1;
+        let elapsed = now.duration_since(since);
+        if elapsed >= Duration::from_secs(1) {
+            let settled = (f64::from(self.fps_frames) / elapsed.as_secs_f64()).round() as u32;
+            self.fps_window = Some(now);
+            self.fps_frames = 0;
+            // A frame is only drawn when something asks for one, so a client
+            // that has stopped drawing would otherwise leave a number behind
+            // that the screen has outlived.
+            if settled != self.fps {
+                self.fps = settled;
+                self.needs_redraw = true;
+            }
+        }
+    }
+
     fn tile_of(&self, index: usize, tile_size: (u32, u32)) -> Rect {
         let grid_x = index as u32 % self.tiles.grid.0;
         let grid_y = index as u32 / self.tiles.grid.0;

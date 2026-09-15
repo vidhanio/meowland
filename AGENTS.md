@@ -59,8 +59,8 @@ direct, base64'd, as before.
 
 Settings are flags that fall back to environment variables, and the flag wins:
 `--gpu-buffers` (`MEOWLAND_GPU_BUFFERS`, default `auto`), `--render-node`
-(`MEOWLAND_RENDER_NODE`), `--log` (`MEOWLAND_LOG`) and `--log-level`
-(`MEOWLAND_LOG_LEVEL`). The resolving is the CLI's job - a module is handed what
+(`MEOWLAND_RENDER_NODE`), `--log` (`MEOWLAND_LOG`), `--log-level`
+(`MEOWLAND_LOG_LEVEL`) and `--fps` (`MEOWLAND_FPS`). The resolving is the CLI's job - a module is handed what
 was decided, not an environment to look up.
 
 `--gpu-buffers off` stops clients being offered GPU buffers at all; `auto` offers

@@ -26,9 +26,12 @@ use std::{
 };
 
 use smithay::{
-    backend::input::{ButtonState, KeyState},
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_shell,
+    backend::{
+        allocator::dmabuf::Dmabuf,
+        input::{ButtonState, KeyState},
+    },
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
@@ -49,6 +52,7 @@ use smithay::{
             with_surface_tree_downward,
         },
         cursor_shape::CursorShapeManagerState,
+        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -65,9 +69,9 @@ use smithay::{
 };
 
 use crate::{
+    buffer::Snapshot,
     keys, kitty,
     render::{Frame, Rect, Tiles},
-    shm::Snapshot,
     tty::{Capabilities, Terminal},
 };
 
@@ -88,6 +92,20 @@ pub const BINDING_MODIFIER: crossterm::event::KeyModifiers = crossterm::event::K
 /// anything.
 const BACKDROP: [u8; 3] = [0x14, 0x16, 0x1b];
 
+/// Why meowland could not be set up.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The keymap clients are given could not be built.
+    #[error("could not build the keymap clients are given")]
+    Keymap(#[source] smithay::input::keyboard::Error),
+    /// The render nodes could not be described to clients.
+    #[error(transparent)]
+    RenderNodes(#[from] crate::dmabuf::Error),
+    /// The GPU buffers clients may hand over could not be described.
+    #[error("could not describe the GPU buffers clients may hand over")]
+    Feedback(#[source] std::io::Error),
+}
+
 /// The compositor.
 pub struct Meowland {
     // Protocol state.
@@ -95,6 +113,11 @@ pub struct Meowland {
     shm_state: ShmState,
     xdg_shell_state: XdgShellState,
     seat_state: SeatState<Self>,
+    dmabuf_state: DmabufState,
+    /// Kept alive so that the platform's render nodes are described to clients;
+    /// never read once it has been created.
+    #[expect(dead_code, reason = "the state object is what keeps the global alive")]
+    dmabuf_global: Option<DmabufGlobal>,
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -153,7 +176,7 @@ impl std::fmt::Debug for Meowland {
 
 impl Meowland {
     /// Advertise the initial state to clients.
-    pub fn new(display: &DisplayHandle, capabilities: &Capabilities) -> anyhow::Result<Self> {
+    pub fn new(display: &DisplayHandle, capabilities: &Capabilities) -> Result<Self, Error> {
         let compositor_state = CompositorState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, []);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
@@ -161,6 +184,7 @@ impl Meowland {
         let data_device_state = DataDeviceState::new::<Self>(display);
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(display);
         let mut seat_state = SeatState::new();
+        let mut dmabuf_state = DmabufState::new();
 
         let output = Output::new(
             "meowland".into(),
@@ -190,27 +214,33 @@ impl Meowland {
         // The keymap clients are given. It has to match [`crate::keys`], which
         // translates the characters the terminal hands us back into key
         // codes of *this* layout.
-        let keyboard = seat.add_keyboard(
-            XkbConfig {
-                rules: "evdev",
-                model: "pc105",
-                layout: "us",
-                variant: "",
-                options: None,
-            },
-            250,
-            30,
-        )?;
+        let keyboard = seat
+            .add_keyboard(
+                XkbConfig {
+                    rules: "evdev",
+                    model: "pc105",
+                    layout: "us",
+                    variant: "",
+                    options: None,
+                },
+                250,
+                30,
+            )
+            .map_err(Error::Keymap)?;
         let pointer = seat.add_pointer();
 
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
         let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
+
+        let dmabuf_global = advertise_render_nodes(display, &mut dmabuf_state)?;
 
         Ok(Self {
             compositor_state,
             shm_state,
             xdg_shell_state,
             seat_state,
+            dmabuf_state,
+            dmabuf_global,
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -308,7 +338,7 @@ impl Meowland {
 
     /// Fill the frame with the current state of the window and hand the changes
     /// to the terminal.
-    pub fn present(&mut self, terminal: &mut Terminal) -> anyhow::Result<()> {
+    pub fn present(&mut self, terminal: &mut Terminal) -> std::io::Result<()> {
         if self.needs_redraw {
             self.compose();
             self.tiles.diff(&self.frame, &mut self.dirty);
@@ -943,7 +973,7 @@ impl Meowland {
         match committed {
             Some((BufferAssignment::NewBuffer(buffer), scale)) => {
                 let copied = match self.snapshots.entry(surface.id()) {
-                    Entry::Occupied(mut entry) => crate::shm::snapshot(
+                    Entry::Occupied(mut entry) => crate::buffer::snapshot(
                         &buffer,
                         scale,
                         (limit.width, limit.height),
@@ -951,7 +981,7 @@ impl Meowland {
                     ),
                     Entry::Vacant(entry) => {
                         let mut snapshot = Snapshot::empty();
-                        let copied = crate::shm::snapshot(
+                        let copied = crate::buffer::snapshot(
                             &buffer,
                             scale,
                             (limit.width, limit.height),
@@ -984,6 +1014,40 @@ impl ShmHandler for Meowland {
 
 impl smithay::wayland::buffer::BufferHandler for Meowland {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
+}
+
+impl DmabufHandler for Meowland {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    /// Decide, before the client draws into it, whether a GPU buffer is one
+    /// meowland will be able to read when it is committed.
+    ///
+    /// Answering no is cheap and the client can still fall back to shared
+    /// memory; answering yes and finding out later is not, because by then the
+    /// client has stopped drawing into shared memory.
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        match crate::buffer::dmabuf_readable(&dmabuf) {
+            Ok(()) => {
+                if let Err(err) = notifier.successful::<Self>() {
+                    tracing::debug!(?err, "the client that offered a GPU buffer is gone");
+                }
+            }
+            Err(reason) => {
+                tracing::debug!(
+                    reason = %reason,
+                    "refusing a GPU buffer meowland cannot read"
+                );
+                notifier.failed();
+            }
+        }
+    }
 }
 
 impl XdgShellHandler for Meowland {
@@ -1100,8 +1164,44 @@ impl DataDeviceHandler for Meowland {
     }
 }
 
+/// Offer clients the machine's render nodes, if any were asked for.
+///
+/// A client that renders on the GPU only keeps doing so if it is told where to
+/// put the memory, and can only hand that memory over if meowland can read it
+/// back - so what is advertised here is exactly what [`crate::buffer`] knows
+/// how to read, and nothing else. See [`crate::dmabuf`] for why that is not
+/// something to offer unasked.
+///
+/// Not offering it is not an error: the global is simply never advertised, and
+/// clients draw into shared memory.
+fn advertise_render_nodes(
+    display: &DisplayHandle,
+    state: &mut DmabufState,
+) -> Result<Option<DmabufGlobal>, Error> {
+    let nodes = crate::dmabuf::nodes()?;
+    let Some((main, rest)) = nodes.split_first() else {
+        return Ok(None);
+    };
+    for node in &nodes {
+        tracing::info!(
+            path = %node.path.display(),
+            device = node.device,
+            "offering a render node to clients"
+        );
+    }
+    let mut feedback = DmabufFeedbackBuilder::new(main.device, crate::dmabuf::FORMATS);
+    for node in rest {
+        feedback = feedback.add_preference_tranche(node.device, None, crate::dmabuf::FORMATS);
+    }
+    let feedback = feedback.build().map_err(Error::Feedback)?;
+    Ok(Some(state.create_global_with_default_feedback::<Meowland>(
+        display, &feedback,
+    )))
+}
+
 delegate_compositor!(Meowland);
 delegate_shm!(Meowland);
+delegate_dmabuf!(Meowland);
 delegate_xdg_shell!(Meowland);
 delegate_output!(Meowland);
 delegate_seat!(Meowland);

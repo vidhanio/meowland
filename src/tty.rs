@@ -51,24 +51,36 @@ pub struct Terminal {
     entered: bool,
 }
 
+/// Why meowland cannot draw in this terminal.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// There is nothing to draw into.
+    #[error("meowland needs a terminal on stdin and stdout (try running it directly)")]
+    NotATerminal,
+    /// The terminal would not let go of line-based input.
+    #[error("could not put the terminal into raw mode")]
+    RawMode(#[source] io::Error),
+    /// The terminal does not implement the protocol the pixels go out through.
+    #[error(
+        "this terminal does not support the kitty graphics protocol (meowland needs kitty, \
+         ghostty, or another terminal that implements it)"
+    )]
+    NoGraphics,
+}
+
 impl Terminal {
     /// Take over the terminal: raw mode, alternate screen, mouse and keyboard
     /// reporting.
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> Result<Self, Error> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            anyhow::bail!(
-                "meowland needs a terminal on stdin and stdout (try running it directly)"
-            );
+            return Err(Error::NotATerminal);
         }
-        crossterm::terminal::enable_raw_mode()?;
+        crossterm::terminal::enable_raw_mode().map_err(Error::RawMode)?;
         let probe = probe().unwrap_or_default();
         let capabilities = resolve_capabilities(&probe, window_size());
         if !capabilities.graphics {
             let _ = crossterm::terminal::disable_raw_mode();
-            anyhow::bail!(
-                "this terminal does not support the kitty graphics protocol (meowland needs kitty, \
-                 ghostty, or another terminal that implements it)"
-            );
+            return Err(Error::NoGraphics);
         }
 
         let mut terminal = Self {

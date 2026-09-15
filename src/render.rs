@@ -1,9 +1,10 @@
 //! The compositor's own frame buffer: everything clients send ends up here, one
 //! pixel at a time.
 //!
-//! There is no GPU involved. Client buffers come from shared memory, get alpha
-//! blended into this frame buffer, and the result is then diffed tile by tile
-//! so only what changed is re-sent to the terminal (see [`crate::kitty`]).
+//! There is no GPU involved on the compositor's side. Client buffers - shared
+//! memory, or a GPU buffer read back on the CPU (see [`crate::buffer`]) - get
+//! alpha blended into this frame buffer, and the result is then diffed tile by
+//! tile so only what changed is re-sent to the terminal (see [`crate::kitty`]).
 //!
 //! Pixels are stored **premultiplied** RGBA, which is also the format Wayland
 //! clients deliver (`wl_shm` says the alpha channel is premultiplied into the

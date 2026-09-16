@@ -26,7 +26,7 @@ pub struct Cli {
 
 #[derive(usage::Subcommands)]
 pub enum Action {
-    /// Run a client in the server, starting and showing one if there is none
+    /// Run a client in the server, and show its window here
     Run(Run),
     /// Show a window of the server in this terminal
     Attach(Attach),

@@ -9,10 +9,35 @@
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
 use tracing_subscriber::EnvFilter;
+
+/// The clock a running count is reported on: how long ago one was last written
+/// to the log, and whether it is time to write another.
+///
+/// The counts themselves are the callers' - what a frame cost, what the
+/// presenter spent - and they are all reported the same way, once a second,
+/// because that is a rate a person reading a log can divide in their head.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Report(Option<Instant>);
+
+impl Report {
+    /// How long the count since the last report covers, if a second of it has
+    /// gone by.
+    pub fn due(&mut self) -> Option<f64> {
+        let now = Instant::now();
+        let since = *self.0.get_or_insert(now);
+        let elapsed = now - since;
+        if elapsed < Duration::from_secs(1) {
+            return None;
+        }
+        self.0 = Some(now);
+        Some(elapsed.as_secs_f64())
+    }
+}
 
 /// Where logs go when the command line does not say.
 pub fn path(configured: Option<&Path>) -> PathBuf {

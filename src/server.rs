@@ -121,7 +121,7 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
         panes: HashMap::new(),
         terminal_sender,
         readers: HashMap::new(),
-        generations: 0,
+        next_pane: 0,
         handle: handle.clone(),
         _sockets: (control_socket, display_socket),
         children: Vec::new(),
@@ -192,7 +192,7 @@ struct App {
     readers: HashMap<u64, JoinHandle<()>>,
     /// Handed out to each pane that connects, so that what one says can be told
     /// from what another says - and from what a pane that has gone said.
-    generations: u64,
+    next_pane: u64,
     /// Where sources are registered, and where a pane's are removed again when
     /// it goes.
     handle: LoopHandle<'static, Self>,
@@ -224,13 +224,12 @@ struct App {
 /// One terminal attached to this server.
 ///
 /// The pane's own state - which window it shows, its geometry, the frame it is
-/// drawn into - lives in the compositor, keyed by this ID (`Meowland::views`).
-/// What is here is the socket, the thread writing frames to it, and the thread
-/// reading what the user does at it.
+/// drawn into - lives in the compositor, keyed by this ID (`Meowland::views`),
+/// which is also the key it is held under here. What is here is the socket, the
+/// thread writing frames to it, and the thread reading what the user does at
+/// it.
 #[derive(Debug)]
 struct Pane {
-    /// The pane's ID, which is what it is known by here and in the compositor.
-    generation: u64,
     /// Kept to shut the socket down when the pane is let go, which is what ends
     /// its reader.
     stream: UnixStream,
@@ -248,7 +247,7 @@ enum FromTerminal {
     /// A terminal said who it is and what it wants to be shown, which is
     /// answered by drawing on it or by saying why not.
     Hello {
-        generation: u64,
+        pane: u64,
         version: u32,
         show: display::Show,
         capabilities: Capabilities,
@@ -256,27 +255,27 @@ enum FromTerminal {
         stream: UnixStream,
     },
     /// Something the user did.
-    Input { generation: u64, input: Input },
+    Input { pane: u64, input: Input },
     /// The terminal was resized, and this is what it can do now.
     Resized {
-        generation: u64,
+        pane: u64,
         capabilities: Capabilities,
     },
     /// It has written the frame it was sent, so the next one may follow.
-    Drawn { generation: u64 },
+    Drawn { pane: u64 },
     /// It is on its way out, whether it said so or its socket ended.
-    Left { generation: u64 },
+    Left { pane: u64 },
 }
 
 impl FromTerminal {
     /// Which terminal said this.
-    const fn generation(&self) -> u64 {
+    const fn pane(&self) -> u64 {
         match self {
-            Self::Hello { generation, .. }
-            | Self::Input { generation, .. }
-            | Self::Resized { generation, .. }
-            | Self::Drawn { generation }
-            | Self::Left { generation } => *generation,
+            Self::Hello { pane, .. }
+            | Self::Input { pane, .. }
+            | Self::Resized { pane, .. }
+            | Self::Drawn { pane }
+            | Self::Left { pane } => *pane,
         }
     }
 }
@@ -285,17 +284,7 @@ impl App {
     /// Answer one request from the control socket.
     fn control_request(&mut self, request: &[u8]) -> control::Reply {
         match control::Command::decode(request) {
-            Some(control::Command::List) => control::Reply::Windows(
-                self.state
-                    .windows()
-                    .map(|window| control::Window {
-                        id: window.id,
-                        label: window.label,
-                        title: window.title,
-                        active: window.active,
-                    })
-                    .collect(),
-            ),
+            Some(control::Command::List) => control::Reply::Windows(self.state.windows().collect()),
             Some(control::Command::Run(argv)) => {
                 let program = argv.first().map_or_else(
                     || "the client".to_owned(),
@@ -333,11 +322,11 @@ impl App {
             frames,
             ..
         } = self;
-        for pane in panes.values_mut() {
-            if !state.should_present_view(pane.generation, pane.presenter.is_ready()) {
+        for (pane, attached) in panes.iter_mut() {
+            if !state.should_present_view(*pane, attached.presenter.is_ready()) {
                 continue;
             }
-            let cost = state.present_view(pane.generation, &mut pane.presenter);
+            let cost = state.present_view(*pane, &mut attached.presenter);
             // The cap runs from when the frame began rather than when it
             // finished: the work happens *inside* the interval, so counting it
             // as well would put the compositor's own cost on the client's
@@ -348,15 +337,25 @@ impl App {
         self.flush_clients();
     }
 
+    /// Everything that follows a change to the server's state, whatever it was:
+    /// the panes that are done, the replies clients are owed, and the frame
+    /// that shows the result.
+    fn settled(&mut self) {
+        self.end_closed_panes();
+        self.flush_clients();
+        self.check_quit();
+        self.schedule_frame();
+    }
+
     /// Let go of the panes whose window is gone.
     ///
     /// A pane showing one client has nothing left to be when that client
     /// closes, so its terminal goes back to whoever was using it - quietly,
     /// because that is what closing an app looks like anywhere else.
     fn end_closed_panes(&mut self) {
-        for generation in self.state.take_closed_views() {
-            tracing::info!(pane = generation, "the window it was showing is gone");
-            self.detach_pane(generation, None);
+        for pane in self.state.take_closed_views() {
+            tracing::info!(pane, "the window it was showing is gone");
+            self.detach_pane(pane, None);
         }
     }
 
@@ -368,9 +367,9 @@ impl App {
 
     /// Whether any pane has something to draw and a presenter free to take it.
     fn panes_pending(&self) -> bool {
-        self.panes.values().any(|pane| {
+        self.panes.iter().any(|(pane, attached)| {
             self.state
-                .should_present_view(pane.generation, pane.presenter.is_ready())
+                .should_present_view(*pane, attached.presenter.is_ready())
         })
     }
 
@@ -387,8 +386,8 @@ impl App {
     /// waiting for a terminal in the thread that draws frames for the one
     /// already attached.
     fn accept_terminal(&mut self, stream: UnixStream) {
-        self.generations += 1;
-        let generation = self.generations;
+        self.next_pane += 1;
+        let pane = self.next_pane;
         let sender = self.terminal_sender.clone();
         let write_half = match stream.try_clone() {
             Ok(half) => half,
@@ -399,10 +398,10 @@ impl App {
         };
         match thread::Builder::new()
             .name("meowland-terminal".into())
-            .spawn(move || read_terminal(stream, sender, generation, write_half))
+            .spawn(move || read_terminal(stream, sender, pane, write_half))
         {
             Ok(reader) => {
-                self.readers.insert(generation, reader);
+                self.readers.insert(pane, reader);
             }
             Err(error) => tracing::warn!(%error, "could not start a terminal reader"),
         }
@@ -414,41 +413,41 @@ impl App {
         // and its reader had one more thing to say. A hello is how a pane
         // arrives, so it is the one message that can come from a pane that is
         // not here yet.
-        let generation = message.generation();
-        if !matches!(message, FromTerminal::Hello { .. }) && !self.has_pane(generation) {
+        let pane = message.pane();
+        if !matches!(message, FromTerminal::Hello { .. }) && !self.has_pane(pane) {
             return;
         }
         match message {
             FromTerminal::Hello {
-                generation,
+                pane,
                 version,
                 show,
                 capabilities,
                 stream,
-            } => self.attach_pane(generation, version, show, &capabilities, stream),
-            FromTerminal::Input { input, .. } => self.on_input(generation, input),
+            } => self.attach_pane(pane, version, show, &capabilities, stream),
+            FromTerminal::Input { input, .. } => self.on_input(pane, input),
             FromTerminal::Resized { capabilities, .. } => {
-                self.resize_pane(generation, &capabilities);
+                self.resize_pane(pane, &capabilities);
             }
             FromTerminal::Drawn { .. } => {
-                if let Some(pane) = self.panes.get(&generation) {
-                    pane.presenter.drawn();
+                if let Some(attached) = self.panes.get(&pane) {
+                    attached.presenter.drawn();
                 }
             }
             FromTerminal::Left { .. } => {
-                tracing::info!(pane = generation, "the terminal went away");
-                self.detach_pane(generation, None);
+                tracing::info!(pane, "the terminal went away");
+                self.detach_pane(pane, None);
             }
         }
-        if self.state.take_detach_request(generation) {
-            tracing::info!(pane = generation, "the detach binding was used");
-            self.detach_pane(generation, None);
+        if self.state.take_detach_request(pane) {
+            tracing::info!(pane, "the detach binding was used");
+            self.detach_pane(pane, None);
         }
     }
 
     /// Whether this message came from a pane that is still attached.
-    fn has_pane(&self, generation: u64) -> bool {
-        self.panes.contains_key(&generation)
+    fn has_pane(&self, pane: u64) -> bool {
+        self.panes.contains_key(&pane)
     }
 
     /// Answer a terminal that said hello: attach it, or say why not.
@@ -459,11 +458,11 @@ impl App {
     /// no window has.
     fn attach_pane(
         &mut self,
-        generation: u64,
+        pane: u64,
         version: u32,
         show: display::Show,
         capabilities: &Capabilities,
-        stream: UnixStream,
+        mut stream: UnixStream,
     ) {
         let refusal = if version != display::VERSION {
             Some(format!(
@@ -479,29 +478,24 @@ impl App {
         };
         if let Some(reason) = refusal {
             tracing::info!(%reason, "turned a terminal away");
-            let mut stream = stream;
+            // The reader is the one that said hello, and there is nothing left
+            // for it to read: the socket goes, and it with it.
+            drop(self.readers.remove(&pane));
             let _ = display::write_to(
                 &mut stream,
-                display::encode_client(&ToClient::Detached(reason)),
+                display::encode_client(ToClient::Detached(reason)),
             );
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
 
-        let Some(reader) = self.readers.remove(&generation) else {
+        let Some(reader) = self.readers.remove(&pane) else {
             tracing::warn!("a terminal said hello that was not being read");
             return;
         };
         // The greeting is the first thing written on the socket, so it is said
         // here rather than handed to the presenter with everything else.
-        let mut writer = match stream.try_clone() {
-            Ok(writer) => writer,
-            Err(error) => {
-                tracing::warn!(%error, "could not take a terminal's socket");
-                return;
-            }
-        };
-        let _ = display::write_to(&mut writer, display::encode_client(&ToClient::Welcome));
+        let _ = display::write_to(&mut stream, display::encode_client(ToClient::Welcome));
 
         // Frames are written, and compressed, on a thread of this pane's own:
         // one terminal being slow must not hold up another.
@@ -528,15 +522,15 @@ impl App {
                 .insert_source(drawn, move |event, (), app: &mut Self| {
                     match event {
                         ChannelEvent::Msg(PresenterEvent::Ready(frame)) => {
-                            if let Some(pane) = app.panes.get_mut(&generation) {
-                                pane.presenter.recycle(frame);
+                            if let Some(attached) = app.panes.get_mut(&pane) {
+                                attached.presenter.recycle(frame);
                             }
                         }
                         // A presenter that has stopped is one pane that will not
                         // be drawn again; the others, and the windows, are not
                         // affected.
                         ChannelEvent::Msg(PresenterEvent::Failed(error)) => {
-                            tracing::error!(%error, pane = generation, "presentation failed");
+                            tracing::error!(%error, pane, "presentation failed");
                         }
                         ChannelEvent::Closed => {}
                     }
@@ -549,12 +543,11 @@ impl App {
                 }
             };
 
-        self.state.attach_view(generation, show, capabilities);
-        tracing::info!(pane = generation, ?capabilities, "pane attached");
+        self.state.attach_view(pane, show, capabilities);
+        tracing::info!(pane, ?capabilities, "pane attached");
         self.panes.insert(
-            generation,
+            pane,
             Pane {
-                generation,
                 stream,
                 presenter,
                 reader: Some(reader),
@@ -567,36 +560,38 @@ impl App {
     ///
     /// The other panes and the windows are untouched: a pane is a place to look
     /// at a window, and what it was looking at stays what it was.
-    fn detach_pane(&mut self, generation: u64, reason: Option<&str>) {
-        let Some(mut pane) = self.panes.remove(&generation) else {
+    fn detach_pane(&mut self, pane: u64, reason: Option<&str>) {
+        let Some(mut attached) = self.panes.remove(&pane) else {
             return;
         };
         if let Some(reason) = reason {
-            pane.presenter.detach(ToClient::Detached(reason.to_owned()));
+            attached
+                .presenter
+                .detach(ToClient::Detached(reason.to_owned()));
         }
         // Stop writing before the socket goes: what undoes the takeover has to
         // be the last thing this terminal is sent.
-        pane.presenter.finish();
-        self.handle.remove(pane.drawn);
-        let _ = pane.stream.shutdown(std::net::Shutdown::Both);
-        if let Some(reader) = pane.reader
+        attached.presenter.finish();
+        self.handle.remove(attached.drawn);
+        let _ = attached.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(reader) = attached.reader
             && reader.join().is_err()
         {
             tracing::error!("the pane's reader panicked");
         }
-        self.state.detach_view(generation);
+        self.state.detach_view(pane);
     }
 
     /// The terminal this pane is in changed size, or what it can do.
-    fn resize_pane(&mut self, generation: u64, capabilities: &Capabilities) {
-        let Some(pane) = self.panes.get(&generation) else {
+    fn resize_pane(&mut self, pane: u64, capabilities: &Capabilities) {
+        let Some(attached) = self.panes.get(&pane) else {
             return;
         };
         // Whatever the terminal kept from before the resize is not this pane's
         // any more, and the wipe has to land after the frames already handed
         // over for the same reason.
-        pane.presenter.clear();
-        self.state.resize_view(generation, capabilities);
+        attached.presenter.clear();
+        self.state.resize_view(pane, capabilities);
     }
 
     /// Handle something the user did at a pane.
@@ -604,10 +599,10 @@ impl App {
     /// Everything is in the terms of the pane it happened in: the bindings act
     /// on the window that pane shows, typing gives that window the keyboard,
     /// and the pointer is somewhere in that pane's own geometry.
-    fn on_input(&mut self, generation: u64, input: Input) {
+    fn on_input(&mut self, pane: u64, input: Input) {
         match input {
-            Input::Key(key) => self.state.key(generation, key),
-            Input::Pointer(pointer) => self.state.pointer(generation, pointer),
+            Input::Key(key) => self.state.key(pane, key),
+            Input::Pointer(pointer) => self.state.pointer(pane, pointer),
             Input::Paste(text) => self.state.paste(&text),
             Input::Focus(_) => {}
         }
@@ -733,8 +728,8 @@ impl App {
 
     /// Let every pane go and stop the clients.
     fn shutdown(&mut self) {
-        while let Some(generation) = self.panes.keys().copied().next() {
-            self.detach_pane(generation, None);
+        while let Some(pane) = self.panes.keys().copied().next() {
+            self.detach_pane(pane, None);
         }
         for child in &mut self.children {
             let _ = child.kill();
@@ -759,7 +754,7 @@ impl App {
 fn read_terminal(
     mut stream: UnixStream,
     sender: Sender<FromTerminal>,
-    generation: u64,
+    pane: u64,
     write_half: UnixStream,
 ) {
     // A terminal that connects and then says nothing is given up on rather
@@ -780,7 +775,7 @@ fn read_terminal(
         return;
     };
     let hello = FromTerminal::Hello {
-        generation,
+        pane,
         version,
         show,
         capabilities,
@@ -795,13 +790,12 @@ fn read_terminal(
             continue;
         };
         let sent = match message {
-            ToServer::Input(input) => sender.send(FromTerminal::Input { generation, input }),
-            ToServer::Resized(capabilities) => sender.send(FromTerminal::Resized {
-                generation,
-                capabilities,
-            }),
-            ToServer::Drawn => sender.send(FromTerminal::Drawn { generation }),
-            ToServer::Bye => sender.send(FromTerminal::Left { generation }),
+            ToServer::Input(input) => sender.send(FromTerminal::Input { pane, input }),
+            ToServer::Resized(capabilities) => {
+                sender.send(FromTerminal::Resized { pane, capabilities })
+            }
+            ToServer::Drawn => sender.send(FromTerminal::Drawn { pane }),
+            ToServer::Bye => sender.send(FromTerminal::Left { pane }),
             // Said once, at the start, and answered by then.
             ToServer::Hello { .. } => continue,
         };
@@ -809,7 +803,7 @@ fn read_terminal(
             return;
         }
     }
-    let _ = sender.send(FromTerminal::Left { generation });
+    let _ = sender.send(FromTerminal::Left { pane });
 }
 
 /// Everything a server is reached through, once it is listening on all of it.
@@ -837,7 +831,7 @@ fn install_sources(
     watch_display(handle, &mut app.display)?;
     watch_terminal(handle, sources.said)?;
     watch_server(handle, sources.signals, sources.commands, sources.terminals)?;
-    schedule_frame(handle, app);
+    app.schedule_frame();
     Ok(())
 }
 
@@ -864,19 +858,15 @@ fn watch_display(
 ) -> anyhow::Result<()> {
     let poll_fd = rustix::io::dup(display.backend().poll_fd())
         .context("could not take the display socket")?;
-    let display_loop = handle.clone();
     handle
         .insert_source(
             Generic::new(poll_fd, Interest::READ, Mode::Level),
-            move |_, _, app: &mut App| {
+            |_, _, app: &mut App| {
                 let dispatched = app.display.dispatch_clients(&mut app.state);
                 if let Err(err) = dispatched {
                     tracing::warn!(?err, "dispatching to clients failed");
                 }
-                app.end_closed_panes();
-                app.flush_clients();
-                app.check_quit();
-                schedule_frame(&display_loop, app);
+                app.settled();
                 Ok(PostAction::Continue)
             },
         )
@@ -889,17 +879,13 @@ fn watch_terminal(
     handle: &LoopHandle<'_, App>,
     terminal_events: Channel<FromTerminal>,
 ) -> anyhow::Result<()> {
-    let terminal_loop = handle.clone();
     handle
-        .insert_source(terminal_events, move |event, (), app: &mut App| {
+        .insert_source(terminal_events, |event, (), app: &mut App| {
             match event {
                 ChannelEvent::Msg(message) => app.on_terminal(message),
                 ChannelEvent::Closed => app.quit(),
             }
-            app.end_closed_panes();
-            app.flush_clients();
-            app.check_quit();
-            schedule_frame(&terminal_loop, app);
+            app.settled();
         })
         .map_err(|err| anyhow::anyhow!("could not watch the terminals: {err:?}"))?;
     Ok(())
@@ -986,7 +972,7 @@ fn watch_server(
 /// The presenter keeps its own count, of the compressing and the writing.
 #[derive(Debug, Default)]
 struct FrameStats {
-    since: Option<Instant>,
+    report: logging::Report,
     frames: u32,
     tiles: u64,
     sent: u64,
@@ -1000,25 +986,21 @@ impl FrameStats {
         self.sent += cost.sent as u64;
         self.compose += cost.compose;
 
-        let now = Instant::now();
-        let since = *self.since.get_or_insert(now);
-        let elapsed = now - since;
-        if elapsed < Duration::from_secs(1) {
+        let Some(seconds) = self.report.due() else {
             return;
-        }
+        };
         let frames = f64::from(self.frames);
         tracing::debug!(
-            fps = frames / elapsed.as_secs_f64(),
+            fps = frames / seconds,
             tiles = self.tiles / u64::from(self.frames),
             sent = self.sent / u64::from(self.frames),
             compose_ms = self.compose.as_secs_f64() * 1e3 / frames,
             "frames composed"
         );
-        self.since = Some(now);
-        self.frames = 0;
-        self.tiles = 0;
-        self.sent = 0;
-        self.compose = Duration::ZERO;
+        *self = Self {
+            report: self.report,
+            ..Self::default()
+        };
     }
 }
 

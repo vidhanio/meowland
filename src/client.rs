@@ -133,7 +133,7 @@ fn greet(
         .context("could not wait for frames")?;
 
     let reply = reply.context("could not read the server's answer")?;
-    match reply.and_then(|(tag, payload)| display::decode_client(tag, &payload)) {
+    match reply.and_then(|(tag, payload)| display::decode_client(tag, payload)) {
         Some(ToClient::Welcome) => Ok(Greeting::Welcome),
         // A refusal is an answer rather than a failure: what to print, and
         // whether to complain, is the caller's to decide.
@@ -203,8 +203,11 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
     let handle = event_loop.handle();
 
     let (frames_sender, frames) = channel();
-    let mut writer = Writer::start(stream.try_clone()?, frames_sender)
-        .context("could not start the frame writer")?;
+    let stream_clone = stream.try_clone()?;
+    let mut writer = Worker::start("meowland-frames", move |stop| {
+        write_frames(stream_clone, &frames_sender, stop);
+    })
+    .context("could not start the frame writer")?;
 
     handle
         .insert_source(frames, |event, (), showing: &mut Showing| match event {
@@ -224,7 +227,10 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
         .map_err(|error| anyhow::anyhow!("could not watch the server: {error:?}"))?;
 
     let (input_sender, input) = channel();
-    let mut input_thread = Reader::start(input_sender).context("could not read the terminal")?;
+    let mut input_thread = Worker::start("meowland-input", move |stop| {
+        read_terminal(&input_sender, stop);
+    })
+    .context("could not read the terminal")?;
     handle
         .insert_source(input, |event, (), showing: &mut Showing| match event {
             ChannelEvent::Msg(event) => on_event(showing, event),
@@ -357,21 +363,31 @@ enum FrameEvent {
     Ended,
 }
 
-/// The thread that writes frames to the terminal.
-struct Writer {
+/// A thread of this process's own, for one of the two things that cannot happen
+/// on the loop: writing frames to the terminal, and reading the user at it.
+///
+/// Both are inside a blocking call - a write that the terminal sets the pace
+/// of, a read that has nothing to return until the user types - so neither can
+/// be the loop's own body, and both are left by asking rather than by waiting
+/// for them.
+struct Worker {
+    name: &'static str,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
-impl Writer {
-    fn start(stream: UnixStream, events: Sender<FrameEvent>) -> anyhow::Result<Self> {
+impl Worker {
+    fn start(
+        name: &'static str,
+        body: impl FnOnce(&AtomicBool) + Send + 'static,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        let writer_stop = Arc::clone(&stop);
+        let thread_stop = Arc::clone(&stop);
         let handle = thread::Builder::new()
-            .name("meowland-frames".into())
-            .spawn(move || write_frames(stream, &events, &writer_stop))
-            .context("could not start the frame writer")?;
+            .name(name.into())
+            .spawn(move || body(&thread_stop))?;
         Ok(Self {
+            name,
             stop,
             handle: Some(handle),
         })
@@ -379,17 +395,31 @@ impl Writer {
 
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take()
-            && handle.join().is_err()
-        {
-            tracing::error!("the frame writer panicked");
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // A thread inside a terminal that has hung up never comes back: it is
+        // spinning in the terminal library's read of it, or blocked writing to
+        // a pty nobody is reading, and waiting for it would be waiting forever.
+        // It holds nothing the rest of this process needs, and the process is
+        // leaving anyway.
+        if tty::hung_up() {
+            return;
         }
+        if handle.join().is_err() {
+            tracing::error!(thread = self.name, "the thread panicked");
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
 /// Write what the server sends to the terminal, until either end goes away.
 fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &AtomicBool) {
-    let mut stdout = std::io::stdout().lock();
     while !stop.load(Ordering::Relaxed) {
         let message = match display::read_from(&mut stream) {
             Ok(Some(message)) => message,
@@ -399,7 +429,7 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
                 break;
             }
         };
-        let (bytes, frame) = match display::decode_client(message.0, &message.1) {
+        let (bytes, frame) = match display::decode_client(message.0, message.1) {
             Some(ToClient::Bytes(bytes)) => (bytes, false),
             Some(ToClient::Frame(bytes)) => (bytes, true),
             Some(ToClient::Detached(reason)) => {
@@ -410,6 +440,10 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
             Some(ToClient::Welcome) | None => continue,
         };
         let phase = std::time::Instant::now();
+        // Taken per message rather than held for the session: a write that the
+        // terminal is not keeping up with must not keep the escapes that hand
+        // it back from being written.
+        let mut stdout = std::io::stdout().lock();
         if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
             tracing::debug!(%error, "could not write to the terminal");
             let _ = events.send(FrameEvent::Ended);
@@ -428,49 +462,6 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
         }
     }
     let _ = events.send(FrameEvent::Ended);
-}
-
-/// The blocking terminal reader and its shutdown signal.
-struct Reader {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl Reader {
-    fn start(sender: Sender<crossterm::event::Event>) -> std::io::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader_stop = Arc::clone(&stop);
-        let handle = thread::Builder::new()
-            .name("meowland-input".into())
-            .spawn(move || read_terminal(&sender, &reader_stop))?;
-        Ok(Self {
-            stop,
-            handle: Some(handle),
-        })
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        // A reader inside a terminal that has hung up never comes back: it is
-        // spinning in the terminal library's read of it, and waiting for it
-        // would be waiting forever. It holds nothing the rest of this process
-        // needs, and the process is leaving anyway.
-        if tty::hung_up() {
-            return;
-        }
-        if handle.join().is_err() {
-            tracing::error!("the terminal input thread panicked");
-        }
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        self.stop();
-    }
 }
 
 /// Read terminal events forever. crossterm parses the escape sequences,

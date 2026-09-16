@@ -60,7 +60,7 @@ pub enum Error {
 #[derive(Debug)]
 enum Message {
     /// The terminal this server is drawn on, or nobody.
-    Attach(Box<Option<UnixStream>>),
+    Attach(Option<UnixStream>),
     /// Whether that terminal reads tiles out of shared memory.
     Configure {
         shared_memory: bool,
@@ -116,19 +116,15 @@ impl Presenter {
 
     /// Draw on this socket from here on, in place of whatever was there.
     pub fn attach(&self, terminal: UnixStream, shared_memory: bool) {
-        if let Some(messages) = &self.messages {
-            let _ = messages.send(Message::Configure { shared_memory });
-            let _ = messages.send(Message::Attach(Box::new(Some(terminal))));
-        }
+        self.send(Message::Configure { shared_memory });
+        self.send(Message::Attach(Some(terminal)));
     }
 
     /// Draw on nothing: the terminal that was attached has gone, or another
     /// one took it over.
     pub fn detach(&self, reason: ToClient) {
-        if let Some(messages) = &self.messages {
-            let _ = messages.send(Message::Tell(reason));
-            let _ = messages.send(Message::Attach(Box::new(None)));
-        }
+        self.send(Message::Tell(reason));
+        self.send(Message::Attach(None));
     }
 
     /// Put the terminal back the way it was found, in the order the frames
@@ -167,11 +163,9 @@ impl Presenter {
             .send(Message::Frame(frame))
             .map_err(|error| match error.0 {
                 Message::Frame(frame) => frame,
-                Message::Attach(_)
-                | Message::Configure { .. }
-                | Message::Tell(_)
-                | Message::Drawn
-                | Message::Raw(_) => unreachable!("sent a frame"),
+                // The message that could not be sent was the frame just handed
+                // over, and nothing else is a frame.
+                _ => unreachable!("sent a frame"),
             })
     }
 
@@ -181,15 +175,18 @@ impl Presenter {
     /// written the loop drops the frames it would otherwise queue, and the
     /// tiles they carried stay due for the one that goes after it.
     pub fn drawn(&self) {
-        if let Some(messages) = &self.messages {
-            let _ = messages.send(Message::Drawn);
-        }
+        self.send(Message::Drawn);
     }
 
     /// Show an escape in its turn, after the frames already handed over.
     pub fn raw(&self, bytes: Vec<u8>) {
+        self.send(Message::Raw(bytes));
+    }
+
+    /// Hand a message to the worker, if it is still there to take one.
+    fn send(&self, message: Message) {
         if let Some(messages) = &self.messages {
-            let _ = messages.send(Message::Raw(bytes));
+            let _ = messages.send(message);
         }
     }
 
@@ -215,15 +212,6 @@ impl Drop for Presenter {
 
 /// Keep failures and panics on the worker observable to the event loop.
 fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
-    struct Cleanup;
-
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            kitty::discard_shared_memory();
-        }
-    }
-
-    let _cleanup = Cleanup;
     let result = catch_unwind(AssertUnwindSafe(|| run(queue, events)));
     let failure = match result {
         Ok(Ok(())) => return,
@@ -239,7 +227,7 @@ fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
     reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
 )]
 fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result<()> {
-    let mut encoder = Encoder::default();
+    let mut encoder = Encoder::new();
     let mut out = Vec::new();
     let mut stats = Stats::default();
     let mut terminal: Option<UnixStream> = None;
@@ -250,7 +238,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
     while let Ok(message) = queue.recv() {
         let mut frame = match message {
             Message::Attach(attached) => {
-                terminal = *attached;
+                terminal = attached;
                 if terminal.is_none() {
                     recycle(&mut in_flight, events)?;
                 }
@@ -261,7 +249,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 continue;
             }
             Message::Tell(message) => {
-                tell(&mut terminal, &message);
+                tell(&mut terminal, message);
                 continue;
             }
             Message::Drawn => {
@@ -270,7 +258,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
             }
             Message::Frame(frame) => frame,
             Message::Raw(bytes) => {
-                write(&mut terminal, &bytes)?;
+                write(&mut terminal, bytes)?;
                 continue;
             }
         };
@@ -334,32 +322,27 @@ fn recycle(in_flight: &mut Option<Frame>, events: &EventSender<Event>) -> std::i
 ///
 /// With nobody attached there is nothing to write them to and nothing to write
 /// them for: a server that nobody is looking at does not draw.
-fn write(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
+fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    display::write_to(
-        terminal,
-        display::encode_client(&ToClient::Bytes(bytes.to_vec())),
-    )
+    display::write_to(terminal, display::encode_client(ToClient::Bytes(bytes)))
 }
 
 /// Hand one frame to the attached terminal, if there is one.
 ///
 /// A frame is written as a frame and not as an escape: it is the one message
-/// the terminal answers.
+/// the terminal answers. It is written where it lies, because it is about to be
+/// handed to the next frame anyway.
 fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    display::write_to(
-        terminal,
-        display::encode_client(&ToClient::Frame(bytes.to_vec())),
-    )
+    display::write_frame(terminal, bytes)
 }
 
 /// Say something about the attachment itself, which is never a frame.
-fn tell(terminal: &mut Option<UnixStream>, message: &ToClient) {
+fn tell(terminal: &mut Option<UnixStream>, message: ToClient) {
     if let Some(terminal) = terminal {
         let _ = display::write_to(terminal, display::encode_client(message));
     }
@@ -369,7 +352,7 @@ fn tell(terminal: &mut Option<UnixStream>, message: &ToClient) {
 /// attributed: this thread's time is the terminal's and the compressor's.
 #[derive(Debug, Default)]
 struct Stats {
-    since: Option<Instant>,
+    report: crate::logging::Report,
     frames: u32,
     tiles: u64,
     bytes: u64,
@@ -385,16 +368,13 @@ impl Stats {
         self.encode += encode;
         self.write += write;
 
-        let now = Instant::now();
-        let since = *self.since.get_or_insert(now);
-        let elapsed = now - since;
-        if elapsed < Duration::from_secs(1) {
+        let Some(seconds) = self.report.due() else {
             return;
-        }
+        };
         let frames = f64::from(self.frames);
         let per_frame = |total: Duration| total.as_secs_f64() * 1e3 / frames;
         tracing::debug!(
-            fps = frames / elapsed.as_secs_f64(),
+            fps = frames / seconds,
             tiles = self.tiles / u64::from(self.frames),
             kib = self.bytes / u64::from(self.frames) / 1024,
             encode_ms = per_frame(self.encode),
@@ -402,7 +382,7 @@ impl Stats {
             "frames sent to the terminal"
         );
         *self = Self {
-            since: Some(now),
+            report: self.report,
             ..Self::default()
         };
     }

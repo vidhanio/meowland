@@ -215,13 +215,7 @@ impl Renderer {
         let (width, height) = (dmabuf.width(), dmabuf.height());
         let size = Size::<i32, BufferCoords>::from((width as i32, height as i32));
         self.with_pixels(dmabuf, Rectangle::from_size(size), |pixels, stride| {
-            destination.pixels.clear();
-            destination.pixels.extend_from_slice(pixels);
-            destination.width = width;
-            destination.height = height;
-            destination.stride = stride;
-            destination.scale = scale;
-            destination.format = readback_of(format);
+            destination.fill(pixels, stride, width, height, scale, readback_of(format));
         })
     }
 

@@ -304,10 +304,10 @@ fn probe() -> io::Result<Probe> {
     let mut input = io::stdin();
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut responses = Vec::new();
-    loop {
+    let mut parsed = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            break parse_responses(&responses);
         }
         let stdin = io::stdin();
         let mut fds = [PollFd::new(&stdin, PollFlags::IN)];
@@ -316,35 +316,35 @@ fn probe() -> io::Result<Probe> {
             tv_nsec: remaining.subsec_nanos().into(),
         };
         match poll(&mut fds, Some(&timeout)) {
-            Ok(0) => break,
+            Ok(0) => break parse_responses(&responses),
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => return Err(err.into()),
         }
         let mut chunk = [0u8; 512];
         match input.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => break parse_responses(&responses),
             Ok(n) => responses.extend_from_slice(&chunk[..n]),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         }
         // Primary device attributes are answered last, so its arrival ends the
         // handshake.
-        if parse_responses(&responses).device_attributes {
-            break;
+        let parsed = parse_responses(&responses);
+        if parsed.device_attributes {
+            break parsed;
         }
-    }
-    let mut probe = parse_responses(&responses).probe;
+    };
     // The tile sent above is either read and unlinked by the terminal, or still
     // sitting in shared memory with nobody having looked at it.
     // By id, not by shape: the graphics query answers "OK" too, and it is the
     // tile that has to have been read.
     let expected = format!("\x1b_Gi={};OK\x1b\\", crate::kitty::SHARED_PROBE_ID);
-    probe.shared_memory = shared_probe.is_some()
+    parsed.probe.shared_memory = shared_probe.is_some()
         && responses
             .windows(expected.len())
             .any(|window| window == expected.as_bytes());
-    Ok(probe)
+    Ok(parsed.probe)
 }
 
 /// The parsed subset of the probe answers we care about.
@@ -474,7 +474,9 @@ fn resolve_capabilities(probe: &Probe, window: Option<(u32, u32, u32, u32)>) -> 
     let cells = (columns.max(1), rows.max(1));
     let pixels = probe
         .pixels
-        .or_else(|| Some((window_width, window_height)).filter(|(w, h)| *w > 0 && *h > 0))
+        .or_else(|| {
+            (window_width > 0 && window_height > 0).then_some((window_width, window_height))
+        })
         .unwrap_or_else(|| {
             let cell = probe.cell.unwrap_or(FALLBACK_CELL);
             (cells.0 * cell.0, cells.1 * cell.1)

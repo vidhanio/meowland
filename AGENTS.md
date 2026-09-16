@@ -164,11 +164,9 @@ constructors are unsafe. The fourth clears the signal mask of a child between
 `fork` and `exec` (`src/process.rs`), where it is the only way to do it and the
 only place where it is safe to try.
 
-Each module declares its own error type with `thiserror`, so a caller can tell
-its failures apart. `anyhow` appears in `src/main.rs` only, which is the one
-place that reports a failure as text. Everything in the library returns its own
-type: `lib::Error` for the command layer, `server::Error` for startup,
-`client::Error` for a pane.
+The library uses one `thiserror` type in `src/error.rs`. An underlying error
+has one variant, with `From` conversions where appropriate. `anyhow` appears
+in `src/main.rs` only, which reports failures as text.
 
 The commands that draw need a terminal on stdin and stdout that speaks the kitty
 graphics protocol. kitty, Ghostty and WezTerm do, and so does a pane that passes

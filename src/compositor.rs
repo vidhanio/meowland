@@ -73,6 +73,7 @@ use smithay::{
 };
 
 use crate::{
+    Error,
     buffer::Snapshot,
     control,
     display::{self, Key, Pointer},
@@ -214,16 +215,6 @@ impl View {
         let id = self.window?;
         windows.iter().position(|window| window.id == id)
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("could not build the keymap clients are given")]
-    Keymap(#[source] smithay::input::keyboard::Error),
-    #[error(transparent)]
-    RenderNodes(#[from] crate::dmabuf::Error),
-    #[error("could not describe the GPU buffers clients may hand over")]
-    Feedback(#[source] std::io::Error),
 }
 
 #[derive(Debug)]
@@ -1776,7 +1767,9 @@ fn bring_up_renderer(
     for node in nodes {
         match crate::gpu::Renderer::new(&node.path) {
             Ok(renderer) => return Some((renderer, node.clone())),
-            Err(err) => tracing::info!(?err, "no renderer on this render node"),
+            Err(err) => {
+                tracing::info!(?err, path = %node.path.display(), "no renderer on this render node");
+            }
         }
     }
     None
@@ -1808,9 +1801,7 @@ fn advertise_render_nodes(
         formats = formats.len(),
         "offering GPU buffers to clients"
     );
-    let feedback = DmabufFeedbackBuilder::new(node.device, formats)
-        .build()
-        .map_err(Error::Feedback)?;
+    let feedback = DmabufFeedbackBuilder::new(node.device, formats).build()?;
     Ok(Some(state.create_global_with_default_feedback::<Meowland>(
         display, &feedback,
     )))

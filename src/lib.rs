@@ -42,6 +42,7 @@ mod compositor;
 mod control;
 mod display;
 mod dmabuf;
+mod error;
 mod gpu;
 mod keys;
 mod kitty;
@@ -62,6 +63,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use error::Error;
+
 use crate::cli::{Action, Cli};
 
 /// How long a `run` waits for the server it started to come up.
@@ -69,34 +72,6 @@ use crate::cli::{Action, Cli};
 /// Long enough to build a renderer and bind the sockets, and short enough to
 /// report a server that cannot start.
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Why a command did not finish.
-///
-/// `Refused` and `NoServer` carry the words of another process: a control reply
-/// and a server that stopped before it was listening. Everything else is a
-/// failure of this process, with the operation that failed named.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The server could not be reached, or the socket refused the command.
-    #[error(transparent)]
-    Control(#[from] control::Error),
-    /// A pane could not be shown here.
-    #[error(transparent)]
-    Attach(#[from] client::Error),
-    /// A server of this process's own failed to start.
-    #[error(transparent)]
-    Server(#[from] server::Error),
-    /// A server of this process's own could not be started.
-    #[error("could not start a server")]
-    SpawnServer(#[source] std::io::Error),
-    /// A server of this process's own did not come up, and this is what it
-    /// said.
-    #[error("the server did not come up: {0}")]
-    NoServer(String),
-    /// The server answered a command that it did not carry out.
-    #[error("{0}")]
-    Refused(String),
-}
 
 /// Do what the command line says.
 pub fn start() -> Result<(), Error> {
@@ -146,7 +121,7 @@ fn run_client(run: cli::Run) -> Result<(), Error> {
         return Ok(());
     }
     if command.is_empty() {
-        return Ok(client::attach(display::Show::Newest)?);
+        return client::attach(display::Show::Newest);
     }
     let show = match appeared(before, WINDOW_WAIT) {
         Window::Appeared(id) => display::Show::Window(id),
@@ -155,7 +130,7 @@ fn run_client(run: cli::Run) -> Result<(), Error> {
         // The server is gone, so there is nothing to show and nothing to say.
         Window::ServerGone => return Ok(()),
     };
-    Ok(client::attach(show)?)
+    client::attach(show)
 }
 
 /// What became of the window a command was expected to open.
@@ -178,7 +153,7 @@ const WINDOW_POLL: Duration = Duration::from_millis(50);
 ///
 /// A missing server is an error, because "no windows" and "no server" are
 /// different answers to wait on.
-fn newest_window() -> Result<Option<u64>, control::Error> {
+fn newest_window() -> Result<Option<u64>, Error> {
     match control::request(&control::Command::List)? {
         control::Reply::Windows(windows) => Ok(windows.into_iter().map(|window| window.id).max()),
         // `list` is the one command answered with windows.
@@ -237,7 +212,7 @@ fn server_running() -> bool {
 /// The server outlives the terminal that shows it, and it is what every later
 /// `attach`, `list` and `server stop` reaches.
 fn start_server(settings: &cli::Settings) -> Result<(), Error> {
-    let program = std::env::current_exe().map_err(Error::SpawnServer)?;
+    let program = std::env::current_exe()?;
     let mut child = Command::new(program)
         .args(["server", "start"])
         .args(settings.args())
@@ -251,14 +226,13 @@ fn start_server(settings: &cli::Settings) -> Result<(), Error> {
         // goes to that log, because the terminal it draws on is no place for
         // it.
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(Error::SpawnServer)?;
+        .spawn()?;
 
     // Wait for the server instead of guessing, because a `run` that overtook
     // its own server would start a second one.
     let deadline = Instant::now() + SERVER_START_TIMEOUT;
     let started = loop {
-        if let Some(status) = child.try_wait().map_err(Error::SpawnServer)? {
+        if let Some(status) = child.try_wait()? {
             break Err(format!("it stopped before it was listening ({status})"));
         }
         if server_running() {

@@ -29,6 +29,7 @@ use std::{
 use calloop::channel::Sender as EventSender;
 
 use crate::{
+    Error,
     display::{self, ToClient},
     kitty::{self, Encoder, Placement},
     tty,
@@ -40,16 +41,6 @@ use crate::{
 pub struct Frame {
     pub pixels: Vec<u8>,
     pub tiles: Vec<Placement>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("could not start the presenter thread")]
-    Start(#[source] std::io::Error),
-    #[error("could not write to the attached terminal")]
-    Output(#[source] std::io::Error),
-    #[error("the presenter thread panicked")]
-    Panicked,
 }
 
 /// A frame, or an escape that must keep its place among frames, such as a
@@ -97,8 +88,7 @@ impl Presenter {
         let (messages, queue) = channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
-            .spawn(move || worker(queue, &events))
-            .map_err(Error::Start)?;
+            .spawn(move || worker(queue, &events))?;
         Ok(Self {
             messages: Some(messages),
             free: Some(Frame::default()),
@@ -199,8 +189,8 @@ fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
     let result = catch_unwind(AssertUnwindSafe(|| run(queue, events)));
     let failure = match result {
         Ok(Ok(())) => return,
-        Ok(Err(err)) => Error::Output(err),
-        Err(_) => Error::Panicked,
+        Ok(Err(err)) => Error::Io(err),
+        Err(_) => Error::PresenterPanicked,
     };
     let _ = events.send(Event::Failed(failure));
 }

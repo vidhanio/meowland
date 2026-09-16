@@ -14,8 +14,8 @@
 //! synchronization bracket, and unmaps it again. The layout matters here too:
 //! only a linear buffer can be read without the driver that wrote it.
 //!
-//! That copy is why this module holds the only `unsafe` in the crate. See
-//! `Cargo.toml` for the lint exception.
+//! The shared memory and mapped GPU copies each need a bounded raw pointer
+//! read. Both uses of `unsafe` are kept next to their bounds checks.
 
 use smithay::{
     backend::allocator::{
@@ -100,6 +100,25 @@ impl Snapshot {
             format: self.format,
         }
     }
+
+    /// Allow a buffer up to twice the pane size while a resize catches up.
+    fn fits(limit: Option<(u32, u32)>, width: u32, height: u32, scale: i32) -> bool {
+        let Some(limit) = limit else {
+            return true;
+        };
+        let scale = scale.max(1) as u32;
+        u64::from(width / scale) <= u64::from(limit.0) * 2
+            && u64::from(height / scale) <= u64::from(limit.1) * 2
+    }
+
+    /// Number of bytes through the last pixel, including spacing between rows.
+    fn pixel_extent(width: u32, height: u32, stride: usize) -> Option<usize> {
+        let row = (width as usize).checked_mul(4)?;
+        if height == 0 || stride < row {
+            return None;
+        }
+        (height as usize - 1).checked_mul(stride)?.checked_add(row)
+    }
 }
 
 /// `None` for a format the compositor cannot composite.
@@ -181,6 +200,8 @@ pub enum Unreadable {
     Planes(usize),
     /// The client did not say how the rows are spaced.
     NoStride,
+    /// The row spacing or dimensions cannot describe a valid pixel buffer.
+    InvalidGeometry,
     /// The buffer is shorter than the geometry the client described.
     Short {
         claimed: usize,
@@ -188,7 +209,7 @@ pub enum Unreadable {
     },
     Map(DmabufMappingFailed),
     NoRenderer,
-    Renderer(crate::gpu::Error),
+    Renderer(crate::Error),
     /// Reading the buffer could not be bracketed for the driver.
     Sync(DmabufSyncFailed),
 }
@@ -201,6 +222,7 @@ impl std::fmt::Display for Unreadable {
             }
             Self::Planes(count) => write!(f, "the buffer has {count} planes, not one"),
             Self::NoStride => write!(f, "the buffer has no row spacing"),
+            Self::InvalidGeometry => write!(f, "the buffer has invalid dimensions or row spacing"),
             Self::Short { claimed, mapped } => write!(
                 f,
                 "the buffer claims {claimed} bytes of pixels but maps {mapped}"
@@ -211,18 +233,6 @@ impl std::fmt::Display for Unreadable {
             Self::Sync(err) => write!(f, "the buffer could not be synchronized: {err}"),
         }
     }
-}
-
-/// Whether a buffer is small enough to be worth copying.
-///
-/// Twice the pane's screen is allowed, for a window that grew before the
-/// compositor caught up. Past that the client asks for memory, not for pixels.
-fn fits(limit: Option<(u32, u32)>, width: u32, height: u32, scale: i32) -> bool {
-    let Some(limit) = limit else {
-        return true;
-    };
-    let scale = scale.max(1) as u32;
-    width / scale <= limit.0 * 2 && height / scale <= limit.1 * 2
 }
 
 /// Copy out the pixels of a GPU buffer.
@@ -247,7 +257,7 @@ fn copy_dmabuf(
         return Some(false);
     };
     let (width, height) = (dmabuf.width(), dmabuf.height());
-    if !fits(limit, width, height, scale) {
+    if !Snapshot::fits(limit, width, height, scale) {
         tracing::debug!(width, height, ?limit, "refusing an oversized client buffer");
         return Some(false);
     }
@@ -295,15 +305,20 @@ fn copy_shm(
             return false;
         };
         let (width, height, stride) = (data.width as u32, data.height as u32, data.stride as usize);
-        if !fits(limit, width, height, scale) {
+        if !Snapshot::fits(limit, width, height, scale) {
             tracing::debug!(width, height, ?limit, "refusing an oversized client buffer");
             return false;
         }
         // The rows are only required to be `stride` apart, so the last byte
         // read decides whether the client's advertisement is consistent
         // with the pool it handed over.
-        let last = (height as usize - 1) * stride + width as usize * 4;
-        if data.offset as usize + last > length {
+        let Some(last) = Snapshot::pixel_extent(width, height, stride) else {
+            return false;
+        };
+        let Some(end) = (data.offset as usize).checked_add(last) else {
+            return false;
+        };
+        if end > length {
             return false;
         }
         // SAFETY: the pointer is valid for `length` bytes for as long as this
@@ -354,8 +369,8 @@ fn read_plane<T>(dmabuf: &Dmabuf, read: impl FnOnce(&[u8], u32) -> T) -> Result<
     }
     let stride = dmabuf.strides().next().ok_or(Unreadable::NoStride)?;
     let (width, height) = (dmabuf.width(), dmabuf.height());
-    let rows = (height.saturating_sub(1) as usize).saturating_mul(stride as usize);
-    let last = rows.saturating_add(width as usize * 4);
+    let last = Snapshot::pixel_extent(width, height, stride as usize)
+        .ok_or(Unreadable::InvalidGeometry)?;
 
     let plane = MappedPlane::new(dmabuf)?;
     if last > plane.mapping.length() {
@@ -486,5 +501,23 @@ mod tests {
         };
         assert_eq!(snapshot.logical_size(), (100, 50));
         assert_eq!(snapshot.image().stride, 800);
+    }
+
+    #[test]
+    fn pixel_extent_rejects_invalid_rows() {
+        assert_eq!(Snapshot::pixel_extent(2, 3, 12), Some(32));
+        assert_eq!(Snapshot::pixel_extent(2, 3, 7), None);
+        assert_eq!(Snapshot::pixel_extent(2, 0, 8), None);
+        assert_eq!(Snapshot::pixel_extent(1, 3, usize::MAX), None);
+    }
+
+    #[test]
+    fn pane_limit_does_not_overflow_for_large_screens() {
+        assert!(Snapshot::fits(
+            Some((u32::MAX, u32::MAX)),
+            u32::MAX,
+            u32::MAX,
+            1
+        ));
     }
 }

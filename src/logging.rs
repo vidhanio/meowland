@@ -15,17 +15,7 @@ use std::{
 
 use tracing_subscriber::EnvFilter;
 
-/// Why the log could not be opened.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The log file could not be created, reopened or copied for a client.
-    #[error("could not log to {path}")]
-    File {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-}
+use crate::Error;
 
 /// A clock for a count that is reported once a second.
 ///
@@ -66,13 +56,11 @@ pub fn path(configured: Option<&Path>) -> PathBuf {
 /// none can overwrite another.
 pub fn init(configured: Option<&Path>, level: Option<&str>) -> Result<File, Error> {
     let path = path(configured);
-    let at = |source| Error::File {
-        path: path.clone(),
-        source,
-    };
+    let at =
+        |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
     File::create(&path).map_err(at)?;
     let file = OpenOptions::new().append(true).open(&path).map_err(at)?;
-    let clients = file.try_clone().map_err(at)?;
+    let clients = file.try_clone()?;
     let filter = level.map_or_else(
         || EnvFilter::new("meowland=info,warn"),
         |level| EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("meowland=info,warn")),

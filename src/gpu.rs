@@ -12,7 +12,7 @@
 //! cannot be, and having an answer is what lets the compositor offer GPU
 //! buffers to clients.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use smithay::{
     backend::{
@@ -21,13 +21,13 @@ use smithay::{
         renderer::{
             Bind as _, Color32F, ExportMem as _, Frame, ImportDma as _, Offscreen as _,
             Renderer as _, Texture as _,
-            gles::{GlesError, GlesRenderer, GlesTexture},
+            gles::{GlesRenderer, GlesTexture},
         },
     },
     utils::{Buffer as BufferCoords, Physical, Rectangle, Size, Transform},
 };
 
-use crate::render::SourceFormat;
+use crate::{Error, render::SourceFormat};
 
 /// The layout a readback is asked for: bytes in red, green, blue, alpha order.
 ///
@@ -44,37 +44,6 @@ const fn readback_of(format: SourceFormat) -> SourceFormat {
     } else {
         SourceFormat::Abgr8888
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// No renderer could be brought up on this device.
-    ///
-    /// A machine with no EGL does not get this far: the bindings load the
-    /// library on first use and panic when they cannot. That is their
-    /// behaviour, and this cannot turn it into an error.
-    #[error("no renderer on {path}")]
-    Device {
-        path: PathBuf,
-        #[source]
-        source: smithay::backend::egl::Error,
-    },
-    #[error("no renderer on {path}")]
-    Create {
-        path: PathBuf,
-        #[source]
-        source: GlesError,
-    },
-    #[error("the buffer could not be imported")]
-    Import(#[source] GlesError),
-    #[error("the buffer could not be drawn")]
-    Draw(#[source] GlesError),
-    #[error("the buffer could not be read back")]
-    Read(#[source] GlesError),
-    #[error("the drawing could not be waited for")]
-    Sync(#[source] smithay::backend::renderer::sync::Interrupted),
-    #[error("the readback is {actual} bytes, not the {expected} it was asked for")]
-    Short { expected: usize, actual: usize },
 }
 
 /// An offscreen renderer. Everything that it draws is drawn to be read back.
@@ -103,19 +72,13 @@ impl Renderer {
     /// that ends up here is therefore the one that [`crate::dmabuf`] offers to
     /// clients.
     pub fn new(path: &Path) -> Result<Self, Error> {
-        let fail = |source| Error::Device {
-            path: path.to_path_buf(),
-            source,
-        };
-        let device = EGLDevice::enumerate()
-            .map_err(fail)?
+        let device = EGLDevice::enumerate()?
             .find(|device| {
                 device
                     .render_device_path()
                     .is_ok_and(|device_path| device_path == path)
             })
-            .ok_or(smithay::backend::egl::Error::DisplayNotSupported)
-            .map_err(fail)?;
+            .ok_or(smithay::backend::egl::Error::DisplayNotSupported)?;
 
         // SAFETY: `EGLDisplay::new` requires the native display handle to
         // outlive the display. The device comes from `enumerate`, is moved into
@@ -124,11 +87,11 @@ impl Renderer {
             unsafe_code,
             reason = "EGL hands out displays only through this unsafe constructor, whose contract is that the device outlives the display"
         )]
-        let display = unsafe { EGLDisplay::new(device) }.map_err(fail)?;
+        let display = unsafe { EGLDisplay::new(device) }?;
 
         // No screen and no config: this renderer draws into textures that it
         // owns.
-        let context = EGLContext::new(&display).map_err(fail)?;
+        let context = EGLContext::new(&display)?;
 
         // SAFETY: creating a renderer from a context requires the context not
         // to be current anywhere else, and takes ownership of it. It was made
@@ -137,10 +100,7 @@ impl Renderer {
             unsafe_code,
             reason = "the GLES renderer constructor is unsafe because the context must not be current elsewhere; this context was just created here and is owned by the renderer"
         )]
-        let renderer = unsafe { GlesRenderer::new(context) }.map_err(|source| Error::Create {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let renderer = unsafe { GlesRenderer::new(context) }?;
 
         tracing::info!(
             path = %path.display(),
@@ -222,7 +182,7 @@ impl Renderer {
         let texture = self
             .renderer
             .import_dmabuf(dmabuf, None)
-            .map_err(Error::Import)?;
+            .map_err(Error::Gles)?;
         let size = texture.size();
         let area =
             Rectangle::<i32, Physical>::from_size(Size::<i32, Physical>::from((size.w, size.h)));
@@ -232,18 +192,18 @@ impl Renderer {
             None => self
                 .renderer
                 .create_buffer(READBACK, size)
-                .map_err(Error::Draw)?,
+                .map_err(Error::Gles)?,
         };
 
         {
-            let mut target = self.renderer.bind(&mut staging).map_err(Error::Draw)?;
+            let mut target = self.renderer.bind(&mut staging).map_err(Error::Gles)?;
             let mut frame = self
                 .renderer
                 .render(&mut target, area.size, Transform::Normal)
-                .map_err(Error::Draw)?;
+                .map_err(Error::Gles)?;
             frame
                 .clear(Color32F::TRANSPARENT, &[area])
-                .map_err(Error::Draw)?;
+                .map_err(Error::Gles)?;
             // Called through the trait: the renderer's own version takes a
             // shader and uniforms, for a caller that does the
             // sampling by hand.
@@ -262,12 +222,12 @@ impl Renderer {
                 Transform::Normal,
                 1.0,
             )
-            .map_err(Error::Draw)?;
+            .map_err(Error::Gles)?;
             // End the pass explicitly, and wait for it. The next readback is
             // defined only after the frame that drew it, and the target has to
             // stop being held before the staging texture can be bound again.
             Frame::finish(frame)
-                .map_err(Error::Draw)?
+                .map_err(Error::Gles)?
                 .wait()
                 .map_err(Error::Sync)?;
         }
@@ -275,11 +235,11 @@ impl Renderer {
         let mapping = self
             .renderer
             .copy_texture(&staging, region, READBACK)
-            .map_err(Error::Read)?;
-        let pixels = self.renderer.map_texture(&mapping).map_err(Error::Read)?;
+            .map_err(Error::Gles)?;
+        let pixels = self.renderer.map_texture(&mapping).map_err(Error::Gles)?;
         let expected = region.size.w as usize * region.size.h as usize * 4;
         if pixels.len() < expected {
-            return Err(Error::Short {
+            return Err(Error::ShortReadback {
                 expected,
                 actual: pixels.len(),
             });

@@ -23,11 +23,11 @@ use crate::{control, tty::Capabilities};
 
 /// The guard removes the socket file when the server ends; a file from a killed
 /// server is taken over.
-pub fn listen() -> Result<(control::Socket, UnixListener), control::Error> {
+pub fn listen() -> Result<(control::Socket, UnixListener), crate::Error> {
     control::Socket::bind(control::DISPLAY_SOCKET)
 }
 
-pub fn connect() -> Result<UnixStream, control::Error> {
+pub fn connect() -> Result<UnixStream, crate::Error> {
     control::connect(control::DISPLAY_SOCKET)
 }
 

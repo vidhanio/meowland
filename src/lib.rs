@@ -24,8 +24,9 @@
 //! the server that is running (`src/cli.rs`, `src/control.rs`).
 //!
 //! One window is on screen at a time, and every window has an ID the server
-//! gave it. Alt+Tab cycles them; Alt+Q stops being shown here, which is not the
-//! same as quitting: the server stays, and `attach` shows it again.
+//! gave it. Alt+Tab cycles them, Alt+W asks the one on screen to close, and
+//! Alt+Q stops being shown here - which is not the same as quitting: the server
+//! stays, and `attach` shows it again.
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 

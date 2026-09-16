@@ -175,6 +175,15 @@ struct Window {
     surface: ToplevelSurface,
     /// What the client calls itself: its app ID, or its title without one.
     label: Option<String>,
+    /// Whether the client asked for the whole screen.
+    ///
+    /// Every window fills the terminal here whether this is set or not, so it
+    /// is not a layout of its own: it is what the client is *told*. A client
+    /// that asked for fullscreen - a video going fullscreen in a page, a player
+    /// started with `--fullscreen` - stays in its windowed one until it hears
+    /// that it has it, and never resizes what it draws. Answering the request
+    /// is the whole of what fullscreen means here.
+    fullscreen: bool,
 }
 
 /// A window exposed through the local control socket.
@@ -447,6 +456,27 @@ impl Meowland {
         self.scene_dirty = true;
     }
 
+    /// Where a window's surface sits in the list.
+    fn index_of(&self, surface: &WlSurface) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|window| window.surface.wl_surface() == surface)
+    }
+
+    /// Ask the window on screen to close.
+    ///
+    /// A request, not a kill: what a client does with it is the client's
+    /// business - an editor with unsaved work is expected to ask first - but a
+    /// client that takes it is one that destroys its window and exits, and the
+    /// server it was started in stops with it (`crate::server`).
+    fn close_window(&self) {
+        let Some(window) = self.active.and_then(|index| self.windows.get(index)) else {
+            return;
+        };
+        tracing::info!(id = window.id, "asked to close");
+        window.surface.send_close();
+    }
+
     fn cycle_window(&mut self) {
         if !self.windows.is_empty() {
             self.activate_index(
@@ -468,19 +498,35 @@ impl Meowland {
         }
     }
 
-    /// Give every toplevel the terminal size and update its activation state.
+    /// Give every toplevel the terminal size, and the state it should believe.
+    ///
+    /// A window that asked for the whole screen is told it has it: that state
+    /// is what a client checks before it stops drawing its windowed self, and
+    /// leaving it out is what makes a fullscreen request do nothing at all.
     fn configure_windows(&self) {
         let size = (self.frame.width as i32, self.frame.height as i32);
         for (index, window) in self.windows.iter().enumerate() {
             window.surface.with_pending_state(|state| {
                 state.size = Some(size.into());
                 state.states.set(xdg_state::MAXIMIZED);
+                if window.fullscreen {
+                    state.states.set(xdg_state::FULLSCREEN);
+                } else {
+                    state.states.unset(xdg_state::FULLSCREEN);
+                }
                 if self.active == Some(index) {
                     state.states.set(xdg_state::ACTIVATED);
                 } else {
                     state.states.unset(xdg_state::ACTIVATED);
                 }
             });
+            tracing::debug!(
+                id = window.id,
+                ?size,
+                fullscreen = window.fullscreen,
+                active = self.active == Some(index),
+                "configured"
+            );
             let _ = window.surface.send_configure();
         }
     }
@@ -737,9 +783,12 @@ impl Meowland {
         {
             return false;
         }
+        // Linux input event codes, as the terminal reports them
+        // (`keys::for_char`): `KEY_TAB`, `KEY_Q` and `KEY_W`.
         match code {
             15 => self.cycle_window(),
             16 => self.detaching = true,
+            17 => self.close_window(),
             _ => return false,
         }
         true
@@ -914,6 +963,7 @@ mod xdg_state {
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
     pub const ACTIVATED: xdg_toplevel::State = xdg_toplevel::State::Activated;
+    pub const FULLSCREEN: xdg_toplevel::State = xdg_toplevel::State::Fullscreen;
     pub const MAXIMIZED: xdg_toplevel::State = xdg_toplevel::State::Maximized;
 }
 
@@ -1173,11 +1223,7 @@ impl CompositorHandler for Meowland {
         self.scene_dirty = true;
         if !drawn
             && self.snapshots.contains_key(&surface.id())
-            && let Some(index) = self
-                .windows
-                .iter()
-                .position(|window| window.surface.wl_surface() == surface)
-            && self.active.is_none_or(|active| active < index)
+            && let Some(index) = self.index_of(surface)
         {
             // Whatever the client asked for, a window with nothing on it is not
             // worth looking at - and some clients open windows they never draw
@@ -1318,7 +1364,12 @@ impl XdgShellHandler for Meowland {
         self.next_window_id = self.next_window_id.saturating_add(1);
         tracing::info!(id, wayland_id = ?surface.wl_surface().id(), "new window");
         let label = window_label(&surface);
-        self.windows.push(Window { id, surface, label });
+        self.windows.push(Window {
+            id,
+            surface,
+            label,
+            fullscreen: false,
+        });
         self.activate_index(self.windows.len() - 1);
     }
 
@@ -1376,17 +1427,31 @@ impl XdgShellHandler for Meowland {
         surface: ToplevelSurface,
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
-        let _ = surface;
+        let Some(index) = self.index_of(surface.wl_surface()) else {
+            return;
+        };
+        tracing::info!(id = self.windows[index].id, "fullscreen asked for");
+        self.windows[index].fullscreen = true;
+        // Asking for the whole screen is asking to be the window on it, which
+        // is what a fullscreen request means in a compositor that shows one
+        // window at a time - and what makes a player that starts fullscreen
+        // appear rather than wait behind whatever was on screen.
+        self.activate_index(index);
+        self.configure_windows();
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let Some(index) = self.index_of(surface.wl_surface()) else {
+            return;
+        };
+        tracing::info!(id = self.windows[index].id, "fullscreen given up");
+        self.windows[index].fullscreen = false;
         self.configure_windows();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.output.leave(surface.wl_surface());
-        let Some(removed) = self
-            .windows
-            .iter()
-            .position(|window| window.surface.wl_surface() == surface.wl_surface())
-        else {
+        let Some(removed) = self.index_of(surface.wl_surface()) else {
             return;
         };
         let was_active = self.active == Some(removed);

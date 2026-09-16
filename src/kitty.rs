@@ -1,12 +1,11 @@
 //! Encoding of the [kitty graphics protocol][spec].
 //!
-//! Everything the compositor needs to put pixels on the terminal screen:
-//! transmitting raw RGB image data (zlib compressed) and placing it into a
-//! cell rectangle in one command, deleting images again, and the handful of
-//! terminal modes the protocol relies on.
+//! The compositor sends raw RGB image data here, zlib compressed, and places it
+//! in a cell rectangle in one command. It deletes images and sets the terminal
+//! modes the protocol needs.
 //!
-//! This module only ever *writes* escapes. Reading the terminal's answers lives
-//! in [`crate::tty`], which is the only place allowed to touch stdin.
+//! This module writes escapes only. [`crate::tty`] reads the answers and is the
+//! only place that touches stdin.
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
@@ -22,20 +21,16 @@ use smithay::input::pointer::CursorIcon;
 /// Maximum size of a base64 plot line, mandated by the protocol.
 const CHUNK: usize = 4096;
 
-/// Z-index of the composited screen. Positive values draw above the terminal
-/// text, so window content covers whatever the terminal last wrote in those
-/// cells.
+/// Z-index of the composited screen. A positive value draws above the terminal
+/// text.
 const Z_ABOVE_TEXT: i32 = 1;
-/// Where a shared memory object lives, and what it is called.
 const SHM_DIRECTORY: &str = "/dev/shm";
 
-/// Remove every object this run put in shared memory that nobody took.
+/// Remove every shared memory object this run left behind.
 ///
-/// The terminal takes one per transfer and unlinks it, so anything left is from
-/// a terminal that stopped reading - and an object is the size of the pixels it
-/// holds. The names carry this process's id, so nothing belonging to another
-/// compositor is at risk - and the namespace, so that a pane's tiles are swept
-/// up without touching another pane's, which are still in use.
+/// The terminal takes one object per transfer and unlinks it. Anything left
+/// holds the pixels of one tile and was never read. The names carry the process
+/// id and the namespace, so no live object of another process is touched.
 fn discard_shared_memory(namespace: u32) {
     let prefix = format!("meowland-{}-{namespace}-", std::process::id());
     let Ok(entries) = std::fs::read_dir(SHM_DIRECTORY) else {
@@ -51,25 +46,21 @@ fn discard_shared_memory(namespace: u32) {
     }
 }
 
-/// The namespace the startup probe's object is in, which no encoder uses.
+/// The namespace of the startup probe's object. No encoder uses it.
 const PROBE_NAMESPACE: u32 = 0;
 
-/// The namespace of the next encoder to be made.
+/// The namespace of the next encoder.
 ///
-/// One per encoder, because a server draws on as many terminals at once as are
-/// attached to it: two panes' tiles may be in shared memory at the same time,
-/// and an object that one of them is still reading is not the other's to
-/// overwrite or take away.
+/// Each encoder has its own, so one pane's tiles never overwrite an object that
+/// another pane still reads.
 static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(PROBE_NAMESPACE + 1);
 
-/// The id the startup probe uses for the tile it sends out of shared memory, so
-/// that its answer can be told from the one the graphics query gives.
+/// The image id of the probe's shared memory tile, distinct from the graphics
+/// query's id.
 pub const SHARED_PROBE_ID: u32 = 78;
 
-/// Send a one-pixel tile out of shared memory, to find out whether the terminal
-/// can read one there.
-///
-/// The returned guard removes the object if the terminal did not take it.
+/// Send a one-pixel tile out of shared memory, to test whether the terminal
+/// reads one there. The guard removes the object if it did not.
 pub fn shared_memory_probe(out: &mut Vec<u8>) -> Option<SharedProbe> {
     let object = Shared::new(PROBE_NAMESPACE, 0);
     if object.write(&[0, 0, 0, 255]).is_err() {
@@ -82,7 +73,6 @@ pub fn shared_memory_probe(out: &mut Vec<u8>) -> Option<SharedProbe> {
     Some(SharedProbe(object))
 }
 
-/// Owns the startup probe object until the terminal has answered.
 #[derive(Debug)]
 pub struct SharedProbe(Shared);
 
@@ -94,11 +84,9 @@ impl Drop for SharedProbe {
 
 /// One tile's payload, in a shared memory object the terminal reads for itself.
 ///
-/// The escape that carries it holds only the object's name, so the pixels never
-/// travel through the pty at all - which is the difference between a few
-/// kilobytes a frame and a few megabytes. The terminal unlinks the object once
-/// it has read it, and the name is made again by the next transfer that wants
-/// it.
+/// The escape carries the name only, so the pixels stay off the pty. The
+/// terminal unlinks the object after reading it, and the next transfer makes it
+/// again.
 #[derive(Debug)]
 struct Shared {
     path: String,
@@ -106,12 +94,10 @@ struct Shared {
 }
 
 impl Shared {
-    /// The object one tile of an encoder's namespace lives in.
+    /// The object that holds one tile of an encoder's namespace.
     ///
-    /// The name says whose it is - this process, and which of its encoders -
-    /// and which tile it holds, since a name per tile is what bounds what a
-    /// terminal that stopped reading can leave behind to the size of one
-    /// screen.
+    /// The name gives the process, the encoder and the tile, which bounds what
+    /// a terminal that stopped reading leaves behind to one screen.
     fn new(namespace: u32, slot: u32) -> Self {
         let name = format!("/meowland-{}-{namespace}-{slot}", std::process::id());
         let path = format!("{SHM_DIRECTORY}{name}");
@@ -123,12 +109,11 @@ impl Shared {
         Self { path, encoded_name }
     }
 
-    /// Write `payload` into the object named after `slot`.
+    /// Write one tile into its object.
     ///
-    /// A name per tile bounds what a terminal that stopped reading can leave
-    /// behind to the size of one screen. A name still owned by the terminal is
-    /// never overwritten: creation then fails and that update travels directly
-    /// through the pty, preserving the order and contents of both updates.
+    /// An object the terminal still holds is never overwritten: creation fails,
+    /// and that update goes through the pty instead, keeping both updates in
+    /// order.
     fn write(&self, payload: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
@@ -145,7 +130,6 @@ impl Shared {
         Ok(())
     }
 
-    /// Remove it, for a terminal that turned out not to read it.
     fn unlink(&self) {
         if let Err(err) = std::fs::remove_file(&self.path) {
             if err.kind() == std::io::ErrorKind::NotFound {
@@ -160,40 +144,34 @@ impl Shared {
     }
 }
 
-/// The smallest saving that makes compressing a frame worth its time, as a
-/// fraction of the pixels: below this the terminal is handed the pixels as they
-/// are, because inflating costs it work and the bytes were never going to
-/// shrink.
+/// The smallest saving that makes compressing a frame worth the time, as a
+/// fraction of the pixels. Below it the terminal gets the pixels as they are,
+/// because inflating costs it work.
 ///
-/// Compressing film-like content pays (it halves), and text pays enormously;
-/// what does not pay is content that is already compressed or has no structure
-/// to find, where zlib spends milliseconds to save a fraction of what base64
-/// then adds straight back.
+/// Film-like content halves when compressed and text shrinks far more. Content
+/// already compressed does not shrink.
 const COMPRESSION_RATIO: (usize, usize) = (3, 4);
 
-/// Reusable compression and base64 storage for tile transmissions.
 #[derive(Debug)]
 pub struct Encoder {
     zlib: ZlibEncoder<Vec<u8>>,
     payload: Vec<u8>,
     finished: bool,
-    /// Whether the frame being encoded is compressed, decided once its first
-    /// tile has shown what the content does. `None` means the frame has not
-    /// shown anything yet.
+    /// Whether the frame is compressed, decided by its first tile. `None` means
+    /// no tile of the frame has arrived yet.
     compress: Option<bool>,
-    /// Whether the terminal reads tiles out of shared memory, which is what
-    /// keeps the pixels off the pty.
+    /// Whether the terminal reads tiles out of shared memory, which keeps their
+    /// pixels off the pty.
     pub shared_memory: bool,
-    /// Which encoder this is, which is what its tiles' objects are named
-    /// after: two encoders' objects are never each other's.
+    /// Which encoder this is. The tiles' objects are named after it, so two
+    /// encoders never name the same object.
     namespace: u32,
-    /// Stable names and encoded names for each tile, made once rather than on
-    /// every frame.
+    /// The name and encoded name of each tile, made once and reused every
+    /// frame.
     shared_objects: Vec<Shared>,
 }
 
 impl Encoder {
-    /// An encoder whose tiles go into shared memory objects of its own.
     pub fn new() -> Self {
         Self {
             zlib: ZlibEncoder::new(Vec::new(), Compression::fast()),
@@ -208,14 +186,12 @@ impl Encoder {
 }
 
 impl Drop for Encoder {
-    /// Whatever the terminal did not take is this process's litter, and it is
-    /// the size of the pixels it holds.
+    /// Remove the objects the terminal did not take.
     fn drop(&mut self) {
         discard_shared_memory(self.namespace);
     }
 }
 
-/// Image identity and terminal-cell placement for one transmission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     pub id: u32,
@@ -223,17 +199,15 @@ pub struct Placement {
     pub height: u32,
     pub cols: u32,
     pub rows: u32,
-    /// The cell the tile's first pixel belongs in: the cursor has to be there
-    /// before the image is placed, and whoever writes the escape has to know.
+    /// The cell of the tile's first pixel. The cursor must be there before the
+    /// image is placed.
     pub cell: (u32, u32),
 }
 
 impl Placement {
-    /// How many bytes of the frame's pixels a tile of this shape is.
-    ///
-    /// One definition for both sides of the tile buffer - the compositor cuts
-    /// tiles out with it and the presenter cuts them back up with it - because
-    /// two versions of this is one frame's worth of overrun waiting to happen.
+    /// The compositor cuts tiles out of the frame buffer with this and the
+    /// presenter cuts them back up with it, so both sides must agree: a wrong
+    /// length reads past the buffer.
     pub const fn bytes(self) -> usize {
         self.width as usize * self.height as usize * crate::render::BYTES
     }
@@ -242,10 +216,8 @@ impl Placement {
 /// Set the terminal's mouse pointer shape, or reset it to the terminal's own
 /// default.
 ///
-/// This is the one part of the pointer the terminal draws better than we can:
-/// its pointer is a real pointer, and clients usually say what they want shown
-/// (a text beam, a resize arrow, a hand over a link) through
-/// `wp_cursor_shape_manager_v1`.
+/// The terminal draws a pointer better than the compositor can. Clients state
+/// the shape they want through `wp_cursor_shape_manager_v1`.
 pub fn set_pointer_shape(out: &mut Vec<u8>, shape: Option<&str>) {
     match shape {
         Some(shape) => {
@@ -288,44 +260,39 @@ pub const fn pointer_shape(icon: CursorIcon) -> &'static str {
         CursorIcon::NwseResize => "nwse-resize",
         CursorIcon::ZoomIn => "zoom-in",
         CursorIcon::ZoomOut => "zoom-out",
-        // The terminal's set of shapes has no name for these; the four-way arrow is the closest
-        // thing it does have.
+        // The terminal's shape set has no name for these, so they share the
+        // nearest one.
         CursorIcon::Move | CursorIcon::AllScroll | CursorIcon::AllResize => "move",
         _ => "default",
     }
 }
 
-/// Move the cursor to a cell. Coordinates are 1-based, like the escape code it
-/// turns into.
+/// Move the cursor to a cell. The coordinates are 1-based, as in the escape.
 pub fn cursor_to(out: &mut Vec<u8>, col: u32, row: u32) {
     let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
 }
 
-/// Delete every image, freeing the terminal's memory for them.
+/// Delete every image, which frees the terminal's memory for them.
 pub fn delete_all(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
 }
 
-/// Transmit `pixels` as the image `id`, and place it in the cell rectangle that
-/// starts at the cursor.
+/// Transmit `pixels` as the image `id`, and place it in the cell rectangle at
+/// the cursor.
 ///
-/// Doing both in one command is what makes an update cheap and flicker free: an
-/// image id is replaced atomically (the old placement disappears with the old
-/// data), so a tile can be re-sent while it is on screen. `C=1` keeps the
-/// cursor where it is, so placing an image never scrolls the terminal and never
-/// moves the anchor the next tile is addressed from.
+/// One command for both keeps an update cheap and flicker free: an image id is
+/// replaced atomically, so a tile can be re-sent on screen. `C=1` keeps the
+/// cursor still, so a placement never scrolls the terminal or moves the anchor
+/// of the next tile.
 impl Encoder {
-    /// Start a frame: the terminal buffers everything until
-    /// [`Encoder::end_frame`], which is what keeps a frame from tearing.
-    ///
-    /// Nothing of the encoder's changes here - the frame's own state is what
-    /// the first tile will decide - so this is the frame, not the encoder.
+    /// Start a frame. The terminal buffers everything until
+    /// [`Encoder::end_frame`], so a frame does not tear.
     pub fn begin_frame(out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[?2026h");
     }
 
-    /// End a frame, with whatever the next one's first tile shows deciding
-    /// whether that frame is compressed.
+    /// End a frame. The first tile of the next frame decides whether that frame
+    /// is compressed.
     pub fn end_frame(&mut self, out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[?2026l");
         self.compress = None;
@@ -336,12 +303,9 @@ impl Encoder {
         debug_assert_eq!(pixels.len(), placement.bytes());
         cursor_to(out, placement.cell.0, placement.cell.1);
 
-        // The first tile of a frame decides for the rest of it: whether
-        // compressing pays is a property of what the frame is *of*, and one
-        // tile answers for all of them. With shared memory the pixels never
-        // travel through the pty, so the answer is no - it would be our time
-        // against the terminal's, and reading pixels costs the terminal less
-        // than inflating them.
+        // The first tile decides the compression for the whole frame. With
+        // shared memory the pixels stay off the pty, so the answer is no:
+        // reading them costs less work than inflating them.
         if self.shared_memory {
             let slot = placement.id as usize;
             while self.shared_objects.len() <= slot {
@@ -361,8 +325,8 @@ impl Encoder {
             return;
         }
         let Some(compress) = self.compress else {
-            // Compressed before being asked whether to: one tile of work is
-            // what it costs to find out.
+            // One tile is compressed before the decision is known: that is
+            // what the decision costs.
             let compressed_len = self.compress(pixels);
             let worth = compressed_len * COMPRESSION_RATIO.1 < pixels.len() * COMPRESSION_RATIO.0;
             self.compress = Some(worth);
@@ -380,12 +344,10 @@ impl Encoder {
         }
     }
 
-    /// Compress `pixels`, leaving the result in the encoder's buffer.
     fn compress(&mut self, pixels: &[u8]) -> usize {
         if self.finished {
-            // The frame before this one is still in the writer's buffer: it is
-            // taken back and cleared, so a steady stream of frames is one
-            // allocation for all of them.
+            // The writer's buffer still holds the previous frame. Taking it
+            // back makes a steady stream of frames one allocation.
             let mut reused = self
                 .zlib
                 .reset(Vec::new())
@@ -395,7 +357,7 @@ impl Encoder {
             self.finished = false;
         }
         self.zlib.get_mut().reserve(pixels.len() / 8);
-        // Compositor output is mostly flat color, so compressing it typically
+        // Compositor output is mostly flat color, so compressing usually
         // shrinks a tile by an order of magnitude.
         self.zlib
             .write_all(pixels)
@@ -406,8 +368,8 @@ impl Encoder {
     }
 }
 
-/// Get `payload` to the terminal: in a shared memory object if it reads those,
-/// otherwise base64'd through the pty.
+/// Send `payload` in a shared memory object if the terminal reads those, and
+/// base64'd through the pty otherwise.
 fn transmit(
     out: &mut Vec<u8>,
     encoded: &mut Vec<u8>,
@@ -419,8 +381,7 @@ fn transmit(
     if let Some(object) = shared {
         match object.write(payload) {
             Ok(()) => {}
-            // Out of shared memory: the pty still works, so this is not worth
-            // failing a frame over.
+            // The pty still works, so a frame is not failed over this.
             Err(err) => {
                 tracing::debug!(
                     ?err,
@@ -436,7 +397,7 @@ fn transmit(
     direct(out, encoded, payload, placement, compressed);
 }
 
-/// The payload base64'd into the escape, in chunks.
+/// Send the payload base64'd inside the escape, in chunks of `CHUNK`.
 fn direct(
     out: &mut Vec<u8>,
     encoded: &mut Vec<u8>,
@@ -477,18 +438,23 @@ fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &
     }
 }
 
-/// One escape, whose payload is not pixels but where to find them.
+/// One escape whose payload is a name, not pixels.
 fn placed(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: &str, payload: &[u8]) {
     out.extend_from_slice(b"\x1b_G");
     describe(out, placement, compressed, Some(medium));
-    // The control data ends where the payload begins, and the payload here is a
-    // name rather than pixels.
     out.extend_from_slice(b";");
     out.extend_from_slice(payload);
     out.extend_from_slice(b"\x1b\\");
 }
 
 /// The control data every transmission carries, whatever the medium.
+///
+/// `a=T` transmits the pixels and places them in one command, `f=24` says they
+/// are RGB, `o=z` says they are zlib compressed, and `t=s` says the payload is
+/// a shared memory object name instead of pixels. `s` and `v` are the size in
+/// pixels, `c` and `r` the same in cells, `i` the image id, `p` the placement
+/// id, `z` the z-index, `C=1` leaves the cursor still, and `q=2` suppresses the
+/// reply.
 fn describe(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: Option<&str>) {
     let Placement {
         id,
@@ -511,9 +477,8 @@ fn describe(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: O
 mod tests {
     use super::*;
 
-    /// A decoding of one escape sequence, following the protocol by the book:
-    /// this is the independent side of the round trip, so a wrong chunk
-    /// size, format or byte order fails.
+    /// A decoding of one escape, independent of the encoder, so a wrong chunk
+    /// size or byte order fails.
     #[derive(Debug, PartialEq, Eq)]
     enum Command {
         Transmit {
@@ -537,9 +502,8 @@ mod tests {
         let text = std::str::from_utf8(stream).expect("escapes are ASCII");
         let mut commands = Vec::new();
         let mut rest = text;
-        // Partial transmissions are reassembled before being interpreted: the
-        // header comes from the first chunk, the payload from all of
-        // them.
+        // Partial transmissions are reassembled before they are interpreted:
+        // the header comes from the first chunk, the payload from all of them.
         let mut pending: Option<(String, String)> = None;
         while let Some(start) = rest.find("\x1b_G") {
             let body = &rest[start + 3..];
@@ -577,8 +541,8 @@ mod tests {
         field(header, key).map_or(default, |v| v.parse().unwrap())
     }
 
-    /// Interpret one reassembled graphics command. A command can transmit *and*
-    /// place, so this returns a list.
+    /// Interpret one reassembled graphics command. A command can transmit and
+    /// place at once.
     fn interpret(header: &str, payload: &str) -> Vec<Command> {
         let action = field(header, "a");
         let mut commands = Vec::new();
@@ -644,8 +608,6 @@ mod tests {
 
     #[test]
     fn a_tile_round_trips_pixels_exactly() {
-        // Large enough to need several chunks, so chunk reassembly is covered
-        // too.
         let (width, height) = (64, 48);
         let pixels = test_pixels(width, height);
         let mut out = Vec::new();
@@ -662,8 +624,7 @@ mod tests {
             },
         );
 
-        // What the encoder decided about compressing is its own tests'
-        // business; this one is about the pixels surviving the trip.
+        // This test covers the pixels surviving the trip, not the decision.
         let decoded = decode(&out);
         let (transmitted, put) = match decoded.as_slice() {
             [
@@ -697,8 +658,7 @@ mod tests {
 
     #[test]
     fn an_encoder_can_be_reused() {
-        // Flat content, so this is about reusing the encoder and nothing else:
-        // what it decides about compressing is the subject of its own test.
+        // Flat content, so this covers reusing the encoder only.
         let flat: Vec<u8> = [1u8, 2, 3].repeat(16);
         let mut encoder = Encoder::new();
         let mut out = Vec::new();
@@ -752,8 +712,8 @@ mod tests {
 
     #[test]
     fn every_tile_of_a_compressed_frame_carries_its_own_pixels() {
-        // A frame is decided once, but every tile of it is still its own
-        // picture: reusing the decision must not reuse the bytes.
+        // Every tile of the frame is still its own picture. Reusing the
+        // decision must not reuse the bytes.
         let flat: Vec<u8> = [7u8, 8, 9].repeat(16);
         let other: Vec<u8> = [10u8, 11, 12].repeat(16);
 
@@ -804,9 +764,7 @@ mod tests {
             &object.encoded_name,
         );
 
-        // The name is the payload, so it has to come after the separator and
-        // nothing else - a terminal reading `q=2,name` as control data would
-        // never load the image.
+        // The name is the payload, so nothing else comes after the separator.
         let text = std::str::from_utf8(&out).expect("escapes are ascii");
         let (head, payload) = text
             .trim_start_matches("\x1b_G")
@@ -815,7 +773,7 @@ mod tests {
             .expect("the escape separates control data from its payload");
         assert!(head.contains("t=s"), "{head}");
         // A POSIX shared memory name begins with a slash, and a terminal that
-        // checks will refuse one that does not.
+        // checks refuses one without it.
         assert!(name.starts_with('/'), "{name}");
         // The name travels base64'd, like every other payload in this protocol.
         assert_eq!(
@@ -827,8 +785,7 @@ mod tests {
     #[test]
     fn content_that_does_not_shrink_is_sent_as_it_is() {
         // Nothing for zlib to find: compressing would spend milliseconds to
-        // save a fraction of what base64 then adds back, so the pixels go as
-        // they are and the decoder has only base64 to undo.
+        // save a fraction of what base64 adds back.
         let mut state = 0x1234_5678u32;
         let noise: Vec<u8> = (0..160 * 160 * crate::render::BYTES)
             .map(|_| {
@@ -910,9 +867,8 @@ mod tests {
             assert!(payload.len() <= CHUNK, "chunk longer than 4096 bytes");
             assert_eq!(payload.len() % 4, 0, "chunks must be whole base64 quanta");
             if control.contains("m=1") {
-                // Anything followed by more data has to fill a whole chunk, or
-                // the terminal would be handed a payload it
-                // cannot decode when it concatenates.
+                // A chunk with a successor must be full, or the
+                // concatenation cannot be decoded.
                 assert_eq!(
                     payload.len(),
                     CHUNK,
@@ -930,8 +886,6 @@ mod tests {
         assert_eq!(pointer_shape(CursorIcon::Default), "default");
         assert_eq!(pointer_shape(CursorIcon::Text), "text");
         assert_eq!(pointer_shape(CursorIcon::Pointer), "pointer");
-        // Icons the terminal set has no separate name for share the nearest
-        // one.
         assert_eq!(pointer_shape(CursorIcon::ColResize), "ew-resize");
         assert_eq!(pointer_shape(CursorIcon::RowResize), "ns-resize");
         assert_eq!(pointer_shape(CursorIcon::AllScroll), "move");

@@ -1,10 +1,10 @@
 //! Where meowland's own output goes.
 //!
-//! A server has no terminal of its own - the panes it is drawn on come and go,
-//! and each is a socket rather than a file descriptor it can print to - so its
-//! log is a file. The handle that comes back is also where the output of every
-//! client it starts goes: a client that prints why it failed would otherwise
-//! print into the screen it is being drawn on.
+//! A server has no terminal of its own. The panes it draws on come and go, and
+//! each is a socket rather than a file descriptor it can print to, so the log
+//! is a file. The handle that `init` returns is also where the output of every
+//! client goes. A client that prints why it failed would otherwise print into
+//! the screen it is drawn on.
 
 use std::{
     fs::{File, OpenOptions},
@@ -15,18 +15,15 @@ use std::{
 use anyhow::Context as _;
 use tracing_subscriber::EnvFilter;
 
-/// The clock a running count is reported on: how long ago one was last written
-/// to the log, and whether it is time to write another.
+/// A clock for a count that is reported once a second.
 ///
-/// The counts themselves are the callers' - what a frame cost, what the
-/// presenter spent - and they are all reported the same way, once a second,
-/// because that is a rate a person reading a log can divide in their head.
+/// The counts belong to the caller: what a frame cost, what the presenter
+/// spent. One second is a rate that a reader can divide in their head.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Report(Option<Instant>);
 
 impl Report {
-    /// How long the count since the last report covers, if a second of it has
-    /// gone by.
+    /// The seconds since the last report, if a whole second has gone by.
     pub fn due(&mut self) -> Option<f64> {
         let now = Instant::now();
         let since = *self.0.get_or_insert(now);
@@ -50,11 +47,11 @@ pub fn path(configured: Option<&Path>) -> PathBuf {
     )
 }
 
-/// Send logs to a file, and hand back the handle clients' own output goes to.
+/// Send logs to a file, and return the handle for the output of clients.
 ///
-/// The file is emptied at startup and reopened for appending, so that every
-/// writer - the server and every client it starts - writes at the end of it
-/// and none of them can overwrite another's.
+/// The file is emptied at startup and reopened for appending. Every writer, the
+/// server and every client it starts, then writes at the end of the file, and
+/// none can overwrite another.
 pub fn init(configured: Option<&Path>, level: Option<&str>) -> anyhow::Result<File> {
     let path = path(configured);
     File::create(&path).with_context(|| format!("could not log to {}", path.display()))?;

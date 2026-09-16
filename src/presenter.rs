@@ -1,23 +1,22 @@
 //! Handing frames to the attached terminal from a thread of its own.
 //!
-//! Composing a frame is cheap; compressing and sending it is not, and it is the
-//! terminal that sets the pace once it starts. Doing that on the thread that
-//! reads input means every keystroke waits behind whatever the last frame
-//! happened to cost - milliseconds, on every frame, for as long as there is
-//! something on screen that moves.
+//! Composing a frame is cheap. Compressing it and writing it is not, and the
+//! terminal sets the pace once it starts. On the thread that reads input, every
+//! keystroke would wait behind the last frame, for milliseconds on every frame,
+//! for as long as something on the screen moves.
 //!
-//! So the loop composes, works out which tiles changed, copies those, and hands
-//! them over. The worker compresses them, escapes them, and writes them to the
-//! terminal that is attached at the time. The loop never waits: if the worker
-//! is still busy, the frame is *dropped* rather than queued, because a frame
-//! that is already out of date is worth less than the newest one, and the tiles
-//! that were dropped stay due, so the next frame the worker gets carries
-//! everything the terminal has not seen yet.
+//! The loop composes a frame, works out which tiles changed, copies those tiles
+//! and hands them over. The worker compresses them, escapes them and writes
+//! them to the terminal that is attached at the time. The loop never waits. If
+//! the worker is still busy, the frame is dropped rather than queued. A frame
+//! that is already out of date is worth less than the newest one. The tiles
+//! that were dropped stay due, so the next frame that the worker gets carries
+//! everything that the terminal has not seen.
 //!
-//! A server has no terminal of its own, so this is where attachment is felt:
-//! the worker writes into a socket while a terminal is attached, and holds
-//! nothing at all in between. What the terminal does with the bytes - write
-//! them, and say when it has - is the terminal side's business (`display`).
+//! A server has no terminal of its own, so this is where attaching is felt. The
+//! worker writes into a socket while a terminal is attached, and holds nothing
+//! in between. What the terminal does with the bytes, which is to write them
+//! and to say when it has, belongs to the terminal side (`display`).
 
 use std::{
     os::unix::net::UnixStream,
@@ -36,15 +35,13 @@ use crate::{
 };
 
 /// One frame on its way to the terminal: the pixels of the tiles that changed,
-/// laid end to end, and where each of them goes.
+/// laid end to end, and the position of each tile.
 #[derive(Debug, Default)]
 pub struct Frame {
-    /// Tile pixels, in the order the tiles are listed.
     pub pixels: Vec<u8>,
     pub tiles: Vec<Placement>,
 }
 
-/// Why terminal presentation stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("could not start the presenter thread")]
@@ -55,53 +52,48 @@ pub enum Error {
     Panicked,
 }
 
-/// A frame, or an escape that has to keep its place among frames: wiping the
-/// screen after a resize, or naming the pointer shape.
+/// A frame, or an escape that must keep its place among frames, such as a
+/// screen wipe after a resize or the pointer shape.
 #[derive(Debug)]
 enum Message {
-    /// The terminal this server is drawn on, or nobody.
     Attach(Option<UnixStream>),
-    /// Whether that terminal reads tiles out of shared memory.
     Configure {
         shared_memory: bool,
     },
-    /// An escape that is not part of a frame, such as letting the terminal go.
     Tell(ToClient),
     Frame(Frame),
-    /// The terminal has written the frame it was sent, so the next one may go.
+    /// The terminal wrote the frame that it was sent, so the next frame may go.
     Drawn,
     Raw(Vec<u8>),
 }
 
-/// What the writer tells the main loop after processing a message.
+/// What the worker reports to the event loop.
 #[derive(Debug)]
 pub enum Event {
-    /// The one reusable frame is available for the next presentation.
+    /// The one reusable frame is free for the next presentation.
     Ready(Frame),
-    /// Terminal output can no longer continue.
     Failed(Error),
 }
 
 /// The thread that writes to whichever terminal is attached.
 #[derive(Debug)]
 pub struct Presenter {
-    /// Held rather than sent through: dropping it ends the worker.
+    /// Held, not sent through: dropping the sender ends the worker.
     messages: Option<MessageSender<Message>>,
-    /// Recycling both vectors keeps a steady stream from allocating either
-    /// pixels or placements per frame.
+    /// Recycling both vectors keeps a steady stream of frames from allocating
+    /// pixels or placements for each frame.
     free: Option<Frame>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Presenter {
-    /// Start the dormant worker, which writes nothing until a terminal is
-    /// attached to it.
+    /// Start the worker, which writes nothing until a terminal attaches.
     pub fn new(events: EventSender<Event>) -> Result<Self, Error> {
-        // One frame in flight at a time: a backlog of frames is a backlog of
-        // latency, and the newest frame supersedes the ones before it.
-        // Frames are bounded by the single recyclable frame below. The channel
-        // itself stays unbounded so control escapes are never discarded merely
-        // because the worker is writing a frame.
+        // One frame is in flight at a time: a backlog of frames is a backlog of
+        // latency, and the newest frame replaces the ones before it. The single
+        // recyclable frame below bounds the frames. The channel stays
+        // unbounded, so a control escape is not discarded because the worker is
+        // writing a frame.
         let (messages, queue) = channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
@@ -114,29 +106,24 @@ impl Presenter {
         })
     }
 
-    /// Draw on this socket from here on, in place of whatever was there.
     pub fn attach(&self, terminal: UnixStream, shared_memory: bool) {
         self.send(Message::Configure { shared_memory });
         self.send(Message::Attach(Some(terminal)));
     }
 
-    /// Draw on nothing: the terminal that was attached has gone, or another
-    /// one took it over.
     pub fn detach(&self, reason: ToClient) {
         self.send(Message::Tell(reason));
         self.send(Message::Attach(None));
     }
 
-    /// Put the terminal back the way it was found, in the order the frames
-    /// before it were written.
     pub fn clear(&self) {
         self.raw(tty::Terminal::clear());
     }
 
     /// A recycled frame to fill, if the worker has finished with it.
     ///
-    /// `None` means the worker is still busy and this frame is being dropped -
-    /// dropping is the point, so it is not an error.
+    /// `None` means that the worker is still busy and that this frame is
+    /// dropped. Dropping the frame is intended, so it is not an error.
     pub const fn frame(&mut self) -> Option<Frame> {
         self.free.take()
     }
@@ -145,7 +132,6 @@ impl Presenter {
         self.free.is_some()
     }
 
-    /// Make a completed or unsent frame available for reuse.
     pub fn recycle(&mut self, frame: Frame) {
         debug_assert!(self.free.is_none());
         self.free = Some(frame);
@@ -153,8 +139,8 @@ impl Presenter {
 
     /// Hand over a frame, or take it back if the worker has stopped.
     ///
-    /// The caller keeps the tiles it could not hand over: they are still due,
-    /// and the next frame carries them along with its own.
+    /// The caller keeps the tiles that it could not hand over. They are still
+    /// due, and the next frame carries them with its own.
     pub fn present(&self, frame: Frame) -> Result<(), Frame> {
         let Some(messages) = &self.messages else {
             return Err(frame);
@@ -163,17 +149,18 @@ impl Presenter {
             .send(Message::Frame(frame))
             .map_err(|error| match error.0 {
                 Message::Frame(frame) => frame,
-                // The message that could not be sent was the frame just handed
-                // over, and nothing else is a frame.
+                // The message that failed was the frame that was handed over,
+                // and nothing else is a frame.
                 _ => unreachable!("sent a frame"),
             })
     }
 
-    /// The terminal wrote the frame it was sent, so the next one may follow.
+    /// The terminal wrote the frame that it was sent, so the next frame may
+    /// follow.
     ///
-    /// A server keeps one frame on its way at a time: while this is being
-    /// written the loop drops the frames it would otherwise queue, and the
-    /// tiles they carried stay due for the one that goes after it.
+    /// The server keeps one frame on its way at a time. While this frame is
+    /// written, the loop drops the frames that it would otherwise queue. The
+    /// tiles that they carried stay due for the frame that goes after.
     pub fn drawn(&self) {
         self.send(Message::Drawn);
     }
@@ -183,17 +170,15 @@ impl Presenter {
         self.send(Message::Raw(bytes));
     }
 
-    /// Hand a message to the worker, if it is still there to take one.
     fn send(&self, message: Message) {
         if let Some(messages) = &self.messages {
             let _ = messages.send(message);
         }
     }
 
-    /// Write everything already handed over, and stop the worker.
-    ///
-    /// Called before the terminal is dropped, so that the escapes that undo
-    /// what the compositor did to it are the last thing written.
+    /// Write everything already handed over, then stop the worker. The server
+    /// calls this before it drops the terminal, so that the escapes that undo
+    /// what the compositor did to the terminal are written last.
     pub fn finish(&mut self) {
         self.messages = None;
         if let Some(handle) = self.handle.take()
@@ -210,7 +195,6 @@ impl Drop for Presenter {
     }
 }
 
-/// Keep failures and panics on the worker observable to the event loop.
 fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
     let result = catch_unwind(AssertUnwindSafe(|| run(queue, events)));
     let failure = match result {
@@ -221,7 +205,6 @@ fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
     let _ = events.send(Event::Failed(failure));
 }
 
-/// The worker: encode frames in the order they arrive and write them out.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
@@ -231,9 +214,10 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
     let mut out = Vec::new();
     let mut stats = Stats::default();
     let mut terminal: Option<UnixStream> = None;
-    // The frame the terminal has been sent and has not said it wrote. Nothing
-    // else can be sent until it does: what the loop would have to hand over
-    // meanwhile is a frame of a screen that no longer looks like that.
+    // The frame that the terminal was sent and has not said that it wrote.
+    // Nothing else can be sent until the terminal says so, because any frame
+    // that the loop handed over in the meantime would show a screen that no
+    // longer looks like that.
     let mut in_flight: Option<Frame> = None;
     while let Ok(message) = queue.recv() {
         let mut frame = match message {
@@ -281,11 +265,11 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
         let written = match write_frame(&mut terminal, &out) {
             Ok(()) => phase.elapsed(),
             Err(error) => {
-                // Writing to a socket means the terminal on the other end of it
-                // is gone - closed, killed, or its end of the pty is. That is
-                // not this thread's failure to die of: the loop hears the same
-                // thing from its reader and detaches, and the server carries
-                // on until another terminal attaches.
+                // A write to the socket fails when the terminal on the other
+                // end has gone, because it closed, or was killed, or its end of
+                // the pty closed. This thread does not stop for that. The loop
+                // hears the same thing from its reader and detaches, and the
+                // server runs until another terminal attaches.
                 tracing::debug!(%error, "the attached terminal is gone");
                 terminal = None;
                 Duration::ZERO
@@ -294,8 +278,8 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
         frame.pixels.clear();
         frame.tiles.clear();
         if terminal.is_none() {
-            // Nobody wrote it: the tiles are still due, so hand the frame back
-            // for the next one to carry.
+            // The frame was not written, and the tiles are still due, so hand
+            // the frame back for the next frame to carry.
             if events.send(Event::Ready(frame)).is_err() {
                 return Ok(());
             }
@@ -308,7 +292,6 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
     Ok(())
 }
 
-/// Hand a frame the terminal has finished with back to the loop.
 fn recycle(in_flight: &mut Option<Frame>, events: &EventSender<Event>) -> std::io::Result<()> {
     let Some(frame) = in_flight.take() else {
         return Ok(());
@@ -318,10 +301,6 @@ fn recycle(in_flight: &mut Option<Frame>, events: &EventSender<Event>) -> std::i
         .map_err(|_| std::io::Error::other("the event loop is gone"))
 }
 
-/// Write escapes to the attached terminal, if there is one.
-///
-/// With nobody attached there is nothing to write them to and nothing to write
-/// them for: a server that nobody is looking at does not draw.
 fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
@@ -329,11 +308,10 @@ fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<(
     display::write_to(terminal, display::encode_client(ToClient::Bytes(bytes)))
 }
 
-/// Hand one frame to the attached terminal, if there is one.
+/// A frame is written as a frame, not as an escape.
 ///
-/// A frame is written as a frame and not as an escape: it is the one message
-/// the terminal answers. It is written where it lies, because it is about to be
-/// handed to the next frame anyway.
+/// It is the one message that the terminal answers, and the bytes are written
+/// in place because the frame is recycled afterwards.
 fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
@@ -341,15 +319,16 @@ fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Resu
     display::write_frame(terminal, bytes)
 }
 
-/// Say something about the attachment itself, which is never a frame.
+/// Something about the attachment itself, which is never a frame.
 fn tell(terminal: &mut Option<UnixStream>, message: ToClient) {
     if let Some(terminal) = terminal {
         let _ = display::write_to(terminal, display::encode_client(message));
     }
 }
 
-/// What the worker did in the last second, logged so that a frame rate can be
-/// attributed: this thread's time is the terminal's and the compressor's.
+/// What the worker did in the last second, logged so that a frame rate is
+/// attributed. The time of this thread is spent in the terminal and in the
+/// compressor.
 #[derive(Debug, Default)]
 struct Stats {
     report: crate::logging::Report,
@@ -388,7 +367,6 @@ impl Stats {
     }
 }
 
-/// The pointer shape, as the terminal wants to hear about it.
 pub fn pointer_shape_bytes(shape: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
     kitty::set_pointer_shape(&mut out, shape);

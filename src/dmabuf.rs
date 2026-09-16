@@ -1,40 +1,40 @@
-//! Where clients are told to put the memory of a GPU buffer.
+//! The render nodes that clients are offered for their GPU buffers.
 //!
-//! A client that renders on the GPU does not hand over pixels, it hands over a
-//! file descriptor for memory its driver allocated. Which device that memory
-//! lives on is the compositor's to choose, so it has to name one - and it has
-//! to be a device the client can render on *and* the compositor can read, or
-//! the client is better off drawing into shared memory.
+//! A client that renders on the GPU does not hand over pixels. It hands over a
+//! file descriptor for memory that its driver allocated. The compositor chooses
+//! the device that the memory is on, so the compositor has to name one. That
+//! device has to be one that the client can render on and the compositor can
+//! read. Otherwise the client is better off drawing into shared memory.
 //!
 //! # What keeps the offer honest
 //!
-//! The offer is what a client chooses on: Mesa's Wayland WSI takes GPU buffers
-//! when a compositor advertises them and has no window at all when the buffers
-//! it produces are then refused. So an offer that cannot be honoured is worse
-//! than no offer, and three things keep this one inside what the compositor can
-//! actually read:
+//! The offer is what a client chooses on. Mesa's Wayland WSI takes GPU buffers
+//! when a compositor advertises them. It has no window when the buffers that it
+//! produces are then refused. An offer that cannot be honoured is therefore
+//! worse than no offer. Three things keep this offer inside what the compositor
+//! can read:
 //!
-//! - No renderer, no offer. The device is only named when there is a renderer
-//!   on it to bring buffers back through ([`crate::gpu`]), and a machine with
-//!   no render node at all simply never advertises the global.
+//! - No renderer, no offer. The device is named only when a renderer on it can
+//!   bring buffers back. See [`crate::gpu`]. A machine with no render node
+//!   never advertises the global.
 //! - What is advertised is what that renderer takes, not what the protocol
 //!   allows.
-//! - Every buffer is read once before the client is told it is good, so a
-//!   layout that imports but cannot be copied out of is refused while the
-//!   client can still fall back to shared memory.
+//! - Every buffer is read once before the compositor reports it to the client
+//!   as good. A layout that imports but cannot be copied out of is therefore
+//!   refused while the client can still fall back to shared memory.
 //!
-//! A driver keeping a buffer where the CPU cannot reach it is expected, not
-//! exceptional: `mmap` of such a buffer fails with `EPERM` whether or not CPU
+//! A driver that keeps a buffer where the CPU cannot reach it is expected, not
+//! exceptional. `mmap` of such a buffer fails with `EPERM`, whether or not CPU
 //! access was begun first, and reading the descriptor fails with `EINVAL`. That
-//! is the reason the renderer exists.
+//! is why the renderer exists.
 //!
-//! [`Offer::Off`] is the way out if a client turns out to be worse off with the
-//! offer than without it.
+//! [`Offer::Off`] is the way out, if a client turns out to be worse off with
+//! the offer than without it.
 //!
 //! # Choosing a device
 //!
-//! On a machine with more than one GPU every render node is offered and the
-//! client picks the one it renders on. The order is a hint, not a rule.
+//! On a machine with more than one GPU, every render node is offered and the
+//! client picks the one that it renders on. The order is a hint, not a rule.
 
 use std::{
     fs,
@@ -45,10 +45,9 @@ use rustix::fs::{FileType, Mode, OFlags};
 
 /// How clients are offered GPU buffers.
 ///
-/// Read from a command line flag that falls back to an environment variable
-/// (see `Settings` in `cli.rs`); what this module knows is the values, not
-/// where
-/// they came from.
+/// The value comes from a command line flag that falls back to an environment
+/// variable. See `Settings` in `cli.rs`. This module holds the values, not
+/// their source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage::ValueEnum)]
 pub enum Offer {
     /// Offer clients the render nodes this machine has.
@@ -57,22 +56,18 @@ pub enum Offer {
     Off,
 }
 
-/// Where render nodes live.
 const DEVICE_DIRECTORY: &str = "/dev/dri";
 
-/// A device clients can render on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderNode {
-    /// The device file, as `/dev/dri/renderD128`.
     pub path: PathBuf,
-    /// The device number, which is what clients match against their own
-    /// devices rather than the path.
+    /// The device number. Clients match this against their own devices, not
+    /// against the path.
     pub device: u64,
 }
 
 impl RenderNode {
-    /// Take a render node, so that naming one is known to work before any
-    /// client relies on it.
+    /// Open a render node, so that a named node is known to work before use.
     fn open(path: PathBuf) -> std::io::Result<Self> {
         let file = rustix::fs::open(&path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())?;
         let stat = rustix::fs::fstat(&file)?;
@@ -89,10 +84,8 @@ impl RenderNode {
     }
 }
 
-/// Why clients cannot be told where to put a GPU buffer.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A render node was named that cannot be opened as one.
     #[error("the render node {path} cannot be used")]
     Unusable {
         path: PathBuf,
@@ -110,18 +103,17 @@ impl Offer {
         }
     }
 
-    /// The render nodes clients may be told to allocate on, most preferred
-    /// first.
+    /// The render nodes that clients may be offered, most preferred first.
     ///
-    /// `pinned` names one node to use instead of looking for any, which is what
-    /// a machine with more than one GPU needs: the order the kernel numbers
-    /// render nodes in is not a statement about which of them is worth
+    /// `pinned` names one node to use instead of looking for any. A machine
+    /// with more than one GPU needs this. The order in which the kernel
+    /// numbers render nodes says nothing about which of them is worth
     /// rendering on.
     ///
-    /// A machine without a render node - no GPU, a container without the
-    /// device, a session over the network - simply has none, which is not an
-    /// error: clients then draw into shared memory, which is what they do by
-    /// default anyway.
+    /// A machine with no render node has none. That covers a machine without a
+    /// GPU, a container without the device, and a session over the network. It
+    /// is not an error: clients then draw into shared memory, which is what
+    /// they do by default.
     pub fn nodes(self, pinned: Option<&Path>) -> Result<Vec<RenderNode>, Error> {
         match (self, pinned) {
             (Self::Off, _) => Ok(Vec::new()),
@@ -138,10 +130,10 @@ impl Offer {
     }
 }
 
-/// Every render node on the machine, in the order the kernel numbers them.
+/// Every render node on the machine, in the order that the kernel numbers them.
 ///
-/// `renderD*` is the node that renders without owning a screen, which is the
-/// only kind that can be offered to a client here.
+/// A `renderD*` node renders without owning a screen. That is the only kind of
+/// node that can be offered to a client here.
 fn find() -> Vec<RenderNode> {
     let Ok(entries) = fs::read_dir(DEVICE_DIRECTORY) else {
         return Vec::new();
@@ -166,7 +158,6 @@ fn find() -> Vec<RenderNode> {
     found.into_iter().map(|(_, node)| node).collect()
 }
 
-/// The number in `renderD<number>`, for a file named like one.
 fn number_of(path: &std::path::Path) -> Option<u32> {
     path.file_name()?
         .to_str()?

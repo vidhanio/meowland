@@ -18,8 +18,7 @@ jobs:
       - name: checkout
         uses: actions/checkout@v6
 
-      # xkbcommon-sys links the system libxkbcommon, which is what the
-      # compositor builds its keymap with.
+      # xkbcommon-sys links the system libxkbcommon, which builds the keymap.
       - name: install libraries
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
 
@@ -44,8 +43,8 @@ jobs:
       - name: install libraries
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
 
-      # Nightly clippy: rustfmt's unstable options and the pedantic/nursery
-      # lints in Cargo.toml are what the flake's checks run too.
+      # Nightly clippy, because rustfmt's unstable options and the pedantic and
+      # nursery lints in Cargo.toml are what the flake checks as well.
       - name: install rust
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -70,7 +69,7 @@ jobs:
         uses: ./.github/actions/setup-nix
 
       # The flake's checks are the authoritative gates: cargo test, cargo
-      # clippy -D warnings, rustfmt and treefmt (nixfmt, statix, deadnix,
+      # clippy -D warnings, rustfmt and treefmt (nixfmt, statix, deadnix and
       # taplo) all run through crane and treefmt-nix.
       - name: check flake
         run: nix flake check

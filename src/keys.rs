@@ -1,24 +1,23 @@
 //! Translation from terminal key events to Linux key codes.
 //!
-//! Wayland clients do all key interpretation themselves: they get an xkb keymap
-//! plus key *codes* and modifier state. The terminal, on the other hand, hands
-//! us characters and modifier flags, already interpreted with the *host*
-//! keyboard layout. So the compositor has to run that translation backwards.
+//! A Wayland client interprets keys itself: it gets an xkb keymap, key codes
+//! and modifier state. The terminal sends characters and modifier flags, which
+//! it already interpreted with the host keyboard layout. The compositor
+//! therefore translates in the opposite direction.
 //!
-//! We do it by pinning the other half of the contract: clients are advertised a
-//! plain `us` layout keymap (see [`crate::compositor::Meowland::new`]), and
-//! characters are mapped back to the key code and shift state that produce them
-//! *in that keymap*. Typing is then layout independent: the terminal decodes
-//! the user's physical layout, and we re-encode the resulting character in the
-//! keymap we promised the client.
+//! The other half of that contract is fixed: clients are advertised a plain
+//! `us` keymap (see [`crate::compositor::Meowland::new`]), and each character
+//! is mapped back to the key code and shift state that produce it in that
+//! keymap. Typing is then independent of the layout, because the terminal
+//! decodes the physical layout and the compositor re-encodes the character in
+//! the keymap it promised.
 //!
-//! Consequence: only characters reachable on a `us` layout can be typed.
-//! Everything else (accented letters, emoji, CJK) would need an input method,
-//! which the compositor does not implement.
+//! Only characters that a `us` layout can reach are typeable. Accented letters,
+//! emoji and CJK need an input method, which the compositor does not implement.
 
 use crossterm::event::{KeyCode, ModifierKeyCode};
 
-/// A key code with the shift state needed to produce the intended symbol.
+/// A key code, with the shift state that the intended symbol needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyStroke {
     /// Linux input event code (`KEY_*`).
@@ -27,12 +26,12 @@ pub struct KeyStroke {
     pub shift: bool,
 }
 
-/// Offset between Linux input event codes and the key codes XKB (and therefore
-/// the Wayland keyboard protocol) works with.
+/// Offset between Linux input event codes and the key codes that XKB, and so
+/// the Wayland keyboard protocol, uses.
 ///
-/// Terminals and `KEY_*` constants are evdev; a keymap compiled from the
-/// `evdev` rules addresses keys as `evdev + 8`, and that is what has to reach
-/// the seat. Getting this wrong does not fail loudly: it types the character
+/// Terminals and the `KEY_*` constants use evdev. A keymap compiled from the
+/// `evdev` rules addresses keys as `evdev + 8`, and that is the number the seat
+/// must be given. A wrong offset does not fail loudly: it types the character
 /// eight keys away from the one that was pressed.
 pub const XKB_OFFSET: u32 = 8;
 
@@ -40,7 +39,7 @@ const fn stroke(code: u32, shift: bool) -> KeyStroke {
     KeyStroke { code, shift }
 }
 
-/// Mouse button codes, spelled the way the Wayland pointer protocol wants them.
+/// Mouse button codes, as the Wayland pointer protocol names them.
 pub mod button {
     /// `BTN_LEFT`.
     pub const LEFT: u32 = 0x110;
@@ -50,8 +49,8 @@ pub mod button {
     pub const MIDDLE: u32 = 0x112;
 }
 
-/// Key codes for the modifier keys, so clients see real modifier presses rather
-/// than only the resulting modifier state.
+/// Key codes for the modifier keys, so that a client sees real presses and not
+/// only modifier state.
 pub mod modifier {
     /// `KEY_LEFTSHIFT`.
     pub const LEFT_SHIFT: u32 = 42;
@@ -71,8 +70,7 @@ pub mod modifier {
     pub const RIGHT_META: u32 = 126;
 }
 
-/// Map a character produced by the terminal to the `us` keymap stroke that
-/// types it.
+/// Map a character from the terminal to the `us` stroke that types it.
 pub fn for_char(c: char) -> Option<KeyStroke> {
     if let 'a'..='z' | 'A'..='Z' = c {
         let lowercase = c.to_ascii_lowercase();
@@ -83,7 +81,7 @@ pub fn for_char(c: char) -> Option<KeyStroke> {
     Some(match c {
         '1'..='9' => stroke(2 + (c as u32 - '1' as u32), false),
         '0' => stroke(11, false),
-        // The shifted digit row, in the order the US layout puts the symbols on it.
+        // The shifted digit row, in the order the layout puts it.
         '!' => stroke(2, true),
         '@' => stroke(3, true),
         '#' => stroke(4, true),
@@ -123,40 +121,15 @@ pub fn for_char(c: char) -> Option<KeyStroke> {
     })
 }
 
-/// The key codes of `F1` to `F12`. The last two are a gap away from the rest,
-/// hence a table.
+/// The key codes of `F1` to `F12`. The last two sit apart from the rest, so a
+/// table is shorter than arithmetic.
 const FUNCTION: [u32; 12] = [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88];
 
-/// The key codes of `a` to `z` on a `us` keyboard. Not a formula: the letters
-/// are laid out in three rows, so the code for a letter is wherever the
-/// physical key happens to be.
+/// The key code of each letter, in alphabet order, on a `us` keyboard. There is
+/// no formula, because the letters lie in three rows.
 const LETTERS: [u32; 26] = [
-    30, // a
-    48, // b
-    46, // c
-    32, // d
-    18, // e
-    33, // f
-    34, // g
-    35, // h
-    23, // i
-    36, // j
-    37, // k
-    38, // l
-    50, // m
-    49, // n
-    24, // o
-    25, // p
-    16, // q
-    19, // r
-    31, // s
-    20, // t
-    22, // u
-    47, // v
-    17, // w
-    45, // x
-    21, // y
-    44, // z
+    30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45,
+    21, 44,
 ];
 
 /// Map the non-character keys the terminal reports.
@@ -190,7 +163,7 @@ pub fn for_key(code: KeyCode) -> Option<KeyStroke> {
     })
 }
 
-/// Map the modifier keys the terminal reports as their own events.
+/// The key code of a modifier that the terminal reports as its own event.
 pub const fn for_modifier(modifier: ModifierKeyCode) -> Option<u32> {
     Some(match modifier {
         ModifierKeyCode::LeftShift => modifier::LEFT_SHIFT,
@@ -211,9 +184,9 @@ mod tests {
 
     #[test]
     fn shifted_symbols_sit_next_to_their_unshifted_neighbours() {
-        // Every pair the US layout shares a key between must agree on the key
-        // code, and only the shifted one may require shift: that is
-        // what makes typing on the terminal layout independent.
+        // A pair that shares a key on the `us` layout must use one key code,
+        // and only the shifted symbol may need shift. That keeps typing
+        // independent of the terminal's layout.
         for (plain, shifted) in [
             ('1', '!'),
             ('2', '@'),
@@ -274,7 +247,7 @@ mod tests {
 
     #[test]
     fn untypeable_characters_are_reported_as_such() {
-        // Nothing in the advertised `us` keymap produces these.
+        // No key in the advertised `us` keymap produces these.
         for c in ['é', '日', '😼', '\u{7f}'] {
             assert_eq!(for_char(c), None);
         }

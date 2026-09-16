@@ -1,38 +1,36 @@
-//! meowland: a Wayland compositor that runs inside your terminal.
+//! meowland: a Wayland compositor that runs inside a terminal.
 //!
-//! Clients connect to a Wayland socket like they always do. Their windows are
-//! rendered into a frame buffer the compositor owns, that frame buffer is
-//! diffed against the previous frame, and the differences are sent to the
-//! terminal as [kitty graphics protocol][spec] images, tiled into the cell
-//! grid. Keyboard and mouse input goes the other way.
+//! Clients connect to a Wayland socket as usual. The compositor draws their
+//! windows into a frame buffer it owns, diffs that buffer against the previous
+//! frame, and sends the differences to the terminal as
+//! [kitty graphics protocol][spec] images in the cell grid. Keyboard and mouse
+//! input goes the other way.
 //!
 //! # A server and its panes
 //!
-//! A *server* owns the compositor, the windows and the clients it started, and
+//! A *server* owns the compositor, the windows and the clients it started. It
 //! has no terminal of its own: it is reached over two sockets in
 //! `$XDG_RUNTIME_DIR`, and it outlives every terminal that shows it. A *pane*
-//! is one attached terminal, and it asks to be shown **one window**: the server
-//! draws that window into that terminal's own geometry and sends it there.
-//! Panes are independent - two of them can be showing the same window, or one
-//! each - so nobody is displaced by anybody, and a pane leaving, or being
-//! closed, is nothing to the others (`src/display.rs`, `src/client.rs`,
-//! `src/server.rs`, and the per-pane state in `src/compositor.rs`).
+//! is one attached terminal. Each pane asks for one window, and the server
+//! draws that window into that terminal's geometry and sends it there. Panes
+//! are independent: two panes can show the same window, or one each, and no
+//! pane displaces another (`src/display.rs`, `src/client.rs`, `src/server.rs`,
+//! and the per-pane state in `src/compositor.rs`).
 //!
-//! What that leaves the command line is four ways to reach a server: `run`
-//! starts one if there is none, hands it a client command and shows that
-//! client's window here - the one it opens, which is what `run` waits for
-//! before taking the terminal over - `attach` shows one window of it here,
-//! `list` prints the windows it has, and `quit` stops it. A server started for
-//! a command stops with it, so `meowland run foot` gives the terminal back when
-//! foot exits; one that was already running was started by something still
-//! using it and stays. `attach` completes the window IDs of the server that is
-//! running (`src/cli.rs`, `src/control.rs`).
+//! The command line has four ways to reach a server. `run` starts one if there
+//! is none, hands it a client command, and shows the window that client opens.
+//! `attach` shows one window of a running server here. `list` prints the
+//! windows. `quit` stops the server. A server that was started for a command
+//! stops with it, so `meowland run foot` gives the terminal back when foot
+//! exits. A server that was already running was started by something that still
+//! uses it, and it stays. `attach` completes the window IDs of the running
+//! server (`src/cli.rs`, `src/control.rs`).
 //!
-//! Every window has an ID the server gave it, and a pane shows one of them
-//! until it goes: `Alt+Q` asks the window it is showing to close, and a client
-//! that takes that request ends its pane with it, which is how the terminal
-//! comes back. With nothing shown, `Alt+Q` lets go of the terminal rather than
-//! closing anything. The server and its other windows stay either way.
+//! Each window has an ID that the server gave it, and a pane shows one of them
+//! until it goes away. `Alt+Q` asks the window that the pane shows to close,
+//! and a client that takes that request ends its pane with it, which gives the
+//! terminal back. With nothing shown, `Alt+Q` releases the terminal. The server
+//! and its other windows stay in both cases.
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
@@ -68,18 +66,16 @@ use crate::cli::{Action, Cli};
 
 /// How long a `run` waits for the server it started to come up.
 ///
-/// Long enough for a compositor to build a renderer and bind its sockets, and
-/// short enough that a server that cannot start is reported instead of waited
-/// for.
+/// Long enough to build a renderer and bind the sockets, and short enough to
+/// report a server that cannot start.
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Do what the command line says.
 pub fn start() -> anyhow::Result<()> {
     match Cli::parse().action {
         Action::Run(run) => run_client(run),
-        // An ID is that window; without one, whatever the server has the
-        // keyboard on, so that this terminal starts out looking at what is
-        // being looked at.
+        // An ID selects that window. Without one, the window with the keyboard
+        // is used, so this terminal starts on what is being looked at.
         Action::Attach(attach) => client::attach(
             attach
                 .window
@@ -95,45 +91,37 @@ pub fn start() -> anyhow::Result<()> {
     }
 }
 
-/// `meowland run`: run a client in the server, starting and showing one if
-/// there is none.
+/// `meowland run`: run a client in the server, starting one if there is none,
+/// and show its window here.
 ///
-/// The command is the server's rather than this process's: a server owns the
-/// clients started in it, which is what leaves `attach` something to attach to
-/// and what lets a window outlive the terminal it was opened from. This
-/// terminal is shown the server too, unless another one already is, in which
-/// case the window appears there and this one says so.
+/// The command belongs to the server, not to this process, so a window can
+/// outlive the terminal it was opened from. This terminal shows the server too,
+/// unless another terminal already does.
 fn run_client(run: cli::Run) -> anyhow::Result<()> {
     let cli::Run { settings, command } = run;
-    // What the command starts is a window that was not there before it, which
-    // is how this knows which one to show: an app that opens its window after a
-    // splash screen, or one that opens a second window later, is still shown by
-    // the window it announced itself with.
+    // Show the window that the command opens. Wait for a window that did not
+    // exist before the command, so that a splash screen or a second window does
+    // not displace the application's own window.
     let before = newest_window().unwrap_or(None);
     give_command(&settings, &command)?;
-    // A server started for a command stops with it, and a command that exits at
-    // once takes the server with it before this terminal has finished looking
-    // at the terminal it was typed in. There is then nothing to show.
+    // A command that exits at once takes its server with it, before this
+    // terminal has finished examining the terminal it was typed in.
     if !server_running() {
         return Ok(());
     }
-    // Showing a client takes a terminal to draw on; running it does not. A
-    // `run` from a script, or with its output redirected, gives the server its
-    // command and leaves it to it.
+    // Running a command needs no terminal. A `run` from a script, or with its
+    // output redirected, gives the server its command and exits.
     if !tty::is_terminal() {
         return Ok(());
     }
     if command.is_empty() {
         return client::attach(display::Show::Newest);
     }
-    // The client's window is the one it opens, and this waits for it rather
-    // than taking the terminal over for a screen that has nothing on it yet.
     let show = match appeared(before, WINDOW_WAIT) {
         Window::Appeared(id) => display::Show::Window(id),
-        // Nothing of its own: the server is shown as it is, and follows
-        // whatever the command opens later.
+        // Nothing of its own, so follow whatever it opens later.
         Window::None => display::Show::Newest,
-        // The command is over and so is the server it ran in.
+        // The command is over, and its server with it.
         Window::ServerGone => return Ok(()),
     };
     client::attach(show)
@@ -146,23 +134,23 @@ enum Window {
     ServerGone,
 }
 
-/// How long a command is given to open a window before this stops waiting.
+/// How long a command is given to open a window.
 ///
-/// Long enough for an app that has to start up first, and short enough that a
-/// command which opens nothing does not leave the terminal sitting there.
+/// Long enough for an application to start up, and short enough that a command
+/// which opens nothing does not hold the terminal.
 const WINDOW_WAIT: Duration = Duration::from_secs(10);
 
 /// How often a command's window is looked for.
 const WINDOW_POLL: Duration = Duration::from_millis(50);
 
-/// The newest window the server has, or `None` when it has none yet.
+/// The newest window the server has, or `None` if it has none yet.
 ///
-/// A server that is not there is an error rather than an empty answer: "no
-/// windows" and "no server" are different things to be waiting on.
+/// A missing server is an error, because "no windows" and "no server" are
+/// different answers to wait on.
 fn newest_window() -> Result<Option<u64>, control::Error> {
     match control::request(&control::Command::List)? {
         control::Reply::Windows(windows) => Ok(windows.into_iter().map(|window| window.id).max()),
-        // The one command that is answered with windows is this one.
+        // `list` is the one command answered with windows.
         control::Reply::Ok | control::Reply::Failed(_) => Ok(None),
     }
 }
@@ -172,16 +160,14 @@ fn appeared(before: Option<u64>, within: Duration) -> Window {
     let deadline = Instant::now() + within;
     loop {
         match newest_window() {
-            // A server that is not there is a command that has finished, and
-            // nothing of its own appeared - which is a command that ran and
-            // left nothing to show rather than a failure.
+            // The server has finished its command and left nothing to show.
             Err(error) => {
                 tracing::debug!(%error, "could not ask the server for its windows");
                 return Window::ServerGone;
             }
             Ok(Some(newest)) if Some(newest) != before => return Window::Appeared(newest),
-            // Nothing yet: a server that is up with no windows is one a client
-            // is still starting in.
+            // A server that is up with no windows is one that a client is still
+            // starting in.
             Ok(None | Some(_)) => {}
         }
         if Instant::now() >= deadline {
@@ -191,14 +177,14 @@ fn appeared(before: Option<u64>, within: Duration) -> Window {
     }
 }
 
-/// Make sure a server is running the command, starting one for it if need be.
+/// Make sure a server runs the command, and start one for it if necessary.
 ///
-/// A server that is already there was started by something that is still using
-/// it, so it is told the command and outlives it. One started here exists for
+/// A server that is already there was started by something that still uses it,
+/// so it is told the command and outlives it. A server started here belongs to
 /// the command and stops when the clients it started are gone.
 fn give_command(settings: &cli::Settings, command: &[OsString]) -> anyhow::Result<()> {
     if command.is_empty() {
-        // Nothing to hand over: this is only a server to show.
+        // Nothing to hand over. This is only a server to show.
         return if server_running() {
             Ok(())
         } else {
@@ -208,31 +194,28 @@ fn give_command(settings: &cli::Settings, command: &[OsString]) -> anyhow::Resul
     if server_running() {
         match control::request(&control::Command::Run(command.to_vec())) {
             Ok(reply) => return accepted(reply),
-            // The server went away between the look and the command. A command
-            // with nowhere to run gets a server of its own, and one that will
-            // not start is reported by that server.
+            // The server went away between the check and the command. That
+            // command gets a server of its own, which reports a command that
+            // will not start.
             Err(error) => tracing::debug!(%error, "no server to hand the command to"),
         }
     }
     start_server(settings, command)
 }
 
-/// Whether a server is there to be talked to.
+/// Whether a server is there to talk to.
 ///
-/// A look cannot fail: every reason a connection did not happen is a reason
-/// there is nothing to talk to, and a command that is actually sent reports
-/// what went wrong when it is.
+/// A failed connection is not an error here. Nothing to talk to is a normal
+/// answer, and a command that is sent reports its own failure.
 fn server_running() -> bool {
     control::connect(control::CONTROL_SOCKET).is_ok()
 }
 
 /// Start a server of its own, with nothing of this terminal in it.
 ///
-/// A server is a process of its own on purpose: it outlives the terminal it is
-/// shown on, and it is what every later `attach`, `list` and `quit` reaches.
-/// The command, if there is one, is the server's to run: it stops when the
-/// clients it started are gone, which is how the terminal comes back when the
-/// command it was started for exits.
+/// The server outlives the terminal that shows it, and it is what every later
+/// `attach`, `list` and `quit` reaches. The command, if there is one, belongs
+/// to the server, which stops when the clients it started are gone.
 fn start_server(settings: &cli::Settings, command: &[OsString]) -> anyhow::Result<()> {
     let program = std::env::current_exe().context("could not find the meowland binary")?;
     let mut child = Command::new(program)
@@ -241,29 +224,24 @@ fn start_server(settings: &cli::Settings, command: &[OsString]) -> anyhow::Resul
         .args(command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // Not this terminal's child: closing the terminal must not take the
-        // server, or the clients running in it, down with the terminal. It gets
-        // a process group of its own for the same reason, since a terminal that
-        // is closed signals the group in front of it.
+        // A process group of its own, so that closing the terminal does not
+        // signal the server or the clients in it.
         .process_group(0)
-        // Read while it comes up, so that a server that cannot start - a
-        // command that is not there, a machine with no renderer - says why
-        // here, rather than in a log nobody opens. Everything it says
-        // afterwards goes to that log: a terminal being drawn on is no place
-        // for it.
+        // Read stderr while the server starts, so that a server which cannot
+        // start reports it here instead of in a log. Everything it says later
+        // goes to that log, because the terminal it draws on is no place for
+        // it.
         .stderr(Stdio::piped())
         .spawn()
         .context("could not start a server")?;
 
-    // Wait for it rather than guess: a `run` that overtook its own server
-    // would start a second one. A server that is still there and not listening
-    // is one that is still building a renderer and binding its sockets.
+    // Wait for the server instead of guessing, because a `run` that overtook
+    // its own server would start a second one.
     let deadline = Instant::now() + SERVER_START_TIMEOUT;
     let started = loop {
         if let Some(status) = child.try_wait().context("could not wait for the server")? {
-            // A server that stopped cleanly is one whose command is already
-            // over: it was started for that command, and it stops with it. The
-            // caller treats that as nothing to show rather than a failure.
+            // A clean stop means the command is already over, so there is
+            // nothing to show and this is not a failure.
             break if status.success() {
                 Ok(())
             } else {
@@ -300,21 +278,21 @@ fn accepted(reply: control::Reply) -> anyhow::Result<()> {
     match reply {
         control::Reply::Ok => Ok(()),
         control::Reply::Failed(reason) => anyhow::bail!(reason),
-        // Only `list` is answered with windows, and this is not `list`.
+        // `list` is the only command answered with windows, and this is not
+        // `list`.
         control::Reply::Windows(_) => anyhow::bail!("the server answered with a window list"),
     }
 }
 
-/// `meowland list`: the open windows, which are what `attach` takes.
+/// `meowland list`: print the open windows.
 fn list_windows() -> anyhow::Result<()> {
     let control::Reply::Windows(windows) = control::request(&control::Command::List)? else {
         anyhow::bail!("the server did not answer with a window list");
     };
     for window in windows {
         let mut fields = vec![window.id.to_string()];
-        // The label names the app, the title says what it is doing: one is what
-        // a shell would have started it by, the other is what the window itself
-        // says, and they are worth telling apart when both are there.
+        // The label is what a shell started the app by, the title is what the
+        // client says. Both are printed when both are there.
         if !window.label.is_empty() {
             fields.push(window.label);
         }

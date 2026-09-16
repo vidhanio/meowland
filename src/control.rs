@@ -1,15 +1,14 @@
 //! The sockets a server is reached on.
 //!
-//! A server has no terminal of its own, so everything said to it and shown by
-//! it goes through `$XDG_RUNTIME_DIR`: a CLI connects to the control socket,
-//! sends one command, reads one reply and exits, and a terminal connects to the
-//! display socket to be shown the server (`src/display.rs`). Both are bound by
-//! the server, and both are named here because this is the only place that
-//! knows where they live and what a socket file with nothing behind it means.
+//! A server has no terminal of its own. A CLI and a terminal reach it through
+//! `$XDG_RUNTIME_DIR`, and the server binds both sockets there. The CLI
+//! connects to the control socket, sends one command, reads one reply and
+//! exits. A terminal connects to the display socket to be shown the server
+//! (`src/display.rs`).
 //!
-//! `$XDG_RUNTIME_DIR` is per-user and reachable only by its owner, which is the
-//! whole of the access control - and it has to be, because one of these
-//! commands starts a process.
+//! `$XDG_RUNTIME_DIR` is per-user, and only its owner can reach it. That is
+//! the whole of the access control, and it must be, because the `run` command
+//! starts a process.
 
 use std::{
     env,
@@ -23,17 +22,13 @@ use std::{
     path::PathBuf,
 };
 
-/// The socket a server listens on and a CLI connects to.
 pub const CONTROL_SOCKET: &str = "meowland-control";
-
-/// The socket a terminal connects to to be shown the server.
 pub const DISPLAY_SOCKET: &str = "meowland-display";
 
 /// What separates the arguments of a `run` request.
 ///
-/// An argument may hold any byte but this one, so an argv crosses the socket
-/// unchanged. Quoting would have to be written twice, once to write it and once
-/// to read it, and would be wrong about something either way.
+/// An argument holds any byte but this one, so an argv crosses the socket
+/// unchanged and needs no quoting.
 const ARGUMENT_SEPARATOR: u8 = 0;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,22 +43,22 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
-/// The server's end of the socket: the file is removed when this is dropped.
+/// The server's end of a socket. Dropping this removes the socket file.
 #[derive(Debug)]
 pub struct Socket {
     path: PathBuf,
 }
 
 impl Socket {
-    /// Take one of the server's socket names, or report that a server
-    /// already holds it.
+    /// Take one of the server's socket names, or report that a server already
+    /// holds it.
     pub fn bind(name: &str) -> Result<(Self, UnixListener), Error> {
         let path = path(name)?;
         match UnixStream::connect(&path) {
-            // Something answered: a server is running, and it is not this one.
+            // Something answered, so another server holds the name.
             Ok(_) => return Err(Error::AlreadyRunning),
-            // A socket file with nothing behind it is what a killed server
-            // leaves, and taking the name over is what makes it recoverable.
+            // A killed server leaves a socket file with nothing behind it.
+            // Removing the file frees the name.
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                 fs::remove_file(&path)?;
             }
@@ -85,7 +80,6 @@ impl Drop for Socket {
 /// One command a CLI sends a running server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Every window the server has.
     List,
     /// Start a client as another window of the server.
     Run(Vec<OsString>),
@@ -94,7 +88,6 @@ pub enum Command {
 }
 
 impl Command {
-    /// The request to send for this command.
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::List => b"list".to_vec(),
@@ -110,7 +103,7 @@ impl Command {
         }
     }
 
-    /// Read a request, or `None` if it names no command this server has.
+    /// Read a request, or `None` if this server has no such command.
     pub fn decode(request: &[u8]) -> Option<Self> {
         if request == b"list" {
             return Some(Self::List);
@@ -132,11 +125,12 @@ impl Command {
 /// One window of a `list` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
-    /// The ID the server gave this window, which is what `attach` takes.
+    /// The ID the server gave this window, which `attach` takes.
     pub id: u64,
-    /// What the client calls itself: its app ID, or its title without one.
+    /// The name the client uses for itself. This is its app ID, or its title
+    /// when it has no app ID.
     pub label: String,
-    /// What the client calls the window, when it says.
+    /// The name the client gives the window, when it gives one.
     pub title: String,
     /// Whether this is the window with the keyboard.
     pub active: bool,
@@ -145,8 +139,8 @@ pub struct Window {
 impl Window {
     /// One line of a `list`.
     ///
-    /// Tabs and newlines in a name become spaces: the line break is what
-    /// separates windows, and only the client decides what a name says.
+    /// Tabs and newlines in a name become spaces. A line break separates
+    /// windows, and only the client decides what a name says.
     fn line(&self) -> String {
         let name = |name: &str| name.replace(['\t', '\n'], " ");
         format!(
@@ -172,20 +166,18 @@ impl Window {
 /// What a server answers a command with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    /// A `list`: every window, in the order they were mapped.
+    /// A `list`, with every window in the order the server mapped them.
     Windows(Vec<Window>),
-    /// A command that was carried out.
     Ok,
     /// A command that was refused, and why.
     Failed(String),
 }
 
 impl Reply {
-    /// The reply to send.
+    /// A window list carries its own length.
     ///
-    /// A window list says how long it is: a list of nothing and a server that
-    /// answered nothing are otherwise the same bytes, and they are not the same
-    /// answer.
+    /// An empty list and a server that answered nothing are otherwise the same
+    /// bytes, and they are not the same answer.
     pub fn encode(&self) -> String {
         match self {
             Self::Windows(windows) => {
@@ -200,7 +192,6 @@ impl Reply {
         }
     }
 
-    /// Read a reply.
     pub fn decode(response: &str) -> Self {
         if response == "ok\n" {
             return Self::Ok;
@@ -209,8 +200,8 @@ impl Reply {
             return Self::Failed(reason.trim().to_owned());
         }
         let Some(header) = response.lines().next() else {
-            // The server was there to accept the command and gone before it
-            // answered, which is a refusal from where the CLI stands.
+            // The server accepted the command, then exited before it answered.
+            // The CLI reports this as a refusal.
             return Self::Failed("the server stopped before it answered".to_owned());
         };
         let Some(count) = header
@@ -236,22 +227,21 @@ impl Reply {
 pub fn request(command: &Command) -> Result<Reply, Error> {
     let mut stream = connect(CONTROL_SOCKET)?;
     stream.write_all(&command.encode())?;
-    // The server reads the request to the end, so closing this side of the
-    // socket is what says the request is complete.
+    // The server reads the request to the end of the stream. Closing the write
+    // end marks the request complete.
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
     Ok(Reply::decode(&response))
 }
 
-/// Connect to one of the server's sockets, or say there is no server.
+/// Connect to one of the server's sockets, or report that there is no server.
 pub fn connect(name: &str) -> Result<UnixStream, Error> {
     let path = path(name)?;
     match UnixStream::connect(&path) {
         Ok(stream) => Ok(stream),
-        // A socket file that refuses the connection, or was taken out from
-        // under it, is a server that is gone: what is on disk is a name left
-        // behind, not a server.
+        // A socket file that refuses the connection, or is gone, means there is
+        // no server.
         Err(error)
             if matches!(
                 error.kind(),

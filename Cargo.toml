@@ -38,15 +38,15 @@ usage = { package = "usage-rs", version = "6.9.1", default-features = false, fea
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 # missing_docs = "warn"
-# Not `forbid`: reading a client's buffer means reaching through a raw pointer,
-# whether it is shared memory or a mapping of a GPU buffer, and both need an
-# `unsafe` slice (`src/buffer.rs`) that the lint would make impossible to write
-# down.
+# Not `forbid`: a client's buffer is read through a raw pointer, in shared
+# memory and in a mapped GPU buffer, and both reads need an `unsafe` slice
+# (`src/buffer.rs`).
 unsafe_code = "deny"
 
 [lints.clippy]
-# Coordinates and pixel values are converted in bulk (pointer positions, tile rectangles, channel
-# arithmetic), where range is known from the surrounding invariants rather than from the type.
+# Pointer positions, tile rectangles and channel arithmetic convert between
+# number types in bulk. The range is known from the invariants around the code,
+# not from the type.
 cast_possible_wrap = "allow"
 cast_possible_truncation = "allow"
 cast_precision_loss = "allow"

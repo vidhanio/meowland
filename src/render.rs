@@ -1,28 +1,26 @@
-//! The compositor's own frame buffer: everything clients send ends up here, one
-//! pixel at a time.
+//! The compositor's own frame buffer. Every client pixel is blended into it.
 //!
-//! There is no GPU involved on the compositor's side. Client buffers - shared
-//! memory, or a GPU buffer read back on the CPU (see [`crate::buffer`]) - get
-//! alpha blended into this frame buffer, and the result is then diffed tile by
-//! tile so only what changed is re-sent to the terminal (see [`crate::kitty`]).
+//! The compositor does not use the GPU. A client buffer arrives from shared
+//! memory, or as a GPU buffer that was read back on the CPU; [`crate::buffer`]
+//! covers that readback. Each buffer is alpha blended into the frame. The
+//! result is diffed tile by tile, so that only the changed tiles go to the
+//! terminal again; [`crate::kitty`] is the terminal side.
 //!
 //! Client pixels are **premultiplied** RGBA, which is what Wayland's `wl_shm`
-//! says they are, so compositing a buffer into the frame is one multiply-add
-//! per channel with no conversion. The frame itself is RGB: everything is
-//! blended onto an opaque backdrop ([`Frame::clear`] paints it), so no alpha
-//! survives, and a channel that is 255 in every pixel is a channel the diff,
-//! the copy to the terminal and the terminal itself would each carry a quarter
-//! more bytes for. It is also the format the terminal is sent (`f=24`).
+//! says they are, so compositing is one multiply-add per channel with no
+//! conversion. The frame itself is RGB: everything is blended onto an opaque
+//! backdrop that [`Frame::clear`] paints, so no alpha survives. The diff, the
+//! copy to the terminal and the terminal itself each carry a quarter fewer
+//! bytes that way. The frame is also the format that the terminal is sent
+//! (`f=24`).
 
-/// Bytes a pixel takes in a client buffer: four channels, the last of which the
-/// frame does not keep.
+/// Bytes one pixel takes in a client buffer: four channels, alpha included.
 pub const BYTES4: usize = 4;
 
-/// Bytes a pixel takes in the frame.
+/// Bytes one pixel takes in the frame: three bytes. The frame keeps no alpha.
 pub const BYTES: usize = 3;
 
-/// A rectangle in framebuffer pixels. Signed, because sub-surface offsets can
-/// be negative and clipping is easier this way.
+/// The origin is signed, because a sub-surface offset can be negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -41,7 +39,6 @@ impl Rect {
         }
     }
 
-    /// The overlapping part of two rectangles, if any.
     pub fn intersect(self, other: Self) -> Option<Self> {
         let x = self.x.max(other.x);
         let y = self.y.max(other.y);
@@ -62,34 +59,28 @@ impl Rect {
     }
 }
 
-/// Pixel layout of a client buffer, or of a buffer brought back from one.
-///
-/// The alpha channel is what the two halves of each name differ in, and the
-/// order of the channels is what the two pairs do: what a name says is the
-/// order of the bytes in memory, so `Argb8888` is the one whose first byte is
-/// blue.
+/// The suffix of each name says whether the layout has an alpha channel. The
+/// prefix says the order of the bytes in memory, so the first byte of
+/// `Argb8888` is blue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
     /// `ARGB8888`: bytes are blue, green, red, alpha.
     Argb8888,
-    /// `XRGB8888`: bytes are blue, green, red, and the fourth is ignored, so
-    /// every pixel is opaque.
+    /// `XRGB8888`: bytes are blue, green, red, and the fourth is ignored.
     Xrgb8888,
     /// `ABGR8888`: bytes are red, green, blue, alpha.
     Abgr8888,
-    /// `XBGR8888`: bytes are red, green, blue, and the fourth is ignored, so
-    /// every pixel is opaque.
+    /// `XBGR8888`: bytes are red, green, blue, and the fourth is ignored.
     Xbgr8888,
 }
 
 impl SourceFormat {
-    /// Whether every pixel of a layout is opaque, whatever its fourth byte
-    /// says.
+    /// Whether every pixel of this layout is opaque, whatever the fourth byte
+    /// holds.
     pub const fn opaque(self) -> bool {
         matches!(self, Self::Xrgb8888 | Self::Xbgr8888)
     }
 
-    /// The red, green and blue channels of a pixel, in that order.
     pub const fn rgb(self, pixel: [u8; 4]) -> [u8; 3] {
         match self {
             Self::Argb8888 | Self::Xrgb8888 => [pixel[2], pixel[1], pixel[0]],
@@ -98,7 +89,6 @@ impl SourceFormat {
     }
 }
 
-/// A client buffer's pixels, as read out of shared memory.
 #[derive(Debug, Clone, Copy)]
 pub struct Image<'a> {
     pub pixels: &'a [u8],
@@ -108,7 +98,6 @@ pub struct Image<'a> {
     pub format: SourceFormat,
 }
 
-/// The screen we are drawing on.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub width: u32,
@@ -142,13 +131,12 @@ impl Frame {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    /// Paint the whole frame with a colour, the backdrop everything else blends
-    /// onto.
+    /// Paint the whole frame with a colour.
     ///
-    /// A pixel is three bytes, so this is a stride-three store loop over the
-    /// screen; the compiler vectorizes it to memory bandwidth (measured at
-    /// 15 GB/s for a 1240x1340 frame), and a pattern-filling version was not
-    /// faster.
+    /// This is the backdrop that every other buffer blends onto. A pixel is
+    /// three bytes, so this is a stride-three store loop over the screen. The
+    /// compiler vectorizes it to memory bandwidth, measured at 15 GB/s for a
+    /// 1240x1340 frame.
     pub fn clear(&mut self, color: [u8; 3]) {
         for pixel in self.pixels.as_chunks_mut::<BYTES>().0 {
             pixel.copy_from_slice(&color);
@@ -157,11 +145,11 @@ impl Frame {
 
     /// Blend a client buffer into `dst`.
     ///
-    /// `src` selects the region of the image to show (in image pixels) and
-    /// `dst` the region of the frame to show it in; when they differ in
-    /// size the image is scaled with nearest-neighbour sampling, which is
-    /// what buffer scale and viewport scaling come down to. Everything is
-    /// clipped to the frame.
+    /// `src` selects the region of the image to show, in image pixels. `dst`
+    /// selects the region of the frame to show it in. When the two differ in
+    /// size, the image is scaled with nearest-neighbour sampling, which is what
+    /// buffer scale and viewport scaling come down to. Everything is clipped to
+    /// the frame.
     pub fn draw(&mut self, image: &Image<'_>, src: Rect, dst: Rect) {
         if src.is_empty() || dst.is_empty() {
             return;
@@ -169,8 +157,8 @@ impl Frame {
         let Some(clipped) = dst.intersect(self.bounds()) else {
             return;
         };
-        // Map the clipped destination back into image space, so clipped pixels
-        // cost nothing.
+        // Map the clipped destination back into image space. Clipped pixels
+        // then cost nothing.
         let scale_x = f64::from(src.width) / f64::from(dst.width);
         let scale_y = f64::from(src.height) / f64::from(dst.height);
         let offset_x = f64::mul_add(f64::from(clipped.x - dst.x), scale_x, f64::from(src.x));
@@ -194,7 +182,6 @@ impl Frame {
         }
     }
 
-    /// Blend one row of an image into the frame, sampling horizontally.
     fn blend_row(
         &mut self,
         image: &Image<'_>,
@@ -222,10 +209,9 @@ impl Frame {
             [red, green, blue, alpha]
         };
 
-        // An exactly one-to-one, fully opaque row only needs its channels
-        // copied into the three-byte frame. Choose the layout once for
-        // the whole row; this is the common case for a client rendering
-        // at the output's scale.
+        // A one-to-one, fully opaque row only needs its channels copied into
+        // the three-byte frame. The layout is chosen once for the whole row.
+        // This is the common case for a client rendering at the output's scale.
         if image.format.opaque() && (scale_x - 1.0).abs() < f64::EPSILON && offset_x >= 0.0 {
             let source_start = source_row + offset_x as usize * BYTES4;
             let source_length = count as usize * BYTES4;
@@ -266,11 +252,11 @@ impl Frame {
     }
 }
 
-/// Blend a premultiplied source over the destination: `dst = src + dst * (1 -
-/// alpha)`.
+/// Blend a premultiplied source over the destination.
 ///
-/// The source is premultiplied, so it is used as-is; the destination is the
-/// frame, which is opaque, so the result is too and the alpha is done with.
+/// Each channel becomes `src + dst * (1 - alpha)`. The source is premultiplied,
+/// so it is used as it is. The destination is the frame, which is opaque, so
+/// the result is opaque as well and the alpha needs no tracking.
 fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     let alpha = u32::from(source[3]);
     if alpha == 255 {
@@ -284,17 +270,14 @@ fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     }
 }
 
-/// Splits the frame into a grid of tiles and reports which of them changed
-/// since the last call.
+/// Splits the frame into a grid of tiles and reports which ones changed.
 ///
-/// Terminals want whole images, so the smallest thing we can update is a tile;
-/// keeping them around 15 to 30 cells across means a keystroke in a terminal
-/// usually costs one small, very compressible image instead of a whole screen.
+/// A terminal takes whole images, so the smallest update is one tile. Around 15
+/// to 30 cells across means a keystroke in a terminal usually costs one small
+/// image that compresses well instead of a whole screen.
 #[derive(Debug)]
 pub struct Tiles {
-    /// Tile size in pixels.
     pub size: (u32, u32),
-    /// Tile grid dimensions.
     pub grid: (u32, u32),
     previous: Vec<u8>,
     /// Whether the next [`Tiles::diff`] should report every tile as changed.
@@ -315,12 +298,11 @@ impl Tiles {
         }
     }
 
-    /// Fill `changed` with the tiles of `frame` that differ from the previous
-    /// one, in the order they are numbered.
+    /// Fill `changed` with the tiles of `frame` that changed.
     ///
-    /// Indices rather than rectangles: a tile is what the caller has to cut out
-    /// and what it has to remember as due, and both ends of that use the
-    /// numbering this grid gives.
+    /// The tiles are listed in tile order. The list holds indices, not
+    /// rectangles. The caller cuts a tile out by index. It also remembers a due
+    /// tile by index, and both uses take the numbering that this grid gives.
     pub fn diff(&mut self, frame: &Frame, changed: &mut Vec<usize>) {
         if self.previous.len() != frame.pixels.len() {
             self.stale = true;
@@ -342,7 +324,7 @@ impl Tiles {
         self.grid.0 as usize * self.grid.1 as usize
     }
 
-    /// The rectangle covered by one tile, clipped to the frame.
+    /// The rectangle of one tile, clipped to the frame.
     pub fn tile(&self, frame: &Frame, index: usize) -> Rect {
         let grid_x = index as u32 % self.grid.0;
         let grid_y = index as u32 / self.grid.0;
@@ -382,7 +364,7 @@ impl Tiles {
 mod tests {
     use super::*;
 
-    /// The colour at a position, as the terminal would see it.
+    /// The colour at a position, in the frame's byte order.
     fn sample(frame: &Frame, x: i32, y: i32) -> Option<[u8; BYTES]> {
         if !frame.bounds().contains(x, y) {
             return None;
@@ -400,8 +382,10 @@ mod tests {
         [pixel[2], pixel[1], pixel[0], pixel[3]]
     }
 
-    /// A buffer holding `pixels` as ARGB8888 (bytes B, G, R, A, colors
-    /// premultiplied, as the protocol says clients must provide them).
+    /// A buffer that holds `pixels` as ARGB8888.
+    ///
+    /// The bytes are blue, green, red, alpha, and the colors are premultiplied,
+    /// as the protocol says clients must provide them.
     fn argb(pixels: &[[u8; 4]], width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         for pixel in pixels {
@@ -440,8 +424,8 @@ mod tests {
         let mut frame = Frame::new(2, 2);
         frame.clear([0, 100, 200]);
         // Half-transparent white, premultiplied as the protocol requires: 128
-        // of each channel with alpha 128. The backdrop must come
-        // through at half strength.
+        // in each color channel, with alpha 128. The backdrop comes through at
+        // half strength.
         let bytes = argb(&[[128, 128, 128, 128]; 1], 1, 1);
         frame.draw(
             &image(&bytes, 1, 1),
@@ -468,9 +452,9 @@ mod tests {
 
     #[test]
     fn a_readback_is_red_green_blue_whichever_way_the_client_had_it() {
-        // Both layouts describe the same color: a client's buffer has it with
-        // blue first, and a buffer brought back through the renderer has it
-        // with red first. The frame has to end up the same either way.
+        // Both layouts describe the same color: a client's buffer holds it with
+        // blue first, and a buffer brought back through the renderer holds it
+        // with red first. The frame ends up the same either way.
         let (blue_first, red_first) = ([30, 20, 10, 255], [10, 20, 30, 255]);
 
         for (format, bytes) in [
@@ -485,8 +469,6 @@ mod tests {
             assert_eq!(sample(&frame, 0, 0), Some([10, 20, 30]), "{format:?}");
         }
 
-        // A layout without an alpha channel is opaque, whatever its fourth byte
-        // happens to hold.
         for (format, bytes) in [
             (SourceFormat::Xrgb8888, [30, 20, 10, 0]),
             (SourceFormat::Xbgr8888, [10, 20, 30, 0]),
@@ -505,8 +487,7 @@ mod tests {
         let mut frame = Frame::new(4, 4);
         frame.clear([0, 0, 0]);
         let bytes = argb(&[[255, 255, 255, 255]; 4], 2, 2);
-        // Straddle the left and top edges: only the in-frame quarter may be
-        // drawn.
+        // Straddle the left and top edges. Only the in-frame quarter is drawn.
         frame.draw(
             &image(&bytes, 2, 2),
             Rect::new(0, 0, 2, 2),
@@ -535,7 +516,8 @@ mod tests {
     fn scaling_uses_the_source_region() {
         let mut frame = Frame::new(4, 4);
         frame.clear([0, 0, 0]);
-        // Two by two image, only the bottom-right pixel is white, shown at 4x4.
+        // A two by two image with only the bottom-right pixel white, shown at
+        // 4x4.
         let bytes = argb(
             &[
                 [0, 0, 0, 255],
@@ -572,8 +554,6 @@ mod tests {
             Rect::new(40, 40, 2, 2),
         );
         tiles.diff(&frame, &mut changed);
-        // The tile holding the change is the one at (32, 32), which is the
-        // second of the two rows.
         assert_eq!(changed, vec![3], "only the tile holding the change");
         assert_eq!(tiles.tile(&frame, 3), Rect::new(32, 32, 32, 32));
         tiles.diff(&frame, &mut changed);

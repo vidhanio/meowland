@@ -1,6 +1,7 @@
-//! meowland: a Wayland compositor that runs inside your terminal.
+//! meowland: a Wayland compositor that runs inside a terminal.
 //!
-//! The library is the whole of it (`meowland::start`); this is only the way in.
+//! The library holds the whole of it (`meowland::start`). This is only the way
+//! in.
 
 fn main() -> anyhow::Result<()> {
     meowland::start()

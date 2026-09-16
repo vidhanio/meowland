@@ -1,8 +1,8 @@
-//! The terminal we draw into: capability probing, mode setup and raw escape
-//! output.
+//! The terminal meowland draws into: capability probing, mode setup and raw
+//! escape output.
 //!
-//! Everything meowland shows goes through here as kitty graphics escapes (see
-//! [`crate::kitty`]).
+//! Every escape that shows a pixel or sets a mode goes out through here, as a
+//! kitty graphics escape that [`crate::kitty`] encodes.
 
 use std::{
     io::{self, IsTerminal as _, Read as _, Write as _},
@@ -11,50 +11,40 @@ use std::{
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-/// What the terminal told us it can do.
-///
-/// A bag of answers rather than a state machine: each is something the terminal
-/// either does or does not, and they vary independently of one another.
+/// What the terminal reported it can do. Each field is one independent answer.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each of these is an independent thing a terminal can do"
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
-    /// Size of one character cell in pixels.
+    /// The size of one character cell, in pixels.
     pub cell: (u32, u32),
     /// The terminal's character grid: `(columns, rows)` in cells.
     pub cells: (u32, u32),
     /// `(width, height)` of the whole drawing area in pixels.
     pub pixels: (u32, u32),
-    /// Terminal name and version, from the `XTVERSION` report.
     pub terminal: Option<String>,
-    /// Whether the terminal answered the graphics query.
     pub graphics: bool,
-    /// Whether the terminal speaks the kitty keyboard protocol.
     pub keyboard: bool,
-    /// Whether mouse reporting can be done in pixels (`SGR-Pixels`) rather than
-    /// cells.
+    /// Whether mouse reporting uses pixels (`SGR-Pixels`) instead of cells.
     pub pixel_mouse: bool,
-    /// Whether the terminal reads tiles out of a shared memory object, which is
-    /// what keeps their pixels off the pty.
+    /// Whether the terminal reads tiles out of shared memory, which keeps their
+    /// pixels off the pty.
     pub shared_memory: bool,
 }
 
-/// Cell size assumed when the terminal does not report one. Only affects
-/// crispness: images are always scaled into a cell rectangle, so a wrong guess
-/// distorts pixels but not layout.
+/// The cell size assumed when the terminal reports none. A wrong guess
+/// distorts pixels, not layout, because images are scaled into a cell
+/// rectangle.
 const FALLBACK_CELL: (u32, u32) = (10, 20);
 
 /// Whether the terminal has gone away.
 ///
-/// A closed terminal hangs its file descriptors up and fails every read on
-/// them, and that is the one thing the thread reading input cannot report:
-/// `crossterm`'s event source answers that error by spinning on it rather than
-/// by returning from the read, so the reader never comes back to say what
-/// happened. Asking the descriptor directly is how the compositor finds out
-/// instead, and it takes nothing out of the input, which is what makes it safe
-/// to ask while the reader is still there.
+/// A closed terminal hangs its file descriptors up. The input thread cannot
+/// report that, because `crossterm`'s event source spins on the error instead
+/// of returning from the read. Polling the descriptors takes nothing out of the
+/// input, so this is safe while the reader runs.
 pub fn hung_up() -> bool {
     let stdin = io::stdin();
     let mut descriptors = [PollFd::new(&stdin, PollFlags::IN)];
@@ -66,11 +56,11 @@ pub fn hung_up() -> bool {
     flags.contains(PollFlags::HUP) || flags.contains(PollFlags::ERR)
 }
 
-/// How long to wait for the terminal to answer the capability queries.
+/// How long the probe waits for the terminal's answers.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Keyboard flags we ask for: disambiguate escape codes, report event types,
-/// report all keys as escape codes, report associated text.
+/// The keyboard flags the compositor asks for: disambiguate escape codes,
+/// report event types, report all keys as escape codes, report associated text.
 const KEYBOARD_FLAGS: u32 = 1 | 2 | 8 | 16;
 
 #[derive(Debug)]
@@ -82,16 +72,12 @@ pub struct Terminal {
 /// Why meowland cannot draw in this terminal.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// There is nothing to draw into.
     #[error("meowland needs a terminal on stdin and stdout (try running it directly)")]
     NotATerminal,
-    /// The terminal would not let go of line-based input.
     #[error("could not put the terminal into raw mode")]
     RawMode(#[source] io::Error),
-    /// The terminal stopped accepting output during setup.
     #[error("could not initialize terminal output")]
     Output(#[source] io::Error),
-    /// The terminal does not implement the protocol the pixels go out through.
     #[error(
         "this terminal does not support the kitty graphics protocol (meowland needs kitty, \
          ghostty, or another terminal that implements it)"
@@ -101,10 +87,9 @@ pub enum Error {
 
 /// The escape that names the window a terminal is in.
 ///
-/// The title comes from a client, so it is not taken at its word: control
-/// characters would let it write escapes of its own into the terminal that is
-/// showing it, and the terminal's answer to a long title is to truncate it
-/// anyway, so it is cut here rather than handed over whole.
+/// A client supplies the title, so control characters are removed: they would
+/// let the client write escapes into the terminal that shows it. The title is
+/// also cut to `MAXIMUM_TITLE`.
 pub fn title(title: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(title.len() + 8);
     out.extend_from_slice(b"\x1b]2;");
@@ -120,16 +105,15 @@ pub fn title(title: &str) -> Vec<u8> {
     out
 }
 
-/// How much of a client's title a terminal is told about.
+/// How much of a client's title a terminal is told.
 const MAXIMUM_TITLE: usize = 256;
 
-/// Whether this process has a terminal to draw on.
 pub fn is_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
 impl Terminal {
-    /// Inspect the terminal geometry without changing any terminal state.
+    /// Read the geometry without changing terminal state.
     pub fn new() -> Result<Self, Error> {
         if !is_terminal() {
             return Err(Error::NotATerminal);
@@ -140,7 +124,7 @@ impl Terminal {
         })
     }
 
-    /// Probe and take over the terminal once there is a window to display.
+    /// Take over the terminal once there is a window to display.
     pub fn activate(&mut self) -> Result<&Capabilities, Error> {
         if self.entered {
             return Ok(&self.capabilities);
@@ -164,17 +148,14 @@ impl Terminal {
         Ok(&self.capabilities)
     }
 
-    /// Write escapes to the terminal in one atomic, tear-free write.
-    ///
-    /// Frames do not go through here - the presenter writes those - so this is
-    /// for the escapes that bracket the compositor's life and for wiping the
-    /// screen, both of which happen when nothing else is being written.
+    /// Write escapes to the terminal in one atomic, tear-free write. Frames do
+    /// not come through here: this is for the escapes that open and close the
+    /// compositor, and for wiping the screen.
     fn write(out: &[u8]) -> io::Result<()> {
         let mut stdout = io::stdout().lock();
         stdout.write_all(out).and_then(|()| stdout.flush())
     }
 
-    /// Re-read the terminal size after a resize. Returns the new capabilities.
     pub fn refresh(&mut self) -> &Capabilities {
         if let Ok(size) = crossterm::terminal::window_size() {
             if size.columns > 0 {
@@ -187,40 +168,36 @@ impl Terminal {
         &self.capabilities
     }
 
-    /// The escapes that wipe the screen: every image and every cell.
+    /// The escapes that wipe the screen, every image and every cell.
     ///
-    /// Used when the terminal changed size, where stale pixels and stale cell
-    /// contents cannot be told apart from live ones. Built rather than written
-    /// because the presenter sends it, so that it lands after the frames the
-    /// terminal has already been promised.
+    /// The compositor sends these after a resize, where stale pixels and stale
+    /// cell contents cannot be told apart from live ones. The bytes are
+    /// returned because the presenter writes them, after the frames already
+    /// promised.
     pub fn clear() -> Vec<u8> {
         let mut out = Vec::new();
         crate::kitty::delete_all(&mut out);
-        // `CSI 2J` also drops any images the terminal still holds, and homes
-        // the cursor.
+        // `CSI 2J` also drops every image the terminal holds, and homes the
+        // cursor.
         out.extend_from_slice(b"\x1b[2J\x1b[H");
         out
     }
 
-    /// Take over the terminal: alternate screen, no autowrap, mouse and pointer
-    /// shapes.
     fn enter(&mut self) -> io::Result<()> {
         let mut out = Vec::with_capacity(64);
-        // Alternate screen keeps the user's scrollback intact and clears images
-        // on the way out.
+        // The alternate screen keeps the user's scrollback and clears the
+        // images on exit.
         out.extend_from_slice(b"\x1b[?1049h");
-        // The title the terminal had is the user's, and comes back on the way
-        // out: what is shown here is this client's, and a client that has
-        // nothing to say about it says nothing.
+        // `CSI 22;2t` saves the terminal's title. The title shown here is the
+        // client's, and a client with nothing to say says nothing.
         out.extend_from_slice(b"\x1b[22;2t");
-        // No autowrap: a stray write at the last column must never scroll the
-        // screen, because scrolling would drag our placements along
-        // with the text.
+        // No autowrap, so a write at the last column cannot scroll the screen
+        // and drag the placements along.
         out.extend_from_slice(b"\x1b[?7l");
         out.extend_from_slice(b"\x1b[?25l");
         out.extend_from_slice(b"\x1b[?1003h\x1b[?1006h");
-        // Bracketed paste: pasted text arrives as a paste, not as a burst of
-        // held keys.
+        // Bracketed paste makes pasted text arrive as one paste, not as held
+        // keys.
         out.extend_from_slice(b"\x1b[?2004h");
         if self.capabilities.pixel_mouse {
             out.extend_from_slice(b"\x1b[?1016h");
@@ -228,15 +205,14 @@ impl Terminal {
         if self.capabilities.keyboard {
             let _ = write!(out, "\x1b[>{KEYBOARD_FLAGS}u");
         }
-        // Clear the screen *before* the first placement: `CSI 2J` also deletes
-        // images.
+        // The screen is cleared before the first placement: `CSI 2J` deletes
+        // images too.
         out.extend_from_slice(b"\x1b[2J\x1b[H");
         Self::write(&out)?;
         self.entered = true;
         Ok(())
     }
 
-    /// Undo everything [`Terminal::enter`] did.
     fn leave(&self) {
         let mut out = Vec::with_capacity(64);
         crate::kitty::delete_all(&mut out);
@@ -246,8 +222,7 @@ impl Terminal {
         }
         out.extend_from_slice(b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?2004l");
         out.extend_from_slice(b"\x1b[?7h\x1b[?25h\x1b[?1049l");
-        // Whatever the client called this terminal goes back to what it was
-        // called before.
+        // `CSI 23;2t` restores the title the terminal had before.
         out.extend_from_slice(b"\x1b[23;2t");
         let _ = Self::write(&out);
         let _ = crossterm::terminal::disable_raw_mode();
@@ -262,8 +237,7 @@ impl Drop for Terminal {
     }
 }
 
-/// Answer to the takeover queries, before defaults and sanity checks are
-/// applied.
+/// The raw probe answers, before defaults and checks.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Probe {
     cell: Option<(u32, u32)>,
@@ -277,27 +251,24 @@ struct Probe {
     pixel_mouse: Option<bool>,
 }
 
-/// Ask the terminal what it supports. Runs before any other reader touches
-/// stdin.
+/// Ask the terminal what it supports, before any other reader touches stdin.
 fn probe() -> io::Result<Probe> {
     let mut stdout = io::stdout().lock();
-    // Cell size and text area, terminal identity, graphics support, keyboard
-    // protocol and pixel mouse support. The completion marker is written only
-    // after the shared-memory probe below.
+    // Cell size, text area, terminal identity, graphics support, keyboard
+    // protocol and pixel mouse support.
     stdout.write_all(
         b"\x1b[16t\x1b[14t\x1b[>q\
           \x1b_Gi=77,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
           \x1b[?u\
           \x1b[?1016$p",
     )?;
-    // Whether tiles can come out of shared memory is not something a terminal
-    // announces: it has to be asked, by sending a tile that way and seeing
-    // whether it says it read it. The object goes with the answer.
+    // A terminal does not announce shared memory support, so the probe sends a
+    // tile that way and checks whether it was read.
     let mut shared_probe_bytes = Vec::new();
     let shared_probe = crate::kitty::shared_memory_probe(&mut shared_probe_bytes);
     stdout.write_all(&shared_probe_bytes)?;
-    // Primary device attributes come last, so their response cannot overtake
-    // the shared-memory answer and end the handshake early.
+    // Primary device attributes come last, so their answer cannot overtake the
+    // shared-memory answer and end the handshake early.
     stdout.write_all(b"\x1b[c")?;
     stdout.flush()?;
 
@@ -328,17 +299,13 @@ fn probe() -> io::Result<Probe> {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         }
-        // Primary device attributes are answered last, so its arrival ends the
-        // handshake.
         let parsed = parse_responses(&responses);
         if parsed.device_attributes {
             break parsed;
         }
     };
-    // The tile sent above is either read and unlinked by the terminal, or still
-    // sitting in shared memory with nobody having looked at it.
-    // By id, not by shape: the graphics query answers "OK" too, and it is the
-    // tile that has to have been read.
+    // The tile was read and unlinked, or its object is still there. The answer
+    // is matched by id: the graphics query answers "OK" too.
     let expected = format!("\x1b_Gi={};OK\x1b\\", crate::kitty::SHARED_PROBE_ID);
     parsed.probe.shared_memory = shared_probe.is_some()
         && responses
@@ -347,22 +314,20 @@ fn probe() -> io::Result<Probe> {
     Ok(parsed.probe)
 }
 
-/// The parsed subset of the probe answers we care about.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ParsedResponses {
     probe: Probe,
     device_attributes: bool,
 }
 
-/// Parse terminal responses. Split out from [`probe`] so the exact byte
-/// sequences a terminal sends can be tested without a terminal.
+/// Parse terminal responses. Split out from [`probe`] so its answers can be
+/// tested without a terminal.
 fn parse_responses(bytes: &[u8]) -> ParsedResponses {
     let mut parsed = ParsedResponses::default();
     let mut rest = bytes;
     while let Some(start) = rest.iter().position(|b| *b == 0x1b) {
         rest = &rest[start..];
         match rest.get(1) {
-            // CSI: escape [ params final
             Some(b'[') => {
                 let Some(final_index) = rest
                     .iter()
@@ -374,8 +339,7 @@ fn parse_responses(bytes: &[u8]) -> ParsedResponses {
                 };
                 let final_byte = rest[final_index];
                 // A CSI can carry intermediate bytes (0x20..=0x2f, like
-                // DECRQM's `$`) between its parameters and its
-                // final byte; they are not part of the parameters.
+                // DECRQM's `$`) before its final byte.
                 let params = std::str::from_utf8(&rest[2..final_index])
                     .unwrap_or_default()
                     .trim_end_matches(|c: char| ('\u{20}'..='\u{2f}').contains(&c));
@@ -387,44 +351,43 @@ fn parse_responses(bytes: &[u8]) -> ParsedResponses {
                         let first = parts.next().and_then(|p| p.parse().ok());
                         let second = parts.next().and_then(|p| p.parse().ok());
                         match (kind, first, second) {
-                            // CSI 4 ; height ; width t — text area in pixels.
+                            // CSI 4 ; height ; width t: the text area in pixels.
                             (Some(4), Some(height), Some(width)) if height > 0 && width > 0 => {
                                 parsed.probe.pixels = Some((width, height));
                             }
-                            // CSI 6 ; height ; width t — a single cell in pixels.
+                            // CSI 6 ; height ; width t: one cell in pixels.
                             (Some(6), Some(height), Some(width)) if height > 0 && width > 0 => {
                                 parsed.probe.cell = Some((width, height));
                             }
                             _ => {}
                         }
                     }
-                    // CSI ? mode $ y — DECRQM: is this mode understood, and is it set?
+                    // CSI ? mode $ y: DECRQM, which reports if a mode is understood.
                     (b'y', params) => {
                         let mut fields = params.split(';');
                         let mode = fields.next().and_then(|p| p.strip_prefix('?'));
                         let answer = fields.next().and_then(|p| p.parse::<u8>().ok());
-                        // 0 means "not recognised", 1 "set", 2 "reset": either
-                        // of the latter
-                        // means the terminal has the mode, which is all we need
-                        // to know.
+                        // 0 means "not recognised"; 1 and 2 mean the terminal
+                        // has the mode, set or reset.
                         if mode == Some("1016") && answer.is_some_and(|answer| answer > 0) {
                             parsed.probe.pixel_mouse = Some(true);
                         }
                     }
-                    // CSI ? flags u — keyboard enhancement flags the terminal supports.
+                    // CSI ? flags u: the keyboard enhancement flags the
+                    // terminal supports.
                     (b'u', params) => {
                         if let Some(flags) = params.strip_prefix('?') {
                             parsed.probe.keyboard = flags.parse::<u32>().is_ok();
                         }
                     }
-                    // CSI ? … c — primary device attributes.
+                    // CSI ? ... c: the primary device attributes.
                     (b'c', params) => {
                         parsed.device_attributes = params.starts_with('?');
                     }
                     _ => {}
                 }
             }
-            // DCS > | name(version) ST — XTVERSION.
+            // DCS > | name(version) ST: XTVERSION.
             Some(b'P') => {
                 let Some(end) = find_st(rest) else { break };
                 let payload = std::str::from_utf8(&rest[2..end]).unwrap_or_default();
@@ -433,7 +396,7 @@ fn parse_responses(bytes: &[u8]) -> ParsedResponses {
                 }
                 rest = &rest[end + 2..];
             }
-            // APC _ G … ST — graphics protocol replies.
+            // APC _ G ... ST: graphics protocol replies.
             Some(b'_') => {
                 let Some(end) = find_st(rest) else { break };
                 let payload = std::str::from_utf8(&rest[2..end]).unwrap_or_default();
@@ -448,12 +411,12 @@ fn parse_responses(bytes: &[u8]) -> ParsedResponses {
     parsed
 }
 
-/// Find the end of a `ESC \` terminated string, returning its start index.
+/// The end of a `ESC \` terminated string, and its start index.
 fn find_st(bytes: &[u8]) -> Option<usize> {
     bytes.windows(2).position(|window| window == b"\x1b\\")
 }
 
-/// The terminal's cell grid, from the kernel's view of the pty.
+/// The cell grid, from the kernel's view of the pty.
 fn window_size() -> Option<(u32, u32, u32, u32)> {
     crossterm::terminal::window_size().ok().map(|size| {
         (
@@ -465,10 +428,10 @@ fn window_size() -> Option<(u32, u32, u32, u32)> {
     })
 }
 
-/// Fill in defaults and work out what we can actually ask the terminal for.
+/// Fill in defaults, and work out what the terminal can be asked for.
 ///
-/// `window` is `(columns, rows, width, height)` as reported by the pty, which
-/// is what is left when the terminal does not answer the pixel-size queries.
+/// `window` is `(columns, rows, width, height)` from the pty, used when the
+/// pixel-size queries go unanswered.
 fn resolve_capabilities(probe: &Probe, window: Option<(u32, u32, u32, u32)>) -> Capabilities {
     let (columns, rows, window_width, window_height) = window.unwrap_or((80, 24, 0, 0));
     let cells = (columns.max(1), rows.max(1));
@@ -485,9 +448,8 @@ fn resolve_capabilities(probe: &Probe, window: Option<(u32, u32, u32, u32)>) -> 
         .cell
         .unwrap_or_else(|| ((pixels.0 / cells.0).max(1), (pixels.1 / cells.1).max(1)));
     let terminal = probe.terminal.clone();
-    // Ask the terminal rather than guess from its name: Ghostty announces
-    // itself as "libghostty", and every other terminal is free to rename
-    // itself too.
+    // The terminal is asked rather than guessed at by name: Ghostty announces
+    // itself as "libghostty", and any terminal can rename itself.
     let pixel_mouse = probe.pixel_mouse.unwrap_or_else(|| {
         terminal.as_deref().is_some_and(|name| {
             name.starts_with("kitty") || name.starts_with("ghostty") || name.starts_with("WezTerm")
@@ -516,9 +478,6 @@ mod tests {
 
     #[test]
     fn a_title_escape_carries_no_escapes_of_its_own() {
-        // A client names its window, and that name goes to a terminal: control
-        // characters in it would be a client writing escapes to a terminal it
-        // does not own.
         let escape = title("\x1b]2;gotcha\x07\u{9b}31mred");
         assert_eq!(escape, b"\x1b]2;]2;gotcha31mred\x07");
         assert_eq!(title(""), b"\x1b]2;\x07");
@@ -546,7 +505,7 @@ mod tests {
     #[test]
     fn parses_a_silent_terminal() {
         // A terminal that understands none of the queries answers the device
-        // attributes only.
+        // attributes alone.
         let parsed = parse_responses(b"\x1b[?1;2c");
         assert!(parsed.device_attributes);
         assert!(!parsed.probe.graphics);
@@ -562,8 +521,8 @@ mod tests {
 
     #[test]
     fn derives_the_cell_size_when_the_terminal_omits_it() {
-        // A terminal that answered nothing: 80x24 cells of 1000x800 pixels is a
-        // 12x33 cell.
+        // A terminal that answered nothing: 80x25 cells of 1000x800 pixels is
+        // a 12x32 cell.
         let capabilities = resolve_capabilities(
             &Probe {
                 graphics: true,
@@ -575,7 +534,6 @@ mod tests {
         assert_eq!(capabilities.pixels, (1000, 800));
         assert_eq!(capabilities.cell, (12, 32));
 
-        // Nothing at all known: the fallback cell size, with a sane grid.
         let capabilities = resolve_capabilities(&Probe::default(), None);
         assert_eq!(capabilities.cells, (80, 24));
         assert_eq!(
@@ -586,9 +544,8 @@ mod tests {
 
     #[test]
     fn a_zero_sized_answer_is_ignored() {
-        // The protocol notes that some terminals answer 0 for the size; taking
-        // that literally would leave the compositor with an empty
-        // screen.
+        // Some terminals answer 0 for the size, which taken literally leaves an
+        // empty screen.
         let parsed = parse_responses(b"\x1b[4;0;0t\x1b[6;0;0t\x1b[?1;2c");
         assert_eq!(parsed.probe.pixels, None);
         assert_eq!(parsed.probe.cell, None);

@@ -11,6 +11,8 @@ use std::{
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
+use crate::kitty::{GRAPHICS_PROBE_ID, SHARED_PROBE_ID};
+
 /// What the terminal reported it can do. Each field is one independent answer.
 #[expect(
     clippy::struct_excessive_bools,
@@ -57,7 +59,11 @@ pub fn hung_up() -> bool {
 }
 
 /// How long the probe waits for the terminal's answers.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+///
+/// A terminal on this machine answers in a few milliseconds. A terminal across
+/// a network, such as kitty at the far end of an SSH connection, answers after
+/// one round trip.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The keyboard flags the compositor asks for: disambiguate escape codes,
 /// report event types, report all keys as escape codes, report associated text.
@@ -254,28 +260,31 @@ struct Probe {
 /// Ask the terminal what it supports, before any other reader touches stdin.
 fn probe() -> io::Result<Probe> {
     let mut stdout = io::stdout().lock();
-    // Cell size, text area, terminal identity, graphics support, keyboard
-    // protocol and pixel mouse support.
-    stdout.write_all(
-        b"\x1b[16t\x1b[14t\x1b[>q\
-          \x1b_Gi=77,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
-          \x1b[?u\
-          \x1b[?1016$p",
-    )?;
+    // Cell size, text area and terminal identity, then the graphics query under
+    // its own id, then keyboard protocol and pixel mouse support.
+    let mut queries = Vec::new();
+    queries.extend_from_slice(b"\x1b[16t\x1b[14t\x1b[>q");
+    let _ = write!(
+        queries,
+        "\x1b_Gi={GRAPHICS_PROBE_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+    );
+    queries.extend_from_slice(b"\x1b[?u\x1b[?1016$p");
+    stdout.write_all(&queries)?;
     // A terminal does not announce shared memory support, so the probe sends a
-    // tile that way and checks whether it was read.
+    // tile that way and sees whether the terminal read it. The guard removes
+    // the object again if it did not.
     let mut shared_probe_bytes = Vec::new();
-    let shared_probe = crate::kitty::shared_memory_probe(&mut shared_probe_bytes);
+    let _shared_probe = crate::kitty::shared_memory_probe(&mut shared_probe_bytes);
     stdout.write_all(&shared_probe_bytes)?;
-    // Primary device attributes come last, so their answer cannot overtake the
-    // shared-memory answer and end the handshake early.
+    // Primary device attributes come last, so their answer cannot overtake an
+    // earlier one and end the handshake early.
     stdout.write_all(b"\x1b[c")?;
     stdout.flush()?;
 
     let mut input = io::stdin();
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut responses = Vec::new();
-    let mut parsed = loop {
+    let parsed = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break parse_responses(&responses);
@@ -304,13 +313,6 @@ fn probe() -> io::Result<Probe> {
             break parsed;
         }
     };
-    // The tile was read and unlinked, or its object is still there. The answer
-    // is matched by id: the graphics query answers "OK" too.
-    let expected = format!("\x1b_Gi={};OK\x1b\\", crate::kitty::SHARED_PROBE_ID);
-    parsed.probe.shared_memory = shared_probe.is_some()
-        && responses
-            .windows(expected.len())
-            .any(|window| window == expected.as_bytes());
     Ok(parsed.probe)
 }
 
@@ -396,14 +398,29 @@ fn parse_responses(bytes: &[u8]) -> ParsedResponses {
                 }
                 rest = &rest[end + 2..];
             }
-            // APC _ G ... ST: graphics protocol replies.
+            // APC _ G <control>;<answer> ST: a graphics protocol reply. The
+            // answer belongs to the query with that id, so a refused query says
+            // nothing about the others.
             Some(b'_') => {
                 let Some(end) = find_st(rest) else { break };
                 let payload = std::str::from_utf8(&rest[2..end]).unwrap_or_default();
-                if payload.starts_with('G') {
-                    parsed.probe.graphics = payload.ends_with("OK");
-                }
                 rest = &rest[end + 2..];
+                let Some(reply) = payload.strip_prefix('G') else {
+                    continue;
+                };
+                let (control, answer) = reply.split_once(';').unwrap_or((reply, ""));
+                let id = control
+                    .split(',')
+                    .find_map(|field| field.strip_prefix("i="))
+                    .and_then(|id| id.parse::<u32>().ok());
+                match (id, answer) {
+                    (Some(GRAPHICS_PROBE_ID), "OK") => parsed.probe.graphics = true,
+                    (Some(SHARED_PROBE_ID), "OK") => parsed.probe.shared_memory = true,
+                    // An error here is a refused query, which is how a terminal
+                    // answers the shared memory probe when the object is not on
+                    // its machine. That is the answer over SSH.
+                    _ => {}
+                }
             }
             _ => rest = &rest[1..],
         }
@@ -475,6 +492,29 @@ mod tests {
     /// sends.
     const KITTY_RESPONSES: &[u8] = b"\x1b[6;20;10t\x1b[4;1340;1240t\x1bP>|kitty(0.48.2)\x1b\\\
                                      \x1b_Gi=77;OK\x1b\\\x1b[?0u\x1b[?1016;2$y\x1b[?62;52;c";
+
+    /// Byte-for-byte what kitty 0.48.2 replied to the exact queries [`probe`]
+    /// sends, when the shared memory probe's object is on another machine. This
+    /// is the answer a kitty at the far end of an SSH connection gives: the
+    /// object is in the remote `/dev/shm`, so kitty cannot open it.
+    const KITTY_RESPONSES_REMOTE: &[u8] = b"\x1b[6;20;10t\x1b[4;1340;1240t\x1bP>|kitty(0.48.2)\x1b\\\
+                                           \x1b_Gi=77;OK\x1b\\\
+                                           \x1b_Gi=78;EBADF:Failed to open file for graphics transmission with error: [2] No such file or directory\x1b\\\
+                                           \x1b[?0u\x1b[?1016;2$y\x1b[?62;52;c";
+
+    #[test]
+    fn a_refused_shared_memory_probe_does_not_deny_graphics() {
+        // The graphics query was answered, so the terminal draws. Only the fast
+        // path is unavailable, and a terminal answers "OK" to the shared memory
+        // probe only when it read the object.
+        let parsed = parse_responses(KITTY_RESPONSES_REMOTE);
+        assert!(parsed.probe.graphics, "the graphics query was answered");
+        assert!(!parsed.probe.shared_memory, "the tile was not read");
+
+        let capabilities = resolve_capabilities(&parsed.probe, Some((124, 67, 1240, 1340)));
+        assert!(capabilities.graphics);
+        assert!(!capabilities.shared_memory);
+    }
 
     #[test]
     fn a_title_escape_carries_no_escapes_of_its_own() {

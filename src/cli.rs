@@ -15,7 +15,7 @@ use crate::{control, dmabuf};
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help,
     completion,
-    after_help = "Alt+Q asks the window shown here to close. The pane ends when that client goes away, and with no window shown Alt+Q releases the terminal instead.\n\nA server outlives the terminals that show it, and each terminal chooses one window: `run` starts a server if there is none and shows the window its client opens, `attach` shows one window here, and `list` and `quit` reach the server from anywhere else."
+    after_help = "Alt+Q asks the window shown here to close. The pane ends when that client goes away, and with no window shown Alt+Q releases the terminal instead.\n\nA server outlives the terminals that show it, and each terminal chooses one window: `run` starts a server if there is none and shows the window its client opens, `attach` shows one window here, and `list` and `server` reach the server from anywhere else."
 )]
 pub struct Cli {
     #[usage(subcommand)]
@@ -30,9 +30,7 @@ pub enum Action {
     Attach(Attach),
     /// Print the open windows and the IDs that `attach` takes
     List(List),
-    /// Stop the server and everything running in it
-    Quit(Quit),
-    /// Be the server, with no terminal of its own
+    /// Start a server, or stop one
     Server(Server),
     /// Print a shell completion script
     Completions(Completions),
@@ -108,25 +106,34 @@ impl Settings {
     }
 }
 
-/// The server itself, which `run` starts when there is none.
+/// What to do with a server.
 ///
-/// Users do not type this command. It is how a command that needs a server
-/// starts one. The server exists for the command it is given: it runs the
-/// client and stops when the client is gone.
+/// A server has no terminal of its own. `meowland run` starts one if there is
+/// none. These commands start a server on its own, and stop one.
 #[derive(usage::Args)]
-#[usage(hide)]
 pub struct Server {
+    #[usage(subcommand)]
+    pub action: ServerAction,
+}
+
+#[derive(usage::Subcommands)]
+pub enum ServerAction {
+    /// Start a server and stay in it: no terminal, reached over its sockets
+    Start(Start),
+    /// Stop the server and everything running in it
+    Stop(Stop),
+}
+
+/// Start a server.
+#[derive(usage::Args)]
+pub struct Start {
     #[usage(flatten)]
     pub settings: Settings,
-
-    /// Client command and arguments this server is for
-    #[usage(
-        value_name = "COMMAND",
-        value_hint = usage::ValueHint::CommandWithArguments,
-        double_dash = "automatic"
-    )]
-    pub command: Vec<OsString>,
 }
+
+/// Stop a server.
+#[derive(usage::Args)]
+pub struct Stop;
 
 #[derive(usage::Args)]
 pub struct Attach {
@@ -137,9 +144,6 @@ pub struct Attach {
 
 #[derive(usage::Args)]
 pub struct List;
-
-#[derive(usage::Args)]
-pub struct Quit;
 
 #[derive(usage::Args)]
 pub struct Completions {

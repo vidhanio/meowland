@@ -22,7 +22,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context as _;
 use calloop::signals::{Signal, Signals};
 use smithay::{
     reexports::{
@@ -45,6 +44,7 @@ use crate::{
     display::{Input, ToClient, ToServer},
     logging,
     presenter::{Event as PresenterEvent, Presenter},
+    process,
     tty::Capabilities,
     xwayland,
 };
@@ -62,11 +62,51 @@ const FRAME_INTERVAL: Duration =
 /// enough that a client which says nothing does not hold the server up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Why the server did not start, or stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The log file could not be opened.
+    #[error(transparent)]
+    Log(#[from] logging::Error),
+    /// One of the sockets the server is reached on could not be bound.
+    #[error("could not bind a socket of the server")]
+    Socket(#[from] control::Error),
+    /// The Wayland socket clients connect to could not be bound.
+    #[error("could not bind a Wayland socket")]
+    WaylandSocket(#[source] smithay::reexports::wayland_server::BindError),
+    /// Process signals could not be watched.
+    #[error("could not listen for process signals")]
+    Signals(#[source] calloop::Error),
+    /// The Wayland display could not be created.
+    #[error("could not create a Wayland display")]
+    Display(#[source] smithay::reexports::wayland_server::backend::InitError),
+    /// The compositor could not advertise its initial state.
+    #[error(transparent)]
+    Compositor(#[from] crate::compositor::Error),
+    /// The GPU buffers that clients may hand over could not be described.
+    #[error(transparent)]
+    Dmabuf(#[from] crate::dmabuf::Error),
+    /// The event loop could not be created, or refused a source.
+    #[error("could not create the event loop")]
+    EventLoop(#[source] calloop::Error),
+    /// A source the server needs could not be watched.
+    #[error("could not watch {source}")]
+    Watch {
+        source: &'static str,
+        #[source]
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The event loop stopped with an error.
+    #[error("the event loop failed")]
+    Loop(#[source] calloop::Error),
+}
+
 /// Run the server until something stops it.
 ///
-/// A server that was started with a command runs that command, and stops once
-/// its clients are gone (`crate::cli::Server`).
-pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
+/// The server starts no clients of its own. `run` hands it one over the control
+/// socket, and the clients it starts are the ones it was handed
+/// (`crate::cli::Server`).
+pub fn run(settings: Settings) -> Result<(), Error> {
     let Settings {
         gpu_buffers,
         render_node,
@@ -86,14 +126,13 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
         Signal::SIGHUP,
         Signal::SIGCHLD,
     ])
-    .context("could not listen for process signals")?;
+    .map_err(Error::Signals)?;
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
     tracing::info!(socket = %socket_name, "meowland server starting");
 
-    let display: Display<Meowland> =
-        Display::new().context("could not create a Wayland display")?;
+    let display: Display<Meowland> = Display::new().map_err(Error::Display)?;
     let nodes = gpu_buffers.nodes(render_node.as_deref())?;
     // No terminal is attached yet, so the seat has nothing to report. A
     // terminal reports what it can do when it attaches.
@@ -111,8 +150,7 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
     let (terminal_sender, terminal_events) = channel();
     // The loop comes first: the app registers a pane's presenter events with it
     // when a pane attaches.
-    let mut event_loop: Calloop<App> =
-        Calloop::try_new().context("could not create an event loop")?;
+    let mut event_loop: Calloop<App> = Calloop::try_new().map_err(Error::EventLoop)?;
     let handle = event_loop.handle();
 
     let mut app = App {
@@ -128,9 +166,7 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
         handle: handle.clone(),
         _sockets: (control_socket, display_socket),
         children: Vec::new(),
-        quit_when_empty: !command.is_empty(),
-        command,
-        quitting: false,
+        stopping: false,
         frame_scheduled: false,
         last_frame_started: None,
         frames: FrameStats::default(),
@@ -150,24 +186,17 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
         },
     )?;
 
-    let result = app.start_client().and_then(|()| {
-        if app.quitting {
-            return Ok(());
-        }
-        event_loop
-            .run(None, &mut app, |_| {})
-            .context("the event loop failed")
-    });
+    let result = event_loop.run(None, &mut app, |_| {}).map_err(Error::Loop);
     app.shutdown();
     result
 }
 
-fn bind_socket() -> anyhow::Result<ListeningSocketSource> {
+fn bind_socket() -> Result<ListeningSocketSource, Error> {
     // The well-known name if it is free. Otherwise the number that the display
     // picks next.
     ListeningSocketSource::with_name("wayland-meowland")
         .or_else(|_| ListeningSocketSource::new_auto())
-        .context("could not bind a Wayland socket")
+        .map_err(Error::WaylandSocket)
 }
 
 /// Everything that the event loop owns.
@@ -193,16 +222,10 @@ struct App {
     handle: LoopHandle<'static, Self>,
     /// Removes the sockets when the event loop ends.
     _sockets: (control::Socket, control::Socket),
+    /// The clients that this server started, so that they can be reaped and
+    /// stopped with the server.
     children: Vec<Child>,
-    /// Whether to stop once the clients that this server started are gone.
-    ///
-    /// A server that was started for a command stops when that command exits,
-    /// so the terminal that asked for it comes back. A server that was started
-    /// to be a server stays up until the quit binding, `meowland quit` or a
-    /// signal stops it, however many clients come and go.
-    quit_when_empty: bool,
-    command: Vec<std::ffi::OsString>,
-    quitting: bool,
+    stopping: bool,
     signal: Option<LoopSignal>,
     /// Whether a one-shot frame timer is already armed.
     frame_scheduled: bool,
@@ -288,11 +311,11 @@ impl App {
                     }
                 }
             }
-            // Quit stops the whole server, and every client that the server
-            // started goes with it.
-            Some(control::Command::Quit) => {
+            // The whole server stops, and every client that it started goes
+            // with it.
+            Some(control::Command::Stop) => {
                 tracing::info!("the server was asked to stop");
-                self.quit();
+                self.stop();
                 control::Reply::Ok
             }
             None => control::Reply::Failed("unknown request".to_owned()),
@@ -332,7 +355,6 @@ impl App {
     fn settled(&mut self) {
         self.end_closed_panes();
         self.flush_clients();
-        self.check_quit();
         self.schedule_frame();
     }
 
@@ -572,24 +594,6 @@ impl App {
         }
     }
 
-    /// Run the client from the command line before the loop starts.
-    ///
-    /// A command that cannot start is then reported to whoever started the
-    /// server, instead of leaving a server with nothing to draw.
-    fn start_client(&mut self) -> anyhow::Result<()> {
-        let Some((program, _)) = self.command.split_first() else {
-            return Ok(());
-        };
-        let program = program.to_string_lossy().into_owned();
-        let command = self.command.clone();
-        if let Err(error) = self.spawn_client(&command) {
-            anyhow::bail!("could not start {program}: {error}");
-        }
-        // Close the spawn-to-signalfd race when a client exits immediately.
-        self.reap();
-        Ok(())
-    }
-
     fn spawn_client(&mut self, command: &[std::ffi::OsString]) -> std::io::Result<()> {
         let Some((program, arguments)) = command.split_first() else {
             return Ok(());
@@ -614,6 +618,7 @@ impl App {
             Some(server) => child.env("DISPLAY", server.display()),
             None => child.env_remove("DISPLAY"),
         };
+        process::spawn_unblocked(&mut child);
         let child = child.spawn()?;
         tracing::info!(program = %program.to_string_lossy(), pid = child.id(), "client started");
         self.children.push(child);
@@ -668,32 +673,55 @@ impl App {
         });
     }
 
-    fn check_quit(&mut self) {
-        if !self.quitting && self.quit_when_empty && self.children.is_empty() {
-            tracing::info!("the client is gone");
-            self.quit();
-        }
-    }
-
-    fn quit(&mut self) {
-        if self.quitting {
+    fn stop(&mut self) {
+        if self.stopping {
             return;
         }
-        self.quitting = true;
+        self.stopping = true;
         if let Some(signal) = &self.signal {
             signal.stop();
         }
     }
 
+    /// Stop the server: hand every terminal back, then stop every process that
+    /// this server started.
+    ///
+    /// The panes go first, because the escapes that undo the takeover have to
+    /// be written before the presenters are gone, and a terminal that is left
+    /// holding a frame the server never took back is a terminal the user has to
+    /// reset.
+    ///
+    /// What follows is the whole tree, not the children of this process: a
+    /// client starts helpers of its own, and `xwayland-satellite` runs
+    /// Xwayland (`crate::process`). Each signal is given a grace period, and
+    /// the tree is read again before the next one.
     fn shutdown(&mut self) {
         while let Some(pane) = self.panes.keys().copied().next() {
             self.detach_pane(pane, None);
         }
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+
+        for (signal, grace) in process::ESCALATION {
+            let mut tree = process::descendants_of(std::process::id());
+            if tree.is_empty() {
+                break;
+            }
+            tracing::info!(signal = ?signal, processes = tree.len(), "stopping the process tree");
+            process::signal(&tree, signal);
+            // The children of this process are reaped while the tree is waited
+            // out, so that a client that has exited is not seen as still there.
+            if process::wait_until_gone(&mut tree, grace, &mut || self.reap()) {
+                break;
+            }
+            tracing::warn!(
+                signal = ?signal,
+                processes = ?tree,
+                "processes are still running after this signal"
+            );
         }
+
         if let Some(mut xwayland) = self.xwayland.take() {
+            // The satellite is already gone with the tree. This releases the X
+            // display and removes its sockets either way.
             xwayland.stop();
         }
         tracing::info!("meowland stopped");
@@ -780,7 +808,7 @@ fn install_sources(
     handle: &LoopHandle<'_, App>,
     app: &mut App,
     sources: Sources,
-) -> anyhow::Result<()> {
+) -> Result<(), Error> {
     watch_clients(handle, sources.clients)?;
     watch_display(handle, &mut app.display)?;
     watch_terminal(handle, sources.said)?;
@@ -789,26 +817,34 @@ fn install_sources(
     Ok(())
 }
 
-fn watch_clients(
-    handle: &LoopHandle<'_, App>,
-    socket: ListeningSocketSource,
-) -> anyhow::Result<()> {
+/// A source that the event loop refused, named so that the failure can be told
+/// from the others.
+fn watch<T: std::fmt::Debug>(source: &'static str, refused: T) -> Error {
+    Error::Watch {
+        source,
+        cause: format!("{refused:?}").into(),
+    }
+}
+
+fn watch_clients(handle: &LoopHandle<'_, App>, socket: ListeningSocketSource) -> Result<(), Error> {
     handle
         .insert_source(socket, |stream, (), app| {
             if let Err(err) = app.state.insert_client(stream) {
                 tracing::warn!(?err, "could not adopt a client");
             }
         })
-        .context("could not watch the Wayland socket")?;
+        .map_err(|refused| watch("the Wayland socket", refused))?;
     Ok(())
 }
 
 fn watch_display(
     handle: &LoopHandle<'_, App>,
     display: &mut Display<Meowland>,
-) -> anyhow::Result<()> {
-    let poll_fd = rustix::io::dup(display.backend().poll_fd())
-        .context("could not take the display socket")?;
+) -> Result<(), Error> {
+    let poll_fd = rustix::io::dup(display.backend().poll_fd()).map_err(|err| Error::Watch {
+        source: "the display socket",
+        cause: err.into(),
+    })?;
     handle
         .insert_source(
             Generic::new(poll_fd, Interest::READ, Mode::Level),
@@ -821,23 +857,23 @@ fn watch_display(
                 Ok(PostAction::Continue)
             },
         )
-        .context("could not watch the display")?;
+        .map_err(|refused| watch("the display", refused))?;
     Ok(())
 }
 
 fn watch_terminal(
     handle: &LoopHandle<'_, App>,
     terminal_events: Channel<FromTerminal>,
-) -> anyhow::Result<()> {
+) -> Result<(), Error> {
     handle
         .insert_source(terminal_events, |event, (), app: &mut App| {
             match event {
                 ChannelEvent::Msg(message) => app.on_terminal(message),
-                ChannelEvent::Closed => app.quit(),
+                ChannelEvent::Closed => app.stop(),
             }
             app.settled();
         })
-        .map_err(|err| anyhow::anyhow!("could not watch the terminals: {err:?}"))?;
+        .map_err(|refused| watch("the terminals", refused))?;
     Ok(())
 }
 
@@ -846,16 +882,13 @@ fn watch_server(
     signals: Signals,
     control_listener: UnixListener,
     display_listener: UnixListener,
-) -> anyhow::Result<()> {
+) -> Result<(), Error> {
     handle
         .insert_source(signals, |event, (), app: &mut App| match event.signal() {
-            Signal::SIGCHLD => {
-                app.reap();
-                app.check_quit();
-            }
-            _ => app.quit(),
+            Signal::SIGCHLD => app.reap(),
+            _ => app.stop(),
         })
-        .context("could not watch process signals")?;
+        .map_err(|refused| watch("process signals", refused))?;
 
     handle
         .insert_source(
@@ -893,7 +926,7 @@ fn watch_server(
                 Ok(PostAction::Continue)
             },
         )
-        .context("could not watch the control socket")?;
+        .map_err(|refused| watch("the control socket", refused))?;
 
     handle
         .insert_source(
@@ -909,7 +942,7 @@ fn watch_server(
                 Ok(PostAction::Continue)
             },
         )
-        .context("could not watch the terminal socket")?;
+        .map_err(|refused| watch("the terminal socket", refused))?;
     Ok(())
 }
 
@@ -964,7 +997,7 @@ fn frame_deadline(now: Instant, last_frame_started: Option<Instant>) -> Instant 
 }
 
 fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
-    if app.quitting {
+    if app.stopping {
         return;
     }
     // A server with no pane attached keeps running, but it has nothing to draw.

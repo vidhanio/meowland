@@ -1,0 +1,236 @@
+//! The process tree of the server, and how it is stopped.
+//!
+//! A server starts clients, and a client starts helpers of its own. Those
+//! helpers are not children of the server, so a server that stops its children
+//! one by one leaves them running. `xwayland-satellite` is the same case: it
+//! runs Xwayland, which is a grandchild of the server.
+//!
+//! So the tree is read from `/proc` and every process under the server is
+//! stopped: first with `SIGHUP`, then `SIGTERM`, then `SIGKILL`, each with a
+//! short grace period. The tree is read again before each signal, so a process
+//! that started something while the last one was being delivered is included.
+//!
+//! A process that daemonizes leaves the tree: it is re-parented to init, and no
+//! scan of `/proc` can tell it from anything else on the machine.
+
+use std::{
+    collections::HashMap,
+    os::unix::process::CommandExt as _,
+    process::Command,
+    time::{Duration, Instant},
+};
+
+use rustix::{
+    process::{Pid, Signal, kill_process, test_kill_process},
+    runtime::{How, KernelSigSet, kernel_sigprocmask},
+};
+
+/// How long each signal is given before the next one is sent.
+///
+/// Long enough for a client to close its windows and exit, and short enough
+/// that stopping a server feels immediate.
+const GRACE: Duration = Duration::from_millis(250);
+
+/// How often the tree is checked while a signal is being waited out.
+const POLL: Duration = Duration::from_millis(20);
+
+/// A signal, and the grace that follows it.
+pub const ESCALATION: [(Signal, Duration); 3] = [
+    (Signal::HUP, GRACE),
+    (Signal::TERM, GRACE),
+    (Signal::KILL, GRACE),
+];
+
+/// Start `command` with the signal mask of this process cleared in the child.
+///
+/// The server blocks the signals that it watches, and a signal mask is
+/// inherited across `fork` and `exec`. Without this, a client of the server
+/// never sees a `SIGHUP` or a `SIGTERM` from anywhere: not from the escalation
+/// above, and not from a `kill` typed at a shell. The mask is cleared between
+/// the fork and the exec, which is the last moment before the program replaces
+/// the process and the only place where the mask of the child can still be
+/// changed.
+///
+/// Not used for the server itself, which needs the block for its own signal
+/// handling, and not for threads, which do not exec.
+pub fn spawn_unblocked(command: &mut Command) -> &mut Command {
+    // SAFETY: the closure runs between `fork` and `exec`, where only
+    // async-signal-safe calls are allowed. `rt_sigprocmask` is one, its
+    // argument is a mask by value, and nothing else happens here.
+    #[expect(
+        unsafe_code,
+        reason = "a child's signal mask can only be changed between fork and exec, which is the contract of pre_exec"
+    )]
+    unsafe {
+        command.pre_exec(|| {
+            kernel_sigprocmask(How::SETMASK, Some(&KernelSigSet::empty()))
+                .map(|_| ())
+                .map_err(std::io::Error::from)
+        })
+    }
+}
+
+/// Every process under `root`, not including `root` itself.
+///
+/// The tree is read in one pass over `/proc`, then walked from `root`.
+pub fn descendants_of(root: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent) = parent_of(pid) else {
+            continue;
+        };
+        children.entry(parent).or_default().push(pid);
+    }
+
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        for child in children.remove(&pid).unwrap_or_default() {
+            found.push(child);
+            frontier.push(child);
+        }
+    }
+    found
+}
+
+/// The parent of one process, read from `/proc/<pid>/stat`.
+///
+/// The second field of that file is the name of the process in parentheses, and
+/// the name may hold spaces and parentheses, so the fields are counted from the
+/// last `)`.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.get(stat.rfind(')')? + 2..)?;
+    fields.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Send `signal` to every process in `pids`, and to nothing else.
+pub fn signal(pids: &[u32], signal: Signal) {
+    for pid in pids {
+        let Some(pid) = Pid::from_raw(*pid as i32) else {
+            continue;
+        };
+        if let Err(err) = kill_process(pid, signal) {
+            tracing::debug!(
+                pid = pid.as_raw_pid(),
+                ?signal,
+                ?err,
+                "could not signal a process"
+            );
+        }
+    }
+}
+
+/// Whether one process is still there.
+///
+/// A process that this server started and has not reaped yet counts as there,
+/// because it still holds the pid.
+pub fn alive(pid: u32) -> bool {
+    Pid::from_raw(pid as i32).is_some_and(|pid| test_kill_process(pid).is_ok())
+}
+
+/// Wait until every process in `pids` is gone, or `grace` runs out.
+///
+/// `reap` is called between checks, so that the children of this process are
+/// taken back from the kernel while their own children are being waited for.
+pub fn wait_until_gone(pids: &mut Vec<u32>, grace: Duration, reap: &mut impl FnMut()) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        reap();
+        pids.retain(|pid| alive(*pid));
+        if pids.is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{process::Command, thread};
+
+    use super::*;
+
+    #[test]
+    fn a_tree_is_read_and_stopped_in_full() {
+        // A client with a helper of its own: the helper is not a child of this
+        // process, and it is what a per-child kill would leave behind.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & sleep 30")
+            .spawn()
+            .expect("could not start a shell");
+        thread::sleep(Duration::from_millis(200));
+
+        let root = std::process::id();
+        let found = descendants_of(root);
+        assert!(
+            found.contains(&child.id()),
+            "the shell is under this process: {found:?}"
+        );
+        for pid in &found {
+            assert_ne!(*pid, root, "the root is not its own descendant");
+        }
+        let sleeps = found
+            .iter()
+            .filter(|pid| **pid != child.id() && is_sleep(**pid))
+            .count();
+        assert!(sleeps >= 2, "both helpers are in the tree: {found:?}");
+
+        // The helpers outlive their parent, which is what the escalation is
+        // for.
+        signal(&found, Signal::KILL);
+        let mut left = found;
+        assert!(
+            // The shell is this process's own child and stays a zombie until
+            // it is reaped, which is done here as the server does it.
+            wait_until_gone(&mut left, Duration::from_secs(2), &mut || {
+                let _ = child.try_wait();
+            }),
+            "nothing is left running: {left:?}"
+        );
+        let _ = child.wait();
+    }
+
+    /// Whether a process is one of the `sleep` helpers, by its command name.
+    ///
+    /// The name is the second field of `/proc/<pid>/stat`, in parentheses, and
+    /// it may hold spaces and parentheses of its own.
+    fn is_sleep(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.split_once(')').is_some_and(|(head, _)| {
+                head.rsplit_once('(')
+                    .is_some_and(|(_, comm)| comm == "sleep")
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use std::{process::Command, time::Duration};
+
+    use super::*;
+
+    #[test]
+    fn a_signal_stops_a_process() {
+        let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let pid = child.id();
+        signal(&[pid], Signal::HUP);
+        let mut left = vec![pid];
+        let gone = wait_until_gone(&mut left, Duration::from_secs(2), &mut || {
+            let _ = child.try_wait();
+        });
+        assert!(gone, "SIGHUP stopped sleep: {left:?} alive={}", alive(pid));
+    }
+}

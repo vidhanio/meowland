@@ -89,7 +89,7 @@ pub const REFRESH_MILLIHZ: i32 = 60_000;
 /// tiles mean less data re-sent.
 const TILE_CELLS: (u32, u32) = (16, 8);
 
-/// The modifier the quit shortcut uses.
+/// The modifier that the `Alt+Q` binding hangs off.
 ///
 /// A keystroke passes the host compositor and the terminal first. Window
 /// managers grab `Super` and terminals grab `Ctrl`, which leaves `Alt`.

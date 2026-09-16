@@ -84,14 +84,14 @@ pub enum Command {
     /// Start a client as another window of the server.
     Run(Vec<OsString>),
     /// Stop the server and everything started under it.
-    Quit,
+    Stop,
 }
 
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::List => b"list".to_vec(),
-            Self::Quit => b"quit".to_vec(),
+            Self::Stop => b"stop".to_vec(),
             Self::Run(argv) => {
                 let mut request = b"run".to_vec();
                 for argument in argv {
@@ -108,8 +108,8 @@ impl Command {
         if request == b"list" {
             return Some(Self::List);
         }
-        if request == b"quit" {
-            return Some(Self::Quit);
+        if request == b"stop" {
+            return Some(Self::Stop);
         }
         let mut fields = request.split(|byte| *byte == ARGUMENT_SEPARATOR);
         if fields.next() != Some(b"run".as_slice()) {
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn the_other_requests_survive_a_round_trip() {
-        for command in [Command::List, Command::Quit] {
+        for command in [Command::List, Command::Stop] {
             assert_eq!(Command::decode(&command.encode()), Some(command));
         }
         assert_eq!(Command::decode(b""), None);

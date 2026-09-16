@@ -312,8 +312,14 @@ fn list_windows() -> anyhow::Result<()> {
     };
     for window in windows {
         let mut fields = vec![window.id.to_string()];
+        // The label names the app, the title says what it is doing: one is what
+        // a shell would have started it by, the other is what the window itself
+        // says, and they are worth telling apart when both are there.
         if !window.label.is_empty() {
             fields.push(window.label);
+        }
+        if !window.title.is_empty() {
+            fields.push(window.title);
         }
         if window.active {
             fields.push("active".to_owned());

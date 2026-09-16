@@ -203,7 +203,13 @@ fn attached_windows(
     windows
         .into_iter()
         .map(|window| {
-            let mut description = window.label;
+            // The title is what tells one window from another while typing:
+            // an app ID is the same for every window an app has.
+            let mut description = if window.title.is_empty() {
+                window.label
+            } else {
+                window.title
+            };
             if window.active {
                 if !description.is_empty() {
                     description.push(' ');

@@ -99,6 +99,30 @@ pub enum Error {
     NoGraphics,
 }
 
+/// The escape that names the window a terminal is in.
+///
+/// The title comes from a client, so it is not taken at its word: control
+/// characters would let it write escapes of its own into the terminal that is
+/// showing it, and the terminal's answer to a long title is to truncate it
+/// anyway, so it is cut here rather than handed over whole.
+pub fn title(title: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(title.len() + 8);
+    out.extend_from_slice(b"\x1b]2;");
+    out.extend(
+        title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAXIMUM_TITLE)
+            .collect::<String>()
+            .bytes(),
+    );
+    out.push(b'\x07');
+    out
+}
+
+/// How much of a client's title a terminal is told about.
+const MAXIMUM_TITLE: usize = 256;
+
 /// Whether this process has a terminal to draw on.
 pub fn is_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -185,6 +209,10 @@ impl Terminal {
         // Alternate screen keeps the user's scrollback intact and clears images
         // on the way out.
         out.extend_from_slice(b"\x1b[?1049h");
+        // The title the terminal had is the user's, and comes back on the way
+        // out: what is shown here is this client's, and a client that has
+        // nothing to say about it says nothing.
+        out.extend_from_slice(b"\x1b[22;2t");
         // No autowrap: a stray write at the last column must never scroll the
         // screen, because scrolling would drag our placements along
         // with the text.
@@ -218,6 +246,9 @@ impl Terminal {
         }
         out.extend_from_slice(b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?2004l");
         out.extend_from_slice(b"\x1b[?7h\x1b[?25h\x1b[?1049l");
+        // Whatever the client called this terminal goes back to what it was
+        // called before.
+        out.extend_from_slice(b"\x1b[23;2t");
         let _ = Self::write(&out);
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -480,6 +511,17 @@ mod tests {
     /// sends.
     const KITTY_RESPONSES: &[u8] = b"\x1b[6;20;10t\x1b[4;1340;1240t\x1bP>|kitty(0.48.2)\x1b\\\
                                      \x1b_Gi=77;OK\x1b\\\x1b[?0u\x1b[?1016;2$y\x1b[?62;52;c";
+
+    #[test]
+    fn a_title_escape_carries_no_escapes_of_its_own() {
+        // A client names its window, and that name goes to a terminal: control
+        // characters in it would be a client writing escapes to a terminal it
+        // does not own.
+        let escape = title("\x1b]2;gotcha\x07\u{9b}31mred");
+        assert_eq!(escape, b"\x1b]2;]2;gotcha31mred\x07");
+        assert_eq!(title(""), b"\x1b]2;\x07");
+        assert!(title(&"x".repeat(MAXIMUM_TITLE * 2)).len() < MAXIMUM_TITLE + 8);
+    }
 
     #[test]
     fn parses_a_kitty_handshake() {

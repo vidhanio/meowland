@@ -194,9 +194,13 @@ pub struct View {
     dirty: Vec<Rect>,
     /// The window changed, or the terminal changed size: draw it all again.
     scene_dirty: bool,
-    pointer_dirty: bool,
+    /// The terminal is owed an escape that is not a frame: the pointer shape,
+    /// or the title of the window being shown.
+    escapes_dirty: bool,
     /// The pointer shape this pane was last told about.
     pointer_shape: Option<&'static str>,
+    /// What this pane's terminal was last told to call itself, if anything.
+    title: Option<String>,
     /// Set by the key binding that asks to stop being shown on this terminal.
     detaching: bool,
     /// The window this pane was given is gone, so the pane is too.
@@ -218,8 +222,9 @@ impl View {
             frame,
             dirty: Vec::new(),
             scene_dirty: true,
-            pointer_dirty: false,
+            escapes_dirty: false,
             pointer_shape: None,
+            title: None,
             detaching: false,
             done: false,
         }
@@ -228,7 +233,7 @@ impl View {
     /// Whether this pane has something to draw and the presenter is free to
     /// take it.
     const fn should_present(&self, presenter_ready: bool) -> bool {
-        self.scene_dirty || self.pointer_dirty || (!self.pending.is_empty() && presenter_ready)
+        self.scene_dirty || self.escapes_dirty || (!self.pending.is_empty() && presenter_ready)
     }
 
     /// The window this pane shows, if it has one to show.
@@ -260,6 +265,9 @@ struct Window {
     surface: ToplevelSurface,
     /// What the client calls itself: its app ID, or its title without one.
     label: Option<String>,
+    /// What the client calls the window, which is what the terminal showing it
+    /// is told to call itself (`crate::tty::title`).
+    title: Option<String>,
     /// Whether this window has been told it is on the output. A window is on
     /// it while any pane shows it, and the protocol has to be told once per
     /// change rather than per frame.
@@ -280,6 +288,7 @@ struct Window {
 pub struct WindowInfo {
     pub id: u64,
     pub label: String,
+    pub title: String,
     pub active: bool,
 }
 
@@ -476,6 +485,7 @@ impl Meowland {
             .map(|(index, window)| WindowInfo {
                 id: window.id,
                 label: window.label.clone().unwrap_or_default(),
+                title: window.title.clone().unwrap_or_default(),
                 active: self.active == Some(index),
             })
     }
@@ -691,13 +701,24 @@ impl Meowland {
 
     /// Re-read what the client calls this window, after it said so.
     fn relabel(&mut self, surface: &ToplevelSurface) {
-        let label = window_label(surface);
-        if let Some(window) = self
-            .windows
-            .iter_mut()
-            .find(|window| window.surface.wl_surface() == surface.wl_surface())
-        {
-            window.label = label;
+        let (label, title) = window_names(surface);
+        tracing::debug!(?label, ?title, "the client named its window");
+        let Some(index) = self.index_of(surface.wl_surface()) else {
+            return;
+        };
+        let window = &mut self.windows[index];
+        let renamed = window.title != title;
+        window.label = label.or_else(|| title.clone());
+        window.title = title;
+        if renamed {
+            // The terminals showing it are told what to call themselves, which
+            // is not a frame but still something they are owed.
+            let id = window.id;
+            for view in &mut self.views {
+                if view.window == Some(id) {
+                    view.escapes_dirty = true;
+                }
+            }
         }
     }
 
@@ -783,8 +804,9 @@ impl Meowland {
         // what this pane's terminal has yet to receive is its presenter's
         // business.
         self.views[index].scene_dirty = false;
-        self.views[index].pointer_dirty = false;
+        self.views[index].escapes_dirty = false;
         self.draw_pointer_shape(index, presenter);
+        self.name_terminal(index, presenter);
         self.hand_over(index, presenter, &mut cost);
 
         // Whatever became of the frame, the client that drew it is owed a
@@ -861,6 +883,23 @@ impl Meowland {
             presenter.raw(crate::presenter::pointer_shape_bytes(shape));
             self.views[pane].pointer_shape = shape;
         }
+    }
+
+    /// Tell the terminal showing a pane's window what to call itself.
+    ///
+    /// The title is the client's, and a terminal's title is the one place
+    /// outside the frame where a client can be seen: a browser says which page
+    /// it is on, an editor which file is open, and the user's window list says
+    /// the same as the screen does.
+    fn name_terminal(&mut self, pane: usize, presenter: &Presenter) {
+        let title = self.views[pane]
+            .index(&self.windows)
+            .and_then(|window| self.windows[window].title.clone());
+        if title.is_none() || self.views[pane].title == title {
+            return;
+        }
+        presenter.raw(crate::tty::title(title.as_deref().unwrap_or_default()));
+        self.views[pane].title = title;
     }
 
     /// Repaint one pane from the window it shows.
@@ -1244,28 +1283,28 @@ mod xdg_state {
     pub const MAXIMIZED: xdg_toplevel::State = xdg_toplevel::State::Maximized;
 }
 
-/// What a client calls its window: the app ID, which is the name a shell would
-/// have started it by, or the title when the client has no app ID.
+/// What a client calls its window: its app ID, and its title.
 ///
-/// This is only ever read to answer `list`, so it is kept in the window rather
-/// than re-read: the label is what a shell offers beside a window ID, and a
-/// title is not worth a lock on the surface for every keystroke of a
-/// completion.
-fn window_label(surface: &ToplevelSurface) -> Option<String> {
+/// This is only ever read to answer `list` and to name the terminal that is
+/// showing the window, so it is kept in the window rather than re-read, where
+/// it would be a lock on the surface for every keystroke of a completion.
+fn window_names(surface: &ToplevelSurface) -> (Option<String>, Option<String>) {
     with_states(surface.wl_surface(), |states| {
-        let label = {
+        let named = || {
             let attributes = states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()?
                 .lock()
                 .ok()?;
-            attributes
-                .app_id
-                .as_ref()
-                .or(attributes.title.as_ref())?
-                .clone()
+            Some((attributes.app_id.clone(), attributes.title.clone()))
         };
-        (!label.trim().is_empty()).then_some(label)
+        let (app_id, title) = named().unwrap_or_default();
+        let named = |name: &Option<String>| {
+            name.as_ref()
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+        };
+        (named(&app_id), named(&title))
     })
 }
 
@@ -1679,11 +1718,12 @@ impl XdgShellHandler for Meowland {
         let id = self.next_window_id;
         self.next_window_id = self.next_window_id.saturating_add(1);
         tracing::info!(id, wayland_id = ?surface.wl_surface().id(), "new window");
-        let label = window_label(&surface);
+        let (label, title) = window_names(&surface);
         self.windows.push(Window {
             id,
             surface,
-            label,
+            label: label.or_else(|| title.clone()),
+            title,
             entered: false,
             fullscreen: false,
         });
@@ -1837,7 +1877,7 @@ impl SeatHandler for Meowland {
         self.cursor = image;
         // Every pane draws the shape it was not told about yet.
         for view in &mut self.views {
-            view.pointer_dirty = true;
+            view.escapes_dirty = true;
         }
     }
 }

@@ -53,7 +53,7 @@ window, or one each, and nothing any pane does displaces another.
 
 ```sh
 meowland run foot        # run foot in the server, starting one if there is none
-meowland list            # the windows, their labels, and the one with the keyboard
+meowland list            # the windows: ID, app, title, and the one with the keyboard
 meowland attach 2        # show window 2 in this terminal
 meowland attach          # ...or the window that has the keyboard
 meowland quit            # stop the server and everything started in it
@@ -84,6 +84,15 @@ client, so when that client goes - closed this way, or by its own button, or by
 exiting - the pane is done and its terminal goes back to whoever was using it.
 Typing or clicking in a pane is what gives its window the keyboard, which is the
 sense in which one window is "active": `list` marks it.
+
+A window's title is the client's, and it goes to the terminal showing it: that
+terminal calls itself what the window calls itself (`tty::title`), so a browser's
+pane says which page it is on and an editor's which file is open, with the title
+the terminal had pushed onto its stack and popped back on the way out. The title
+is filtered and cut before it is sent - control characters in it would be a
+client writing escapes to a terminal it does not own - and the same name is what
+`list` prints beside the app, which is what tells one window of an app from
+another.
 
 What a client draws is its own size, and the size it is told is that of the pane
 showing it - the first such pane, when more than one is. Every window is told

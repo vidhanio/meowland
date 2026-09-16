@@ -17,7 +17,7 @@ use crate::{control, dmabuf};
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help,
     completion,
-    after_help = "Alt+Tab cycles the windows this terminal shows, Alt+W asks the one it is showing to close, and Alt+Q stops showing them here.\n\nA server outlives the terminals it is drawn on, and every terminal shows a window of its own choosing: `run` starts a server and shows it the newest window, `attach` shows one here, and `list` and `quit` reach the server from anywhere else."
+    after_help = "Alt+Q asks the window this terminal is showing to close: closing the client it belongs to is what ends the terminal's showing, and with nothing shown it lets go of the terminal instead.\n\nA server outlives the terminals it is drawn on, and every terminal shows a window of its own choosing: `run` starts a server and shows the window its client opens, `attach` shows one here, and `list` and `quit` reach the server from anywhere else."
 )]
 pub struct Cli {
     #[usage(subcommand)]

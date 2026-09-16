@@ -16,9 +16,10 @@
 //! module draws that window into that terminal's geometry with a frame buffer
 //! and tile bookkeeping of its own ([`View`]). Panes are independent - two of
 //! them may show the same window, or one each - and none of them is the whole
-//! of the server: `Alt+Tab` cycles the window of the pane the key was typed
-//! in, `Alt+W` asks that window to close, and the window the last key was
-//! typed in is the one with the keyboard. Popups remain
+//! of the server: `Alt+Q` asks the window the pane is showing to close, and the
+//! window the last key was typed in is the one with the keyboard. A pane that
+//! was given one window is done when that window goes, and the server lets its
+//! terminal go (`Meowland::take_closed_views`). Popups remain
 //! attached to their parent view.
 
 use std::{
@@ -179,8 +180,9 @@ pub struct View {
     capabilities: Capabilities,
     /// The window this pane is shown, when it has one yet.
     window: Option<u64>,
-    /// Whether this pane is still following the newest window - what was just
-    /// started is what is looked at - or has been given one to show.
+    /// Whether this pane is following the newest window - what was just
+    /// started is what is looked at - or was given one window to show, which is
+    /// the one it ends with.
     follow: bool,
     /// The pixels of this pane's screen, and the tiles they are cut into.
     frame: Frame,
@@ -197,6 +199,8 @@ pub struct View {
     pointer_shape: Option<&'static str>,
     /// Set by the key binding that asks to stop being shown on this terminal.
     detaching: bool,
+    /// The window this pane was given is gone, so the pane is too.
+    done: bool,
 }
 
 impl View {
@@ -217,6 +221,7 @@ impl View {
             pointer_dirty: false,
             pointer_shape: None,
             detaching: false,
+            done: false,
         }
     }
 
@@ -531,24 +536,6 @@ impl Meowland {
         self.sync_outputs();
     }
 
-    /// Show something else in this pane.
-    pub fn show_in_view(&mut self, id: u64, show: display::Show) {
-        let (window, follow) = self.resolve(show);
-        let Some(index) = self.view(id) else {
-            return;
-        };
-        let view = &mut self.views[index];
-        if view.window == window && view.follow == follow {
-            return;
-        }
-        view.window = window;
-        view.follow = follow;
-        // Everything is drawn again: it is another window, not a change in
-        // one.
-        view.scene_dirty = true;
-        tracing::debug!(id, ?window, "pane switched");
-    }
-
     /// The terminal this pane is in changed size, or changed what it can do.
     pub fn resize_view(&mut self, id: u64, capabilities: &Capabilities) {
         let Some(index) = self.view(id) else {
@@ -645,6 +632,21 @@ impl Meowland {
         std::mem::replace(&mut self.views[index].detaching, false)
     }
 
+    /// The panes whose window is gone, taking the list with it.
+    ///
+    /// A pane is a place to look at one client: when that client closes, the
+    /// pane has nothing left to be, so the terminal it was taken from goes
+    /// back to whoever was using it.
+    pub fn take_closed_views(&mut self) -> Vec<u64> {
+        let mut closed = Vec::new();
+        for view in &mut self.views {
+            if std::mem::replace(&mut view.done, false) {
+                closed.push(view.id);
+            }
+        }
+        closed
+    }
+
     /// Where a window's surface sits in the list.
     fn index_of(&self, surface: &WlSurface) -> Option<usize> {
         self.windows
@@ -671,23 +673,6 @@ impl Meowland {
     fn pane_window(&self, pane: u64) -> Option<usize> {
         let index = self.view(pane)?;
         self.views[index].index(&self.windows)
-    }
-
-    /// Show the next window in this pane, and give it the keyboard.
-    ///
-    /// The windows are cycled in the order they were created, which is the
-    /// order `list` prints them in.
-    fn cycle_window(&mut self, pane: u64) {
-        if self.windows.is_empty() {
-            return;
-        }
-        let current = self.pane_window(pane);
-        let next = match current {
-            Some(index) => self.windows[(index + 1) % self.windows.len()].id,
-            None => self.windows[self.windows.len() - 1].id,
-        };
-        self.show_in_view(pane, display::Show::Window(next));
-        self.focus_pane(pane);
     }
 
     /// Give the keyboard to the window a pane is showing, and hand back where
@@ -1001,7 +986,7 @@ impl Meowland {
     /// Handle compositor bindings before a key reaches a client.
     ///
     /// They act on the pane the key was typed in: with more than one pane, the
-    /// window on screen is whatever that pane is showing.
+    /// window being closed is whatever that pane is showing.
     fn binding(&mut self, pane: u64, modifiers: crossterm::event::KeyModifiers, code: u32) -> bool {
         use crossterm::event::KeyModifiers as M;
         if !modifiers.contains(BINDING_MODIFIER)
@@ -1011,16 +996,18 @@ impl Meowland {
             return false;
         }
         // Linux input event codes, as the terminal reports them
-        // (`keys::for_char`): `KEY_TAB`, `KEY_Q` and `KEY_W`.
+        // (`keys::for_char`): `KEY_Q`.
         match code {
-            15 => self.cycle_window(pane),
             16 => {
-                let Some(index) = self.view(pane) else {
-                    return false;
-                };
-                self.views[index].detaching = true;
+                // The window this pane shows, if it has one: closing a client
+                // is what ends its pane, and a pane with nothing to show has
+                // nothing to close, so this lets go of the terminal instead.
+                if self.pane_window(pane).is_some() {
+                    self.close_window(pane);
+                } else if let Some(index) = self.view(pane) {
+                    self.views[index].detaching = true;
+                }
             }
-            17 => self.close_window(pane),
             _ => return false,
         }
         true
@@ -1797,13 +1784,19 @@ impl XdgShellHandler for Meowland {
             Some(active) if was_active => Some(active.min(self.windows.len() - 1)),
             active => active,
         };
-        // A pane showing it has nothing to show: the backdrop, until the user
-        // asks for another window or starts one.
+        // A pane that was given this window has nothing left to show, and is
+        // done: it goes when this is answered (`take_closed_views`), and its
+        // terminal goes back to whoever was using it. A pane that follows the
+        // newest window is not about this client in particular, and carries on
+        // looking at whatever is next.
         for view in &mut self.views {
-            if view.window == Some(gone) {
-                view.window = None;
-                view.follow = false;
-                view.scene_dirty = true;
+            if view.window != Some(gone) {
+                continue;
+            }
+            view.window = None;
+            view.scene_dirty = true;
+            if !view.follow {
+                view.done = true;
             }
         }
         if was_active {

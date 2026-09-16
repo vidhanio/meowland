@@ -17,7 +17,7 @@ use crate::{control, dmabuf};
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help,
     completion,
-    after_help = "Alt+Tab cycles the open windows and Alt+Q stops showing this server here.\n\nA server outlives the terminal it is drawn on: `run` starts one and hands it its command, `attach` shows it, and `list` and `quit` reach it from anywhere else."
+    after_help = "Alt+Tab cycles the open windows, Alt+W asks the window on screen to close, and Alt+Q stops showing this server here.\n\nA server outlives the terminal it is drawn on: `run` starts one and hands it its command, `attach` shows it, and `list` and `quit` reach it from anywhere else."
 )]
 pub struct Cli {
     #[usage(subcommand)]

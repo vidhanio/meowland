@@ -74,6 +74,15 @@ stopping it; `meowland quit` stops the server. Showing a server takes a terminal
 and running a command does not, so a `run` with no terminal to draw on - a
 script, or output redirected - gives the server its command and exits.
 
+There are no decorations, so the bindings are the whole of the window
+management: `Alt+Tab` cycles the windows, `Alt+W` asks the window on screen to
+close (`xdg_toplevel.close`, which a client is free to answer with a question
+rather than by exiting), and `Alt+Q` lets go of the terminal. What a client
+draws is its own size: every window is *told* the size of the terminal and
+`Activated`, and one that asked for fullscreen is told `Fullscreen` too - a page
+whose video goes fullscreen, or a player started with `--fullscreen`, stays in
+its windowed self until it hears that, so the state is not a formality.
+
 The server is reached over two sockets in `$XDG_RUNTIME_DIR`, commands on one
 (`src/control.rs`) and terminals on the other (`src/display.rs`, and the
 vocabulary both ends speak). Their names are fixed and binding them is what says

@@ -1,8 +1,4 @@
-//! The terminal meowland draws into: capability probing, mode setup and raw
-//! escape output.
-//!
-//! Every escape that shows a pixel or sets a mode goes out through here, as a
-//! kitty graphics escape that [`crate::kitty`] encodes.
+//! Terminal capability probing and mode setup.
 
 use std::{
     io::{self, IsTerminal as _, Read as _, Write as _},

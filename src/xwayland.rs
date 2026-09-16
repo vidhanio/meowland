@@ -1,11 +1,4 @@
-//! The X display and the xwayland-satellite child of a server.
-//!
-//! The server reserves one display number and opens the two listening sockets
-//! of that display. It passes the sockets to one `xwayland-satellite` child as
-//! `-listenfd` arguments, and the child answers X11 clients on the display.
-//!
-//! The reservation is the lock file `/tmp/.X<N>-lock`, which holds the PID of
-//! the owner.
+//! X display reservation and xwayland-satellite startup.
 
 use std::{
     fs::{File, OpenOptions},

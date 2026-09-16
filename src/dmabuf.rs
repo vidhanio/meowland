@@ -1,40 +1,4 @@
-//! The render nodes that clients are offered for their GPU buffers.
-//!
-//! A client that renders on the GPU does not hand over pixels. It hands over a
-//! file descriptor for memory that its driver allocated. The compositor chooses
-//! the device that the memory is on, so the compositor has to name one. That
-//! device has to be one that the client can render on and the compositor can
-//! read. Otherwise the client is better off drawing into shared memory.
-//!
-//! # What keeps the offer honest
-//!
-//! The offer is what a client chooses on. Mesa's Wayland WSI takes GPU buffers
-//! when a compositor advertises them. It has no window when the buffers that it
-//! produces are then refused. An offer that cannot be honoured is therefore
-//! worse than no offer. Three things keep this offer inside what the compositor
-//! can read:
-//!
-//! - No renderer, no offer. The device is named only when a renderer on it can
-//!   bring buffers back. See [`crate::gpu`]. A machine with no render node
-//!   never advertises the global.
-//! - What is advertised is what that renderer takes, not what the protocol
-//!   allows.
-//! - Every buffer is read once before the compositor reports it to the client
-//!   as good. A layout that imports but cannot be copied out of is therefore
-//!   refused while the client can still fall back to shared memory.
-//!
-//! A driver that keeps a buffer where the CPU cannot reach it is expected, not
-//! exceptional. `mmap` of such a buffer fails with `EPERM`, whether or not CPU
-//! access was begun first, and reading the descriptor fails with `EINVAL`. That
-//! is why the renderer exists.
-//!
-//! [`Offer::Off`] is the way out, if a client turns out to be worse off with
-//! the offer than without it.
-//!
-//! # Choosing a device
-//!
-//! On a machine with more than one GPU, every render node is offered and the
-//! client picks the one that it renders on. The order is a hint, not a rule.
+//! Discover render nodes for GPU buffer offers.
 
 use std::{
     fs,

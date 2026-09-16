@@ -1,21 +1,15 @@
-//! What the command line says.
-//!
-//! Parsing only: `crate::start` decides what the values mean. One question goes
-//! to the server, because completion of `attach` offers the window IDs that the
-//! running server has.
-
 use std::{ffi::OsString, path::PathBuf};
 
 use crate::{control, dmabuf};
 
-/// A terminal-native Wayland compositor.
+/// A Wayland compositor in a terminal.
 #[derive(usage::Cli)]
 #[usage(
     bin = "meowland",
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help,
     completion,
-    after_help = "Alt+Q asks the window shown here to close. The pane ends when that client goes away, and with no window shown Alt+Q releases the terminal instead.\n\nA server outlives the terminals that show it, and each terminal chooses one window: `run` starts a server if there is none and shows the window its client opens, `attach` shows one window here, and `list` and `server` reach the server from anywhere else."
+    after_help = "Alt+Q closes the shown window or detaches an empty pane. The server stays running after a pane exits."
 )]
 pub struct Cli {
     #[usage(subcommand)]
@@ -24,15 +18,15 @@ pub struct Cli {
 
 #[derive(usage::Subcommands)]
 pub enum Action {
-    /// Run a client in the server and show its window here
+    /// Run a client and show its window
     Run(Run),
-    /// Show one window of the server in this terminal
+    /// Show a window in this terminal
     Attach(Attach),
-    /// Print the open windows and the IDs that `attach` takes
+    /// List open windows
     List(List),
-    /// Start a server, or stop one
+    /// Start or stop the server
     Server(Server),
-    /// Print a shell completion script
+    /// Print shell completions
     Completions(Completions),
 }
 
@@ -41,7 +35,7 @@ pub struct Run {
     #[usage(flatten)]
     pub settings: Settings,
 
-    /// Client command and its arguments. Without it, only show the server.
+    /// Client command; omit to show the server without starting a client
     #[usage(
         value_name = "COMMAND",
         value_hint = usage::ValueHint::CommandWithArguments,
@@ -50,13 +44,9 @@ pub struct Run {
     pub command: Vec<OsString>,
 }
 
-/// How a server is set up. Each flag falls back to an environment variable.
 #[derive(usage::Args)]
-#[usage(
-    after_help = "Every setting has a command line flag and an environment variable; the flag wins."
-)]
 pub struct Settings {
-    /// How clients are offered GPU buffers
+    /// GPU buffer offering mode
     #[usage(
         long,
         value_enum,
@@ -66,25 +56,21 @@ pub struct Settings {
     )]
     pub gpu_buffers: dmabuf::Offer,
 
-    /// The render node to offer clients, instead of the first one with a
-    /// renderer
+    /// Render node to offer clients
     #[usage(long, env = "MEOWLAND_RENDER_NODE", value_name = "PATH")]
     pub render_node: Option<PathBuf>,
 
-    /// Where to write logs, instead of `$XDG_RUNTIME_DIR/meowland.log`
+    /// Log path
     #[usage(long, env = "MEOWLAND_LOG", value_name = "PATH")]
     pub log: Option<PathBuf>,
 
-    /// A `tracing` filter, as in `meowland=debug`
+    /// Log filter, such as `meowland=debug`
     #[usage(long, env = "MEOWLAND_LOG_LEVEL", value_name = "FILTER")]
     pub log_level: Option<String>,
 }
 
 impl Settings {
-    /// These settings as the flags that carry them.
-    ///
-    /// A server is a separate process, so it must be told what this command
-    /// decided. It reads the same environment, but a flag is not in it.
+    /// Pass resolved flags to a new server process.
     pub fn args(&self) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("--gpu-buffers"),
@@ -106,10 +92,6 @@ impl Settings {
     }
 }
 
-/// What to do with a server.
-///
-/// A server has no terminal of its own. `meowland run` starts one if there is
-/// none. These commands start a server on its own, and stop one.
 #[derive(usage::Args)]
 pub struct Server {
     #[usage(subcommand)]
@@ -118,26 +100,24 @@ pub struct Server {
 
 #[derive(usage::Subcommands)]
 pub enum ServerAction {
-    /// Start a server and stay in it: no terminal, reached over its sockets
+    /// Start a server without attaching a terminal
     Start(Start),
-    /// Stop the server and everything running in it
+    /// Stop the server and its clients
     Stop(Stop),
 }
 
-/// Start a server.
 #[derive(usage::Args)]
 pub struct Start {
     #[usage(flatten)]
     pub settings: Settings,
 }
 
-/// Stop a server.
 #[derive(usage::Args)]
 pub struct Stop;
 
 #[derive(usage::Args)]
 pub struct Attach {
-    /// Server-assigned window ID to show, or the window that has the keyboard
+    /// Window ID; defaults to the focused window
     #[usage(value_name = "ID", complete = attached_windows)]
     pub window: Option<u64>,
 }
@@ -147,12 +127,11 @@ pub struct List;
 
 #[derive(usage::Args)]
 pub struct Completions {
-    /// Shell to print the script for
+    /// Shell name
     #[usage(value_enum, value_name = "SHELL")]
     pub shell: CompletionShell,
 }
 
-/// The shells a completion script is printed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, usage::ValueEnum)]
 pub enum CompletionShell {
     Bash,
@@ -165,10 +144,6 @@ pub enum CompletionShell {
     PowerShell,
 }
 
-/// The script a shell sources to complete meowland's own words.
-///
-/// It calls back into `meowland __complete_word__`, so this build answers what
-/// is offered.
 pub fn script(shell: CompletionShell) -> String {
     Cli::completion_script(shell.into())
 }
@@ -186,11 +161,7 @@ impl From<CompletionShell> for usage::complete::Shell {
     }
 }
 
-/// The window IDs that `attach` may be given, read from the running server.
-///
-/// A shell asks this while the user types, so a server that is not running is
-/// an empty answer and not an error. A complaint printed into a half-finished
-/// command line is worse than offering nothing.
+/// Complete IDs from the running server.
 fn attached_windows(
     _partial: &<Attach as usage::argv::spec::CommandArgs>::Partial,
     _ctx: &usage::complete::CompleteCtx<'_>,
@@ -201,7 +172,6 @@ fn attached_windows(
     windows
         .into_iter()
         .map(|window| {
-            // The title tells one window from another. An app ID does not.
             let mut description = if window.title.is_empty() {
                 window.label
             } else {
@@ -258,7 +228,6 @@ mod tests {
             parsed.settings.render_node,
             Some(PathBuf::from("/dev/dri/renderD129"))
         );
-        // The client's own flags are not the compositor's to read.
         assert_eq!(
             parsed.command,
             ["foot", "-T", "meowland"].map(OsString::from)

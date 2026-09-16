@@ -1,10 +1,4 @@
-//! Where meowland's own output goes.
-//!
-//! A server has no terminal of its own. The panes it draws on come and go, and
-//! each is a socket rather than a file descriptor it can print to, so the log
-//! is a file. The handle that `init` returns is also where the output of every
-//! client goes. A client that prints why it failed would otherwise print into
-//! the screen it is drawn on.
+//! Server and client file logging.
 
 use std::{
     fs::{File, OpenOptions},

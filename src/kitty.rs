@@ -1,13 +1,4 @@
-//! Encoding of the [kitty graphics protocol][spec].
-//!
-//! The compositor sends raw RGB image data here, zlib compressed, and places it
-//! in a cell rectangle in one command. It deletes images and sets the terminal
-//! modes the protocol needs.
-//!
-//! This module writes escapes only. [`crate::tty`] reads the answers and is the
-//! only place that touches stdin.
-//!
-//! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+//! Kitty graphics protocol encoding.
 
 use std::{
     io::Write as _,

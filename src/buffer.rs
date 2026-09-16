@@ -1,21 +1,4 @@
-//! Reading client pixels out of `wl_buffer`s.
-//!
-//! A client hands the compositor pixels in one of two ways. The first is shared
-//! memory (`wl_shm`). The second is a file descriptor for memory that a GPU
-//! driver allocated (`zwp_linux_dmabuf_v1`). The memory stays the client's, and
-//! the client may reuse it as soon as the compositor reports that it is done.
-//! The compositor therefore copies the pixels out at once ([`snapshot`]) and
-//! hands the buffer straight back. After that it holds the copy, and
-//! compositing never touches client memory again.
-//!
-//! Both ways share the copy, and differ in what makes it safe. Shared memory
-//! arrives with a length, and the copy is bounded by that length. A GPU buffer
-//! arrives as a file descriptor. The compositor maps it, reads it inside a
-//! synchronization bracket, and unmaps it again. The layout matters here too:
-//! only a linear buffer can be read without the driver that wrote it.
-//!
-//! The shared memory and mapped GPU copies each need a bounded raw pointer
-//! read. Both uses of `unsafe` are kept next to their bounds checks.
+//! Copy shared-memory and GPU buffers into owned snapshots.
 
 use smithay::{
     backend::allocator::{
@@ -31,7 +14,6 @@ use smithay::{
 
 use crate::render::{Image, SourceFormat};
 
-/// A copy of one client buffer, owned by the compositor.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub width: u32,
@@ -45,7 +27,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Empty storage used until a surface commits its first valid buffer.
     pub const fn empty() -> Self {
         Self {
             width: 0,
@@ -59,8 +40,6 @@ impl Snapshot {
 }
 
 impl Snapshot {
-    /// The size the client laid this buffer out against, in logical
-    /// coordinates.
     pub fn logical_size(&self) -> (i32, i32) {
         let scale = self.scale.max(1) as u32;
         (
@@ -69,10 +48,6 @@ impl Snapshot {
         )
     }
 
-    /// Take `pixels` as this snapshot.
-    ///
-    /// Every reader of a client buffer ends here: shared memory, a mapped GPU
-    /// buffer, and a readback through the renderer.
     pub fn fill(
         &mut self,
         pixels: &[u8],
@@ -121,7 +96,6 @@ impl Snapshot {
     }
 }
 
-/// `None` for a format the compositor cannot composite.
 pub const fn shm_format(format: ShmFormat) -> Option<SourceFormat> {
     match format {
         ShmFormat::Argb8888 => Some(SourceFormat::Argb8888),
@@ -130,11 +104,6 @@ pub const fn shm_format(format: ShmFormat) -> Option<SourceFormat> {
     }
 }
 
-/// Translate a GPU buffer's layout into a layout the renderer understands.
-///
-/// This covers color order and alpha, and not the modifier. The modifier
-/// decides only whether the pixels can be reached by mapping them, or have to
-/// go through the renderer ([`crate::gpu`]).
 pub const fn dmabuf_format(format: DmabufFormat) -> Option<SourceFormat> {
     match format.code {
         Fourcc::Argb8888 => Some(SourceFormat::Argb8888),
@@ -143,18 +112,7 @@ pub const fn dmabuf_format(format: DmabufFormat) -> Option<SourceFormat> {
     }
 }
 
-/// Copy out the pixels of a client buffer, of either kind.
-///
-/// `limit` is the size of the largest screen of any pane that shows this
-/// window. A buffer far larger than that is refused instead of copied, so a
-/// client cannot make the compositor hold memory it has no screen for. With no
-/// pane attached there is no screen to be too large for, so nothing is refused
-/// on this ground.
-///
-/// Returns `false` for a buffer from a protocol that meowland does not
-/// advertise, and for a format that it cannot composite. It also returns
-/// `false` for a buffer whose advertised geometry does not fit the memory that
-/// the client handed over.
+/// Copy a client buffer, bounded by `limit` when a pane shows it.
 pub fn snapshot(
     buffer: &WlBuffer,
     scale: i32,
@@ -168,12 +126,7 @@ pub fn snapshot(
     copy_shm(buffer, scale, limit, destination)
 }
 
-/// Whether the compositor can read a GPU buffer.
-///
-/// This decides whether the compositor reports the buffer to the client as
-/// good. The question is asked before the client draws into the buffer. A
-/// buffer that meowland cannot composite is then refused while the client can
-/// still fall back to shared memory.
+/// Check readability before accepting a GPU buffer.
 pub fn dmabuf_readable(
     dmabuf: &Dmabuf,
     gpu: Option<&mut crate::gpu::Renderer>,
@@ -181,8 +134,6 @@ pub fn dmabuf_readable(
     if dmabuf_format(dmabuf.format()).is_none() {
         return Err(Unreadable::Layout(dmabuf.format()));
     }
-    // A buffer that the CPU can map is one the compositor can already read,
-    // whatever the modifier. Any other buffer has to go through the renderer.
     if dmabuf.format().modifier == Modifier::Linear && read_plane(dmabuf, |_, _| ()).is_ok() {
         return Ok(());
     }
@@ -190,8 +141,6 @@ pub fn dmabuf_readable(
     gpu.can_read(dmabuf).map_err(Unreadable::Renderer)
 }
 
-/// Each variant is a different thing to look at when a window comes up blank.
-/// The variants are therefore kept apart instead of collapsed into one "no".
 #[derive(Debug)]
 pub enum Unreadable {
     /// The client laid the pixels out in a way that cannot be read as rows.
@@ -235,12 +184,7 @@ impl std::fmt::Display for Unreadable {
     }
 }
 
-/// Copy out the pixels of a GPU buffer.
-///
-/// `None` when the buffer is not a GPU buffer: it is a `wl_shm` buffer, or it
-/// comes from a protocol that is not advertised. Otherwise `Some` says whether
-/// the copy happened. That keeps a refused GPU buffer out of the shared memory
-/// reader, where it would be reported as a failure of the wrong kind.
+/// `None` means this buffer is not a DMA buffer.
 fn copy_dmabuf(
     buffer: &WlBuffer,
     scale: i32,
@@ -262,10 +206,6 @@ fn copy_dmabuf(
         return Some(false);
     }
 
-    // Mapping the buffer is the cheap path, with no GPU work and no readback,
-    // so it is tried first, and only for the layout that it can interpret.
-    // A buffer that cannot be mapped is still readable though: the device
-    // that wrote it can read it.
     let copy = |pixels: &[u8], stride: u32, destination: &mut Snapshot| {
         destination.fill(pixels, stride, width, height, scale, format);
     };
@@ -309,9 +249,6 @@ fn copy_shm(
             tracing::debug!(width, height, ?limit, "refusing an oversized client buffer");
             return false;
         }
-        // The rows are only required to be `stride` apart, so the last byte
-        // read decides whether the client's advertisement is consistent
-        // with the pool it handed over.
         let Some(last) = Snapshot::pixel_extent(width, height, stride) else {
             return false;
         };
@@ -351,18 +288,7 @@ fn copy_shm(
     }
 }
 
-/// Read the single plane of a GPU buffer.
-///
-/// The plane is mapped, handed to `read` as rows of pixels, and unmapped again.
-/// The mapping is readable only between the two halves of a synchronization
-/// bracket. The lengths involved are the client's word against the memory that
-/// it handed over, so both are checked here and not at the call sites.
-///
-/// The bracket comes first on purpose. A driver may keep a buffer somewhere
-/// that the CPU cannot reach, which is what video memory is. Beginning CPU
-/// access is the request that moves the buffer somewhere that the CPU can
-/// reach. A buffer that is mapped without that bracket is refused, which is
-/// what happens when the order is the other way round.
+/// Map a plane within a CPU access synchronization bracket.
 fn read_plane<T>(dmabuf: &Dmabuf, read: impl FnOnce(&[u8], u32) -> T) -> Result<T, Unreadable> {
     if dmabuf.num_planes() != 1 {
         return Err(Unreadable::Planes(dmabuf.num_planes()));
@@ -414,7 +340,6 @@ impl<'a> MappedPlane<'a> {
     }
 }
 
-/// One open DMA buffer CPU-access bracket.
 #[derive(Debug)]
 struct PlaneRead<'a>(&'a Dmabuf);
 

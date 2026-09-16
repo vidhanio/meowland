@@ -1,23 +1,7 @@
-//! The compositor's own frame buffer. Every client pixel is blended into it.
-//!
-//! The compositor does not use the GPU. A client buffer arrives from shared
-//! memory, or as a GPU buffer that was read back on the CPU; [`crate::buffer`]
-//! covers that readback. Each buffer is alpha blended into the frame. The
-//! result is diffed tile by tile, so that only the changed tiles go to the
-//! terminal again; [`crate::kitty`] is the terminal side.
-//!
-//! Client pixels are **premultiplied** RGBA, which is what Wayland's `wl_shm`
-//! says they are, so compositing is one multiply-add per channel with no
-//! conversion. The frame itself is RGB: everything is blended onto an opaque
-//! backdrop that [`Frame::clear`] paints, so no alpha survives. The diff, the
-//! copy to the terminal and the terminal itself each carry a quarter fewer
-//! bytes that way. The frame is also the format that the terminal is sent
-//! (`f=24`).
+//! Blend premultiplied client pixels into an RGB frame and diff its tiles.
 
-/// Bytes one pixel takes in a client buffer: four channels, alpha included.
 pub const BYTES4: usize = 4;
 
-/// Bytes one pixel takes in the frame: three bytes. The frame keeps no alpha.
 pub const BYTES: usize = 3;
 
 /// The origin is signed, because a sub-surface offset can be negative.
@@ -59,9 +43,7 @@ impl Rect {
     }
 }
 
-/// The suffix of each name says whether the layout has an alpha channel. The
-/// prefix says the order of the bytes in memory, so the first byte of
-/// `Argb8888` is blue.
+/// Pixel layouts, named by channel order in a little-endian word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
     /// `ARGB8888`: bytes are blue, green, red, alpha.
@@ -75,8 +57,6 @@ pub enum SourceFormat {
 }
 
 impl SourceFormat {
-    /// Whether every pixel of this layout is opaque, whatever the fourth byte
-    /// holds.
     pub const fn opaque(self) -> bool {
         matches!(self, Self::Xrgb8888 | Self::Xbgr8888)
     }
@@ -130,25 +110,13 @@ impl Frame {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    /// Paint the whole frame with a colour.
-    ///
-    /// This is the backdrop that every other buffer blends onto. A pixel is
-    /// three bytes, so this is a stride-three store loop over the screen. The
-    /// compiler vectorizes it to memory bandwidth, measured at 15 GB/s for a
-    /// 1240x1340 frame.
     pub fn clear(&mut self, color: [u8; 3]) {
         for pixel in self.pixels.as_chunks_mut::<BYTES>().0 {
             pixel.copy_from_slice(&color);
         }
     }
 
-    /// Blend a client buffer into `dst`.
-    ///
-    /// `src` selects the region of the image to show, in image pixels. `dst`
-    /// selects the region of the frame to show it in. When the two differ in
-    /// size, the image is scaled with nearest-neighbour sampling, which is what
-    /// buffer scale and viewport scaling come down to. Everything is clipped to
-    /// the frame.
+    /// Draw `src` into `dst` with nearest-neighbor scaling and frame clipping.
     pub fn draw(&mut self, image: &Image<'_>, src: Rect, dst: Rect) {
         if src.is_empty() || dst.is_empty() {
             return;
@@ -156,8 +124,6 @@ impl Frame {
         let Some(clipped) = dst.intersect(self.bounds()) else {
             return;
         };
-        // Map the clipped destination back into image space. Clipped pixels
-        // then cost nothing.
         let scale_x = f64::from(src.width) / f64::from(dst.width);
         let scale_y = f64::from(src.height) / f64::from(dst.height);
         let offset_x = f64::mul_add(f64::from(clipped.x - dst.x), scale_x, f64::from(src.x));
@@ -208,9 +174,7 @@ impl Frame {
             [red, green, blue, alpha]
         };
 
-        // A one-to-one, fully opaque row only needs its channels copied into
-        // the three-byte frame. The layout is chosen once for the whole row.
-        // This is the common case for a client rendering at the output's scale.
+        // Copy opaque rows at native scale without blending.
         if image.format.opaque() && (scale_x - 1.0).abs() < f64::EPSILON && offset_x >= 0.0 {
             let source_start = source_row + offset_x as usize * BYTES4;
             let source_length = count as usize * BYTES4;
@@ -251,11 +215,7 @@ impl Frame {
     }
 }
 
-/// Blend a premultiplied source over the destination.
-///
-/// Each channel becomes `src + dst * (1 - alpha)`. The source is premultiplied,
-/// so it is used as it is. The destination is the frame, which is opaque, so
-/// the result is opaque as well and the alpha needs no tracking.
+/// Blend premultiplied source RGB over opaque destination RGB.
 fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     let alpha = u32::from(source[3]);
     if alpha == 255 {
@@ -269,11 +229,7 @@ fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     }
 }
 
-/// Splits the frame into a grid of tiles and reports which ones changed.
-///
-/// A terminal takes whole images, so the smallest update is one tile. Around 15
-/// to 30 cells across means a keystroke in a terminal usually costs one small
-/// image that compresses well instead of a whole screen.
+/// Tracks changed tiles between frames.
 #[derive(Debug)]
 pub struct Tiles {
     pub size: (u32, u32),
@@ -298,11 +254,7 @@ impl Tiles {
         }
     }
 
-    /// Fill `changed` with the tiles of `frame` that changed.
-    ///
-    /// The tiles are listed in tile order. The list holds indices, not
-    /// rectangles. The caller cuts a tile out by index. It also remembers a due
-    /// tile by index, and both uses take the numbering that this grid gives.
+    /// Fill `changed` with tile indices in grid order.
     pub fn diff(&mut self, frame: &Frame, changed: &mut Vec<usize>) {
         if self.previous.len() != frame.pixels.len() {
             self.stale = true;
@@ -324,7 +276,6 @@ impl Tiles {
         self.grid.0 as usize * self.grid.1 as usize
     }
 
-    /// The rectangle of one tile, clipped to the frame.
     pub fn tile(&self, frame: &Frame, index: usize) -> Rect {
         let grid_x = index as u32 % self.grid.0;
         let grid_y = index as u32 / self.grid.0;

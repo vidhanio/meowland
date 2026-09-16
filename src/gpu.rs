@@ -1,16 +1,4 @@
-//! Reading a client's GPU buffer through the renderer.
-//!
-//! A driver may keep a buffer somewhere that the CPU cannot reach, such as
-//! video memory. Mapping such a buffer fails, and reading its descriptor fails
-//! too; [`crate::dmabuf`] has the details. The device that wrote the pixels can
-//! still read them, so the compositor has the GPU draw the buffer into a
-//! texture that the CPU can read back.
-//!
-//! The readback goes to [`crate::buffer`], which cannot tell those pixels from
-//! the pixels of a buffer that was mapped. None of this is needed for a buffer
-//! that can be mapped, which is cheaper. It is the answer for the buffers that
-//! cannot be, and having an answer is what lets the compositor offer GPU
-//! buffers to clients.
+//! Read GPU buffers back through GLES when they cannot be mapped.
 
 use std::path::Path;
 

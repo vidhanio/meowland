@@ -42,20 +42,30 @@ pub fn connect() -> Result<UnixStream, control::Error> {
 /// A server outlives upgrades, so the two ends can be different builds: a
 /// client that says another version is turned away rather than understood
 /// wrongly.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+/// Which window a pane is asking to be shown.
+///
+/// Panes are independent: the server draws the window each one asks for, and
+/// two of them may be showing the same window or one each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Show {
+    /// The window the server has focused, resolved when the pane attaches.
+    Focused,
+    /// The newest window, from here on: what was just started is what is
+    /// looked at.
+    Newest,
+    /// This window, by the ID the server gave it.
+    Window(u64),
+}
 
 /// What a terminal tells the server it is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToServer {
-    /// Take over as the terminal this server is drawn on.
+    /// Attach this pane to the server, showing what [`Show`] asks for.
     Hello {
         version: u32,
-        /// A window to show, if the user asked for one.
-        window: Option<u64>,
-        /// Whether to take the server over from another terminal that is
-        /// showing it. `run` asks not to, so that handing a command to a
-        /// server someone else is looking at does not move it.
-        steal: bool,
+        show: Show,
         capabilities: Capabilities,
     },
     /// The terminal was resized, and this is what it can do now.
@@ -174,14 +184,12 @@ pub fn encode(message: &ToServer) -> Message {
     match message {
         ToServer::Hello {
             version,
-            window,
-            steal,
+            show,
             capabilities,
         } => {
             let mut payload = Vec::new();
             payload.extend_from_slice(&version.to_le_bytes());
-            put_window(&mut payload, *window);
-            payload.push(u8::from(*steal));
+            put_show(&mut payload, *show);
             put_capabilities(&mut payload, capabilities);
             (tag::HELLO, payload)
         }
@@ -217,8 +225,7 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<ToServer> {
     Some(match tag {
         tag::HELLO => ToServer::Hello {
             version: read.u32()?,
-            window: read.window()?.named(),
-            steal: read.flag()?,
+            show: read.show()?,
             capabilities: read.capabilities()?,
         },
         tag::RESIZED => ToServer::Resized(read.capabilities()?),
@@ -330,36 +337,22 @@ fn input_from(read: &mut Reader<'_>) -> Option<Input> {
     })
 }
 
-/// The window a message names, through the reader.
-///
-/// Asking for no particular window is a value this protocol carries, not the
-/// absence of one: an [`Option<Option<u64>>`](Option) would say the same thing
-/// and read as an accident.
-#[derive(Debug, Clone, Copy)]
-enum Chosen {
-    /// No window in particular.
-    Any,
-    /// This one.
-    Window(u64),
+/// The kind byte each [`Show`] carries, and the window that goes with one of
+/// them.
+mod show {
+    pub const FOCUSED: u8 = 0;
+    pub const NEWEST: u8 = 1;
+    pub const WINDOW: u8 = 2;
 }
 
-impl Chosen {
-    /// The window named, or `None` for no window in particular.
-    const fn named(self) -> Option<u64> {
-        match self {
-            Self::Any => None,
-            Self::Window(id) => Some(id),
-        }
-    }
-}
-
-fn put_window(payload: &mut Vec<u8>, window: Option<u64>) {
-    match window {
-        Some(id) => {
-            payload.push(1);
+fn put_show(payload: &mut Vec<u8>, show: Show) {
+    match show {
+        Show::Focused => payload.push(show::FOCUSED),
+        Show::Newest => payload.push(show::NEWEST),
+        Show::Window(id) => {
+            payload.push(show::WINDOW);
             payload.extend_from_slice(&id.to_le_bytes());
         }
-        None => payload.push(0),
     }
 }
 
@@ -429,16 +422,19 @@ impl<'a> Reader<'a> {
         Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    /// The window a message names, where naming none is a value of its own:
-    /// `None` from here is a message that ended too early.
-    fn window(&mut self) -> Option<Chosen> {
-        if !self.flag()? {
-            return Some(Chosen::Any);
-        }
-        let bytes = self.take(8)?;
-        let mut value = [0u8; 8];
-        value.copy_from_slice(bytes);
-        Some(Chosen::Window(u64::from_le_bytes(value)))
+    /// Which window a pane asked to be shown.
+    fn show(&mut self) -> Option<Show> {
+        Some(match self.u8()? {
+            show::FOCUSED => Show::Focused,
+            show::NEWEST => Show::Newest,
+            show::WINDOW => {
+                let bytes = self.take(8)?;
+                let mut value = [0u8; 8];
+                value.copy_from_slice(bytes);
+                Show::Window(u64::from_le_bytes(value))
+            }
+            _ => return None,
+        })
     }
 
     fn string(&mut self) -> Option<String> {
@@ -518,7 +514,7 @@ mod tests {
     use std::io::{self, Cursor};
 
     use super::{
-        Capabilities, Input, Key, KeyKind, Pointer, ToClient, ToServer, VERSION, decode,
+        Capabilities, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer, VERSION, decode,
         decode_client, encode, encode_client, read_from, write_to,
     };
 
@@ -549,18 +545,21 @@ mod tests {
     fn a_hello_survives_a_round_trip() {
         round_trip(ToServer::Hello {
             version: VERSION,
-            window: Some(7),
-            steal: false,
+            show: Show::Window(7),
             capabilities: capabilities(),
         });
         round_trip(ToServer::Hello {
             version: VERSION,
-            window: None,
-            steal: true,
+            show: Show::Newest,
             capabilities: Capabilities {
                 terminal: None,
                 ..capabilities()
             },
+        });
+        round_trip(ToServer::Hello {
+            version: VERSION,
+            show: Show::Focused,
+            capabilities: capabilities(),
         });
     }
 
@@ -676,8 +675,7 @@ mod tests {
                 &mut writer,
                 encode(&ToServer::Hello {
                     version: VERSION,
-                    window: Some(3),
-                    steal: true,
+                    show: Show::Window(3),
                     capabilities: capabilities(),
                 }),
             )
@@ -695,8 +693,7 @@ mod tests {
                 decode(tag, &payload),
                 Some(ToServer::Hello {
                     version: VERSION,
-                    window: Some(3),
-                    steal: true,
+                    show: Show::Window(3),
                     capabilities: capabilities(),
                 }),
                 "a piece of {piece}"

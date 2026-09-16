@@ -46,26 +46,6 @@ pub struct Capabilities {
 /// distorts pixels but not layout.
 const FALLBACK_CELL: (u32, u32) = (10, 20);
 
-impl Capabilities {
-    /// What a server knows before any terminal has told it anything.
-    ///
-    /// A server does not own a terminal: it is started with nothing known
-    /// about one, and the terminal that attaches replaces this with what it can
-    /// actually do (`crate::server`).
-    pub const fn detached() -> Self {
-        Self {
-            cell: FALLBACK_CELL,
-            cells: (0, 0),
-            pixels: (0, 0),
-            terminal: None,
-            graphics: false,
-            keyboard: false,
-            pixel_mouse: false,
-            shared_memory: false,
-        }
-    }
-}
-
 /// Whether the terminal has gone away.
 ///
 /// A closed terminal hangs its file descriptors up and fails every read on

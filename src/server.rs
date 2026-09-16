@@ -27,13 +27,13 @@ use smithay::{
     reexports::{
         calloop::{
             EventLoop as Calloop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
+            RegistrationToken,
             channel::{Channel, Event as ChannelEvent, Sender, channel},
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
         wayland_server::Display,
     },
-    utils::{Logical, Point},
     wayland::socket::ListeningSocketSource,
 };
 
@@ -41,7 +41,7 @@ use crate::{
     cli::Settings,
     compositor::{Cost, Meowland},
     control, display,
-    display::{Input, Pointer, ToClient, ToServer},
+    display::{Input, ToClient, ToServer},
     logging,
     presenter::{Event as PresenterEvent, Presenter},
     tty::Capabilities,
@@ -94,7 +94,7 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
     let nodes = gpu_buffers.nodes(render_node.as_deref())?;
     // No terminal is attached yet, so the seat has nothing to tell clients
     // about: what a terminal can do arrives with the terminal.
-    let state = Meowland::new(&display.handle(), &Capabilities::detached(), &nodes)?;
+    let state = Meowland::new(&display.handle(), &nodes)?;
     // X11 clients are the satellite's business, not the compositor's: without
     // it a Wayland client still gets a window, so this is a warning and not a
     // reason to refuse to start.
@@ -105,21 +105,24 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
             None
         }
     };
-    let (presenter_sender, presenter_events) = channel();
-    let presenter = Presenter::new(presenter_sender)?;
     let (terminal_sender, terminal_events) = channel();
+    // The loop comes first, because the app registers a pane's presenter events
+    // with it as panes attach.
+    let mut event_loop: Calloop<App> =
+        Calloop::try_new().context("could not create an event loop")?;
+    let handle = event_loop.handle();
 
     let mut app = App {
         display,
         state,
-        presenter,
         xwayland,
         socket_name,
         log,
-        terminal: None,
+        panes: HashMap::new(),
         terminal_sender,
         readers: HashMap::new(),
         generations: 0,
+        handle: handle.clone(),
         _sockets: (control_socket, display_socket),
         children: Vec::new(),
         quit_when_empty: !command.is_empty(),
@@ -131,12 +134,7 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
         signal: None,
     };
 
-    let mut event_loop: Calloop<App> =
-        Calloop::try_new().context("could not create an event loop")?;
-    let signal_handle = event_loop.get_signal();
-    app.signal = Some(signal_handle);
-
-    let handle = event_loop.handle();
+    app.signal = Some(event_loop.get_signal());
     install_sources(
         &handle,
         &mut app,
@@ -146,7 +144,6 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
             commands: control_listener,
             signals,
             said: terminal_events,
-            drawn: presenter_events,
         },
     )?;
 
@@ -176,22 +173,29 @@ struct App {
     /// Kept separate from `state`: dispatching needs both at once.
     display: Display<Meowland>,
     state: Meowland,
-    presenter: Presenter,
     xwayland: Option<xwayland::Server>,
     socket_name: String,
     /// The log file, shared with every client this server starts: their own
     /// output cannot go to the terminal the server is drawn on.
     log: File,
-    /// The terminal the server is drawn on, if one is attached.
-    terminal: Option<Attached>,
-    /// What a terminal's reader says comes through here.
+    /// The panes attached at the moment, by the ID each was given.
+    ///
+    /// A pane is one terminal: it asks to be shown a window and is drawn that
+    /// window, with a presenter of its own writing to its own socket. Nothing
+    /// about one pane is another's business.
+    panes: HashMap<u64, Pane>,
+    /// What a pane's reader says comes through here, stamped with the pane it
+    /// came from.
     terminal_sender: Sender<FromTerminal>,
     /// Readers of terminals that are connecting or attached, kept so that they
     /// can be let go of rather than left running.
     readers: HashMap<u64, JoinHandle<()>>,
-    /// Handed out to each terminal that connects, so that what one says after
-    /// it has been replaced can be told from what the one after it says.
+    /// Handed out to each pane that connects, so that what one says can be told
+    /// from what another says - and from what a pane that has gone said.
     generations: u64,
+    /// Where sources are registered, and where a pane's are removed again when
+    /// it goes.
+    handle: LoopHandle<'static, Self>,
     /// Removes the sockets when the event loop ends.
     _sockets: (control::Socket, control::Socket),
     children: Vec<Child>,
@@ -217,32 +221,36 @@ struct App {
     frames: FrameStats,
 }
 
-/// The terminal the server is drawn on.
+/// One terminal attached to this server.
+///
+/// The pane's own state - which window it shows, its geometry, the frame it is
+/// drawn into - lives in the compositor, keyed by this ID (`Meowland::views`).
+/// What is here is the socket, the thread writing frames to it, and the thread
+/// reading what the user does at it.
 #[derive(Debug)]
-struct Attached {
-    /// Which attachment this is. A terminal that was replaced - or that was
-    /// never attached - can still have a thread reading it, and what that
-    /// thread sends is not about the terminal in use now.
+struct Pane {
+    /// The pane's ID, which is what it is known by here and in the compositor.
     generation: u64,
-    /// Kept to shut the socket down when this terminal is let go, which is what
-    /// ends its reader.
+    /// Kept to shut the socket down when the pane is let go, which is what ends
+    /// its reader.
     stream: UnixStream,
-    /// What this terminal can do, which is what its input is in terms of.
-    capabilities: Capabilities,
-    /// The thread reading it, joined when it is let go.
+    /// Writes this pane's frames, and compresses them, on a thread of its own.
+    presenter: Presenter,
+    /// The thread reading this pane's terminal, joined when it is let go.
     reader: Option<JoinHandle<()>>,
+    /// The registration of this pane's presenter events, removed with it.
+    drawn: RegistrationToken,
 }
 
 /// What a terminal that is connecting or attached says to a server.
 #[derive(Debug)]
 enum FromTerminal {
-    /// A terminal said who it is, which is answered by drawing on it or by
-    /// saying why not.
+    /// A terminal said who it is and what it wants to be shown, which is
+    /// answered by drawing on it or by saying why not.
     Hello {
         generation: u64,
         version: u32,
-        window: Option<u64>,
-        steal: bool,
+        show: display::Show,
         capabilities: Capabilities,
         /// The half of its socket the server writes to.
         stream: UnixStream,
@@ -287,13 +295,6 @@ impl App {
                     })
                     .collect(),
             ),
-            Some(control::Command::Attach(id)) => {
-                if self.state.activate(id) {
-                    control::Reply::Ok
-                } else {
-                    control::Reply::Failed("no window has that ID".to_owned())
-                }
-            }
             Some(control::Command::Run(argv)) => {
                 let program = argv.first().map_or_else(
                     || "the client".to_owned(),
@@ -319,17 +320,45 @@ impl App {
         }
     }
 
-    /// Draw a scheduled frame and flush protocol replies.
+    /// Draw a scheduled frame for every pane that has something to draw, and
+    /// flush protocol replies.
     fn present_frame(&mut self) {
         let started = Instant::now();
-        let cost = self.state.present(&mut self.presenter);
-        // The cap runs from when the frame began rather than when it
-        // finished: the work happens *inside* the interval, so counting it
-        // as well would put the compositor's own cost on the client's
-        // latency and drop the frame rate with it.
+        // The panes are drawn one at a time and each has a presenter of its
+        // own: one terminal being slow holds up nothing but itself.
+        let Self {
+            state,
+            panes,
+            frames,
+            ..
+        } = self;
+        for pane in panes.values_mut() {
+            if !state.should_present_view(pane.generation, pane.presenter.is_ready()) {
+                continue;
+            }
+            let cost = state.present_view(pane.generation, &mut pane.presenter);
+            // The cap runs from when the frame began rather than when it
+            // finished: the work happens *inside* the interval, so counting it
+            // as well would put the compositor's own cost on the client's
+            // latency and drop the frame rate with it.
+            frames.record(&cost);
+        }
         self.last_frame_started = Some(started);
-        self.frames.record(&cost);
         self.flush_clients();
+    }
+
+    /// Arm a frame if any pane has something to draw.
+    fn schedule_frame(&mut self) {
+        let handle = self.handle.clone();
+        schedule_frame(&handle, self);
+    }
+
+    /// Whether any pane has something to draw and a presenter free to take it.
+    fn panes_pending(&self) -> bool {
+        self.panes.values().any(|pane| {
+            self.state
+                .should_present_view(pane.generation, pane.presenter.is_ready())
+        })
     }
 
     /// Push queued protocol events to clients without waiting for client input.
@@ -368,46 +397,59 @@ impl App {
 
     /// Handle what a terminal says.
     fn on_terminal(&mut self, message: FromTerminal) {
-        // A terminal that is not the one on screen: it was turned away, or
-        // another one took the server over before it said this.
-        if !matches!(message, FromTerminal::Hello { .. }) && !self.is_showing(message.generation())
-        {
+        // A pane that is not one of ours: it was turned away, or it has gone
+        // and its reader had one more thing to say. A hello is how a pane
+        // arrives, so it is the one message that can come from a pane that is
+        // not here yet.
+        let generation = message.generation();
+        if !matches!(message, FromTerminal::Hello { .. }) && !self.has_pane(generation) {
             return;
         }
         match message {
             FromTerminal::Hello {
                 generation,
                 version,
-                window,
-                steal,
+                show,
                 capabilities,
                 stream,
-            } => self.attach_terminal(generation, version, window, steal, capabilities, stream),
-            FromTerminal::Input { input, .. } => self.on_input(input),
-            FromTerminal::Resized { capabilities, .. } => self.resize_terminal(&capabilities),
-            FromTerminal::Drawn { .. } => self.presenter.drawn(),
-            FromTerminal::Left { .. } => {
-                tracing::info!("the terminal went away");
-                self.detach_terminal(false);
+            } => self.attach_pane(generation, version, show, &capabilities, stream),
+            FromTerminal::Input { input, .. } => self.on_input(generation, input),
+            FromTerminal::Resized { capabilities, .. } => {
+                self.resize_pane(generation, &capabilities);
             }
+            FromTerminal::Drawn { .. } => {
+                if let Some(pane) = self.panes.get(&generation) {
+                    pane.presenter.drawn();
+                }
+            }
+            FromTerminal::Left { .. } => {
+                tracing::info!(pane = generation, "the terminal went away");
+                self.detach_pane(generation, None);
+            }
+        }
+        if self.state.take_detach_request(generation) {
+            tracing::info!(pane = generation, "the detach binding was used");
+            self.detach_pane(generation, None);
         }
     }
 
-    /// Whether what this message says came from the terminal on screen.
-    fn is_showing(&self, generation: u64) -> bool {
-        self.terminal
-            .as_ref()
-            .is_some_and(|attached| attached.generation == generation)
+    /// Whether this message came from a pane that is still attached.
+    fn has_pane(&self, generation: u64) -> bool {
+        self.panes.contains_key(&generation)
     }
 
-    /// Answer a terminal that said hello: draw on it, or say why not.
-    fn attach_terminal(
+    /// Answer a terminal that said hello: attach it, or say why not.
+    ///
+    /// Panes are independent, so nothing is refused for another pane's sake:
+    /// as many terminals as want to can be attached at once, showing the same
+    /// window or one each. The one thing that cannot be answered is a window ID
+    /// no window has.
+    fn attach_pane(
         &mut self,
         generation: u64,
         version: u32,
-        window: Option<u64>,
-        steal: bool,
-        capabilities: Capabilities,
+        show: display::Show,
+        capabilities: &Capabilities,
         stream: UnixStream,
     ) {
         let refusal = if version != display::VERSION {
@@ -415,13 +457,8 @@ impl App {
                 "this server speaks version {} of the protocol, and this terminal speaks {version}",
                 display::VERSION
             ))
-        } else if self.terminal.is_some() && !steal {
-            Some(
-                "the server is shown on another terminal: `meowland attach` shows it here"
-                    .to_owned(),
-            )
-        } else if let Some(id) = window
-            && !self.state.activate(id)
+        } else if let display::Show::Window(id) = show
+            && !self.state.has_window(id)
         {
             Some("no window has that ID".to_owned())
         } else {
@@ -435,15 +472,9 @@ impl App {
                 display::encode_client(&ToClient::Detached(reason)),
             );
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            self.readers.remove(&generation);
             return;
         }
 
-        if self.terminal.is_some() {
-            // Asked to take the server over while another terminal was showing
-            // it: that one is told, and let go of, first.
-            self.detach_terminal(true);
-        }
         let Some(reader) = self.readers.remove(&generation) else {
             tracing::warn!("a terminal said hello that was not being read");
             return;
@@ -458,6 +489,9 @@ impl App {
             }
         };
         let _ = display::write_to(&mut writer, display::encode_client(&ToClient::Welcome));
+
+        // Frames are written, and compressed, on a thread of this pane's own:
+        // one terminal being slow must not hold up another.
         let draw_on = match stream.try_clone() {
             Ok(half) => half,
             Err(error) => {
@@ -465,112 +499,105 @@ impl App {
                 return;
             }
         };
-        self.presenter.attach(draw_on, capabilities.shared_memory);
-        // Everything is drawn again: what the terminal has on screen is
-        // whatever it was showing before, and this server's screen is not it.
-        self.state.resize(&capabilities);
-        tracing::info!(?capabilities, "terminal attached");
-        self.terminal = Some(Attached {
+        let (drawn_sender, drawn) = channel();
+        let presenter = match Presenter::new(drawn_sender) {
+            Ok(presenter) => presenter,
+            Err(error) => {
+                tracing::warn!(%error, "could not start a presenter for a pane");
+                return;
+            }
+        };
+        presenter.attach(draw_on, capabilities.shared_memory);
+        let drawn =
+            match self
+                .handle
+                .clone()
+                .insert_source(drawn, move |event, (), app: &mut Self| {
+                    match event {
+                        ChannelEvent::Msg(PresenterEvent::Ready(frame)) => {
+                            if let Some(pane) = app.panes.get_mut(&generation) {
+                                pane.presenter.recycle(frame);
+                            }
+                        }
+                        // A presenter that has stopped is one pane that will not
+                        // be drawn again; the others, and the windows, are not
+                        // affected.
+                        ChannelEvent::Msg(PresenterEvent::Failed(error)) => {
+                            tracing::error!(%error, pane = generation, "presentation failed");
+                        }
+                        ChannelEvent::Closed => {}
+                    }
+                    app.schedule_frame();
+                }) {
+                Ok(token) => token,
+                Err(error) => {
+                    tracing::warn!(%error, "could not watch a pane's presenter");
+                    return;
+                }
+            };
+
+        self.state.attach_view(generation, show, capabilities);
+        tracing::info!(pane = generation, ?capabilities, "pane attached");
+        self.panes.insert(
             generation,
-            stream,
-            capabilities,
-            reader: Some(reader),
-        });
+            Pane {
+                generation,
+                stream,
+                presenter,
+                reader: Some(reader),
+                drawn,
+            },
+        );
     }
 
-    /// Let the terminal showing this server go.
+    /// Let a pane go.
     ///
-    /// The server carries on without it: the windows, the clients and their
-    /// state are all still here, and attaching a terminal shows them again.
-    fn detach_terminal(&mut self, taken_over: bool) {
-        let Some(attached) = self.terminal.take() else {
+    /// The other panes and the windows are untouched: a pane is a place to look
+    /// at a window, and what it was looking at stays what it was.
+    fn detach_pane(&mut self, generation: u64, reason: Option<&str>) {
+        let Some(mut pane) = self.panes.remove(&generation) else {
             return;
         };
-        let reason = if taken_over {
-            "another terminal took the server over"
-        } else {
-            "the server is no longer drawn here"
-        };
-        self.presenter.detach(ToClient::Detached(reason.to_owned()));
-        let _ = attached.stream.shutdown(std::net::Shutdown::Both);
-        if let Some(reader) = attached.reader
+        if let Some(reason) = reason {
+            pane.presenter.detach(ToClient::Detached(reason.to_owned()));
+        }
+        // Stop writing before the socket goes: what undoes the takeover has to
+        // be the last thing this terminal is sent.
+        pane.presenter.finish();
+        self.handle.remove(pane.drawn);
+        let _ = pane.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(reader) = pane.reader
             && reader.join().is_err()
         {
-            tracing::error!("the terminal reader panicked");
+            tracing::error!("the pane's reader panicked");
         }
+        self.state.detach_view(generation);
     }
 
-    /// The terminal changed size, or changed what it can do.
-    fn resize_terminal(&mut self, capabilities: &Capabilities) {
-        if let Some(attached) = &mut self.terminal {
-            attached.capabilities.clone_from(capabilities);
-        }
-        self.state.resize(capabilities);
-        // Whatever the terminal kept from before the resize is not ours any
-        // more, and this has to land after the frames already handed over for
-        // the same reason.
-        self.presenter.clear();
+    /// The terminal this pane is in changed size, or what it can do.
+    fn resize_pane(&mut self, generation: u64, capabilities: &Capabilities) {
+        let Some(pane) = self.panes.get(&generation) else {
+            return;
+        };
+        // Whatever the terminal kept from before the resize is not this pane's
+        // any more, and the wipe has to land after the frames already handed
+        // over for the same reason.
+        pane.presenter.clear();
+        self.state.resize_view(generation, capabilities);
     }
 
-    /// Handle something the user did at the terminal.
-    fn on_input(&mut self, input: Input) {
+    /// Handle something the user did at a pane.
+    ///
+    /// Everything is in the terms of the pane it happened in: the bindings act
+    /// on the window that pane shows, typing gives that window the keyboard,
+    /// and the pointer is somewhere in that pane's own geometry.
+    fn on_input(&mut self, generation: u64, input: Input) {
         match input {
-            Input::Key(key) => self.state.key(key),
-            Input::Pointer(pointer) => self.on_pointer(pointer),
+            Input::Key(key) => self.state.key(generation, key),
+            Input::Pointer(pointer) => self.state.pointer(generation, pointer),
             Input::Paste(text) => self.state.paste(&text),
             Input::Focus(_) => {}
         }
-        if self.state.take_detach_request() {
-            tracing::info!("the detach binding was used");
-            self.detach_terminal(false);
-        }
-    }
-
-    /// Handle a mouse event, which arrives in cells unless the terminal was
-    /// asked for pixels.
-    fn on_pointer(&mut self, pointer: Pointer) {
-        match pointer {
-            Pointer::Motion { column, row } => {
-                let position = self.position(column, row);
-                self.state.pointer_motion(position);
-            }
-            Pointer::Button {
-                column,
-                row,
-                button,
-                pressed,
-            } => {
-                let position = self.position(column, row);
-                self.state.pointer_motion(position);
-                self.state.pointer_button(button, pressed);
-            }
-            Pointer::ScrollUp | Pointer::ScrollLeft => self.state.pointer_axis(-15.0),
-            Pointer::ScrollDown | Pointer::ScrollRight => self.state.pointer_axis(15.0),
-        }
-    }
-
-    /// Where an event at a cell happened, in the pixels the server draws in.
-    fn position(&self, column: u16, row: u16) -> Point<f64, Logical> {
-        let Some(attached) = &self.terminal else {
-            return (f64::from(column), f64::from(row)).into();
-        };
-        if attached.capabilities.pixel_mouse {
-            return (f64::from(column), f64::from(row)).into();
-        }
-        let (cell_width, cell_height) = attached.capabilities.cell;
-        (
-            f64::mul_add(
-                f64::from(column),
-                f64::from(cell_width),
-                f64::from(cell_width) / 2.0,
-            ),
-            f64::mul_add(
-                f64::from(row),
-                f64::from(cell_height),
-                f64::from(cell_height) / 2.0,
-            ),
-        )
-            .into()
     }
 
     /// Run the client the command line asked for, before the loop starts, so
@@ -691,9 +718,11 @@ impl App {
         }
     }
 
-    /// Let the terminal go and stop the clients.
+    /// Let every pane go and stop the clients.
     fn shutdown(&mut self) {
-        self.detach_terminal(false);
+        while let Some(generation) = self.panes.keys().copied().next() {
+            self.detach_pane(generation, None);
+        }
         for child in &mut self.children {
             let _ = child.kill();
             let _ = child.wait();
@@ -701,9 +730,6 @@ impl App {
         if let Some(mut xwayland) = self.xwayland.take() {
             xwayland.stop();
         }
-        // Stop writing before the sockets are dropped: what undoes the takeover
-        // has to be the last thing the terminal is sent.
-        self.presenter.finish();
         tracing::info!("meowland stopped");
     }
 }
@@ -731,8 +757,7 @@ fn read_terminal(
     let _ = stream.set_read_timeout(None);
     let Some(ToServer::Hello {
         version,
-        window,
-        steal,
+        show,
         capabilities,
     }) = hello
         .ok()
@@ -744,8 +769,7 @@ fn read_terminal(
     let hello = FromTerminal::Hello {
         generation,
         version,
-        window,
-        steal,
+        show,
         capabilities,
         stream: write_half,
     };
@@ -785,10 +809,10 @@ struct Sources {
     commands: UnixListener,
     /// Process signals arrive here.
     signals: Signals,
-    /// What an attached terminal says arrives here.
+    /// What the attached terminals say arrives here. What their presenters do
+    /// with the frames arrives on a source of its own, registered with the pane
+    /// it belongs to (`App::attach_pane`).
     said: Channel<FromTerminal>,
-    /// What the presenter did with it arrives here.
-    drawn: Channel<PresenterEvent>,
 }
 
 fn install_sources(
@@ -798,7 +822,7 @@ fn install_sources(
 ) -> anyhow::Result<()> {
     watch_clients(handle, sources.clients)?;
     watch_display(handle, &mut app.display)?;
-    watch_terminal(handle, sources.said, sources.drawn)?;
+    watch_terminal(handle, sources.said)?;
     watch_server(handle, sources.signals, sources.commands, sources.terminals)?;
     schedule_frame(handle, app);
     Ok(())
@@ -846,12 +870,10 @@ fn watch_display(
     Ok(())
 }
 
-/// Watch what the attached terminal says, and what the presenter reports about
-/// what it was sent.
+/// Watch what the attached terminals say.
 fn watch_terminal(
     handle: &LoopHandle<'_, App>,
     terminal_events: Channel<FromTerminal>,
-    presenter_events: Channel<PresenterEvent>,
 ) -> anyhow::Result<()> {
     let terminal_loop = handle.clone();
     handle
@@ -864,25 +886,7 @@ fn watch_terminal(
             app.check_quit();
             schedule_frame(&terminal_loop, app);
         })
-        .map_err(|err| anyhow::anyhow!("could not watch the terminal: {err:?}"))?;
-
-    let presenter_loop = handle.clone();
-    handle
-        .insert_source(presenter_events, move |event, (), app: &mut App| {
-            match event {
-                ChannelEvent::Msg(PresenterEvent::Ready(frame)) => app.presenter.recycle(frame),
-                // The worker writes to whichever terminal is attached and is
-                // not stopped by one of them going away, so this is the worker
-                // itself: nothing will be drawn again.
-                ChannelEvent::Msg(PresenterEvent::Failed(error)) => {
-                    tracing::error!(%error, "terminal presentation failed");
-                    app.quit();
-                }
-                ChannelEvent::Closed => app.quit(),
-            }
-            schedule_frame(&presenter_loop, app);
-        })
-        .map_err(|err| anyhow::anyhow!("could not watch terminal presentation: {err:?}"))?;
+        .map_err(|err| anyhow::anyhow!("could not watch the terminals: {err:?}"))?;
     Ok(())
 }
 
@@ -1020,12 +1024,9 @@ fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
     if app.quitting {
         return;
     }
-    // Nobody is looking: a server with no terminal attached keeps running, but
+    // Nobody is looking: a server with no pane attached keeps running, but
     // there is nothing to draw.
-    if app.terminal.is_none() {
-        return;
-    }
-    if app.frame_scheduled || !app.state.should_present(app.presenter.is_ready()) {
+    if app.frame_scheduled || !app.panes_pending() {
         return;
     }
     app.frame_scheduled = true;

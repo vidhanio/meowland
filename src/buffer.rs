@@ -106,9 +106,11 @@ pub const fn dmabuf_format(format: DmabufFormat) -> Option<SourceFormat> {
 
 /// Copy out the pixels of a client buffer, whichever kind it is.
 ///
-/// `limit` is the size of the screen the copy is meant for: a buffer far larger
-/// than that is refused rather than copied, so a client cannot ask the
-/// compositor to hold memory it has no screen for.
+/// `limit` is the size of the largest screen a pane showing this window has: a
+/// buffer far larger than that is refused rather than copied, so a client
+/// cannot ask the compositor to hold memory it has no screen for. With no pane
+/// attached yet there is no screen to be too big for, and nothing is refused on
+/// this ground.
 ///
 /// Returns `false` for buffers that come from a protocol meowland does not
 /// advertise, for formats it cannot composite, and for buffers whose advertised
@@ -116,7 +118,7 @@ pub const fn dmabuf_format(format: DmabufFormat) -> Option<SourceFormat> {
 pub fn snapshot(
     buffer: &WlBuffer,
     scale: i32,
-    limit: (u32, u32),
+    limit: Option<(u32, u32)>,
     destination: &mut Snapshot,
     gpu: Option<&mut crate::gpu::Renderer>,
 ) -> bool {
@@ -196,7 +198,10 @@ impl std::fmt::Display for Unreadable {
 /// Twice the screen is generous room for a window that grew before the
 /// compositor caught up; past that the client is asking for memory, not for
 /// pixels.
-fn fits(limit: (u32, u32), width: u32, height: u32, scale: i32) -> bool {
+fn fits(limit: Option<(u32, u32)>, width: u32, height: u32, scale: i32) -> bool {
+    let Some(limit) = limit else {
+        return true;
+    };
     let scale = scale.max(1) as u32;
     width / scale <= limit.0 * 2 && height / scale <= limit.1 * 2
 }
@@ -210,7 +215,7 @@ fn fits(limit: (u32, u32), width: u32, height: u32, scale: i32) -> bool {
 fn copy_dmabuf(
     buffer: &WlBuffer,
     scale: i32,
-    limit: (u32, u32),
+    limit: Option<(u32, u32)>,
     destination: &mut Snapshot,
     gpu: Option<&mut crate::gpu::Renderer>,
 ) -> Option<bool> {
@@ -264,7 +269,12 @@ fn copy_dmabuf(
 }
 
 /// Copy out the pixels of a shared memory buffer.
-fn copy_shm(buffer: &WlBuffer, scale: i32, limit: (u32, u32), destination: &mut Snapshot) -> bool {
+fn copy_shm(
+    buffer: &WlBuffer,
+    scale: i32,
+    limit: Option<(u32, u32)>,
+    destination: &mut Snapshot,
+) -> bool {
     let copied = with_buffer_contents::<_, bool>(buffer, |pointer, length, data| {
         if data.offset < 0 || data.width <= 0 || data.height <= 0 || data.stride <= 0 {
             return false;

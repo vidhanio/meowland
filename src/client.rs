@@ -31,7 +31,7 @@ use calloop::{
 };
 
 use crate::{
-    display::{self, Input, Key, KeyKind, Pointer, ToClient, ToServer},
+    display::{self, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer},
     keys,
     tty::{self, Capabilities, Terminal},
 };
@@ -48,12 +48,15 @@ const GREETING_TIMEOUT: Duration = Duration::from_secs(1);
 /// asks, and the reader is left spinning until this process ends.
 const HANGUP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Show a server on this terminal until something ends the attachment.
+/// Show a window of the server in this terminal until something ends the
+/// attachment.
 ///
-/// `steal` is whether to take over from the terminal already showing the
-/// server or to leave it where it is. Either way this only ends the showing:
-/// the server keeps its windows and its clients.
-pub fn attach(window: Option<u64>, steal: bool) -> anyhow::Result<()> {
+/// What is shown is `show`: the window the server has the keyboard on, the
+/// newest one - following as others appear - or one by ID. Terminals are
+/// independent, so any number of them can be attached at once, showing the same
+/// window or one each; what ends here is one terminal's showing, never a window
+/// or another terminal's.
+pub fn attach(show: Show) -> anyhow::Result<()> {
     // Before the terminal is touched, because a server that is not there is
     // not worth wiping a screen for.
     let mut stream = display::connect()?;
@@ -61,9 +64,9 @@ pub fn attach(window: Option<u64>, steal: bool) -> anyhow::Result<()> {
     let capabilities = terminal.activate()?.clone();
     tracing::info!(?capabilities, "terminal taken over");
 
-    let departure = match greet(&mut stream, capabilities, window, steal)? {
+    let departure = match greet(&mut stream, capabilities, show)? {
         // The terminal goes with it, and is handed back on the way out.
-        Greeting::Welcome => show(stream, terminal)?,
+        Greeting::Welcome => display_it(stream, terminal)?,
         Greeting::Refused(reason) => {
             drop(terminal);
             Departure::Detached(reason)
@@ -109,15 +112,13 @@ enum Greeting {
 fn greet(
     stream: &mut UnixStream,
     capabilities: Capabilities,
-    window: Option<u64>,
-    steal: bool,
+    show: Show,
 ) -> anyhow::Result<Greeting> {
     display::write_to(
         stream,
         display::encode(&ToServer::Hello {
             version: display::VERSION,
-            window,
-            steal,
+            show,
             capabilities,
         }),
     )
@@ -195,7 +196,7 @@ impl Showing {
 
 /// Write out what the server sends and forward what the user does, until one
 /// of them goes away. The terminal is handed back on the way out.
-fn show(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departure> {
+fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departure> {
     let mut event_loop: EventLoop<Showing> =
         EventLoop::try_new().context("could not make an event loop")?;
     let signal = event_loop.get_signal();

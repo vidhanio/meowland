@@ -17,6 +17,7 @@ mod process;
 mod render;
 mod server;
 mod tty;
+mod types;
 mod xwayland;
 
 use std::{
@@ -30,7 +31,10 @@ use std::{
 
 pub use error::Error;
 
-use crate::cli::{Action, Cli};
+use crate::{
+    cli::{Action, Cli},
+    types::WindowId,
+};
 
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -79,7 +83,7 @@ fn run_client(run: cli::Run) -> Result<(), Error> {
 }
 
 enum Window {
-    Appeared(u64),
+    Appeared(WindowId),
     None,
     ServerGone,
 }
@@ -87,15 +91,14 @@ enum Window {
 const WINDOW_WAIT: Duration = Duration::from_secs(10);
 
 const WINDOW_POLL: Duration = Duration::from_millis(50);
-
-fn newest_window() -> Result<Option<u64>, Error> {
+fn newest_window() -> Result<Option<WindowId>, Error> {
     match control::request(&control::Command::List)? {
         control::Reply::Windows(windows) => Ok(windows.into_iter().map(|window| window.id).max()),
         control::Reply::Ok | control::Reply::Failed(_) => Ok(None),
     }
 }
 
-fn appeared(before: Option<u64>, within: Duration) -> Window {
+fn appeared(before: Option<WindowId>, within: Duration) -> Window {
     let deadline = Instant::now() + within;
     loop {
         match newest_window() {

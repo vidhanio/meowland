@@ -1,12 +1,13 @@
 //! Map terminal keys to Linux key codes for the advertised `us` keymap.
 
-use crossterm::event::{KeyCode, ModifierKeyCode};
+use crossterm::event::{KeyCode as TerminalKeyCode, ModifierKeyCode};
+use evdev::KeyCode;
 
 /// A key code, with the shift state that the intended symbol needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyStroke {
     /// Linux input event code (`KEY_*`).
-    pub code: u32,
+    pub code: KeyCode,
     /// Whether shift must be held while it is pressed.
     pub shift: bool,
 }
@@ -21,38 +22,43 @@ pub struct KeyStroke {
 pub const XKB_OFFSET: u32 = 8;
 
 const fn stroke(code: u32, shift: bool) -> KeyStroke {
-    KeyStroke { code, shift }
+    KeyStroke {
+        code: KeyCode::new(code as u16),
+        shift,
+    }
 }
 
 /// Mouse button codes, as the Wayland pointer protocol names them.
 pub mod button {
+    use super::KeyCode;
     /// `BTN_LEFT`.
-    pub const LEFT: u32 = 0x110;
+    pub const LEFT: KeyCode = KeyCode::BTN_LEFT;
     /// `BTN_RIGHT`.
-    pub const RIGHT: u32 = 0x111;
+    pub const RIGHT: KeyCode = KeyCode::BTN_RIGHT;
     /// `BTN_MIDDLE`.
-    pub const MIDDLE: u32 = 0x112;
+    pub const MIDDLE: KeyCode = KeyCode::BTN_MIDDLE;
 }
 
 /// Key codes for the modifier keys, so that a client sees real presses and not
 /// only modifier state.
 pub mod modifier {
+    use super::KeyCode;
     /// `KEY_LEFTSHIFT`.
-    pub const LEFT_SHIFT: u32 = 42;
+    pub const LEFT_SHIFT: KeyCode = KeyCode::KEY_LEFTSHIFT;
     /// `KEY_LEFTSHIFT`'s sibling.
-    pub const RIGHT_SHIFT: u32 = 54;
+    pub const RIGHT_SHIFT: KeyCode = KeyCode::KEY_RIGHTSHIFT;
     /// `KEY_LEFTCTRL`.
-    pub const LEFT_CTRL: u32 = 29;
+    pub const LEFT_CTRL: KeyCode = KeyCode::KEY_LEFTCTRL;
     /// `KEY_RIGHTCTRL`.
-    pub const RIGHT_CTRL: u32 = 97;
+    pub const RIGHT_CTRL: KeyCode = KeyCode::KEY_RIGHTCTRL;
     /// `KEY_LEFTALT`.
-    pub const LEFT_ALT: u32 = 56;
+    pub const LEFT_ALT: KeyCode = KeyCode::KEY_LEFTALT;
     /// `KEY_RIGHTALT`.
-    pub const RIGHT_ALT: u32 = 100;
+    pub const RIGHT_ALT: KeyCode = KeyCode::KEY_RIGHTALT;
     /// `KEY_LEFTMETA`.
-    pub const LEFT_META: u32 = 125;
+    pub const LEFT_META: KeyCode = KeyCode::KEY_LEFTMETA;
     /// `KEY_RIGHTMETA`.
-    pub const RIGHT_META: u32 = 126;
+    pub const RIGHT_META: KeyCode = KeyCode::KEY_RIGHTMETA;
 }
 
 /// Map a character from the terminal to the `us` stroke that types it.
@@ -118,38 +124,40 @@ const LETTERS: [u32; 26] = [
 ];
 
 /// Map the non-character keys the terminal reports.
-pub fn for_key(code: KeyCode) -> Option<KeyStroke> {
+pub fn for_key(code: TerminalKeyCode) -> Option<KeyStroke> {
     Some(match code {
-        KeyCode::Esc => stroke(1, false),
-        KeyCode::Enter => stroke(28, false),
-        KeyCode::Tab => stroke(15, false),
-        KeyCode::BackTab => stroke(15, true),
-        KeyCode::Backspace => stroke(14, false),
-        KeyCode::Insert => stroke(110, false),
-        KeyCode::Delete => stroke(111, false),
-        KeyCode::Home => stroke(102, false),
-        KeyCode::End => stroke(107, false),
-        KeyCode::PageUp => stroke(104, false),
-        KeyCode::PageDown => stroke(109, false),
-        KeyCode::Up => stroke(103, false),
-        KeyCode::Down => stroke(108, false),
-        KeyCode::Left => stroke(105, false),
-        KeyCode::Right => stroke(106, false),
-        KeyCode::CapsLock => stroke(58, false),
-        KeyCode::ScrollLock => stroke(70, false),
-        KeyCode::NumLock => stroke(69, false),
-        KeyCode::PrintScreen => stroke(99, false),
-        KeyCode::Pause => stroke(119, false),
-        KeyCode::Menu => stroke(127, false),
-        KeyCode::F(n) => stroke(*FUNCTION.get(usize::from(n).checked_sub(1)?)?, false),
-        KeyCode::Modifier(modifier) => stroke(for_modifier(modifier)?, false),
-        KeyCode::Char(c) => return for_char(c),
+        TerminalKeyCode::Esc => stroke(1, false),
+        TerminalKeyCode::Enter => stroke(28, false),
+        TerminalKeyCode::Tab => stroke(15, false),
+        TerminalKeyCode::BackTab => stroke(15, true),
+        TerminalKeyCode::Backspace => stroke(14, false),
+        TerminalKeyCode::Insert => stroke(110, false),
+        TerminalKeyCode::Delete => stroke(111, false),
+        TerminalKeyCode::Home => stroke(102, false),
+        TerminalKeyCode::End => stroke(107, false),
+        TerminalKeyCode::PageUp => stroke(104, false),
+        TerminalKeyCode::PageDown => stroke(109, false),
+        TerminalKeyCode::Up => stroke(103, false),
+        TerminalKeyCode::Down => stroke(108, false),
+        TerminalKeyCode::Left => stroke(105, false),
+        TerminalKeyCode::Right => stroke(106, false),
+        TerminalKeyCode::CapsLock => stroke(58, false),
+        TerminalKeyCode::ScrollLock => stroke(70, false),
+        TerminalKeyCode::NumLock => stroke(69, false),
+        TerminalKeyCode::PrintScreen => stroke(99, false),
+        TerminalKeyCode::Pause => stroke(119, false),
+        TerminalKeyCode::Menu => stroke(127, false),
+        TerminalKeyCode::F(n) => stroke(*FUNCTION.get(usize::from(n).checked_sub(1)?)?, false),
+        TerminalKeyCode::Modifier(modifier) => {
+            stroke(u32::from(for_modifier(modifier)?.code()), false)
+        }
+        TerminalKeyCode::Char(c) => return for_char(c),
         _ => return None,
     })
 }
 
 /// The key code of a modifier that the terminal reports as its own event.
-pub const fn for_modifier(modifier: ModifierKeyCode) -> Option<u32> {
+pub const fn for_modifier(modifier: ModifierKeyCode) -> Option<KeyCode> {
     Some(match modifier {
         ModifierKeyCode::LeftShift => modifier::LEFT_SHIFT,
         ModifierKeyCode::RightShift => modifier::RIGHT_SHIFT,
@@ -165,6 +173,8 @@ pub const fn for_modifier(modifier: ModifierKeyCode) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode as TerminalKeyCode, ModifierKeyCode};
+
     use super::*;
 
     #[test]
@@ -240,17 +250,20 @@ mod tests {
 
     #[test]
     fn named_keys_map_to_their_input_codes() {
-        assert_eq!(for_key(KeyCode::Esc), Some(stroke(1, false)));
-        assert_eq!(for_key(KeyCode::Enter), Some(stroke(28, false)));
-        assert_eq!(for_key(KeyCode::Backspace), Some(stroke(14, false)));
-        assert_eq!(for_key(KeyCode::Left), Some(stroke(105, false)));
-        assert_eq!(for_key(KeyCode::Down), Some(stroke(108, false)));
-        assert_eq!(for_key(KeyCode::F(1)), Some(stroke(59, false)));
-        assert_eq!(for_key(KeyCode::F(11)), Some(stroke(87, false)));
-        assert_eq!(for_key(KeyCode::F(12)), Some(stroke(88, false)));
+        assert_eq!(for_key(TerminalKeyCode::Esc), Some(stroke(1, false)));
+        assert_eq!(for_key(TerminalKeyCode::Enter), Some(stroke(28, false)));
+        assert_eq!(for_key(TerminalKeyCode::Backspace), Some(stroke(14, false)));
+        assert_eq!(for_key(TerminalKeyCode::Left), Some(stroke(105, false)));
+        assert_eq!(for_key(TerminalKeyCode::Down), Some(stroke(108, false)));
+        assert_eq!(for_key(TerminalKeyCode::F(1)), Some(stroke(59, false)));
+        assert_eq!(for_key(TerminalKeyCode::F(11)), Some(stroke(87, false)));
+        assert_eq!(for_key(TerminalKeyCode::F(12)), Some(stroke(88, false)));
         assert_eq!(
-            for_key(KeyCode::Modifier(ModifierKeyCode::LeftShift)),
-            Some(stroke(modifier::LEFT_SHIFT, false))
+            for_key(TerminalKeyCode::Modifier(ModifierKeyCode::LeftShift)),
+            Some(KeyStroke {
+                code: modifier::LEFT_SHIFT,
+                shift: false,
+            })
         );
     }
 }

@@ -28,10 +28,11 @@
 //! using it and stays. `attach` completes the window IDs of the server that is
 //! running (`src/cli.rs`, `src/control.rs`).
 //!
-//! Every window has an ID the server gave it. `Alt+Tab` cycles the windows a
-//! pane shows, `Alt+W` asks the one it is showing to close, and `Alt+Q` stops
-//! showing them in this terminal - which is not the same as quitting: the
-//! server and its windows stay, and `attach` shows them again.
+//! Every window has an ID the server gave it, and a pane shows one of them
+//! until it goes: `Alt+Q` asks the window it is showing to close, and a client
+//! that takes that request ends its pane with it, which is how the terminal
+//! comes back. With nothing shown, `Alt+Q` lets go of the terminal rather than
+//! closing anything. The server and its other windows stay either way.
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 

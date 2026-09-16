@@ -76,13 +76,14 @@ using it and outlives the command it was handed. Showing a window takes a
 terminal and running a command does not, so a `run` with no terminal to draw on
 - a script, or output redirected - gives the server its command and exits.
 
-There are no decorations, so the bindings are the whole of the window
-management, and each one acts on the pane it was typed in: `Alt+Tab` cycles the
-windows that pane shows, `Alt+W` asks the one it is showing to close
-(`xdg_toplevel.close`, which a client is free to answer with a question rather
-than by exiting), and `Alt+Q` lets go of that terminal. Typing or clicking in a
-pane is what gives its window the keyboard, which is the sense in which one
-window is "active": `list` marks it.
+There is one binding, because there is nothing else to decide: `Alt+Q` asks the
+window the pane is showing to close (`xdg_toplevel.close`, which a client is
+free to answer with a question rather than by exiting), and a pane with nothing
+to show lets go of its terminal instead. A pane is a place to look at one
+client, so when that client goes - closed this way, or by its own button, or by
+exiting - the pane is done and its terminal goes back to whoever was using it.
+Typing or clicking in a pane is what gives its window the keyboard, which is the
+sense in which one window is "active": `list` marks it.
 
 What a client draws is its own size, and the size it is told is that of the pane
 showing it - the first such pane, when more than one is. Every window is told
@@ -102,8 +103,9 @@ own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another window too, with no
 pane to show it until one attaches.
 
 A pane says hello with what it can do and what it wants to be shown
-(`Show::Window`, `Show::Newest`, `Show::Focused`), and is answered by being
-drawn on or by being told why not - a version this server does not speak, or a
+(`Show::Window` for one window by ID, `Show::Focused` for whichever has the
+keyboard, `Show::Newest` to follow what is started next), and is answered by
+being drawn on or by being told why not - a version this server does not speak, or a
 window ID no window has. What it is sent is frames and escapes in the order they
 were made, and a frame is the one message it answers: each pane keeps one frame
 on its way at a time, so what a terminal is behind on is one screen rather than
@@ -119,7 +121,9 @@ placed on and a newline among it scrolls the frame out from under itself. They
 are given the log instead, which is opened for appending so that the server and
 its clients write to one file in the order they wrote. Client output that reads
 as "why did no window appear" is found there. A server with no pane attached
-keeps running and keeps its windows, and draws nothing.
+keeps running and keeps its windows, and draws nothing. The one window a pane
+was given is the whole of what it is for: that window going is the pane going,
+while a pane that follows the newest window carries on to the next one.
 
 `meowland completions <shell>` prints the completion script `usage` generates for
 this CLI, which calls back into `meowland __complete_word__`; completing `attach`

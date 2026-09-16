@@ -347,6 +347,18 @@ impl App {
         self.flush_clients();
     }
 
+    /// Let go of the panes whose window is gone.
+    ///
+    /// A pane showing one client has nothing left to be when that client
+    /// closes, so its terminal goes back to whoever was using it - quietly,
+    /// because that is what closing an app looks like anywhere else.
+    fn end_closed_panes(&mut self) {
+        for generation in self.state.take_closed_views() {
+            tracing::info!(pane = generation, "the window it was showing is gone");
+            self.detach_pane(generation, None);
+        }
+    }
+
     /// Arm a frame if any pane has something to draw.
     fn schedule_frame(&mut self) {
         let handle = self.handle.clone();
@@ -860,6 +872,7 @@ fn watch_display(
                 if let Err(err) = dispatched {
                     tracing::warn!(?err, "dispatching to clients failed");
                 }
+                app.end_closed_panes();
                 app.flush_clients();
                 app.check_quit();
                 schedule_frame(&display_loop, app);
@@ -882,6 +895,7 @@ fn watch_terminal(
                 ChannelEvent::Msg(message) => app.on_terminal(message),
                 ChannelEvent::Closed => app.quit(),
             }
+            app.end_closed_panes();
             app.flush_clients();
             app.check_quit();
             schedule_frame(&terminal_loop, app);

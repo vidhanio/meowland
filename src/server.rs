@@ -459,8 +459,12 @@ impl App {
         match input {
             Input::Key(key) => self.state.key(pane, key),
             Input::Pointer(pointer) => self.state.pointer(pane, pointer),
-            Input::Paste(text) => self.state.paste(&text),
-            Input::Focus(_) => {}
+            Input::Paste(text) => {
+                self.state.interact(pane);
+                self.state.paste(&text);
+            }
+            Input::Focus(true) => self.state.interact(pane),
+            Input::Focus(false) => {}
         }
     }
 

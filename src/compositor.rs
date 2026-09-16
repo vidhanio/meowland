@@ -186,6 +186,8 @@ struct Window {
     label: Option<String>,
     title: Option<String>,
     entered: bool,
+    /// The pane whose interaction most recently selected this window.
+    last_interacted: Option<PaneId>,
     /// Sent back in the configure state.
     fullscreen: bool,
 }
@@ -402,6 +404,11 @@ impl Meowland {
 
     pub fn detach_view(&mut self, id: PaneId) {
         self.views.retain(|view| view.id != id);
+        for window in &mut self.windows {
+            if window.last_interacted == Some(id) {
+                window.last_interacted = None;
+            }
+        }
         tracing::info!(id = %id, "pane gone");
         self.configure_windows();
         self.sync_outputs();
@@ -524,9 +531,22 @@ impl Meowland {
     fn focus_pane(&mut self, pane: PaneId) -> Option<usize> {
         let index = self.view(pane)?;
         if let Some(window) = self.views[index].index(&self.windows) {
-            self.activate_index(window);
+            let changed = self.windows[window].last_interacted != Some(pane);
+            self.windows[window].last_interacted = Some(pane);
+            if self.active == Some(window) {
+                if changed {
+                    self.configure_windows();
+                }
+            } else {
+                self.activate_index(window);
+            }
         }
         Some(index)
+    }
+
+    /// Record that a terminal pane was actively used.
+    pub fn interact(&mut self, pane: PaneId) {
+        let _ = self.focus_pane(pane);
     }
 
     fn relabel(&mut self, surface: &ToplevelSurface) {
@@ -547,13 +567,25 @@ impl Meowland {
         }
     }
 
-    /// Configure each window from its first attached pane.
+    fn configured_view(
+        views: &[View],
+        window: WindowId,
+        last_interacted: Option<PaneId>,
+    ) -> Option<&View> {
+        last_interacted
+            .and_then(|id| {
+                views
+                    .iter()
+                    .find(|view| view.id == id && view.window == Some(window))
+            })
+            .or_else(|| views.iter().find(|view| view.window == Some(window)))
+    }
+
+    /// Configure each window from the pane that most recently interacted with
+    /// it, falling back to the first attached pane.
     fn configure_windows(&self) {
         for (index, window) in self.windows.iter().enumerate() {
-            let Some(pane) = self
-                .views
-                .iter()
-                .find(|view| view.window == Some(window.id))
+            let Some(pane) = Self::configured_view(&self.views, window.id, window.last_interacted)
             else {
                 continue;
             };
@@ -577,6 +609,7 @@ impl Meowland {
             });
             tracing::debug!(
                 id = %window.id,
+                pane = %pane.id,
                 ?size,
                 fullscreen = window.fullscreen,
                 active = self.active == Some(index),
@@ -948,8 +981,14 @@ impl Meowland {
                 self.pointer_motion(index, position);
                 self.pointer_button(button, pressed);
             }
-            Pointer::ScrollUp | Pointer::ScrollLeft => self.pointer_axis(index, -15.0),
-            Pointer::ScrollDown | Pointer::ScrollRight => self.pointer_axis(index, 15.0),
+            Pointer::ScrollUp | Pointer::ScrollLeft => {
+                self.focus_pane(pane);
+                self.pointer_axis(index, -15.0);
+            }
+            Pointer::ScrollDown | Pointer::ScrollRight => {
+                self.focus_pane(pane);
+                self.pointer_axis(index, 15.0);
+            }
         }
     }
 
@@ -1041,17 +1080,23 @@ fn output_mode(capabilities: &Capabilities) -> Mode {
 /// The name is a tile of that terminal's frame, so the same tile of the next
 /// frame replaces the image the terminal has.
 fn placement(tile: Rect, cell: (u32, u32), index: usize) -> kitty::Placement {
-    let (cell_width, cell_height) = cell;
+    let (cell_width, cell_height) = (cell.0.max(1), cell.1.max(1));
+    let cell_aligned =
+        tile.width.is_multiple_of(cell_width) && tile.height.is_multiple_of(cell_height);
+    let (cols, rows) = if cell_aligned {
+        (tile.width / cell_width, tile.height / cell_height)
+    } else {
+        (0, 0)
+    };
     kitty::Placement {
         id: ImageId::new(index as u32 + 1),
         width: tile.width,
         height: tile.height,
-        cols: tile.width.div_ceil(cell_width.max(1)).max(1),
-        rows: tile.height.div_ceil(cell_height.max(1)).max(1),
-        cell: (
-            tile.x as u32 / cell_width.max(1),
-            tile.y as u32 / cell_height.max(1),
-        ),
+        // c/r would scale a partial edge tile to a whole cell rectangle.
+        // Zero leaves it at its native pixel size instead.
+        cols,
+        rows,
+        cell: (tile.x as u32 / cell_width, tile.y as u32 / cell_height),
     }
 }
 
@@ -1483,6 +1528,7 @@ impl XdgShellHandler for Meowland {
             label: label.or_else(|| title.clone()),
             title,
             entered: false,
+            last_interacted: None,
             fullscreen: false,
         });
         // A window that has not drawn yet is not shown. Panes that follow the
@@ -1707,3 +1753,49 @@ delegate_seat!(Meowland);
 delegate_data_device!(Meowland);
 delegate_cursor_shape!(Meowland);
 delegate_viewporter!(Meowland);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capabilities(pixels: (u32, u32)) -> Capabilities {
+        Capabilities {
+            cell: (10, 20),
+            cells: (pixels.0 / 10, pixels.1 / 20),
+            pixels,
+            terminal: None,
+            graphics: true,
+            keyboard: true,
+            pixel_mouse: true,
+            shared_memory: false,
+        }
+    }
+
+    #[test]
+    fn configured_view_prefers_the_most_recently_interacted_pane() {
+        let window = WindowId::new(1);
+        let mut first = View::new(PaneId::new(1), &capabilities((800, 600)));
+        first.window = Some(window);
+        let mut second = View::new(PaneId::new(2), &capabilities((1200, 900)));
+        second.window = Some(window);
+        let views = vec![first, second];
+
+        assert_eq!(
+            Meowland::configured_view(&views, window, Some(PaneId::new(2))).map(|view| view.id),
+            Some(PaneId::new(2))
+        );
+        assert_eq!(
+            Meowland::configured_view(&views, window, Some(PaneId::new(3))).map(|view| view.id),
+            Some(PaneId::new(1))
+        );
+    }
+
+    #[test]
+    fn partial_edge_tiles_keep_native_dimensions() {
+        let edge = placement(Rect::new(0, 0, 7, 9), (10, 20), 0);
+        assert_eq!((edge.cols, edge.rows), (0, 0));
+
+        let full = placement(Rect::new(0, 0, 160, 160), (10, 20), 1);
+        assert_eq!((full.cols, full.rows), (16, 8));
+    }
+}

@@ -57,6 +57,31 @@ pub fn spawn_unblocked(command: &mut Command) -> &mut Command {
         })
     }
 }
+/// Start `command` in a new session.
+///
+/// The session leader check in [`is_detached`] identifies the child that should
+/// enter the server event loop instead of spawning another copy.
+pub fn spawn_detached(command: &mut Command) -> &mut Command {
+    // SAFETY: the closure runs between `fork` and `exec`, where only
+    // async-signal-safe calls are allowed. `setsid` is one, and no allocation
+    // or Rust runtime work happens here.
+    #[expect(
+        unsafe_code,
+        reason = "a detached child can only create its session between fork and exec"
+    )]
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::setsid()
+                .map(|_| ())
+                .map_err(std::io::Error::from)
+        })
+    }
+}
+
+/// Whether this process is the leader of its own session.
+pub fn is_detached() -> bool {
+    rustix::process::getsid(None).is_ok_and(|session| session == rustix::process::getpid())
+}
 
 /// Every process under `root`, not including `root` itself.
 ///

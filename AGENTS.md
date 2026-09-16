@@ -62,7 +62,14 @@ meowland quit            # stop the server and everything started in it
 `run` starts a server if there is none and hands the command over, and a server
 already running starts the client - so the client gets the *server's*
 environment, `PATH` included, rather than that of the shell which typed the
-command. A server started for a command is one that exists for it: it stops once
+command. It shows the window that client opens rather than the newest one there
+is: it notes which windows exist before the command, waits for one that does not
+- which is how it knows the app's own window, splash screens and second windows
+included - and pins its pane to that one, so nothing else that opens while it is
+being looked at can take the pane over. A command that opens no window within
+ten seconds leaves the server shown as it is, following whatever appears later,
+and one that is gone before then (a windowless command that has finished, a
+server that stopped with its command) leaves the terminal alone entirely. A server started for a command is one that exists for it: it stops once
 the clients it started are gone, so `meowland run foot` gives the terminal back
 when foot exits. One that is already running was started by something still
 using it and outlives the command it was handed. Showing a window takes a

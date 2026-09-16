@@ -19,13 +19,14 @@
 //! `src/server.rs`, and the per-pane state in `src/compositor.rs`).
 //!
 //! What that leaves the command line is four ways to reach a server: `run`
-//! starts one if there is none, hands it a client command and shows the newest
-//! window here, `attach` shows one window of it here, `list` prints the windows
-//! it has, and `quit` stops it. A server started for a command stops with it,
-//! so `meowland run foot` gives the terminal back when foot exits; one that was
-//! already running was started by something still using it and stays. `attach`
-//! completes the window IDs of the server that is running (`src/cli.rs`,
-//! `src/control.rs`).
+//! starts one if there is none, hands it a client command and shows that
+//! client's window here - the one it opens, which is what `run` waits for
+//! before taking the terminal over - `attach` shows one window of it here,
+//! `list` prints the windows it has, and `quit` stops it. A server started for
+//! a command stops with it, so `meowland run foot` gives the terminal back when
+//! foot exits; one that was already running was started by something still
+//! using it and stays. `attach` completes the window IDs of the server that is
+//! running (`src/cli.rs`, `src/control.rs`).
 //!
 //! Every window has an ID the server gave it. `Alt+Tab` cycles the windows a
 //! pane shows, `Alt+W` asks the one it is showing to close, and `Alt+Q` stops
@@ -103,6 +104,11 @@ pub fn start() -> anyhow::Result<()> {
 /// case the window appears there and this one says so.
 fn run_client(run: cli::Run) -> anyhow::Result<()> {
     let cli::Run { settings, command } = run;
+    // What the command starts is a window that was not there before it, which
+    // is how this knows which one to show: an app that opens its window after a
+    // splash screen, or one that opens a second window later, is still shown by
+    // the window it announced itself with.
+    let before = newest_window().unwrap_or(None);
     give_command(&settings, &command)?;
     // A server started for a command stops with it, and a command that exits at
     // once takes the server with it before this terminal has finished looking
@@ -110,13 +116,78 @@ fn run_client(run: cli::Run) -> anyhow::Result<()> {
     if !server_running() {
         return Ok(());
     }
-    // Showing a server takes a terminal to draw on; running a command does not.
-    // A `run` from a script, or with its output redirected, gives the server
-    // its command and leaves it to it.
+    // Showing a client takes a terminal to draw on; running it does not. A
+    // `run` from a script, or with its output redirected, gives the server its
+    // command and leaves it to it.
     if !tty::is_terminal() {
         return Ok(());
     }
-    client::attach(display::Show::Newest)
+    if command.is_empty() {
+        return client::attach(display::Show::Newest);
+    }
+    // The client's window is the one it opens, and this waits for it rather
+    // than taking the terminal over for a screen that has nothing on it yet.
+    let show = match appeared(before, WINDOW_WAIT) {
+        Window::Appeared(id) => display::Show::Window(id),
+        // Nothing of its own: the server is shown as it is, and follows
+        // whatever the command opens later.
+        Window::None => display::Show::Newest,
+        // The command is over and so is the server it ran in.
+        Window::ServerGone => return Ok(()),
+    };
+    client::attach(show)
+}
+
+/// What became of the window a command was expected to open.
+enum Window {
+    Appeared(u64),
+    None,
+    ServerGone,
+}
+
+/// How long a command is given to open a window before this stops waiting.
+///
+/// Long enough for an app that has to start up first, and short enough that a
+/// command which opens nothing does not leave the terminal sitting there.
+const WINDOW_WAIT: Duration = Duration::from_secs(10);
+
+/// How often a command's window is looked for.
+const WINDOW_POLL: Duration = Duration::from_millis(50);
+
+/// The newest window the server has, or `None` when it has none yet.
+///
+/// A server that is not there is an error rather than an empty answer: "no
+/// windows" and "no server" are different things to be waiting on.
+fn newest_window() -> Result<Option<u64>, control::Error> {
+    match control::request(&control::Command::List)? {
+        control::Reply::Windows(windows) => Ok(windows.into_iter().map(|window| window.id).max()),
+        // The one command that is answered with windows is this one.
+        control::Reply::Ok | control::Reply::Failed(_) => Ok(None),
+    }
+}
+
+/// Wait for a window newer than `before` to appear.
+fn appeared(before: Option<u64>, within: Duration) -> Window {
+    let deadline = Instant::now() + within;
+    loop {
+        match newest_window() {
+            // A server that is not there is a command that has finished, and
+            // nothing of its own appeared - which is a command that ran and
+            // left nothing to show rather than a failure.
+            Err(error) => {
+                tracing::debug!(%error, "could not ask the server for its windows");
+                return Window::ServerGone;
+            }
+            Ok(Some(newest)) if Some(newest) != before => return Window::Appeared(newest),
+            // Nothing yet: a server that is up with no windows is one a client
+            // is still starting in.
+            Ok(None | Some(_)) => {}
+        }
+        if Instant::now() >= deadline {
+            return Window::None;
+        }
+        thread::sleep(WINDOW_POLL);
+    }
 }
 
 /// Make sure a server is running the command, starting one for it if need be.

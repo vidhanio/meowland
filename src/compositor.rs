@@ -848,7 +848,7 @@ impl Meowland {
     /// Handle compositor bindings before a key reaches a client.
     ///
     /// A binding acts on the pane the key was typed in, so it closes the window
-    /// that pane shows.
+    /// that pane shows or detaches the pane.
     fn binding(
         &mut self,
         pane: PaneId,
@@ -863,7 +863,7 @@ impl Meowland {
             return false;
         }
         // Linux input event codes, as the terminal reports them
-        // (`keys::for_char`): `KEY_Q`.
+        // (`keys::for_char`): `KEY_Q` and `KEY_W`.
         match code {
             KeyCode::KEY_Q => {
                 // Close the window this pane shows, if it has one. Closing a
@@ -872,6 +872,11 @@ impl Meowland {
                 if self.pane_window(pane).is_some() {
                     self.close_window(pane);
                 } else if let Some(index) = self.view(pane) {
+                    self.views[index].detaching = true;
+                }
+            }
+            KeyCode::KEY_W => {
+                if let Some(index) = self.view(pane) {
                     self.views[index].detaching = true;
                 }
             }
@@ -1797,5 +1802,16 @@ mod tests {
 
         let full = placement(Rect::new(0, 0, 160, 160), (10, 20), 1);
         assert_eq!((full.cols, full.rows), (16, 8));
+    }
+    #[test]
+    fn alt_w_requests_pane_detach() {
+        let display =
+            smithay::reexports::wayland_server::Display::<Meowland>::new().expect("display");
+        let mut state = Meowland::new(&display.handle(), &[]).expect("compositor");
+        let pane = PaneId::new(1);
+        state.attach_view(pane, display::Show::Focused, &capabilities((800, 600)));
+
+        assert!(state.binding(pane, BINDING_MODIFIER, KeyCode::KEY_W));
+        assert!(state.take_detach_request(pane));
     }
 }

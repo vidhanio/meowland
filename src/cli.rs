@@ -9,7 +9,7 @@ use crate::{control, dmabuf, types::WindowId};
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help,
     completion,
-    after_help = "Alt+Q closes the shown window or detaches an empty pane. The server stays running after a pane exits."
+    after_help = "Alt+Q closes the shown window or detaches an empty pane; Alt+W detaches the pane. The server stays running after a pane exits."
 )]
 pub struct Cli {
     #[usage(subcommand)]

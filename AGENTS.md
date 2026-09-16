@@ -52,7 +52,8 @@ meowland run foot        # run foot in the server, starting one if there is none
 meowland list            # the windows: ID, app, title, and the one with the keyboard
 meowland attach 2        # show window 2 in this terminal
 meowland attach          # ...or the window that has the keyboard
-meowland quit            # stop the server and everything started in it
+meowland server start    # start a server on its own, and stay in it
+meowland server stop     # stop the server and everything started in it
 ```
 
 `run` starts a server if there is none, and hands the command to it. A server
@@ -65,10 +66,19 @@ or opens a second window later. A command that opens no window within ten
 seconds leaves the server shown as it is. A command that is gone before then
 leaves the terminal alone.
 
-A server that was started for a command stops when the clients it started are
-gone. `meowland run foot` therefore gives the terminal back when foot exits. A
-server that was already running was started by something that still uses it, and
-it outlives the command it was handed. Showing a window needs a terminal.
+Stopping a server hands every pane back first, and then stops every process
+under the server: `SIGHUP`, `SIGTERM`, then `SIGKILL`, each with a short grace
+period (`src/process.rs`). The tree is read again before each signal, so a helper
+that a client started while the last one was being delivered is included. A
+process that daemonizes leaves the tree and survives, as it would with any other
+supervisor.
+
+A server has no command of its own. `run` starts one if there is none, then
+hands it the command over the control socket, so the first `run` and every later
+one take the same path. The server starts the clients it is handed and keeps
+them: it stops only when `meowland server stop` or a signal stops it.
+`meowland run foot` gives the terminal back when the window of foot goes away,
+and the server stays for the next command. Showing a window needs a terminal.
 Running a command does not. A `run` with no terminal to draw on therefore gives
 the server its command and exits.
 
@@ -147,21 +157,23 @@ cargo build --release
 
 `rustfmt.toml` uses unstable options, so formatting needs nightly rustfmt.
 Clippy runs the nursery and pedantic groups; fix lints instead of allowing them.
-`unsafe_code` is denied crate-wide. The documented exceptions read a client
-buffer through a raw pointer. Shared memory is read as a slice, and a mapped GPU
-buffer as a slice bounded by the mapping. Bringing up EGL and GLES is the third
-exception, because the smithay constructors for both are unsafe and there is no
-safe path into them.
+`unsafe_code` is denied crate-wide. Three documented exceptions read a client
+buffer through a raw pointer: shared memory as a slice, a mapped GPU buffer as a
+slice bounded by the mapping, and bringing up EGL and GLES, whose smithay
+constructors are unsafe. The fourth clears the signal mask of a child between
+`fork` and `exec` (`src/process.rs`), where it is the only way to do it and the
+only place where it is safe to try.
 
 Each module declares its own error type with `thiserror`, so a caller can tell
-its failures apart. `anyhow` belongs to the command layer: `src/lib.rs` and the
-startup work that `src/server.rs` does before its event loop. Failures are
-reported there and handled elsewhere. `src/main.rs` only says where to start.
+its failures apart. `anyhow` appears in `src/main.rs` only, which is the one
+place that reports a failure as text. Everything in the library returns its own
+type: `lib::Error` for the command layer, `server::Error` for startup,
+`client::Error` for a pane.
 
 The commands that draw need a terminal on stdin and stdout that speaks the kitty
 graphics protocol. kitty, Ghostty and WezTerm do, and so does a pane that passes
 graphics through. Redirecting their output makes them exit immediately.
-`meowland server` needs no terminal, which is what lets a server outlive the
+`meowland server start` needs no terminal, which is what lets a server outlive the
 terminal it was started from. Logs go to `$XDG_RUNTIME_DIR/meowland.log`, and a
 client's own output goes there too. Wayland clients connect with
 `WAYLAND_DISPLAY=wayland-meowland`.

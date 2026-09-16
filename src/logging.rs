@@ -8,12 +8,24 @@
 
 use std::{
     fs::{File, OpenOptions},
+    io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use anyhow::Context as _;
 use tracing_subscriber::EnvFilter;
+
+/// Why the log could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The log file could not be created, reopened or copied for a client.
+    #[error("could not log to {path}")]
+    File {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
 
 /// A clock for a count that is reported once a second.
 ///
@@ -52,16 +64,15 @@ pub fn path(configured: Option<&Path>) -> PathBuf {
 /// The file is emptied at startup and reopened for appending. Every writer, the
 /// server and every client it starts, then writes at the end of the file, and
 /// none can overwrite another.
-pub fn init(configured: Option<&Path>, level: Option<&str>) -> anyhow::Result<File> {
+pub fn init(configured: Option<&Path>, level: Option<&str>) -> Result<File, Error> {
     let path = path(configured);
-    File::create(&path).with_context(|| format!("could not log to {}", path.display()))?;
-    let file = OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("could not log to {}", path.display()))?;
-    let clients = file
-        .try_clone()
-        .with_context(|| format!("could not log to {}", path.display()))?;
+    let at = |source| Error::File {
+        path: path.clone(),
+        source,
+    };
+    File::create(&path).map_err(at)?;
+    let file = OpenOptions::new().append(true).open(&path).map_err(at)?;
+    let clients = file.try_clone().map_err(at)?;
     let filter = level.map_or_else(
         || EnvFilter::new("meowland=info,warn"),
         |level| EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("meowland=info,warn")),

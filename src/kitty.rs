@@ -55,6 +55,10 @@ const PROBE_NAMESPACE: u32 = 0;
 /// another pane still reads.
 static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(PROBE_NAMESPACE + 1);
 
+/// The image id of the probe's graphics support query. Its answer is the one
+/// that says whether the terminal speaks the protocol.
+pub const GRAPHICS_PROBE_ID: u32 = 77;
+
 /// The image id of the probe's shared memory tile, distinct from the graphics
 /// query's id.
 pub const SHARED_PROBE_ID: u32 = 78;

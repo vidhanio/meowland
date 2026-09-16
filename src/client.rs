@@ -20,7 +20,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context as _;
 use calloop::{
     EventLoop, LoopSignal,
     channel::{Event as ChannelEvent, Sender, channel},
@@ -53,7 +52,7 @@ const HANGUP_INTERVAL: Duration = Duration::from_secs(1);
 /// new windows as they appear. Terminals are independent, so any number of them
 /// can be attached at once, showing the same window or one each. Only one
 /// terminal's showing ends here, never a window or another terminal's.
-pub fn attach(show: Show) -> anyhow::Result<()> {
+pub fn attach(show: Show) -> Result<(), Error> {
     // Before the terminal is touched: a server that is not there must not clear
     // the screen.
     let mut stream = display::connect()?;
@@ -82,9 +81,9 @@ pub fn attach(show: Show) -> anyhow::Result<()> {
             eprintln!("{reason}");
             Ok(())
         }
-        // Not an error. A server stops when the command it was started for is
-        // gone, and `meowland quit` stops one on purpose. The terminal is given
-        // back, and the shell that typed the command carries on.
+        // Not an error. The server was stopped, whether by `meowland server stop`
+        // or by a signal. The terminal is given back, and the shell that typed the
+        // command carries on.
         Departure::ServerGone => {
             tracing::info!("the server stopped");
             Ok(())
@@ -95,6 +94,50 @@ pub fn attach(show: Show) -> anyhow::Result<()> {
         }
         Departure::Signal => Ok(()),
     }
+}
+
+/// Why the terminal side did not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// The server could not be reached.
+    #[error(transparent)]
+    Control(#[from] crate::control::Error),
+    /// The terminal could not be taken over.
+    #[error(transparent)]
+    Terminal(#[from] tty::Error),
+    /// The hello could not be sent, or its answer could not be read.
+    #[error("could not reach the server")]
+    Server(#[source] std::io::Error),
+    /// The server sent pixels before it said hello.
+    #[error("the server sent pixels before it said hello")]
+    PixelsFirst,
+    /// The event loop could not be made, or refused a source.
+    #[error("could not make an event loop")]
+    EventLoop(#[source] calloop::Error),
+    /// A source the terminal side needs could not be watched.
+    #[error("could not watch {source}")]
+    Watch {
+        source: &'static str,
+        #[source]
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The signals of this process could not be watched.
+    #[error("could not listen for signals")]
+    Signals(#[source] calloop::Error),
+    /// The thread that writes frames, or the one that reads the user, did not
+    /// start.
+    #[error("could not start {thread}")]
+    Thread {
+        thread: &'static str,
+        #[source]
+        cause: std::io::Error,
+    },
+    /// The socket could not be cloned for a thread of its own.
+    #[error("could not take a copy of the server's socket")]
+    Clone(#[source] std::io::Error),
+    /// Showing the server ended in failure.
+    #[error("showing the server failed")]
+    Showing(#[source] calloop::Error),
 }
 
 /// The server's answer to a terminal that attaches.
@@ -110,7 +153,7 @@ fn greet(
     stream: &mut UnixStream,
     capabilities: Capabilities,
     show: Show,
-) -> anyhow::Result<Greeting> {
+) -> Result<Greeting, Error> {
     display::write_to(
         stream,
         display::encode(&ToServer::Hello {
@@ -119,29 +162,24 @@ fn greet(
             capabilities,
         }),
     )
-    .context("could not say hello to the server")?;
+    .map_err(Error::Server)?;
 
     stream
         .set_read_timeout(Some(GREETING_TIMEOUT))
-        .context("could not wait for the server")?;
+        .map_err(Error::Server)?;
     let reply = display::read_from(stream);
-    stream
-        .set_read_timeout(None)
-        .context("could not wait for frames")?;
+    stream.set_read_timeout(None).map_err(Error::Server)?;
 
-    let reply = reply.context("could not read the server's answer")?;
+    let reply = reply.map_err(Error::Server)?;
     match reply.and_then(|(tag, payload)| display::decode_client(tag, payload)) {
         Some(ToClient::Welcome) => Ok(Greeting::Welcome),
         // A refusal is an answer, not a failure. The caller decides what to
         // print.
         Some(ToClient::Detached(reason)) => Ok(Greeting::Refused(reason)),
-        // The socket ended before the server sent anything. A server stops when
-        // the command it was started for is gone, and a command that exits at
-        // once stops it before a pane has finished probing its terminal.
+        // The socket ended before the server sent anything. The server was
+        // stopped, or a command that exits at once took it with it.
         None => Ok(Greeting::Gone),
-        Some(ToClient::Bytes(_) | ToClient::Frame(_)) => {
-            anyhow::bail!("the server sent pixels before it said hello")
-        }
+        Some(ToClient::Bytes(_) | ToClient::Frame(_)) => Err(Error::PixelsFirst),
     }
 }
 
@@ -188,18 +226,20 @@ impl Showing {
 
 /// Write frames out and forward input until one end goes away. The terminal is
 /// given back at the end.
-fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departure> {
-    let mut event_loop: EventLoop<Showing> =
-        EventLoop::try_new().context("could not make an event loop")?;
+fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
+    let mut event_loop: EventLoop<Showing> = EventLoop::try_new().map_err(Error::EventLoop)?;
     let signal = event_loop.get_signal();
     let handle = event_loop.handle();
 
     let (frames_sender, frames) = channel();
-    let stream_clone = stream.try_clone()?;
+    let stream_clone = stream.try_clone().map_err(Error::Clone)?;
     let mut writer = Worker::start("meowland-frames", move |stop| {
         write_frames(stream_clone, &frames_sender, stop);
     })
-    .context("could not start the frame writer")?;
+    .map_err(|cause| Error::Thread {
+        thread: "the frame writer",
+        cause,
+    })?;
 
     handle
         .insert_source(frames, |event, (), showing: &mut Showing| match event {
@@ -216,19 +256,22 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
                 showing.stop();
             }
         })
-        .map_err(|error| anyhow::anyhow!("could not watch the server: {error:?}"))?;
+        .map_err(|refused| watch("the server", refused))?;
 
     let (input_sender, input) = channel();
     let mut input_thread = Worker::start("meowland-input", move |stop| {
         read_terminal(&input_sender, stop);
     })
-    .context("could not read the terminal")?;
+    .map_err(|cause| Error::Thread {
+        thread: "the terminal reader",
+        cause,
+    })?;
     handle
         .insert_source(input, |event, (), showing: &mut Showing| match event {
             ChannelEvent::Msg(event) => on_event(showing, event),
             ChannelEvent::Closed => {}
         })
-        .map_err(|error| anyhow::anyhow!("could not watch the terminal: {error:?}"))?;
+        .map_err(|refused| watch("the terminal", refused))?;
 
     handle
         .insert_source(
@@ -241,18 +284,18 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
                 TimeoutAction::ToDuration(HANGUP_INTERVAL)
             },
         )
-        .map_err(|error| anyhow::anyhow!("could not watch the terminal: {error:?}"))?;
+        .map_err(|refused| watch("the hangup timer", refused))?;
 
     handle
         .insert_source(
             Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP])
-                .context("could not listen for signals")?,
+                .map_err(Error::Signals)?,
             |_, (), showing: &mut Showing| {
                 showing.leave(Departure::Signal);
                 showing.stop();
             },
         )
-        .context("could not watch for signals")?;
+        .map_err(|refused| watch("the signals", refused))?;
 
     let mut showing = Showing {
         stream,
@@ -267,8 +310,17 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
     let _ = showing.stream.shutdown(std::net::Shutdown::Both);
     writer.stop();
     input_thread.stop();
-    result.context("showing the server failed")?;
+    result.map_err(Error::Showing)?;
     Ok(showing.departure.unwrap_or(Departure::ServerGone))
+}
+
+/// A source that the event loop refused, named so that the failure can be told
+/// from the others.
+fn watch<T: std::fmt::Debug>(source: &'static str, refused: T) -> Error {
+    Error::Watch {
+        source,
+        cause: format!("{refused:?}").into(),
+    }
 }
 
 /// One event from the terminal, in the terms the server counts in.

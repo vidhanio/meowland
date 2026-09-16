@@ -67,6 +67,7 @@ impl Server {
                 .arg("-listenfd")
                 .arg(listener.as_raw_fd().to_string());
         }
+        crate::process::spawn_unblocked(&mut command);
         let child = command.spawn();
         let mut reset_error = None;
         // The flag goes back on, so no later child inherits the sockets.

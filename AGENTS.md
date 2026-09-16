@@ -26,15 +26,14 @@ tiles it carried stay due until a later frame carries them. `Meowland` is the ap
 toplevels, input routing and presentation. Pass that one state around rather than
 building a second copy of any part of it.
 
-Every toplevel is a window of its own: it fills the terminal, one window is on
-screen at a time, and `Alt+Tab` cycles between them. The screen shows the active
-window and nothing else - no tiling, no window list on screen - which is what
-keeps movement and focus simple. A window is named by the ID the server gives it
-when it is created, and that is what `attach` takes. A window takes the screen
-when it first has pixels to put on it - the newest one that does, so what was
-just started is what is being looked at. Nothing else moves it: clients open
-windows they never draw in, and taking the screen for one of those would leave
-nothing on it at all.
+Every toplevel is a window of its own, filling whatever pane shows it: there is
+no tiling and no window list on a screen, which is what keeps movement and focus
+simple. A window is named by the ID the server gives it when it is created, and
+that is what `attach` takes. A pane that has not been given a window to show
+follows the newest one, and takes it when it first has pixels to put on a screen
+- the newest one that does, so what was just started is what is being looked at.
+Nothing else moves a pane: clients open windows they never draw in, and showing
+one of those would leave the pane with nothing on it at all.
 `wp_viewporter` is applied while snapshots are drawn; xwayland-satellite needs
 that protocol to expose X11 windows as ordinary xdg-shell surfaces. Meowland
 reserves an X display, passes its listening sockets to xwayland-satellite, and
@@ -43,18 +42,20 @@ package and development shell provide xwayland-satellite and Xwayland; without
 the satellite the compositor still runs, and its clients are given no `DISPLAY`
 at all rather than an X server outside this terminal.
 
-## The server
+## The server and its panes
 
 Meowland is a server with no terminal of its own (`src/server.rs`). It owns the
-compositor, the windows and the clients started in it, and it draws on whichever
-terminal is attached to it at the time - a terminal being a separate process
-(`src/client.rs`), so the one it is being looked at in can be closed, or another
-one can take over, without the server or its windows going anywhere:
+compositor, the windows and the clients started in it; a *pane* is one attached
+terminal (`src/client.rs`), and it asks to be shown **one window**. The server
+draws that window into that terminal's own geometry and sends it there, so
+panes are independent of one another: two of them can be showing the same
+window, or one each, and nothing any pane does displaces another.
 
 ```sh
-meowland run foot        # run foot in the server, starting and showing one if there is none
-meowland list            # the windows, their labels, and the active one
-meowland attach 2        # show window 2 here
+meowland run foot        # run foot in the server, starting one if there is none
+meowland list            # the windows, their labels, and the one with the keyboard
+meowland attach 2        # show window 2 in this terminal
+meowland attach          # ...or the window that has the keyboard
 meowland quit            # stop the server and everything started in it
 ```
 
@@ -64,49 +65,54 @@ environment, `PATH` included, rather than that of the shell which typed the
 command. A server started for a command is one that exists for it: it stops once
 the clients it started are gone, so `meowland run foot` gives the terminal back
 when foot exits. One that is already running was started by something still
-using it and outlives the command it was handed.
-
-Both `run` and `attach` show the server in the terminal they were typed in, and
-they differ in what they do about a server that is already shown: `run` leaves
-it alone, so a command typed elsewhere appears in the terminal that has the
-server, while `attach` takes it over. `Alt+Q` stops showing the server without
-stopping it; `meowland quit` stops the server. Showing a server takes a terminal
-and running a command does not, so a `run` with no terminal to draw on - a
-script, or output redirected - gives the server its command and exits.
+using it and outlives the command it was handed. Showing a window takes a
+terminal and running a command does not, so a `run` with no terminal to draw on
+- a script, or output redirected - gives the server its command and exits.
 
 There are no decorations, so the bindings are the whole of the window
-management: `Alt+Tab` cycles the windows, `Alt+W` asks the window on screen to
-close (`xdg_toplevel.close`, which a client is free to answer with a question
-rather than by exiting), and `Alt+Q` lets go of the terminal. What a client
-draws is its own size: every window is *told* the size of the terminal and
-`Activated`, and one that asked for fullscreen is told `Fullscreen` too - a page
-whose video goes fullscreen, or a player started with `--fullscreen`, stays in
-its windowed self until it hears that, so the state is not a formality.
+management, and each one acts on the pane it was typed in: `Alt+Tab` cycles the
+windows that pane shows, `Alt+W` asks the one it is showing to close
+(`xdg_toplevel.close`, which a client is free to answer with a question rather
+than by exiting), and `Alt+Q` lets go of that terminal. Typing or clicking in a
+pane is what gives its window the keyboard, which is the sense in which one
+window is "active": `list` marks it.
+
+What a client draws is its own size, and the size it is told is that of the pane
+showing it - the first such pane, when more than one is. Every window is told
+`Activated` when it has the keyboard, and one that asked for fullscreen is told
+`Fullscreen` too: a page whose video goes fullscreen, or a player started with
+`--fullscreen`, stays in its windowed self until it hears that, so the state is
+not a formality. A window no pane shows is not configured at all: there is no
+terminal to size it for, and a client that is told nothing waits rather than
+guessing.
 
 The server is reached over two sockets in `$XDG_RUNTIME_DIR`, commands on one
-(`src/control.rs`) and terminals on the other (`src/display.rs`, and the
-vocabulary both ends speak). Their names are fixed and binding them is what says
-whether a server is already there: they are per-user and owner-only, since one
-of the commands starts a process. A client that connects to the Wayland socket
-on its own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another window too.
+(`src/control.rs`) and panes on the other (`src/display.rs`, and the vocabulary
+both ends speak). Their names are fixed and binding them is what says whether a
+server is already there: they are per-user and owner-only, since one of the
+commands starts a process. A client that connects to the Wayland socket on its
+own (`WAYLAND_DISPLAY=wayland-meowland`) becomes another window too, with no
+pane to show it until one attaches.
 
-A terminal says hello with what it can do and what it wants, and is answered by
-being drawn on or by being told why not - a version this server does not speak,
-a window ID that no window has, or another terminal already showing it. What it
-is sent is frames and escapes in the order they were made, and a frame is the
-one message it answers: the server keeps one frame on its way at a time, so what
-a terminal is behind on is one screen rather than a queue of stale ones. The
-terminal side writes and reads in threads of its own, and asks whether the
-terminal has hung up, because a closed terminal fails reads in a way the
-terminal library spins on instead of reporting.
+A pane says hello with what it can do and what it wants to be shown
+(`Show::Window`, `Show::Newest`, `Show::Focused`), and is answered by being
+drawn on or by being told why not - a version this server does not speak, or a
+window ID no window has. What it is sent is frames and escapes in the order they
+were made, and a frame is the one message it answers: each pane keeps one frame
+on its way at a time, so what a terminal is behind on is one screen rather than
+a queue of stale ones. Each pane has a presenter thread of its own, which is
+what keeps a slow terminal from being anyone else's business, and the terminal
+side writes, reads and asks whether the terminal has hung up in threads of its
+own, because a closed terminal fails reads in a way the terminal library spins
+on instead of reporting.
 
 A client's own stdout and stderr are not the terminal: the server is drawing on
-it through the terminal side, so text written there lands in the cells the frame
-is placed on and a newline among it scrolls the frame out from under itself.
-They are given the log instead, which is opened for appending so that the server
-and its clients write to one file in the order they wrote. Client output that
-reads as "why did no window appear" is found there. A server with no terminal
-attached keeps running and keeps its windows, and draws nothing.
+it through the pane, so text written there lands in the cells the frame is
+placed on and a newline among it scrolls the frame out from under itself. They
+are given the log instead, which is opened for appending so that the server and
+its clients write to one file in the order they wrote. Client output that reads
+as "why did no window appear" is found there. A server with no pane attached
+keeps running and keeps its windows, and draws nothing.
 
 `meowland completions <shell>` prints the completion script `usage` generates for
 this CLI, which calls back into `meowland __complete_word__`; completing `attach`

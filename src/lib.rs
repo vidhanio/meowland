@@ -6,27 +6,31 @@
 //! terminal as [kitty graphics protocol][spec] images, tiled into the cell
 //! grid. Keyboard and mouse input goes the other way.
 //!
-//! # A server and its terminals
+//! # A server and its panes
 //!
 //! A *server* owns the compositor, the windows and the clients it started, and
 //! has no terminal of its own: it is reached over two sockets in
-//! `$XDG_RUNTIME_DIR`, and it outlives the terminal it is being drawn on. A
-//! terminal *attaches* to it, is shown its windows, and can leave - or be taken
-//! over by another terminal - without the server noticing anything but the
-//! screen changing hands (`src/display.rs`, `src/client.rs`, `src/server.rs`).
+//! `$XDG_RUNTIME_DIR`, and it outlives every terminal that shows it. A *pane*
+//! is one attached terminal, and it asks to be shown **one window**: the server
+//! draws that window into that terminal's own geometry and sends it there.
+//! Panes are independent - two of them can be showing the same window, or one
+//! each - so nobody is displaced by anybody, and a pane leaving, or being
+//! closed, is nothing to the others (`src/display.rs`, `src/client.rs`,
+//! `src/server.rs`, and the per-pane state in `src/compositor.rs`).
 //!
 //! What that leaves the command line is four ways to reach a server: `run`
-//! starts one if there is none and hands it a client command, `attach` shows
-//! it in this terminal, `list` prints the windows it has, and `quit` stops it.
-//! A server started for a command stops with it, so `meowland run foot` gives
-//! the terminal back when foot exits; one that was already running was started
-//! by something still using it and stays. `attach` completes the window IDs of
-//! the server that is running (`src/cli.rs`, `src/control.rs`).
+//! starts one if there is none, hands it a client command and shows the newest
+//! window here, `attach` shows one window of it here, `list` prints the windows
+//! it has, and `quit` stops it. A server started for a command stops with it,
+//! so `meowland run foot` gives the terminal back when foot exits; one that was
+//! already running was started by something still using it and stays. `attach`
+//! completes the window IDs of the server that is running (`src/cli.rs`,
+//! `src/control.rs`).
 //!
-//! One window is on screen at a time, and every window has an ID the server
-//! gave it. Alt+Tab cycles them, Alt+W asks the one on screen to close, and
-//! Alt+Q stops being shown here - which is not the same as quitting: the server
-//! stays, and `attach` shows it again.
+//! Every window has an ID the server gave it. `Alt+Tab` cycles the windows a
+//! pane shows, `Alt+W` asks the one it is showing to close, and `Alt+Q` stops
+//! showing them in this terminal - which is not the same as quitting: the
+//! server and its windows stay, and `attach` shows them again.
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
@@ -71,7 +75,14 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn start() -> anyhow::Result<()> {
     match Cli::parse().action {
         Action::Run(run) => run_client(run),
-        Action::Attach(attach) => client::attach(attach.window, true),
+        // An ID is that window; without one, whatever the server has the
+        // keyboard on, so that this terminal starts out looking at what is
+        // being looked at.
+        Action::Attach(attach) => client::attach(
+            attach
+                .window
+                .map_or(display::Show::Focused, display::Show::Window),
+        ),
         Action::List(_) => list_windows(),
         Action::Quit(_) => quit_server(),
         Action::Server(server) => server::run(server.settings, server.command),
@@ -105,7 +116,7 @@ fn run_client(run: cli::Run) -> anyhow::Result<()> {
     if !tty::is_terminal() {
         return Ok(());
     }
-    client::attach(None, false)
+    client::attach(display::Show::Newest)
 }
 
 /// Make sure a server is running the command, starting one for it if need be.

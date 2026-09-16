@@ -10,10 +10,15 @@
 //! into a frame buffer every frame, and the frame is diffed tile by tile before
 //! being encoded as terminal graphics.
 //!
-//! # One window per view
+//! # A pane per window shown
 //!
-//! Every toplevel is an independent, terminal-sized view. Exactly one view is
-//! visible and receives input; `Alt+Tab` cycles between them. Popups remain
+//! A *pane* is one attached terminal: it asks to be shown a window, and this
+//! module draws that window into that terminal's geometry with a frame buffer
+//! and tile bookkeeping of its own ([`View`]). Panes are independent - two of
+//! them may show the same window, or one each - and none of them is the whole
+//! of the server: `Alt+Tab` cycles the window of the pane the key was typed
+//! in, `Alt+W` asks that window to close, and the window the last key was
+//! typed in is the one with the keyboard. Popups remain
 //! attached to their parent view.
 
 use std::{
@@ -69,7 +74,7 @@ use smithay::{
 
 use crate::{
     buffer::Snapshot,
-    display::{self, Key},
+    display::{self, Key, Pointer},
     keys, kitty,
     presenter::Presenter,
     render::{BYTES, Frame, Rect, Tiles},
@@ -153,6 +158,81 @@ impl PendingTiles {
     }
 }
 
+/// One pane: a terminal attached to this server, the window it is shown, and
+/// everything that is that pane's own.
+///
+/// A pane is not a view of the whole server but a view of *one window*, drawn
+/// into the geometry of *one* terminal: several panes can be showing the same
+/// window, each of them with its own frame buffer, its own tiles and its own
+/// idea of what that terminal already has. Nothing here can be shared between
+/// panes for that reason.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each of these is an independent thing about one pane"
+)]
+#[derive(Debug)]
+pub struct View {
+    /// The pane's ID, which is the attachment it belongs to
+    /// (`crate::server`).
+    id: u64,
+    /// What this pane's terminal can do: its geometry, and its cells.
+    capabilities: Capabilities,
+    /// The window this pane is shown, when it has one yet.
+    window: Option<u64>,
+    /// Whether this pane is still following the newest window - what was just
+    /// started is what is looked at - or has been given one to show.
+    follow: bool,
+    /// The pixels of this pane's screen, and the tiles they are cut into.
+    frame: Frame,
+    tiles: Tiles,
+    /// Tiles whose newest pixels this pane's terminal has not been handed,
+    /// because its presenter was busy with the frame before them.
+    pending: PendingTiles,
+    /// Tiles that changed since the last frame this pane was given.
+    dirty: Vec<Rect>,
+    /// The window changed, or the terminal changed size: draw it all again.
+    scene_dirty: bool,
+    pointer_dirty: bool,
+    /// The pointer shape this pane was last told about.
+    pointer_shape: Option<&'static str>,
+    /// Set by the key binding that asks to stop being shown on this terminal.
+    detaching: bool,
+}
+
+impl View {
+    /// A pane that has attached and not chosen a window yet.
+    fn new(id: u64, capabilities: &Capabilities) -> Self {
+        let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
+        let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
+        Self {
+            id,
+            capabilities: capabilities.clone(),
+            window: None,
+            follow: true,
+            pending: PendingTiles::new(tiles.tile_count()),
+            tiles,
+            frame,
+            dirty: Vec::new(),
+            scene_dirty: true,
+            pointer_dirty: false,
+            pointer_shape: None,
+            detaching: false,
+        }
+    }
+
+    /// Whether this pane has something to draw and the presenter is free to
+    /// take it.
+    const fn should_present(&self, presenter_ready: bool) -> bool {
+        self.scene_dirty || self.pointer_dirty || (!self.pending.is_empty() && presenter_ready)
+    }
+
+    /// The window this pane shows, if it has one to show.
+    fn index(&self, windows: &[Window]) -> Option<usize> {
+        let id = self.window?;
+        windows.iter().position(|window| window.id == id)
+    }
+}
+
 /// Why meowland could not be set up.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -175,6 +255,10 @@ struct Window {
     surface: ToplevelSurface,
     /// What the client calls itself: its app ID, or its title without one.
     label: Option<String>,
+    /// Whether this window has been told it is on the output. A window is on
+    /// it while any pane shows it, and the protocol has to be told once per
+    /// change rather than per frame.
+    entered: bool,
     /// Whether the client asked for the whole screen.
     ///
     /// Every window fills the terminal here whether this is set or not, so it
@@ -209,15 +293,7 @@ pub struct Meowland {
     /// The renderer a client's GPU buffers are brought back through, when
     /// there is a device to have one on.
     gpu: Option<crate::gpu::Renderer>,
-    /// Which tiles have changed and have not reached the terminal yet, one flag
-    /// per cell of the tile grid, because the presenter was busy with the frame
-    /// before them.
-    /// A set rather than a queue: a tile that changes again while it waits is
-    /// still one tile to send, and it carries its newest pixels when it goes.
-    /// If it were a queue, a client at 60 Hz and a terminal that cannot
-    /// keep up would grow it without bound, and every handover would cost
-    /// more than the one before it until the screen stopped moving.
-    pending: PendingTiles,
+
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised;
     /// never queried.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -249,25 +325,17 @@ pub struct Meowland {
     pressed: Vec<u32>,
     pointer_position: Point<f64, Logical>,
     cursor: CursorImageStatus,
-    pointer_shape: Option<&'static str>,
+
+    /// The panes attached at the moment, in the order they attached.
+    views: Vec<View>,
 
     // Presentation.
-    /// Pixels of the last committed buffer of every surface, the thing we
-    /// actually composite.
+    /// Pixels of the last committed buffer of every surface, the thing every
+    /// pane composites.
     snapshots: HashMap<ObjectId, Snapshot>,
-    frame: Frame,
-    tiles: Tiles,
-    dirty: Vec<Rect>,
+    /// Scratch space for one pane's drawing order, so that composing does not
+    /// allocate per frame.
     plan: Vec<(WlSurface, Point<i32, Logical>)>,
-    /// The client scene changed and must be composited again.
-    scene_dirty: bool,
-    pointer_dirty: bool,
-    /// Set by the key binding that asks to stop being shown on this terminal.
-    ///
-    /// A server outlives the terminal it is drawn on: this ends the showing,
-    /// not the server, and a terminal is shown again by attaching another one.
-    detaching: bool,
-    cell: (u32, u32),
 }
 
 impl std::fmt::Debug for Meowland {
@@ -283,7 +351,6 @@ impl Meowland {
     /// Advertise the initial state to clients.
     pub fn new(
         display: &DisplayHandle,
-        capabilities: &Capabilities,
         nodes: &[crate::dmabuf::RenderNode],
     ) -> Result<Self, Error> {
         let compositor_state = CompositorState::new::<Self>(display);
@@ -296,25 +363,24 @@ impl Meowland {
         let mut seat_state = SeatState::new();
         let mut dmabuf_state = DmabufState::new();
 
+        // The output is described once a terminal has attached: what this
+        // server has to show is only as big as the pane showing it, and a pane
+        // that has not attached yet is not a size to make one up from. Until
+        // then there is nothing to draw on, so windows wait for their first
+        // configure (`configure_windows`).
         let output = Output::new(
             "meowland".into(),
             PhysicalProperties {
                 // Reported as a ~96 DPI monitor, which is what a terminal font roughly is.
-                size: (
-                    (capabilities.pixels.0 * 2646 / 10_000) as i32,
-                    (capabilities.pixels.1 * 2646 / 10_000) as i32,
-                )
-                    .into(),
+                size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
                 make: "meowland".into(),
                 model: "terminal".into(),
             },
         );
         let _global = output.create_global::<Self>(display);
-        let mode = output_mode(capabilities);
-        output.set_preferred(mode);
         output.change_current_state(
-            Some(mode),
+            None,
             Some(Transform::Normal),
             Some(Scale::Integer(1)),
             Some((0, 0).into()),
@@ -339,10 +405,6 @@ impl Meowland {
             .map_err(Error::Keymap)?;
         let pointer = seat.add_pointer();
 
-        let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
-        let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
-        let grid_tiles = tiles.tile_count();
-
         let (gpu, dmabuf_global) = match bring_up_renderer(nodes) {
             Some((renderer, node)) => {
                 let global =
@@ -360,7 +422,6 @@ impl Meowland {
             dmabuf_state,
             dmabuf_global,
             gpu,
-            pending: PendingTiles::new(grid_tiles),
             output_manager_state,
             data_device_state,
             cursor_shape_state,
@@ -377,16 +438,9 @@ impl Meowland {
             pressed: Vec::new(),
             pointer_position: (0.0, 0.0).into(),
             cursor: CursorImageStatus::default_named(),
-            pointer_shape: None,
+            views: Vec::new(),
             snapshots: HashMap::new(),
-            frame,
-            tiles,
-            dirty: Vec::new(),
             plan: Vec::new(),
-            scene_dirty: false,
-            pointer_dirty: false,
-            detaching: false,
-            cell: capabilities.cell,
         })
     }
 
@@ -401,14 +455,6 @@ impl Meowland {
         self.display_handle
             .insert_client(stream, Arc::new(MeowlandClient::default()))?;
         Ok(())
-    }
-
-    /// Whether the terminal showing this server asked to be let go, taking
-    /// the request with it.
-    pub const fn take_detach_request(&mut self) -> bool {
-        let detaching = self.detaching;
-        self.detaching = false;
-        detaching
     }
 
     fn active_surface(&self) -> Option<WlSurface> {
@@ -429,31 +475,174 @@ impl Meowland {
             })
     }
 
-    /// Select a view by its server-assigned ID.
-    pub fn activate(&mut self, id: u64) -> bool {
-        let Some(index) = self.windows.iter().position(|window| window.id == id) else {
-            return false;
-        };
-        self.activate_index(index);
-        true
+    /// The window the keyboard is on.
+    pub fn active_window(&self) -> Option<u64> {
+        self.active.map(|index| self.windows[index].id)
     }
 
     fn activate_index(&mut self, index: usize) {
         if self.active == Some(index) || index >= self.windows.len() {
             return;
         }
-        if let Some(surface) = self.active_surface() {
-            self.output.leave(&surface);
-        }
         self.active = Some(index);
         let surface = self.active_surface();
         let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, surface.clone(), SERIAL_COUNTER.next_serial());
-        if let Some(surface) = surface {
-            self.output.enter(&surface);
+        keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+        self.configure_windows();
+        // Every pane showing it draws it again: the state the client sees
+        // changed, and the frame it is owed is what it draws its new look for.
+        let id = self.windows[index].id;
+        tracing::debug!(id, "focused");
+        for view in &mut self.views {
+            if view.window == Some(id) {
+                view.scene_dirty = true;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- panes
+
+    /// A pane attached: draw what it asked to be shown in its own geometry.
+    ///
+    /// Nothing here is refused for another pane's sake: the panes are
+    /// independent, and several of them may be showing the same window. The one
+    /// thing that cannot be answered is a window ID no window has, which the
+    /// caller asks about with [`Self::has_window`] first.
+    pub fn attach_view(&mut self, id: u64, show: display::Show, capabilities: &Capabilities) {
+        let (window, follow) = self.resolve(show);
+        let mut view = View::new(id, capabilities);
+        view.window = window;
+        view.follow = follow;
+        if self.views.is_empty() {
+            self.describe_output(capabilities);
+        }
+        tracing::info!(id, ?window, follow, "pane attached");
+        self.views.push(view);
+        self.configure_windows();
+        self.sync_outputs();
+    }
+
+    /// A pane went away. The others are untouched, and the window it was
+    /// showing keeps whatever size it has.
+    pub fn detach_view(&mut self, id: u64) {
+        self.views.retain(|view| view.id != id);
+        tracing::info!(id, "pane gone");
+        self.configure_windows();
+        self.sync_outputs();
+    }
+
+    /// Show something else in this pane.
+    pub fn show_in_view(&mut self, id: u64, show: display::Show) {
+        let (window, follow) = self.resolve(show);
+        let Some(index) = self.view(id) else {
+            return;
+        };
+        let view = &mut self.views[index];
+        if view.window == window && view.follow == follow {
+            return;
+        }
+        view.window = window;
+        view.follow = follow;
+        // Everything is drawn again: it is another window, not a change in
+        // one.
+        view.scene_dirty = true;
+        tracing::debug!(id, ?window, "pane switched");
+    }
+
+    /// The terminal this pane is in changed size, or changed what it can do.
+    pub fn resize_view(&mut self, id: u64, capabilities: &Capabilities) {
+        let Some(index) = self.view(id) else {
+            return;
+        };
+        let first = index == 0;
+        let view = &mut self.views[index];
+        view.capabilities.clone_from(capabilities);
+        view.frame
+            .resize(capabilities.pixels.0, capabilities.pixels.1);
+        view.tiles = Tiles::new(&view.frame, tile_size(capabilities.cell));
+        view.pending = PendingTiles::new(view.tiles.tile_count());
+        view.scene_dirty = true;
+        // There is one output, and it is as big as the pane that attached
+        // first: the others are windows onto the same server showing what they
+        // were asked for.
+        if first {
+            self.describe_output(capabilities);
         }
         self.configure_windows();
-        self.scene_dirty = true;
+    }
+
+    /// Whether a window with this ID is one this server has.
+    pub fn has_window(&self, id: u64) -> bool {
+        self.windows.iter().any(|window| window.id == id)
+    }
+
+    /// The pane with this ID.
+    fn view(&self, id: u64) -> Option<usize> {
+        self.views.iter().position(|view| view.id == id)
+    }
+
+    /// Which window each pane shows, from what it asked for.
+    fn resolve(&self, show: display::Show) -> (Option<u64>, bool) {
+        match show {
+            display::Show::Window(id) => (Some(id), false),
+            display::Show::Newest => (self.windows.last().map(|window| window.id), true),
+            // What has the keyboard, if anything does; otherwise the newest
+            // window there is, which the pane then follows.
+            display::Show::Focused => self.active_window().map_or_else(
+                || (self.windows.last().map(|window| window.id), true),
+                |id| (Some(id), false),
+            ),
+        }
+    }
+
+    /// Describe the output at the size of the pane that attached first.
+    fn describe_output(&self, capabilities: &Capabilities) {
+        let mode = output_mode(capabilities);
+        self.output.set_preferred(mode);
+        self.output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(Scale::Integer(1)),
+            Some((0, 0).into()),
+        );
+    }
+
+    /// Tell clients which of them are on the output.
+    ///
+    /// A window is on it while any pane shows it - with several panes, that is
+    /// what being on a screen means here - and a client is told when that
+    /// changes rather than per frame.
+    fn sync_outputs(&mut self) {
+        for index in 0..self.windows.len() {
+            let id = self.windows[index].id;
+            let shown = self.views.iter().any(|view| view.window == Some(id));
+            if shown == self.windows[index].entered {
+                continue;
+            }
+            self.windows[index].entered = shown;
+            let surface = self.windows[index].surface.wl_surface().clone();
+            if shown {
+                self.output.enter(&surface);
+            } else {
+                self.output.leave(&surface);
+            }
+        }
+    }
+
+    /// Whether this pane has something to draw, and the presenter free to take
+    /// it.
+    pub fn should_present_view(&self, id: u64, presenter_ready: bool) -> bool {
+        self.view(id)
+            .is_some_and(|index| self.views[index].should_present(presenter_ready))
+    }
+
+    /// Whether the pane showing this terminal asked to be let go, taking the
+    /// request with it.
+    pub fn take_detach_request(&mut self, id: u64) -> bool {
+        let Some(index) = self.view(id) else {
+            return false;
+        };
+        std::mem::replace(&mut self.views[index].detaching, false)
     }
 
     /// Where a window's surface sits in the list.
@@ -463,27 +652,56 @@ impl Meowland {
             .position(|window| window.surface.wl_surface() == surface)
     }
 
-    /// Ask the window on screen to close.
+    /// Ask the window this pane shows to close.
     ///
     /// A request, not a kill: what a client does with it is the client's
     /// business - an editor with unsaved work is expected to ask first - but a
     /// client that takes it is one that destroys its window and exits, and the
     /// server it was started in stops with it (`crate::server`).
-    fn close_window(&self) {
-        let Some(window) = self.active.and_then(|index| self.windows.get(index)) else {
+    fn close_window(&self, pane: u64) {
+        let Some(index) = self.pane_window(pane) else {
             return;
         };
-        tracing::info!(id = window.id, "asked to close");
+        let window = &self.windows[index];
+        tracing::info!(id = window.id, pane, "asked to close");
         window.surface.send_close();
     }
 
-    fn cycle_window(&mut self) {
-        if !self.windows.is_empty() {
-            self.activate_index(
-                self.active
-                    .map_or(0, |index| (index + 1) % self.windows.len()),
-            );
+    /// Where the window this pane shows sits in the list.
+    fn pane_window(&self, pane: u64) -> Option<usize> {
+        let index = self.view(pane)?;
+        self.views[index].index(&self.windows)
+    }
+
+    /// Show the next window in this pane, and give it the keyboard.
+    ///
+    /// The windows are cycled in the order they were created, which is the
+    /// order `list` prints them in.
+    fn cycle_window(&mut self, pane: u64) {
+        if self.windows.is_empty() {
+            return;
         }
+        let current = self.pane_window(pane);
+        let next = match current {
+            Some(index) => self.windows[(index + 1) % self.windows.len()].id,
+            None => self.windows[self.windows.len() - 1].id,
+        };
+        self.show_in_view(pane, display::Show::Window(next));
+        self.focus_pane(pane);
+    }
+
+    /// Give the keyboard to the window a pane is showing, and hand back where
+    /// that pane is.
+    ///
+    /// The pane the user is typing in decides what has the keyboard: panes are
+    /// places to look at a window, and the one being used is the one being
+    /// typed at.
+    fn focus_pane(&mut self, pane: u64) -> Option<usize> {
+        let index = self.view(pane)?;
+        if let Some(window) = self.views[index].index(&self.windows) {
+            self.activate_index(window);
+        }
+        Some(index)
     }
 
     /// Re-read what the client calls this window, after it said so.
@@ -498,14 +716,29 @@ impl Meowland {
         }
     }
 
-    /// Give every toplevel the terminal size, and the state it should believe.
+    /// Give every window the size of the pane showing it, and the state it
+    /// should believe.
     ///
     /// A window that asked for the whole screen is told it has it: that state
     /// is what a client checks before it stops drawing its windowed self, and
     /// leaving it out is what makes a fullscreen request do nothing at all.
+    ///
+    /// A window no pane shows is not configured: there is no terminal to size
+    /// it for, and a client that is told nothing waits rather than guessing -
+    /// which is what a client started before any pane has attached does.
     fn configure_windows(&self) {
-        let size = (self.frame.width as i32, self.frame.height as i32);
         for (index, window) in self.windows.iter().enumerate() {
+            let Some(pane) = self
+                .views
+                .iter()
+                .find(|view| view.window == Some(window.id))
+            else {
+                continue;
+            };
+            let size = (
+                pane.capabilities.pixels.0 as i32,
+                pane.capabilities.pixels.1 as i32,
+            );
             window.surface.with_pending_state(|state| {
                 state.size = Some(size.into());
                 state.states.set(xdg_state::MAXIMIZED);
@@ -538,33 +771,44 @@ impl Meowland {
     /// sending is the presenter's, so a keystroke is never behind a frame. What
     /// the presenter is too busy to take stays due, and the next frame carries
     /// it - which is what makes dropping a frame safe.
-    pub fn present(&mut self, presenter: &mut Presenter) -> Cost {
+    pub fn present_view(&mut self, id: u64, presenter: &mut Presenter) -> Cost {
+        let Some(index) = self.view(id) else {
+            return Cost::default();
+        };
         let phase = Instant::now();
-        if self.scene_dirty {
-            self.compose();
-            self.tiles.diff(&self.frame, &mut self.dirty);
+        if self.views[index].scene_dirty {
+            self.compose(index);
+            let View {
+                tiles,
+                frame,
+                dirty,
+                ..
+            } = &mut self.views[index];
+            tiles.diff(frame, dirty);
         } else {
-            self.dirty.clear();
+            self.views[index].dirty.clear();
         }
         let mut cost = Cost {
-            tiles: self.dirty.len(),
+            tiles: self.views[index].dirty.len(),
             compose: phase.elapsed(),
             ..Cost::default()
         };
 
         // Everything composed is on screen as far as the clients are concerned;
-        // what the terminal has yet to receive is the presenter's business.
-        self.scene_dirty = false;
-        self.pointer_dirty = false;
-        self.draw_pointer_shape(presenter);
-        self.hand_over(presenter, &mut cost);
+        // what this pane's terminal has yet to receive is its presenter's
+        // business.
+        self.views[index].scene_dirty = false;
+        self.views[index].pointer_dirty = false;
+        self.draw_pointer_shape(index, presenter);
+        self.hand_over(index, presenter, &mut cost);
 
-        // Whatever became of the frame, the clients that drew it are owed a
-        // callback: without one a client that paces itself by them waits
-        // forever, and the screen stops moving.
+        // Whatever became of the frame, the client that drew it is owed a
+        // callback: without one it paces itself to a screen that never
+        // finishes a frame, and stops moving. Only the window this pane shows
+        // is waiting on it.
         let time = self.time();
-        for window in &self.windows {
-            let surface = window.surface.wl_surface().clone();
+        if let Some(window) = self.views[index].index(&self.windows) {
+            let surface = self.windows[window].surface.wl_surface().clone();
             send_frame_callbacks(&surface, time);
             for (popup, _) in PopupManager::popups_for_surface(&surface) {
                 send_frame_callbacks(popup.wl_surface(), time);
@@ -576,12 +820,13 @@ impl Meowland {
     /// Copy the tiles that are due into a buffer and pass them on, unless the
     /// presenter is still busy with the frame before them - in which case they
     /// stay due and the next frame carries them.
-    fn hand_over(&mut self, presenter: &mut Presenter, cost: &mut Cost) {
-        for tile in self.dirty.drain(..) {
-            let index = self.tiles.index(tile);
-            self.pending.mark(index);
+    fn hand_over(&mut self, pane: usize, presenter: &mut Presenter, cost: &mut Cost) {
+        let view = &mut self.views[pane];
+        for tile in view.dirty.drain(..) {
+            let index = view.tiles.index(tile);
+            view.pending.mark(index);
         }
-        if self.pending.is_empty() {
+        if view.pending.is_empty() {
             return;
         }
         let Some(mut frame) = presenter.frame() else {
@@ -592,44 +837,26 @@ impl Meowland {
         // so the presenter can cut them apart again without knowing the frame.
         frame.pixels.clear();
         frame.tiles.clear();
-        frame.tiles.reserve(self.pending.len());
-        let stride = self.frame.width as usize * BYTES;
-        for index in self.pending.indices() {
-            let tile = self.tiles.tile(&self.frame, index);
+        frame.tiles.reserve(view.pending.len());
+        let stride = view.frame.width as usize * BYTES;
+        for index in view.pending.indices() {
+            let tile = view.tiles.tile(&view.frame, index);
             for row in 0..tile.height {
                 let start = (tile.y as usize + row as usize) * stride + tile.x as usize * BYTES;
                 frame.pixels.extend_from_slice(
-                    &self.frame.pixels()[start..start + tile.width as usize * BYTES],
+                    &view.frame.pixels()[start..start + tile.width as usize * BYTES],
                 );
             }
-            frame.tiles.push(self.placement(tile));
+            frame
+                .tiles
+                .push(placement(tile, view.capabilities.cell, index));
         }
 
         cost.sent = frame.tiles.len();
         match presenter.present(frame) {
-            Ok(()) => {
-                self.pending.clear();
-            }
+            Ok(()) => view.pending.clear(),
             // Not taken: the tiles stay due, so nothing is lost by the wait.
             Err(frame) => presenter.recycle(frame),
-        }
-    }
-
-    /// Where one tile goes and what it is called.
-    fn placement(&self, tile: Rect) -> kitty::Placement {
-        let (cell_width, cell_height) = self.cell;
-        let columns = tile.width.div_ceil(cell_width.max(1)).max(1);
-        let rows = tile.height.div_ceil(cell_height.max(1)).max(1);
-        kitty::Placement {
-            id: self.tiles.index(tile) as u32 + 1,
-            width: tile.width,
-            height: tile.height,
-            cols: columns,
-            rows,
-            cell: (
-                tile.x as u32 / cell_width.max(1),
-                tile.y as u32 / cell_height.max(1),
-            ),
         }
     }
 
@@ -638,51 +865,63 @@ impl Meowland {
     /// The shape names come from the clients (`wp_cursor_shape_manager_v1`),
     /// the drawing is the terminal's: its pointer is a real pointer, and it
     /// keeps working while we are not drawing.
-    fn draw_pointer_shape(&mut self, presenter: &Presenter) {
+    fn draw_pointer_shape(&mut self, pane: usize, presenter: &Presenter) {
         let shape = match &self.cursor {
             CursorImageStatus::Named(icon) => Some(kitty::pointer_shape(*icon)),
             // A cursor sent as an image cannot be described to the terminal, and the compositor
             // does not draw one of its own, so the terminal's default pointer stands in.
             CursorImageStatus::Surface(_) | CursorImageStatus::Hidden => None,
         };
-        if self.pointer_shape != shape {
+        if self.views[pane].pointer_shape != shape {
             presenter.raw(crate::presenter::pointer_shape_bytes(shape));
-            self.pointer_shape = shape;
+            self.views[pane].pointer_shape = shape;
         }
     }
 
-    /// Repaint the active view into the frame buffer.
+    /// Repaint one pane from the window it shows.
     ///
-    /// Reading geometry needs `&self` while drawing needs `&mut self.frame`, so
+    /// Reading geometry needs `&self` while drawing needs the pane's frame, so
     /// the frame is planned in drawing order first and painted afterwards.
-    fn compose(&mut self) {
-        self.frame.clear(BACKDROP);
+    fn compose(&mut self, pane: usize) {
+        self.views[pane].frame.clear(BACKDROP);
 
         self.plan.clear();
-        if let Some(surface) = self.active_surface()
-            && self.snapshots.contains_key(&surface.id())
-        {
-            self.plan.push((surface.clone(), Point::from((0, 0))));
-            let geometry = geometry_offset(&surface);
-            for (popup, location) in PopupManager::popups_for_surface(&surface) {
-                self.plan.push((
-                    popup.wl_surface().clone(),
-                    geometry + location - popup.geometry().loc,
-                ));
+        if let Some(window) = self.views[pane].index(&self.windows) {
+            let surface = self.windows[window].surface.wl_surface().clone();
+            if self.snapshots.contains_key(&surface.id()) {
+                self.plan.push((surface.clone(), Point::from((0, 0))));
+                let geometry = geometry_offset(&surface);
+                for (popup, location) in PopupManager::popups_for_surface(&surface) {
+                    self.plan.push((
+                        popup.wl_surface().clone(),
+                        geometry + location - popup.geometry().loc,
+                    ));
+                }
             }
         }
 
+        let View { frame, .. } = &mut self.views[pane];
         for (surface, position) in &self.plan {
-            draw_tree(&mut self.frame, &self.snapshots, surface, *position);
+            draw_tree(frame, &self.snapshots, surface, *position);
         }
     }
 
-    /// The surface under a point in output coordinates.
-    fn surface_at(&self, point: Point<f64, Logical>) -> Option<(WlSurface, Point<i32, Logical>)> {
-        if !self.frame.bounds().contains(point.x as i32, point.y as i32) {
+    /// The surface under a point, in the coordinates of the window this pane
+    /// shows.
+    fn surface_at(
+        &self,
+        pane: usize,
+        point: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<i32, Logical>)> {
+        let window = self.views[pane].index(&self.windows)?;
+        if !self.views[pane]
+            .frame
+            .bounds()
+            .contains(point.x as i32, point.y as i32)
+        {
             return None;
         }
-        let surface = self.active_surface()?;
+        let surface = self.windows[window].surface.wl_surface().clone();
         let geometry = geometry_offset(&surface);
         for (popup, location) in PopupManager::popups_for_surface(&surface) {
             let origin = geometry + location - popup.geometry().loc;
@@ -691,25 +930,6 @@ impl Meowland {
             }
         }
         surface_under(&self.snapshots, &surface, point, Point::from((0, 0)))
-    }
-
-    /// Re-read the terminal geometry after a resize and tell the client.
-    pub fn resize(&mut self, capabilities: &Capabilities) {
-        self.cell = capabilities.cell;
-        self.frame
-            .resize(capabilities.pixels.0, capabilities.pixels.1);
-        self.tiles = Tiles::new(&self.frame, tile_size(capabilities.cell));
-        self.pending = PendingTiles::new(self.tiles.tile_count());
-        let mode = output_mode(capabilities);
-        self.output.set_preferred(mode);
-        self.output.change_current_state(
-            Some(mode),
-            Some(Transform::Normal),
-            Some(Scale::Integer(1)),
-            Some((0, 0).into()),
-        );
-        self.configure_windows();
-        self.scene_dirty = true;
     }
 
     // ---------------------------------------------------------------- input
@@ -726,7 +946,10 @@ impl Meowland {
     /// The key arrives already reduced to a code and a shift by the terminal it
     /// was typed at (`crate::display`), which is the side that has the key
     /// codes and the keymap.
-    pub fn key(&mut self, key: Key) {
+    ///
+    /// The pane is the one it was typed in: what the bindings act on is that
+    /// pane's window, and typing is what gives a window the keyboard.
+    pub fn key(&mut self, pane: u64, key: Key) {
         use display::KeyKind;
 
         let modifiers = crossterm::event::KeyModifiers::from_bits_truncate(key.modifiers);
@@ -751,7 +974,8 @@ impl Meowland {
 
         match key.kind {
             KeyKind::Press | KeyKind::Repeat => {
-                if !self.binding(modifiers, stroke.code) {
+                if !self.binding(pane, modifiers, stroke.code) {
+                    self.focus_pane(pane);
                     self.type_stroke(stroke);
                 }
             }
@@ -774,8 +998,11 @@ impl Meowland {
         }
     }
 
-    /// Handle compositor bindings before a key reaches the active client.
-    fn binding(&mut self, modifiers: crossterm::event::KeyModifiers, code: u32) -> bool {
+    /// Handle compositor bindings before a key reaches a client.
+    ///
+    /// They act on the pane the key was typed in: with more than one pane, the
+    /// window on screen is whatever that pane is showing.
+    fn binding(&mut self, pane: u64, modifiers: crossterm::event::KeyModifiers, code: u32) -> bool {
         use crossterm::event::KeyModifiers as M;
         if !modifiers.contains(BINDING_MODIFIER)
             || modifiers.contains(M::CONTROL)
@@ -786,9 +1013,14 @@ impl Meowland {
         // Linux input event codes, as the terminal reports them
         // (`keys::for_char`): `KEY_TAB`, `KEY_Q` and `KEY_W`.
         match code {
-            15 => self.cycle_window(),
-            16 => self.detaching = true,
-            17 => self.close_window(),
+            15 => self.cycle_window(pane),
+            16 => {
+                let Some(index) = self.view(pane) else {
+                    return false;
+                };
+                self.views[index].detaching = true;
+            }
+            17 => self.close_window(pane),
             _ => return false,
         }
         true
@@ -876,8 +1108,58 @@ impl Meowland {
         );
     }
 
+    /// Handle a mouse event in a pane, in the cells its terminal reports.
+    pub fn pointer(&mut self, pane: u64, pointer: Pointer) {
+        let Some(index) = self.view(pane) else {
+            return;
+        };
+        match pointer {
+            Pointer::Motion { column, row } => {
+                let position = self.cell_position(index, column, row);
+                self.pointer_motion(index, position);
+            }
+            Pointer::Button {
+                column,
+                row,
+                button,
+                pressed,
+            } => {
+                // The window a pane shows is the one its clicks are for.
+                self.focus_pane(pane);
+                let position = self.cell_position(index, column, row);
+                self.pointer_motion(index, position);
+                self.pointer_button(button, pressed);
+            }
+            Pointer::ScrollUp | Pointer::ScrollLeft => self.pointer_axis(index, -15.0),
+            Pointer::ScrollDown | Pointer::ScrollRight => self.pointer_axis(index, 15.0),
+        }
+    }
+
+    /// Where an event at a cell of a pane's terminal happened, in the pixels
+    /// that pane draws in.
+    fn cell_position(&self, pane: usize, column: u16, row: u16) -> Point<f64, Logical> {
+        let capabilities = &self.views[pane].capabilities;
+        if capabilities.pixel_mouse {
+            return (f64::from(column), f64::from(row)).into();
+        }
+        let (cell_width, cell_height) = capabilities.cell;
+        (
+            f64::mul_add(
+                f64::from(column),
+                f64::from(cell_width),
+                f64::from(cell_width) / 2.0,
+            ),
+            f64::mul_add(
+                f64::from(row),
+                f64::from(cell_height),
+                f64::from(cell_height) / 2.0,
+            ),
+        )
+            .into()
+    }
+
     /// Handle pointer motion.
-    pub fn pointer_motion(&mut self, position: Point<f64, Logical>) {
+    fn pointer_motion(&mut self, pane: usize, position: Point<f64, Logical>) {
         self.pointer_position = position;
         // The seat wants the pointer's position in *output* coordinates and the
         // focused surface's origin beside it: it subtracts the two to
@@ -888,7 +1170,7 @@ impl Meowland {
             time: self.time(),
         };
         let pointer = self.pointer.clone();
-        if let Some((surface, origin)) = self.surface_at(position) {
+        if let Some((surface, origin)) = self.surface_at(pane, position) {
             pointer.motion(self, Some((surface, origin.to_f64())), &event);
         } else {
             pointer.motion(self, None, &event);
@@ -897,7 +1179,7 @@ impl Meowland {
     }
 
     /// Handle a mouse button.
-    pub fn pointer_button(&mut self, button: u32, pressed: bool) {
+    fn pointer_button(&mut self, button: u32, pressed: bool) {
         let pointer = self.pointer.clone();
         let event = ButtonEvent {
             serial: SERIAL_COUNTER.next_serial(),
@@ -914,9 +1196,9 @@ impl Meowland {
     }
 
     /// Handle a scroll wheel tick.
-    pub fn pointer_axis(&mut self, vertical: f64) {
+    fn pointer_axis(&mut self, pane: usize, vertical: f64) {
         let pointer = self.pointer.clone();
-        if let Some((surface, origin)) = self.surface_at(self.pointer_position) {
+        if let Some((surface, origin)) = self.surface_at(pane, self.pointer_position) {
             let event = MotionEvent {
                 location: self.pointer_position,
                 serial: SERIAL_COUNTER.next_serial(),
@@ -929,18 +1211,6 @@ impl Meowland {
         pointer.axis(self, frame);
         pointer.frame(self);
     }
-
-    /// Whether the main loop should present now. A due frame waits without
-    /// polling until the presenter reports that its reusable frame is ready.
-    ///
-    /// This is asked only once the terminal is ours, which `main` decides; on
-    /// its own this says whether anything has changed. It must not wait for the
-    /// active window to have pixels: cycling to a window that has not drawn yet
-    /// still has to produce a frame, because that frame is what carries the
-    /// callback the client draws its first one for.
-    pub const fn should_present(&self, presenter_ready: bool) -> bool {
-        self.scene_dirty || self.pointer_dirty || (!self.pending.is_empty() && presenter_ready)
-    }
 }
 
 /// The mode the output advertises: the whole terminal, at the terminal's pixel
@@ -950,6 +1220,26 @@ fn output_mode(capabilities: &Capabilities) -> Mode {
         size: (capabilities.pixels.0 as i32, capabilities.pixels.1 as i32).into(),
         // A terminal has no refresh rate; frame callbacks are what pace clients here.
         refresh: REFRESH_MILLIHZ,
+    }
+}
+
+/// Where one tile goes on a pane's screen and what it is called.
+///
+/// The name is a tile of that terminal's frame, which is what makes a
+/// terminal's own images replaceable: the same tile of the next frame is sent
+/// under the same name.
+fn placement(tile: Rect, cell: (u32, u32), index: usize) -> kitty::Placement {
+    let (cell_width, cell_height) = cell;
+    kitty::Placement {
+        id: index as u32 + 1,
+        width: tile.width,
+        height: tile.height,
+        cols: tile.width.div_ceil(cell_width.max(1)).max(1),
+        rows: tile.height.div_ceil(cell_height.max(1)).max(1),
+        cell: (
+            tile.x as u32 / cell_width.max(1),
+            tile.y as u32 / cell_height.max(1),
+        ),
     }
 }
 
@@ -1220,16 +1510,40 @@ impl CompositorHandler for Meowland {
         // when the user says so.
         let drawn = self.snapshots.contains_key(&surface.id());
         self.snapshot(surface);
-        self.scene_dirty = true;
-        if !drawn
-            && self.snapshots.contains_key(&surface.id())
-            && let Some(index) = self.index_of(surface)
-        {
+        let first_pixels = !drawn && self.snapshots.contains_key(&surface.id());
+        // The panes showing this window are the ones that have to draw again. A
+        // surface that is not a toplevel is a sub-surface or a popup, which
+        // belongs to a window this cannot name from here, so every pane draws
+        // again for those.
+        let committed = match self.index_of(surface) {
+            Some(index) => Some(self.windows[index].id),
+            None => None,
+        };
+        for view in &mut self.views {
+            if committed.is_none_or(|id| view.window == Some(id)) {
+                view.scene_dirty = true;
+            }
+        }
+        if first_pixels && let Some(index) = self.index_of(surface) {
             // Whatever the client asked for, a window with nothing on it is not
             // worth looking at - and some clients open windows they never draw
-            // in at all, which must not leave the screen without the one that
-            // is drawing.
-            self.activate_index(index);
+            // in at all, which must not leave a pane without the window it
+            // follows. A pane that was given a window to show keeps it.
+            let id = self.windows[index].id;
+            for view in &mut self.views {
+                if view.follow {
+                    view.window = Some(id);
+                    view.scene_dirty = true;
+                    tracing::debug!(id = view.id, window = id, "pane took the newest window");
+                }
+            }
+            if self.views.iter().any(|view| view.window == Some(id)) {
+                // What was just started is what the keyboard is on, so the
+                // pane showing it is the one that was asked for it.
+                self.configure_windows();
+                self.sync_outputs();
+                self.activate_index(index);
+            }
         }
         tracing::debug!(id = ?surface.id(), "committed");
     }
@@ -1247,8 +1561,23 @@ impl CompositorHandler for Meowland {
 /// cannot tear a frame, and a client that is waiting for its buffer to come
 /// back is not kept waiting.
 impl Meowland {
+    /// The biggest screen any pane has, which is as large as a client's buffer
+    /// can be worth copying: nothing bigger can be shown.
+    ///
+    /// With no pane attached there is no bound - a client that connects before
+    /// any terminal does is not one to refuse to composite - and the copy is
+    /// the buffer's own size.
+    fn snapshot_limit(&self) -> Option<(u32, u32)> {
+        let (width, height) = self.views.iter().fold((0, 0), |largest, view| {
+            let bounds = view.frame.bounds();
+            (largest.0.max(bounds.width), largest.1.max(bounds.height))
+        });
+        (width > 0 && height > 0).then_some((width, height))
+    }
+
     fn snapshot(&mut self, surface: &WlSurface) {
-        let limit = self.frame.bounds();
+        let limit = self.snapshot_limit();
+
         let committed = with_states(surface, |states| {
             // The cached state is only borrowed for the few reads that need it:
             // the copy below happens with no surface lock held.
@@ -1273,7 +1602,7 @@ impl Meowland {
                     Entry::Occupied(mut entry) => crate::buffer::snapshot(
                         &buffer,
                         scale,
-                        (limit.width, limit.height),
+                        limit,
                         entry.get_mut(),
                         self.gpu.as_mut(),
                     ),
@@ -1282,7 +1611,7 @@ impl Meowland {
                         let copied = crate::buffer::snapshot(
                             &buffer,
                             scale,
-                            (limit.width, limit.height),
+                            limit,
                             &mut snapshot,
                             self.gpu.as_mut(),
                         );
@@ -1368,9 +1697,13 @@ impl XdgShellHandler for Meowland {
             id,
             surface,
             label,
+            entered: false,
             fullscreen: false,
         });
-        self.activate_index(self.windows.len() - 1);
+        // A window that has not drawn yet is not one to look at: the panes
+        // that follow the newest window take it when it first has pixels
+        // (`commit`), which is also when it is configured, since until then
+        // there is nothing to size it for.
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -1455,6 +1788,7 @@ impl XdgShellHandler for Meowland {
             return;
         };
         let was_active = self.active == Some(removed);
+        let gone = self.windows[removed].id;
         self.windows.remove(removed);
         self.active = match self.active {
             None => None,
@@ -1463,16 +1797,27 @@ impl XdgShellHandler for Meowland {
             Some(active) if was_active => Some(active.min(self.windows.len() - 1)),
             active => active,
         };
+        // A pane showing it has nothing to show: the backdrop, until the user
+        // asks for another window or starts one.
+        for view in &mut self.views {
+            if view.window == Some(gone) {
+                view.window = None;
+                view.follow = false;
+                view.scene_dirty = true;
+            }
+        }
+        if was_active {
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, self.active_surface(), SERIAL_COUNTER.next_serial());
+        }
+        self.configure_windows();
+        self.sync_outputs();
         if was_active {
             let surface = self.active_surface();
             let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, surface.clone(), SERIAL_COUNTER.next_serial());
-            if let Some(surface) = surface {
-                self.output.enter(&surface);
-            }
+            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
         }
         self.configure_windows();
-        self.scene_dirty = true;
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
@@ -1497,7 +1842,10 @@ impl SeatHandler for Meowland {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor = image;
-        self.pointer_dirty = true;
+        // Every pane draws the shape it was not told about yet.
+        for view in &mut self.views {
+            view.pointer_dirty = true;
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! Where meowland's own output goes.
 //!
-//! A server has no terminal of its own - the terminal it is drawn on comes and
-//! goes, and is a socket rather than a file descriptor it can print to - so its
+//! A server has no terminal of its own - the panes it is drawn on come and go,
+//! and each is a socket rather than a file descriptor it can print to - so its
 //! log is a file. The handle that comes back is also where the output of every
 //! client it starts goes: a client that prints why it failed would otherwise
 //! print into the screen it is being drawn on.

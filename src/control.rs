@@ -87,8 +87,6 @@ impl Drop for Socket {
 pub enum Command {
     /// Every window the server has.
     List,
-    /// Show one window, by the ID the server gave it.
-    Attach(u64),
     /// Start a client as another window of the server.
     Run(Vec<OsString>),
     /// Stop the server and everything started under it.
@@ -101,7 +99,6 @@ impl Command {
         match self {
             Self::List => b"list".to_vec(),
             Self::Quit => b"quit".to_vec(),
-            Self::Attach(id) => format!("attach {id}").into_bytes(),
             Self::Run(argv) => {
                 let mut request = b"run".to_vec();
                 for argument in argv {
@@ -120,14 +117,6 @@ impl Command {
         }
         if request == b"quit" {
             return Some(Self::Quit);
-        }
-        if let Some(id) = request.strip_prefix(b"attach ") {
-            return std::str::from_utf8(id)
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
-                .map(Self::Attach);
         }
         let mut fields = request.split(|byte| *byte == ARGUMENT_SEPARATOR);
         if fields.next() != Some(b"run".as_slice()) {
@@ -302,11 +291,9 @@ mod tests {
 
     #[test]
     fn the_other_requests_survive_a_round_trip() {
-        for command in [Command::List, Command::Attach(17), Command::Quit] {
+        for command in [Command::List, Command::Quit] {
             assert_eq!(Command::decode(&command.encode()), Some(command));
         }
-        assert_eq!(Command::decode(b"attach 1x"), None);
-        assert_eq!(Command::decode(b"attach"), None);
         assert_eq!(Command::decode(b""), None);
         assert_eq!(Command::decode(b"lately"), None);
     }

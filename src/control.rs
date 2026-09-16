@@ -22,6 +22,8 @@ use std::{
     path::PathBuf,
 };
 
+use crate::Error;
+
 pub const CONTROL_SOCKET: &str = "meowland-control";
 pub const DISPLAY_SOCKET: &str = "meowland-display";
 
@@ -30,18 +32,6 @@ pub const DISPLAY_SOCKET: &str = "meowland-display";
 /// An argument holds any byte but this one, so an argv crosses the socket
 /// unchanged and needs no quoting.
 const ARGUMENT_SEPARATOR: u8 = 0;
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("XDG_RUNTIME_DIR is not set")]
-    NoRuntimeDirectory,
-    #[error("another meowland server is already running")]
-    AlreadyRunning,
-    #[error("no meowland server is running")]
-    NotRunning,
-    #[error("the control socket could not be used")]
-    Io(#[from] std::io::Error),
-}
 
 /// The server's end of a socket. Dropping this removes the socket file.
 #[derive(Debug)]
@@ -53,7 +43,7 @@ impl Socket {
     /// Take one of the server's socket names, or report that a server already
     /// holds it.
     pub fn bind(name: &str) -> Result<(Self, UnixListener), Error> {
-        let path = path(name)?;
+        let path = Self::path(name)?;
         match UnixStream::connect(&path) {
             // Something answered, so another server holds the name.
             Ok(_) => return Err(Error::AlreadyRunning),
@@ -66,8 +56,14 @@ impl Socket {
             Err(error) => return Err(error.into()),
         }
         let listener = UnixListener::bind(&path)?;
+        let socket = Self { path };
         listener.set_nonblocking(true)?;
-        Ok((Self { path }, listener))
+        Ok((socket, listener))
+    }
+
+    fn path(name: &str) -> Result<PathBuf, Error> {
+        let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDirectory)?;
+        Ok(PathBuf::from(runtime).join(name))
     }
 }
 
@@ -139,15 +135,14 @@ pub struct Window {
 impl Window {
     /// One line of a `list`.
     ///
-    /// Tabs and newlines in a name become spaces. A line break separates
-    /// windows, and only the client decides what a name says.
+    /// Control characters become spaces so a client name stays on one line
+    /// and cannot send terminal escapes through `list`.
     fn line(&self) -> String {
-        let name = |name: &str| name.replace(['\t', '\n'], " ");
         format!(
             "{}\t{}\t{}\t{}\n",
             self.id,
-            name(&self.label),
-            name(&self.title),
+            Self::clean_name(&self.label),
+            Self::clean_name(&self.title),
             if self.active { "active" } else { "idle" }
         )
     }
@@ -156,10 +151,22 @@ impl Window {
         let mut fields = line.split('\t');
         Some(Self {
             id: fields.next()?.parse().ok()?,
-            label: fields.next()?.to_owned(),
-            title: fields.next()?.to_owned(),
+            label: Self::clean_name(fields.next()?),
+            title: Self::clean_name(fields.next()?),
             active: fields.next()? == "active",
         })
+    }
+
+    fn clean_name(name: &str) -> String {
+        name.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect()
     }
 }
 
@@ -237,7 +244,7 @@ pub fn request(command: &Command) -> Result<Reply, Error> {
 
 /// Connect to one of the server's sockets, or report that there is no server.
 pub fn connect(name: &str) -> Result<UnixStream, Error> {
-    let path = path(name)?;
+    let path = Socket::path(name)?;
     match UnixStream::connect(&path) {
         Ok(stream) => Ok(stream),
         // A socket file that refuses the connection, or is gone, means there is
@@ -254,11 +261,6 @@ pub fn connect(name: &str) -> Result<UnixStream, Error> {
         }
         Err(error) => Err(error.into()),
     }
-}
-
-fn path(name: &str) -> Result<PathBuf, Error> {
-    let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDirectory)?;
-    Ok(PathBuf::from(runtime).join(name))
 }
 
 #[cfg(test)]
@@ -315,13 +317,35 @@ mod tests {
                 title: String::new(),
                 active: false,
             },
+            Window {
+                id: 4,
+                label: "bad\x1b[2J\rname".to_owned(),
+                title: "control\u{7f}character".to_owned(),
+                active: false,
+            },
         ];
         let reply = Reply::Windows(windows.clone());
         let decoded = Reply::decode(&reply.encode());
         let mut expected = windows;
         expected[1].label = "two lines here".to_owned();
         expected[1].title = "and tabs here".to_owned();
+        expected[3].label = "bad [2J name".to_owned();
+        expected[3].title = "control character".to_owned();
         assert_eq!(decoded, Reply::Windows(expected));
+    }
+
+    #[test]
+    fn a_window_list_from_an_older_server_cannot_print_terminal_controls() {
+        let reply = Reply::decode("windows 1\n1\tapp\x1b[2J\ttitle\u{7f}\tidle\n");
+        assert_eq!(
+            reply,
+            Reply::Windows(vec![Window {
+                id: 1,
+                label: "app [2J".to_owned(),
+                title: "title ".to_owned(),
+                active: false,
+            }])
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ use calloop::{
 };
 
 use crate::{
+    Error,
     display::{self, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer},
     keys,
     tty::{self, Capabilities, Terminal},
@@ -96,50 +97,6 @@ pub fn attach(show: Show) -> Result<(), Error> {
     }
 }
 
-/// Why the terminal side did not finish.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The server could not be reached.
-    #[error(transparent)]
-    Control(#[from] crate::control::Error),
-    /// The terminal could not be taken over.
-    #[error(transparent)]
-    Terminal(#[from] tty::Error),
-    /// The hello could not be sent, or its answer could not be read.
-    #[error("could not reach the server")]
-    Server(#[source] std::io::Error),
-    /// The server sent pixels before it said hello.
-    #[error("the server sent pixels before it said hello")]
-    PixelsFirst,
-    /// The event loop could not be made, or refused a source.
-    #[error("could not make an event loop")]
-    EventLoop(#[source] calloop::Error),
-    /// A source the terminal side needs could not be watched.
-    #[error("could not watch {source}")]
-    Watch {
-        source: &'static str,
-        #[source]
-        cause: Box<dyn std::error::Error + Send + Sync>,
-    },
-    /// The signals of this process could not be watched.
-    #[error("could not listen for signals")]
-    Signals(#[source] calloop::Error),
-    /// The thread that writes frames, or the one that reads the user, did not
-    /// start.
-    #[error("could not start {thread}")]
-    Thread {
-        thread: &'static str,
-        #[source]
-        cause: std::io::Error,
-    },
-    /// The socket could not be cloned for a thread of its own.
-    #[error("could not take a copy of the server's socket")]
-    Clone(#[source] std::io::Error),
-    /// Showing the server ended in failure.
-    #[error("showing the server failed")]
-    Showing(#[source] calloop::Error),
-}
-
 /// The server's answer to a terminal that attaches.
 enum Greeting {
     Welcome,
@@ -161,16 +118,13 @@ fn greet(
             show,
             capabilities,
         }),
-    )
-    .map_err(Error::Server)?;
+    )?;
 
-    stream
-        .set_read_timeout(Some(GREETING_TIMEOUT))
-        .map_err(Error::Server)?;
+    stream.set_read_timeout(Some(GREETING_TIMEOUT))?;
     let reply = display::read_from(stream);
-    stream.set_read_timeout(None).map_err(Error::Server)?;
+    stream.set_read_timeout(None)?;
 
-    let reply = reply.map_err(Error::Server)?;
+    let reply = reply?;
     match reply.and_then(|(tag, payload)| display::decode_client(tag, payload)) {
         Some(ToClient::Welcome) => Ok(Greeting::Welcome),
         // A refusal is an answer, not a failure. The caller decides what to
@@ -227,18 +181,14 @@ impl Showing {
 /// Write frames out and forward input until one end goes away. The terminal is
 /// given back at the end.
 fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
-    let mut event_loop: EventLoop<Showing> = EventLoop::try_new().map_err(Error::EventLoop)?;
+    let mut event_loop: EventLoop<Showing> = EventLoop::try_new()?;
     let signal = event_loop.get_signal();
     let handle = event_loop.handle();
 
     let (frames_sender, frames) = channel();
-    let stream_clone = stream.try_clone().map_err(Error::Clone)?;
+    let stream_clone = stream.try_clone()?;
     let mut writer = Worker::start("meowland-frames", move |stop| {
         write_frames(stream_clone, &frames_sender, stop);
-    })
-    .map_err(|cause| Error::Thread {
-        thread: "the frame writer",
-        cause,
     })?;
 
     handle
@@ -261,10 +211,6 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error
     let (input_sender, input) = channel();
     let mut input_thread = Worker::start("meowland-input", move |stop| {
         read_terminal(&input_sender, stop);
-    })
-    .map_err(|cause| Error::Thread {
-        thread: "the terminal reader",
-        cause,
     })?;
     handle
         .insert_source(input, |event, (), showing: &mut Showing| match event {
@@ -288,8 +234,7 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error
 
     handle
         .insert_source(
-            Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP])
-                .map_err(Error::Signals)?,
+            Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP])?,
             |_, (), showing: &mut Showing| {
                 showing.leave(Departure::Signal);
                 showing.stop();
@@ -310,7 +255,7 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error
     let _ = showing.stream.shutdown(std::net::Shutdown::Both);
     writer.stop();
     input_thread.stop();
-    result.map_err(Error::Showing)?;
+    result?;
     Ok(showing.departure.unwrap_or(Departure::ServerGone))
 }
 

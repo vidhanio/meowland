@@ -38,6 +38,7 @@ use smithay::{
 };
 
 use crate::{
+    Error,
     cli::Settings,
     compositor::{Cost, Meowland},
     control, display,
@@ -61,45 +62,6 @@ const FRAME_INTERVAL: Duration =
 /// That is long enough for a request that is already in flight, and short
 /// enough that a client which says nothing does not hold the server up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// Why the server did not start, or stopped.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// The log file could not be opened.
-    #[error(transparent)]
-    Log(#[from] logging::Error),
-    /// One of the sockets the server is reached on could not be bound.
-    #[error("could not bind a socket of the server")]
-    Socket(#[from] control::Error),
-    /// The Wayland socket clients connect to could not be bound.
-    #[error("could not bind a Wayland socket")]
-    WaylandSocket(#[source] smithay::reexports::wayland_server::BindError),
-    /// Process signals could not be watched.
-    #[error("could not listen for process signals")]
-    Signals(#[source] calloop::Error),
-    /// The Wayland display could not be created.
-    #[error("could not create a Wayland display")]
-    Display(#[source] smithay::reexports::wayland_server::backend::InitError),
-    /// The compositor could not advertise its initial state.
-    #[error(transparent)]
-    Compositor(#[from] crate::compositor::Error),
-    /// The GPU buffers that clients may hand over could not be described.
-    #[error(transparent)]
-    Dmabuf(#[from] crate::dmabuf::Error),
-    /// The event loop could not be created, or refused a source.
-    #[error("could not create the event loop")]
-    EventLoop(#[source] calloop::Error),
-    /// A source the server needs could not be watched.
-    #[error("could not watch {source}")]
-    Watch {
-        source: &'static str,
-        #[source]
-        cause: Box<dyn std::error::Error + Send + Sync>,
-    },
-    /// The event loop stopped with an error.
-    #[error("the event loop failed")]
-    Loop(#[source] calloop::Error),
-}
 
 /// Run the server until something stops it.
 ///
@@ -125,8 +87,7 @@ pub fn run(settings: Settings) -> Result<(), Error> {
         Signal::SIGINT,
         Signal::SIGHUP,
         Signal::SIGCHLD,
-    ])
-    .map_err(Error::Signals)?;
+    ])?;
 
     let socket = bind_socket()?;
     let socket_name = socket.socket_name().to_string_lossy().into_owned();
@@ -150,7 +111,7 @@ pub fn run(settings: Settings) -> Result<(), Error> {
     let (terminal_sender, terminal_events) = channel();
     // The loop comes first: the app registers a pane's presenter events with it
     // when a pane attaches.
-    let mut event_loop: Calloop<App> = Calloop::try_new().map_err(Error::EventLoop)?;
+    let mut event_loop: Calloop<App> = Calloop::try_new()?;
     let handle = event_loop.handle();
 
     let mut app = App {
@@ -186,7 +147,7 @@ pub fn run(settings: Settings) -> Result<(), Error> {
         },
     )?;
 
-    let result = event_loop.run(None, &mut app, |_| {}).map_err(Error::Loop);
+    let result = event_loop.run(None, &mut app, |_| {}).map_err(Error::from);
     app.shutdown();
     result
 }

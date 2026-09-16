@@ -11,7 +11,10 @@ use std::{
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-use crate::kitty::{GRAPHICS_PROBE_ID, SHARED_PROBE_ID};
+use crate::{
+    Error,
+    kitty::{GRAPHICS_PROBE_ID, SHARED_PROBE_ID},
+};
 
 /// What the terminal reported it can do. Each field is one independent answer.
 #[expect(
@@ -75,22 +78,6 @@ pub struct Terminal {
     entered: bool,
 }
 
-/// Why meowland cannot draw in this terminal.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("meowland needs a terminal on stdin and stdout (try running it directly)")]
-    NotATerminal,
-    #[error("could not put the terminal into raw mode")]
-    RawMode(#[source] io::Error),
-    #[error("could not initialize terminal output")]
-    Output(#[source] io::Error),
-    #[error(
-        "this terminal does not support the kitty graphics protocol (meowland needs kitty, \
-         ghostty, or another terminal that implements it)"
-    )]
-    NoGraphics,
-}
-
 /// The escape that names the window a terminal is in.
 ///
 /// A client supplies the title, so control characters are removed: they would
@@ -135,7 +122,7 @@ impl Terminal {
         if self.entered {
             return Ok(&self.capabilities);
         }
-        crossterm::terminal::enable_raw_mode().map_err(Error::RawMode)?;
+        crossterm::terminal::enable_raw_mode()?;
         let probe = probe().unwrap_or_else(|error| {
             tracing::warn!(%error, "could not probe terminal capabilities");
             Probe::default()
@@ -149,7 +136,7 @@ impl Terminal {
         self.capabilities = capabilities;
         if let Err(error) = self.enter() {
             let _ = crossterm::terminal::disable_raw_mode();
-            return Err(Error::Output(error));
+            return Err(error.into());
         }
         Ok(&self.capabilities)
     }

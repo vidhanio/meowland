@@ -114,13 +114,12 @@ impl Frame {
         }
     }
 
-    /// Resize, discarding the contents.
+    /// Resize the storage. The caller repaints the frame before reading it.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
         self.pixels
             .resize(width as usize * height as usize * BYTES, 0);
-        self.pixels.fill(0);
     }
 
     pub fn pixels(&self) -> &[u8] {
@@ -286,9 +285,10 @@ pub struct Tiles {
 
 impl Tiles {
     pub fn new(frame: &Frame, size: (u32, u32)) -> Self {
+        let size = (size.0.max(1), size.1.max(1));
         let grid = (
-            frame.width.div_ceil(size.0.max(1)).max(1),
-            frame.height.div_ceil(size.1.max(1)).max(1),
+            frame.width.div_ceil(size.0).max(1),
+            frame.height.div_ceil(size.1).max(1),
         );
         Self {
             size,
@@ -339,11 +339,8 @@ impl Tiles {
     }
 
     fn tile_differs(&self, frame: &Frame, tile: Rect) -> bool {
-        for row in 0..tile.height {
-            let start = (tile.y as usize + row as usize) * frame.width as usize * BYTES
-                + tile.x as usize * BYTES;
-            let end = start + tile.width as usize * BYTES;
-            if frame.pixels()[start..end] != self.previous[start..end] {
+        for row in Self::rows(frame, tile) {
+            if frame.pixels()[row.clone()] != self.previous[row] {
                 return true;
             }
         }
@@ -351,12 +348,19 @@ impl Tiles {
     }
 
     fn update_previous(&mut self, frame: &Frame, tile: Rect) {
-        for row in 0..tile.height {
-            let start = (tile.y as usize + row as usize) * frame.width as usize * BYTES
-                + tile.x as usize * BYTES;
-            let end = start + tile.width as usize * BYTES;
-            self.previous[start..end].copy_from_slice(&frame.pixels()[start..end]);
+        for row in Self::rows(frame, tile) {
+            self.previous[row.clone()].copy_from_slice(&frame.pixels()[row]);
         }
+    }
+
+    fn rows(frame: &Frame, tile: Rect) -> impl Iterator<Item = std::ops::Range<usize>> {
+        let stride = frame.width as usize * BYTES;
+        let first = tile.y as usize * stride + tile.x as usize * BYTES;
+        let length = tile.width as usize * BYTES;
+        (0..tile.height as usize).map(move |row| {
+            let start = first + row * stride;
+            start..start + length
+        })
     }
 }
 

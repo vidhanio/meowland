@@ -20,17 +20,11 @@ use rustix::{
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType},
 };
 
+use crate::Error;
+
 /// The display numbers the server tries, in order.
 const DISPLAY_SLOTS: std::ops::RangeInclusive<u32> = 0..=32;
 const SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("could not reserve an X11 display")]
-    Display(#[source] std::io::Error),
-    #[error("could not start xwayland-satellite")]
-    Spawn(#[source] std::io::Error),
-}
 
 /// One xwayland-satellite child and the X display it reserved.
 ///
@@ -45,14 +39,12 @@ pub struct Server {
 
 impl Server {
     pub fn start(wayland_display: &str) -> Result<Self, Error> {
-        let (lock, listeners) = reserve_display().map_err(Error::Display)?;
+        let (lock, listeners) = reserve_display()?;
         let x_display = format!(":{}", lock.number);
 
         // The child takes the sockets as `-listenfd`, so it must inherit them.
         for listener in &listeners {
-            fcntl_setfd(listener, FdFlags::empty())
-                .map_err(std::io::Error::from)
-                .map_err(Error::Spawn)?;
+            fcntl_setfd(listener, FdFlags::empty()).map_err(std::io::Error::from)?;
         }
         let mut command = Command::new("xwayland-satellite");
         command
@@ -76,11 +68,11 @@ impl Server {
                 reset_error.get_or_insert_with(|| std::io::Error::from(error));
             }
         }
-        let mut child = child.map_err(Error::Spawn)?;
+        let mut child = child?;
         if let Some(error) = reset_error {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::Spawn(error));
+            return Err(error.into());
         }
 
         tracing::info!(display = %x_display, pid = child.id(), "xwayland-satellite started");

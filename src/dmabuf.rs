@@ -43,6 +43,8 @@ use std::{
 
 use rustix::fs::{FileType, Mode, OFlags};
 
+use crate::Error;
+
 /// How clients are offered GPU buffers.
 ///
 /// The value comes from a command line flag that falls back to an environment
@@ -84,16 +86,6 @@ impl RenderNode {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("the render node {path} cannot be used")]
-    Unusable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
 impl Offer {
     /// How this offer is written on a command line (`--gpu-buffers`).
     pub const fn as_str(self) -> &'static str {
@@ -119,11 +111,9 @@ impl Offer {
             (Self::Off, _) => Ok(Vec::new()),
             (Self::Auto, None) => Ok(find()),
             (Self::Auto, Some(path)) => {
-                let node =
-                    RenderNode::open(path.to_path_buf()).map_err(|source| Error::Unusable {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
+                let node = RenderNode::open(path.to_path_buf()).map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                })?;
                 Ok(vec![node])
             }
         }

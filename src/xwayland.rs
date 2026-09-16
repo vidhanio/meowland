@@ -13,7 +13,7 @@ use rustix::{
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType},
 };
 
-use crate::Error;
+use crate::{Error, types::XDisplayNumber};
 
 /// The display numbers the server tries, in order.
 const DISPLAY_SLOTS: std::ops::RangeInclusive<u32> = 0..=32;
@@ -108,12 +108,12 @@ impl Drop for Server {
 
 #[derive(Debug)]
 struct DisplayLock {
-    number: u32,
+    number: XDisplayNumber,
 }
 
 impl DisplayLock {
     /// Create the lock file for one display, or take over a stale one.
-    fn acquire(number: u32) -> std::io::Result<Self> {
+    fn acquire(number: XDisplayNumber) -> std::io::Result<Self> {
         let path = lock_path(number);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => write_lock(file, &path, number),
@@ -130,7 +130,7 @@ impl DisplayLock {
     }
 }
 
-fn write_lock(mut file: File, path: &Path, number: u32) -> std::io::Result<DisplayLock> {
+fn write_lock(mut file: File, path: &Path, number: XDisplayNumber) -> std::io::Result<DisplayLock> {
     if let Err(error) = writeln!(file, "{:>10}", std::process::id()) {
         drop(file);
         let _ = std::fs::remove_file(path);
@@ -149,7 +149,8 @@ impl Drop for DisplayLock {
 fn reserve_display() -> std::io::Result<(DisplayLock, Vec<UnixListener>)> {
     std::fs::create_dir_all(SOCKET_DIRECTORY)?;
     let mut last_error = None;
-    for number in DISPLAY_SLOTS {
+    for raw in DISPLAY_SLOTS {
+        let number = XDisplayNumber::new(raw);
         let lock = match DisplayLock::acquire(number) {
             Ok(lock) => lock,
             Err(error) => {
@@ -171,7 +172,7 @@ fn reserve_display() -> std::io::Result<(DisplayLock, Vec<UnixListener>)> {
 ///
 /// X clients use either address. A socket file left by a dead display is
 /// removed first.
-fn open_listeners(number: u32) -> std::io::Result<Vec<UnixListener>> {
+fn open_listeners(number: XDisplayNumber) -> std::io::Result<Vec<UnixListener>> {
     let path = socket_path(number);
     let _ = std::fs::remove_file(&path);
     let filesystem = SocketAddrUnix::new(path.as_os_str().as_encoded_bytes())?;
@@ -215,10 +216,10 @@ fn remove_stale_lock(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn socket_path(number: u32) -> std::path::PathBuf {
+fn socket_path(number: XDisplayNumber) -> std::path::PathBuf {
     Path::new(SOCKET_DIRECTORY).join(format!("X{number}"))
 }
 
-fn lock_path(number: u32) -> std::path::PathBuf {
+fn lock_path(number: XDisplayNumber) -> std::path::PathBuf {
     Path::new("/tmp").join(format!(".X{number}-lock"))
 }

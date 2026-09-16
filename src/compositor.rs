@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use evdev::KeyCode;
 use smithay::{
     backend::{
         allocator::dmabuf::Dmabuf,
@@ -63,6 +64,7 @@ use crate::{
     presenter::Presenter,
     render::{BYTES, Frame, Rect, Tiles},
     tty::Capabilities,
+    types::{ImageId, PaneId, WindowId},
 };
 
 pub const REFRESH_MILLIHZ: i32 = 60_000;
@@ -129,9 +131,9 @@ impl PendingTiles {
 )]
 #[derive(Debug)]
 pub struct View {
-    id: u64,
+    id: PaneId,
     capabilities: Capabilities,
-    window: Option<u64>,
+    window: Option<WindowId>,
     follow: bool,
     frame: Frame,
     tiles: Tiles,
@@ -146,7 +148,7 @@ pub struct View {
 }
 
 impl View {
-    fn new(id: u64, capabilities: &Capabilities) -> Self {
+    fn new(id: PaneId, capabilities: &Capabilities) -> Self {
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
         let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
         Self {
@@ -179,7 +181,7 @@ impl View {
 
 #[derive(Debug)]
 struct Window {
-    id: u64,
+    id: WindowId,
     surface: ToplevelSurface,
     label: Option<String>,
     title: Option<String>,
@@ -220,9 +222,9 @@ pub struct Meowland {
     // connection and may be reused, so they are not stable handles.
     windows: Vec<Window>,
     active: Option<usize>,
-    next_window_id: u64,
+    next_window_id: WindowId,
 
-    pressed: Vec<u32>,
+    pressed: Vec<KeyCode>,
     pointer_position: Point<f64, Logical>,
     cursor: CursorImageStatus,
 
@@ -324,7 +326,7 @@ impl Meowland {
             pointer,
             windows: Vec::new(),
             active: None,
-            next_window_id: 1,
+            next_window_id: WindowId::new(1),
             pressed: Vec::new(),
             pointer_position: (0.0, 0.0).into(),
             cursor: CursorImageStatus::default_named(),
@@ -362,7 +364,7 @@ impl Meowland {
             })
     }
 
-    pub fn active_window(&self) -> Option<u64> {
+    pub fn active_window(&self) -> Option<WindowId> {
         self.active.map(|index| self.windows[index].id)
     }
 
@@ -378,13 +380,13 @@ impl Meowland {
         // Every pane showing it draws again, because the state the client sees
         // changed.
         let id = self.windows[index].id;
-        tracing::debug!(id, "focused");
+        tracing::debug!(id = %id, "focused");
         for view in self.views_of(id) {
             view.scene_dirty = true;
         }
     }
 
-    pub fn attach_view(&mut self, id: u64, show: display::Show, capabilities: &Capabilities) {
+    pub fn attach_view(&mut self, id: PaneId, show: display::Show, capabilities: &Capabilities) {
         let (window, follow) = self.resolve(show);
         let mut view = View::new(id, capabilities);
         view.window = window;
@@ -392,20 +394,20 @@ impl Meowland {
         if self.views.is_empty() {
             self.describe_output(capabilities);
         }
-        tracing::info!(id, ?window, follow, "pane attached");
+        tracing::info!(id = %id, ?window, follow, "pane attached");
         self.views.push(view);
         self.configure_windows();
         self.sync_outputs();
     }
 
-    pub fn detach_view(&mut self, id: u64) {
+    pub fn detach_view(&mut self, id: PaneId) {
         self.views.retain(|view| view.id != id);
-        tracing::info!(id, "pane gone");
+        tracing::info!(id = %id, "pane gone");
         self.configure_windows();
         self.sync_outputs();
     }
 
-    pub fn resize_view(&mut self, id: u64, capabilities: &Capabilities) {
+    pub fn resize_view(&mut self, id: PaneId, capabilities: &Capabilities) {
         let Some(index) = self.view(id) else {
             return;
         };
@@ -423,21 +425,21 @@ impl Meowland {
         self.configure_windows();
     }
 
-    pub fn has_window(&self, id: u64) -> bool {
+    pub fn has_window(&self, id: WindowId) -> bool {
         self.windows.iter().any(|window| window.id == id)
     }
 
-    fn view(&self, id: u64) -> Option<usize> {
+    fn view(&self, id: PaneId) -> Option<usize> {
         self.views.iter().position(|view| view.id == id)
     }
 
-    fn views_of(&mut self, window: u64) -> impl Iterator<Item = &mut View> {
+    fn views_of(&mut self, window: WindowId) -> impl Iterator<Item = &mut View> {
         self.views
             .iter_mut()
             .filter(move |view| view.window == Some(window))
     }
 
-    fn resolve(&self, show: display::Show) -> (Option<u64>, bool) {
+    fn resolve(&self, show: display::Show) -> (Option<WindowId>, bool) {
         match show {
             display::Show::Window(id) => (Some(id), false),
             display::Show::Newest => (self.windows.last().map(|window| window.id), true),
@@ -476,19 +478,19 @@ impl Meowland {
         }
     }
 
-    pub fn should_present_view(&self, id: u64, presenter_ready: bool) -> bool {
+    pub fn should_present_view(&self, id: PaneId, presenter_ready: bool) -> bool {
         self.view(id)
             .is_some_and(|index| self.views[index].should_present(presenter_ready))
     }
 
-    pub fn take_detach_request(&mut self, id: u64) -> bool {
+    pub fn take_detach_request(&mut self, id: PaneId) -> bool {
         let Some(index) = self.view(id) else {
             return false;
         };
         std::mem::replace(&mut self.views[index].detaching, false)
     }
 
-    pub fn take_closed_views(&mut self) -> Vec<u64> {
+    pub fn take_closed_views(&mut self) -> Vec<PaneId> {
         let mut closed = Vec::new();
         for view in &mut self.views {
             if std::mem::replace(&mut view.done, false) {
@@ -505,21 +507,21 @@ impl Meowland {
     }
 
     /// Send `xdg_toplevel.close` to this pane's window.
-    fn close_window(&self, pane: u64) {
+    fn close_window(&self, pane: PaneId) {
         let Some(index) = self.pane_window(pane) else {
             return;
         };
         let window = &self.windows[index];
-        tracing::info!(id = window.id, pane, "asked to close");
+        tracing::info!(id = %window.id, pane = %pane, "asked to close");
         window.surface.send_close();
     }
 
-    fn pane_window(&self, pane: u64) -> Option<usize> {
+    fn pane_window(&self, pane: PaneId) -> Option<usize> {
         let index = self.view(pane)?;
         self.views[index].index(&self.windows)
     }
 
-    fn focus_pane(&mut self, pane: u64) -> Option<usize> {
+    fn focus_pane(&mut self, pane: PaneId) -> Option<usize> {
         let index = self.view(pane)?;
         if let Some(window) = self.views[index].index(&self.windows) {
             self.activate_index(window);
@@ -574,7 +576,7 @@ impl Meowland {
                 }
             });
             tracing::debug!(
-                id = window.id,
+                id = %window.id,
                 ?size,
                 fullscreen = window.fullscreen,
                 active = self.active == Some(index),
@@ -584,7 +586,7 @@ impl Meowland {
         }
     }
 
-    pub fn present_view(&mut self, id: u64, presenter: &mut Presenter) -> Cost {
+    pub fn present_view(&mut self, id: PaneId, presenter: &mut Presenter) -> Cost {
         let Some(index) = self.view(id) else {
             return Cost::default();
         };
@@ -763,7 +765,7 @@ impl Meowland {
     /// (`crate::display`), because it has the key codes and the keymap.
     /// Typing in a pane gives its window the keyboard, and the bindings act
     /// on that window.
-    pub fn key(&mut self, pane: u64, key: Key) {
+    pub fn key(&mut self, pane: PaneId, key: Key) {
         use display::KeyKind;
 
         let modifiers = crossterm::event::KeyModifiers::from_bits_truncate(key.modifiers);
@@ -772,7 +774,7 @@ impl Meowland {
             code: key.code,
             shift: key.shift,
         };
-        tracing::debug!(?key, code = stroke.code, "key");
+        tracing::debug!(?key, code = stroke.code.code(), "key");
 
         // Modifier keys are *state* for everything typed while they are held,
         // so they follow the terminal's flags, not a keystroke.
@@ -814,7 +816,12 @@ impl Meowland {
     ///
     /// A binding acts on the pane the key was typed in, so it closes the window
     /// that pane shows.
-    fn binding(&mut self, pane: u64, modifiers: crossterm::event::KeyModifiers, code: u32) -> bool {
+    fn binding(
+        &mut self,
+        pane: PaneId,
+        modifiers: crossterm::event::KeyModifiers,
+        code: KeyCode,
+    ) -> bool {
         use crossterm::event::KeyModifiers as M;
         if !modifiers.contains(BINDING_MODIFIER)
             || modifiers.contains(M::CONTROL)
@@ -825,7 +832,7 @@ impl Meowland {
         // Linux input event codes, as the terminal reports them
         // (`keys::for_char`): `KEY_Q`.
         match code {
-            16 => {
+            KeyCode::KEY_Q => {
                 // Close the window this pane shows, if it has one. Closing a
                 // client ends its pane; a pane with nothing to
                 // show releases its terminal instead.
@@ -874,19 +881,19 @@ impl Meowland {
         }
     }
 
-    fn press_modifier(&mut self, code: u32) {
+    fn press_modifier(&mut self, code: KeyCode) {
         if !self.is_pressed(code) {
             self.forward_key(code, KeyState::Pressed);
         }
     }
 
-    fn release_modifier(&mut self, code: u32) {
+    fn release_modifier(&mut self, code: KeyCode) {
         if self.is_pressed(code) {
             self.forward_key(code, KeyState::Released);
         }
     }
 
-    fn is_pressed(&self, code: u32) -> bool {
+    fn is_pressed(&self, code: KeyCode) -> bool {
         self.pressed.contains(&code)
     }
 
@@ -896,8 +903,8 @@ impl Meowland {
     /// (evdev); the seat counts as XKB does, eight codes further along, so
     /// the conversion happens here and nowhere else. Confusing the two is
     /// not a loud failure: it types the neighbouring key.
-    fn forward_key(&mut self, code: u32, state: KeyState) {
-        tracing::debug!(code, ?state, "forwarding key");
+    fn forward_key(&mut self, code: KeyCode, state: KeyState) {
+        tracing::debug!(code = code.code(), ?state, "forwarding key");
         if state == KeyState::Pressed {
             if !self.pressed.contains(&code) {
                 self.pressed.push(code);
@@ -910,7 +917,7 @@ impl Meowland {
         let time = self.time();
         keyboard.input(
             self,
-            Keycode::from(code + keys::XKB_OFFSET),
+            Keycode::from(u32::from(code.code()) + keys::XKB_OFFSET),
             state,
             serial,
             time,
@@ -919,7 +926,7 @@ impl Meowland {
     }
 
     /// Handle a mouse event in a pane, in the cells the terminal reports.
-    pub fn pointer(&mut self, pane: u64, pointer: Pointer) {
+    pub fn pointer(&mut self, pane: PaneId, pointer: Pointer) {
         let Some(index) = self.view(pane) else {
             return;
         };
@@ -988,12 +995,12 @@ impl Meowland {
         pointer.frame(self);
     }
 
-    fn pointer_button(&mut self, button: u32, pressed: bool) {
+    fn pointer_button(&mut self, button: KeyCode, pressed: bool) {
         let pointer = self.pointer.clone();
         let event = ButtonEvent {
             serial: SERIAL_COUNTER.next_serial(),
             time: self.time(),
-            button,
+            button: u32::from(button.code()),
             state: if pressed {
                 ButtonState::Pressed
             } else {
@@ -1036,7 +1043,7 @@ fn output_mode(capabilities: &Capabilities) -> Mode {
 fn placement(tile: Rect, cell: (u32, u32), index: usize) -> kitty::Placement {
     let (cell_width, cell_height) = cell;
     kitty::Placement {
-        id: index as u32 + 1,
+        id: ImageId::new(index as u32 + 1),
         width: tile.width,
         height: tile.height,
         cols: tile.width.div_ceil(cell_width.max(1)).max(1),
@@ -1313,7 +1320,7 @@ impl CompositorHandler for Meowland {
                 if view.follow {
                     view.window = Some(id);
                     view.scene_dirty = true;
-                    tracing::debug!(id = view.id, window = id, "pane took the newest window");
+                    tracing::debug!(id = %view.id, window = %id, "pane took the newest window");
                 }
             }
             if self.views.iter().any(|view| view.window == Some(id)) {
@@ -1467,8 +1474,8 @@ impl XdgShellHandler for Meowland {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = self.next_window_id;
-        self.next_window_id = self.next_window_id.saturating_add(1);
-        tracing::info!(id, wayland_id = ?surface.wl_surface().id(), "new window");
+        self.next_window_id = WindowId::new(self.next_window_id.into_inner().saturating_add(1));
+        tracing::info!(id = %id, wayland_id = ?surface.wl_surface().id(), "new window");
         let (label, title) = window_names(&surface);
         self.windows.push(Window {
             id,
@@ -1538,7 +1545,7 @@ impl XdgShellHandler for Meowland {
         let Some(index) = self.index_of(surface.wl_surface()) else {
             return;
         };
-        tracing::info!(id = self.windows[index].id, "fullscreen asked for");
+        tracing::info!(id = %self.windows[index].id, "fullscreen asked for");
         self.windows[index].fullscreen = true;
         // A request for the whole screen is a request to be the window on it,
         // which is what fullscreen means here. It brings a player that
@@ -1551,7 +1558,7 @@ impl XdgShellHandler for Meowland {
         let Some(index) = self.index_of(surface.wl_surface()) else {
             return;
         };
-        tracing::info!(id = self.windows[index].id, "fullscreen given up");
+        tracing::info!(id = %self.windows[index].id, "fullscreen given up");
         self.windows[index].fullscreen = false;
         self.configure_windows();
     }
@@ -1681,11 +1688,11 @@ fn advertise_render_nodes(
     }
     tracing::info!(
         path = %node.path.display(),
-        device = node.device,
+        device = node.device.into_inner(),
         formats = formats.len(),
         "offering GPU buffers to clients"
     );
-    let feedback = DmabufFeedbackBuilder::new(node.device, formats).build()?;
+    let feedback = DmabufFeedbackBuilder::new(node.device.into_inner(), formats).build()?;
     Ok(Some(state.create_global_with_default_feedback::<Meowland>(
         display, &feedback,
     )))

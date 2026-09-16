@@ -9,6 +9,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::{Compression, write::ZlibEncoder};
 use smithay::input::pointer::CursorIcon;
 
+use crate::types::ImageId;
+
 /// Maximum size of a base64 plot line, mandated by the protocol.
 const CHUNK: usize = 4096;
 
@@ -48,11 +50,11 @@ static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(PROBE_NAMESPACE + 1);
 
 /// The image id of the probe's graphics support query. Its answer is the one
 /// that says whether the terminal speaks the protocol.
-pub const GRAPHICS_PROBE_ID: u32 = 77;
+pub const GRAPHICS_PROBE_ID: ImageId = ImageId::new(77);
 
 /// The image id of the probe's shared memory tile, distinct from the graphics
 /// query's id.
-pub const SHARED_PROBE_ID: u32 = 78;
+pub const SHARED_PROBE_ID: ImageId = ImageId::new(78);
 
 /// Send a one-pixel tile out of shared memory, to test whether the terminal
 /// reads one there. The guard removes the object if it did not.
@@ -189,7 +191,7 @@ impl Drop for Encoder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
-    pub id: u32,
+    pub id: ImageId,
     pub width: u32,
     pub height: u32,
     pub cols: u32,
@@ -302,7 +304,7 @@ impl Encoder {
         // shared memory the pixels stay off the pty, so the answer is no:
         // reading them costs less work than inflating them.
         if self.shared_memory {
-            let slot = placement.id as usize;
+            let slot = placement.id.into_inner() as usize;
             while self.shared_objects.len() <= slot {
                 self.shared_objects.push(Shared::new(
                     self.namespace,
@@ -610,7 +612,7 @@ mod tests {
             &mut out,
             &pixels,
             Placement {
-                id: 7,
+                id: ImageId::new(7),
                 width,
                 height,
                 cols: 6,
@@ -661,7 +663,7 @@ mod tests {
             &mut out,
             &flat,
             Placement {
-                id: 1,
+                id: ImageId::new(1),
                 width: 4,
                 height: 4,
                 cols: 1,
@@ -675,7 +677,7 @@ mod tests {
             &mut out,
             &flat,
             Placement {
-                id: 2,
+                id: ImageId::new(2),
                 width: 4,
                 height: 4,
                 cols: 1,
@@ -719,7 +721,7 @@ mod tests {
                 &mut out,
                 pixels,
                 Placement {
-                    id: index as u32,
+                    id: ImageId::new(index as u32),
                     width: 4,
                     height: 4,
                     cols: 1,
@@ -747,7 +749,7 @@ mod tests {
         placed(
             &mut out,
             Placement {
-                id: 3,
+                id: ImageId::new(3),
                 width: 160,
                 height: 160,
                 cols: 16,
@@ -797,7 +799,7 @@ mod tests {
             &mut out,
             &noise,
             Placement {
-                id: 1,
+                id: ImageId::new(1),
                 width: 160,
                 height: 160,
                 cols: 16,
@@ -844,7 +846,7 @@ mod tests {
             &mut out,
             &pixels,
             Placement {
-                id: 1,
+                id: ImageId::new(1),
                 width,
                 height,
                 cols: 20,

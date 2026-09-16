@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::PathBuf};
 
-use crate::{control, dmabuf};
+use crate::{control, dmabuf, types::WindowId};
 
 /// A Wayland compositor in a terminal.
 #[derive(usage::Cli)]
@@ -119,7 +119,7 @@ pub struct Stop;
 pub struct Attach {
     /// Window ID; defaults to the focused window
     #[usage(value_name = "ID", complete = attached_windows)]
-    pub window: Option<u64>,
+    pub window: Option<WindowId>,
 }
 
 #[derive(usage::Args)]

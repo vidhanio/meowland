@@ -12,6 +12,7 @@ use rustix::{
     runtime::{How, KernelSigSet, kernel_sigprocmask},
 };
 
+use crate::types::ProcessId;
 /// How long each signal is given before the next one is sent.
 ///
 /// Long enough for a client to close its windows and exit, and short enough
@@ -60,14 +61,18 @@ pub fn spawn_unblocked(command: &mut Command) -> &mut Command {
 /// Every process under `root`, not including `root` itself.
 ///
 /// The tree is read in one pass over `/proc`, then walked from `root`.
-pub fn descendants_of(root: u32) -> Vec<u32> {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+pub fn descendants_of(root: ProcessId) -> Vec<ProcessId> {
+    let mut children: HashMap<ProcessId, Vec<ProcessId>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .map(ProcessId::new)
+        else {
             continue;
         };
         let Some(parent) = parent_of(pid) else {
@@ -92,16 +97,21 @@ pub fn descendants_of(root: u32) -> Vec<u32> {
 /// The second field of that file is the name of the process in parentheses, and
 /// the name may hold spaces and parentheses, so the fields are counted from the
 /// last `)`.
-fn parent_of(pid: u32) -> Option<u32> {
+fn parent_of(pid: ProcessId) -> Option<ProcessId> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields = stat.get(stat.rfind(')')? + 2..)?;
-    fields.split_whitespace().nth(1)?.parse().ok()
+    fields
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u32>()
+        .ok()
+        .map(ProcessId::new)
 }
 
 /// Send `signal` to every process in `pids`, and to nothing else.
-pub fn signal(pids: &[u32], signal: Signal) {
+pub fn signal(pids: &[ProcessId], signal: Signal) {
     for pid in pids {
-        let Some(pid) = Pid::from_raw(*pid as i32) else {
+        let Some(pid) = Pid::from_raw(pid.into_inner() as i32) else {
             continue;
         };
         if let Err(err) = kill_process(pid, signal) {
@@ -119,15 +129,19 @@ pub fn signal(pids: &[u32], signal: Signal) {
 ///
 /// A process that this server started and has not reaped yet counts as there,
 /// because it still holds the pid.
-pub fn alive(pid: u32) -> bool {
-    Pid::from_raw(pid as i32).is_some_and(|pid| test_kill_process(pid).is_ok())
+pub fn alive(pid: ProcessId) -> bool {
+    Pid::from_raw(pid.into_inner() as i32).is_some_and(|pid| test_kill_process(pid).is_ok())
 }
 
 /// Wait until every process in `pids` is gone, or `grace` runs out.
 ///
 /// `reap` is called between checks, so that the children of this process are
 /// taken back from the kernel while their own children are being waited for.
-pub fn wait_until_gone(pids: &mut Vec<u32>, grace: Duration, reap: &mut impl FnMut()) -> bool {
+pub fn wait_until_gone(
+    pids: &mut Vec<ProcessId>,
+    grace: Duration,
+    reap: &mut impl FnMut(),
+) -> bool {
     let deadline = Instant::now() + grace;
     loop {
         reap();
@@ -159,10 +173,11 @@ mod tests {
             .expect("could not start a shell");
         thread::sleep(Duration::from_millis(200));
 
-        let root = std::process::id();
+        let root = ProcessId::new(std::process::id());
+        let child_pid = ProcessId::new(child.id());
         let found = descendants_of(root);
         assert!(
-            found.contains(&child.id()),
+            found.contains(&child_pid),
             "the shell is under this process: {found:?}"
         );
         for pid in &found {
@@ -170,7 +185,7 @@ mod tests {
         }
         let sleeps = found
             .iter()
-            .filter(|pid| **pid != child.id() && is_sleep(**pid))
+            .filter(|pid| **pid != child_pid && is_sleep(**pid))
             .count();
         assert!(sleeps >= 2, "both helpers are in the tree: {found:?}");
 
@@ -193,7 +208,7 @@ mod tests {
     ///
     /// The name is the second field of `/proc/<pid>/stat`, in parentheses, and
     /// it may hold spaces and parentheses of its own.
-    fn is_sleep(pid: u32) -> bool {
+    fn is_sleep(pid: ProcessId) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
             stat.split_once(')').is_some_and(|(head, _)| {
                 head.rsplit_once('(')
@@ -212,7 +227,7 @@ mod signal_tests {
     #[test]
     fn a_signal_stops_a_process() {
         let mut child = Command::new("sleep").arg("30").spawn().expect("sleep");
-        let pid = child.id();
+        let pid = ProcessId::new(child.id());
         signal(&[pid], Signal::HUP);
         let mut left = vec![pid];
         let gone = wait_until_gone(&mut left, Duration::from_secs(2), &mut || {

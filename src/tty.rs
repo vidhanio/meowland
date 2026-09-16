@@ -10,6 +10,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use crate::{
     Error,
     kitty::{GRAPHICS_PROBE_ID, SHARED_PROBE_ID},
+    types::ImageId,
 };
 
 /// What the terminal reported it can do. Each field is one independent answer.
@@ -395,7 +396,8 @@ fn parse_responses(bytes: &[u8]) -> ParsedResponses {
                 let id = control
                     .split(',')
                     .find_map(|field| field.strip_prefix("i="))
-                    .and_then(|id| id.parse::<u32>().ok());
+                    .and_then(|id| id.parse::<u32>().ok())
+                    .map(ImageId::new);
                 match (id, answer) {
                     (Some(GRAPHICS_PROBE_ID), "OK") => parsed.probe.graphics = true,
                     (Some(SHARED_PROBE_ID), "OK") => parsed.probe.shared_memory = true,

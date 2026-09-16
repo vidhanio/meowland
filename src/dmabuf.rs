@@ -7,7 +7,7 @@ use std::{
 
 use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::Error;
+use crate::{Error, types::DeviceId};
 
 /// How clients are offered GPU buffers.
 ///
@@ -29,7 +29,7 @@ pub struct RenderNode {
     pub path: PathBuf,
     /// The device number. Clients match this against their own devices, not
     /// against the path.
-    pub device: u64,
+    pub device: DeviceId,
 }
 
 impl RenderNode {
@@ -45,7 +45,7 @@ impl RenderNode {
         }
         Ok(Self {
             path,
-            device: stat.st_rdev,
+            device: DeviceId::new(stat.st_rdev),
         })
     }
 }

@@ -35,6 +35,7 @@ use crate::{
     presenter::{Event as PresenterEvent, Presenter},
     process,
     tty::Capabilities,
+    types::{PaneId, ProcessId, ProtocolVersion},
     xwayland,
 };
 
@@ -89,7 +90,7 @@ pub fn run(settings: Settings) -> Result<(), Error> {
         panes: HashMap::new(),
         terminal_sender,
         readers: HashMap::new(),
-        next_pane: 0,
+        next_pane: PaneId::new(0),
         handle: handle.clone(),
         _sockets: (control_socket, display_socket),
         children: Vec::new(),
@@ -131,10 +132,10 @@ struct App {
     xwayland: Option<xwayland::Server>,
     socket_name: String,
     log: File,
-    panes: HashMap<u64, Pane>,
+    panes: HashMap<PaneId, Pane>,
     terminal_sender: Sender<FromTerminal>,
-    readers: HashMap<u64, JoinHandle<()>>,
-    next_pane: u64,
+    readers: HashMap<PaneId, JoinHandle<()>>,
+    next_pane: PaneId,
     handle: LoopHandle<'static, Self>,
     /// Removes the sockets when the event loop ends.
     _sockets: (control::Socket, control::Socket),
@@ -157,30 +158,30 @@ struct Pane {
 #[derive(Debug)]
 enum FromTerminal {
     Hello {
-        pane: u64,
-        version: u32,
+        pane: PaneId,
+        version: ProtocolVersion,
         show: display::Show,
         capabilities: Capabilities,
         stream: UnixStream,
     },
     Input {
-        pane: u64,
+        pane: PaneId,
         input: Input,
     },
     Resized {
-        pane: u64,
+        pane: PaneId,
         capabilities: Capabilities,
     },
     Drawn {
-        pane: u64,
+        pane: PaneId,
     },
     Left {
-        pane: u64,
+        pane: PaneId,
     },
 }
 
 impl FromTerminal {
-    const fn pane(&self) -> u64 {
+    const fn pane(&self) -> PaneId {
         match self {
             Self::Hello { pane, .. }
             | Self::Input { pane, .. }
@@ -249,7 +250,7 @@ impl App {
 
     fn end_closed_panes(&mut self) {
         for pane in self.state.take_closed_views() {
-            tracing::info!(pane, "the window it was showing is gone");
+            tracing::info!(pane = %pane, "the window it was showing is gone");
             self.detach_pane(pane, None);
         }
     }
@@ -273,7 +274,7 @@ impl App {
     }
 
     fn accept_terminal(&mut self, stream: UnixStream) {
-        self.next_pane += 1;
+        self.next_pane = PaneId::new(self.next_pane.into_inner().saturating_add(1));
         let pane = self.next_pane;
         let sender = self.terminal_sender.clone();
         let write_half = match stream.try_clone() {
@@ -318,24 +319,24 @@ impl App {
                 }
             }
             FromTerminal::Left { .. } => {
-                tracing::info!(pane, "the terminal went away");
+                tracing::info!(pane = %pane, "the terminal went away");
                 self.detach_pane(pane, None);
             }
         }
         if self.state.take_detach_request(pane) {
-            tracing::info!(pane, "the detach binding was used");
+            tracing::info!(pane = %pane, "the detach binding was used");
             self.detach_pane(pane, None);
         }
     }
 
-    fn has_pane(&self, pane: u64) -> bool {
+    fn has_pane(&self, pane: PaneId) -> bool {
         self.panes.contains_key(&pane)
     }
 
     fn attach_pane(
         &mut self,
-        pane: u64,
-        version: u32,
+        pane: PaneId,
+        version: ProtocolVersion,
         show: display::Show,
         capabilities: &Capabilities,
         mut stream: UnixStream,
@@ -398,7 +399,7 @@ impl App {
                             }
                         }
                         ChannelEvent::Msg(PresenterEvent::Failed(error)) => {
-                            tracing::error!(%error, pane, "presentation failed");
+                            tracing::error!(%error, pane = %pane, "presentation failed");
                         }
                         ChannelEvent::Closed => {}
                     }
@@ -412,7 +413,7 @@ impl App {
             };
 
         self.state.attach_view(pane, show, capabilities);
-        tracing::info!(pane, ?capabilities, "pane attached");
+        tracing::info!(pane = %pane, ?capabilities, "pane attached");
         self.panes.insert(
             pane,
             Pane {
@@ -424,7 +425,7 @@ impl App {
         );
     }
 
-    fn detach_pane(&mut self, pane: u64, reason: Option<&str>) {
+    fn detach_pane(&mut self, pane: PaneId, reason: Option<&str>) {
         let Some(mut attached) = self.panes.remove(&pane) else {
             return;
         };
@@ -445,7 +446,7 @@ impl App {
         self.state.detach_view(pane);
     }
 
-    fn resize_pane(&mut self, pane: u64, capabilities: &Capabilities) {
+    fn resize_pane(&mut self, pane: PaneId, capabilities: &Capabilities) {
         let Some(attached) = self.panes.get(&pane) else {
             return;
         };
@@ -454,7 +455,7 @@ impl App {
         self.state.resize_view(pane, capabilities);
     }
 
-    fn on_input(&mut self, pane: u64, input: Input) {
+    fn on_input(&mut self, pane: PaneId, input: Input) {
         match input {
             Input::Key(key) => self.state.key(pane, key),
             Input::Pointer(pointer) => self.state.pointer(pane, pointer),
@@ -550,7 +551,7 @@ impl App {
         }
 
         for (signal, grace) in process::ESCALATION {
-            let mut tree = process::descendants_of(std::process::id());
+            let mut tree = process::descendants_of(ProcessId::new(std::process::id()));
             if tree.is_empty() {
                 break;
             }
@@ -580,7 +581,7 @@ impl App {
 fn read_terminal(
     mut stream: UnixStream,
     sender: Sender<FromTerminal>,
-    pane: u64,
+    pane: PaneId,
     write_half: UnixStream,
 ) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));

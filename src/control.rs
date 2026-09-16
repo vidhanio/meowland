@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::Error;
+use crate::{Error, types::WindowId};
 
 pub const CONTROL_SOCKET: &str = "meowland-control";
 pub const DISPLAY_SOCKET: &str = "meowland-display";
@@ -97,7 +97,7 @@ impl Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
-    pub id: u64,
+    pub id: WindowId,
     pub label: String,
     pub title: String,
     pub active: bool,
@@ -223,6 +223,7 @@ mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
 
     use super::{Command, Reply, Window};
+    use crate::types::WindowId;
 
     #[test]
     fn a_run_request_carries_an_argv_unchanged() {
@@ -255,25 +256,25 @@ mod tests {
     fn a_window_list_survives_a_round_trip() {
         let windows = vec![
             Window {
-                id: 1,
+                id: WindowId::new(1),
                 label: "foot".to_owned(),
                 title: "~ /code".to_owned(),
                 active: true,
             },
             Window {
-                id: 2,
+                id: WindowId::new(2),
                 label: "two\tlines\nhere".to_owned(),
                 title: "and\ttabs\nhere".to_owned(),
                 active: false,
             },
             Window {
-                id: 3,
+                id: WindowId::new(3),
                 label: String::new(),
                 title: String::new(),
                 active: false,
             },
             Window {
-                id: 4,
+                id: WindowId::new(4),
                 label: "bad\x1b[2J\rname".to_owned(),
                 title: "control\u{7f}character".to_owned(),
                 active: false,
@@ -295,7 +296,7 @@ mod tests {
         assert_eq!(
             reply,
             Reply::Windows(vec![Window {
-                id: 1,
+                id: WindowId::new(1),
                 label: "app [2J".to_owned(),
                 title: "title ".to_owned(),
                 active: false,

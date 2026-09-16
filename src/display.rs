@@ -5,7 +5,13 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
 };
 
-use crate::{control, tty::Capabilities};
+use evdev::KeyCode;
+
+use crate::{
+    control,
+    tty::Capabilities,
+    types::{ProtocolVersion, WindowId},
+};
 
 pub fn listen() -> Result<(control::Socket, UnixListener), crate::Error> {
     control::Socket::bind(control::DISPLAY_SOCKET)
@@ -15,7 +21,7 @@ pub fn connect() -> Result<UnixStream, crate::Error> {
     control::connect(control::DISPLAY_SOCKET)
 }
 
-pub const VERSION: u32 = 2;
+pub const VERSION: ProtocolVersion = ProtocolVersion::new(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Show {
@@ -24,13 +30,13 @@ pub enum Show {
     /// The newest window, and each new one after it.
     Newest,
     /// This window, by the ID the server gave it.
-    Window(u64),
+    Window(WindowId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToServer {
     Hello {
-        version: u32,
+        version: ProtocolVersion,
         show: Show,
         capabilities: Capabilities,
     },
@@ -62,7 +68,7 @@ pub enum Input {
 /// Key code and modifier state sent to Wayland clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
-    pub code: u32,
+    pub code: KeyCode,
     /// Whether the symbol this key stands for needs shift. The terminal side
     /// has this, and the key code does not.
     pub shift: bool,
@@ -91,7 +97,7 @@ pub enum Pointer {
         column: u16,
         row: u16,
         /// The evdev button code, which the compositor forwards.
-        button: u32,
+        button: KeyCode,
         pressed: bool,
     },
     ScrollUp,
@@ -130,7 +136,7 @@ pub fn encode(message: &ToServer) -> Message {
             capabilities,
         } => {
             let mut payload = Vec::new();
-            payload.extend_from_slice(&version.to_le_bytes());
+            payload.extend_from_slice(&version.into_inner().to_le_bytes());
             put_show(&mut payload, *show);
             put_capabilities(&mut payload, capabilities);
             (tag::HELLO, payload)
@@ -161,7 +167,7 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<ToServer> {
     let mut read = Reader::new(payload);
     Some(match tag {
         tag::HELLO => ToServer::Hello {
-            version: read.u32()?,
+            version: read.version()?,
             show: read.show()?,
             capabilities: read.capabilities()?,
         },
@@ -188,7 +194,7 @@ fn input_message(input: &Input) -> Message {
     match input {
         Input::Key(key) => {
             payload.push(tag::KEY);
-            payload.extend_from_slice(&key.code.to_le_bytes());
+            payload.extend_from_slice(&u32::from(key.code.code()).to_le_bytes());
             payload.push(u8::from(key.shift));
             payload.push(key.modifiers);
             payload.push(match key.kind {
@@ -215,7 +221,7 @@ fn input_message(input: &Input) -> Message {
                     payload.push(1);
                     payload.extend_from_slice(&column.to_le_bytes());
                     payload.extend_from_slice(&row.to_le_bytes());
-                    payload.extend_from_slice(&button.to_le_bytes());
+                    payload.extend_from_slice(&u32::from(button.code()).to_le_bytes());
                     payload.push(u8::from(*pressed));
                 }
                 Pointer::ScrollUp => payload.push(2),
@@ -240,7 +246,7 @@ fn input_message(input: &Input) -> Message {
 fn input_from(read: &mut Reader<'_>) -> Option<Input> {
     Some(match read.u8()? {
         tag::KEY => Input::Key(Key {
-            code: read.u32()?,
+            code: read.key_code()?,
             shift: read.flag()?,
             modifiers: read.u8()?,
             kind: match read.u8()? {
@@ -258,7 +264,7 @@ fn input_from(read: &mut Reader<'_>) -> Option<Input> {
             1 => Input::Pointer(Pointer::Button {
                 column: read.u16()?,
                 row: read.u16()?,
-                button: read.u32()?,
+                button: read.button_code()?,
                 pressed: read.flag()?,
             }),
             2 => Input::Pointer(Pointer::ScrollUp),
@@ -285,7 +291,7 @@ fn put_show(payload: &mut Vec<u8>, show: Show) {
         Show::Newest => payload.push(show::NEWEST),
         Show::Window(id) => {
             payload.push(show::WINDOW);
-            payload.extend_from_slice(&id.to_le_bytes());
+            payload.extend_from_slice(&id.into_inner().to_le_bytes());
         }
     }
 }
@@ -355,6 +361,18 @@ impl<'a> Reader<'a> {
         Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    fn version(&mut self) -> Option<ProtocolVersion> {
+        Some(ProtocolVersion::new(self.u32()?))
+    }
+
+    fn key_code(&mut self) -> Option<KeyCode> {
+        Some(KeyCode::new(u16::try_from(self.u32()?).ok()?))
+    }
+
+    fn button_code(&mut self) -> Option<KeyCode> {
+        Some(KeyCode::new(u16::try_from(self.u32()?).ok()?))
+    }
+
     fn show(&mut self) -> Option<Show> {
         Some(match self.u8()? {
             show::FOCUSED => Show::Focused,
@@ -363,7 +381,7 @@ impl<'a> Reader<'a> {
                 let bytes = self.take(8)?;
                 let mut value = [0u8; 8];
                 value.copy_from_slice(bytes);
-                Show::Window(u64::from_le_bytes(value))
+                Show::Window(WindowId::new(u64::from_le_bytes(value)))
             }
             _ => return None,
         })
@@ -451,8 +469,8 @@ mod tests {
     use std::io::{self, Cursor};
 
     use super::{
-        Capabilities, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer, VERSION, decode,
-        decode_client, encode, encode_client, read_from, write_frame, write_to,
+        Capabilities, Input, Key, KeyCode, KeyKind, Pointer, Show, ToClient, ToServer, VERSION,
+        WindowId, decode, decode_client, encode, encode_client, read_from, write_frame, write_to,
     };
 
     fn capabilities() -> Capabilities {
@@ -482,7 +500,7 @@ mod tests {
     fn a_hello_survives_a_round_trip() {
         round_trip(ToServer::Hello {
             version: VERSION,
-            show: Show::Window(7),
+            show: Show::Window(WindowId::new(7)),
             capabilities: capabilities(),
         });
         round_trip(ToServer::Hello {
@@ -503,14 +521,14 @@ mod tests {
     #[test]
     fn every_kind_of_input_survives_a_round_trip() {
         round_trip(ToServer::Input(Input::Key(Key {
-            code: 30,
+            code: KeyCode::new(30),
             shift: true,
             modifiers: 0b1010,
             kind: KeyKind::Repeat,
             modifier: false,
         })));
         round_trip(ToServer::Input(Input::Key(Key {
-            code: 56,
+            code: KeyCode::new(56),
             shift: false,
             modifiers: 0,
             kind: KeyKind::Release,
@@ -524,7 +542,7 @@ mod tests {
             Pointer::Button {
                 column: 1,
                 row: 2,
-                button: 272,
+                button: KeyCode::new(272),
                 pressed: true,
             },
             Pointer::ScrollUp,
@@ -573,7 +591,7 @@ mod tests {
     #[test]
     fn a_message_that_is_cut_short_is_not_a_message() {
         let (tag, payload) = encode(&ToServer::Input(Input::Key(Key {
-            code: 30,
+            code: KeyCode::new(30),
             shift: false,
             modifiers: 0,
             kind: KeyKind::Press,
@@ -630,7 +648,7 @@ mod tests {
                 &mut writer,
                 encode(&ToServer::Hello {
                     version: VERSION,
-                    show: Show::Window(3),
+                    show: Show::Window(WindowId::new(3)),
                     capabilities: capabilities(),
                 }),
             )
@@ -648,7 +666,7 @@ mod tests {
                 decode(tag, &payload),
                 Some(ToServer::Hello {
                     version: VERSION,
-                    show: Show::Window(3),
+                    show: Show::Window(WindowId::new(3)),
                     capabilities: capabilities(),
                 }),
                 "a piece of {piece}"

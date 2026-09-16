@@ -14,6 +14,8 @@ crossterm = { version = "0.29.0", default-features = false, features = [
   "events",
 ] }
 flate2 = "1.1.10"
+evdev = "0.13.2"
+nutype = "0.6.2"
 calloop = { version = "0.14.4", features = ["signals"] }
 rustix = { version = "1.1.4", features = ["net", "process", "runtime", "shm"] }
 smithay = { version = "0.7", default-features = false, features = [

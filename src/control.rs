@@ -136,30 +136,36 @@ pub struct Window {
     pub id: u64,
     /// What the client calls itself: its app ID, or its title without one.
     pub label: String,
-    /// Whether this is the window on screen.
+    /// What the client calls the window, when it says.
+    pub title: String,
+    /// Whether this is the window with the keyboard.
     pub active: bool,
 }
 
 impl Window {
     /// One line of a `list`.
     ///
-    /// Tabs and newlines in the label become spaces: the line break is what
-    /// separates windows, and only the client decides what a label says.
+    /// Tabs and newlines in a name become spaces: the line break is what
+    /// separates windows, and only the client decides what a name says.
     fn line(&self) -> String {
+        let name = |name: &str| name.replace(['\t', '\n'], " ");
         format!(
-            "{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\n",
             self.id,
-            self.label.replace(['\t', '\n'], " "),
+            name(&self.label),
+            name(&self.title),
             if self.active { "active" } else { "idle" }
         )
     }
 
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split('\t');
-        let id = fields.next()?.parse().ok()?;
-        let label = fields.next()?.to_owned();
-        let active = fields.next()? == "active";
-        Some(Self { id, label, active })
+        Some(Self {
+            id: fields.next()?.parse().ok()?,
+            label: fields.next()?.to_owned(),
+            title: fields.next()?.to_owned(),
+            active: fields.next()? == "active",
+        })
     }
 }
 
@@ -304,16 +310,19 @@ mod tests {
             Window {
                 id: 1,
                 label: "foot".to_owned(),
+                title: "~ /code".to_owned(),
                 active: true,
             },
             Window {
                 id: 2,
                 label: "two\tlines\nhere".to_owned(),
+                title: "and\ttabs\nhere".to_owned(),
                 active: false,
             },
             Window {
                 id: 3,
                 label: String::new(),
+                title: String::new(),
                 active: false,
             },
         ];
@@ -321,6 +330,7 @@ mod tests {
         let decoded = Reply::decode(&reply.encode());
         let mut expected = windows;
         expected[1].label = "two lines here".to_owned();
+        expected[1].title = "and tabs here".to_owned();
         assert_eq!(decoded, Reply::Windows(expected));
     }
 
@@ -335,7 +345,7 @@ mod tests {
             Reply::Failed("the server stopped before it answered".to_owned())
         );
         assert_eq!(
-            Reply::decode("2\n1\tfoot\tactive\n"),
+            Reply::decode("2\n1\tfoot\t~ /code\tactive\n"),
             Reply::Failed("the server sent something unrecognised".to_owned())
         );
         assert_eq!(

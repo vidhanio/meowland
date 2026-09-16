@@ -291,6 +291,7 @@ impl App {
                     .map(|window| control::Window {
                         id: window.id,
                         label: window.label,
+                        title: window.title,
                         active: window.active,
                     })
                     .collect(),

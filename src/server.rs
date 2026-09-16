@@ -1,15 +1,16 @@
 //! The server: the compositor, its windows and its clients, with no terminal.
 //!
-//! `run` starts one of these and `attach` shows it in a terminal that is
-//! somewhere else entirely; what the two ends say to each other is
-//! `src/display.rs`, and the commands that reach a server are
-//! `src/control.rs`.
+//! `run` starts a server. `attach` shows it in a terminal that is elsewhere.
+//! The protocol between the two ends is `src/display.rs`. The commands that
+//! reach a server are `src/control.rs`.
 //!
-//! Nothing here reads or writes a terminal. What the attached terminal says
-//! arrives as messages from the thread reading its socket, what it is shown
-//! goes back through the presenter, and a server with nobody attached simply
-//! runs on: it accepts clients, keeps their state and draws nothing, which is
-//! what makes attaching later a matter of showing what is already there.
+//! This module does not read or write a terminal. What the terminal says
+//! arrives as messages from the thread that reads its socket, and frames go
+//! back through the presenter.
+//!
+//! A server with no terminal attached keeps running: it accepts clients, keeps
+//! their state and draws nothing. When a terminal attaches later, the server
+//! shows it what is already there.
 
 use std::{
     collections::HashMap,
@@ -48,20 +49,23 @@ use crate::{
     xwayland,
 };
 
-/// How often the compositor considers drawing a frame. Derived from the rate
-/// clients are told about, so their pacing and ours cannot drift apart.
+/// How often the compositor considers drawing a frame.
+///
+/// The interval derives from the refresh rate that clients are told, so client
+/// pacing and server pacing cannot drift apart.
 const FRAME_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000_000 / crate::compositor::REFRESH_MILLIHZ as u64);
 
-/// How long a connection has to finish saying what it wants, which is long
-/// enough for a request already in flight and short enough that a client which
-/// says nothing does not hold anything up.
+/// The time that a connection has to finish its request: one second.
+///
+/// That is long enough for a request that is already in flight, and short
+/// enough that a client which says nothing does not hold the server up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Run the server until something stops it.
 ///
-/// A command here is what the server exists for: it is run in the server, and
-/// the server stops once its clients are gone (`crate::cli::Server`).
+/// A server that was started with a command runs that command, and stops once
+/// its clients are gone (`crate::cli::Server`).
 pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Result<()> {
     let Settings {
         gpu_buffers,
@@ -71,9 +75,8 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
     } = settings;
     let log = logging::init(log.as_deref(), log_level.as_deref())?;
 
-    // Both sockets are taken before anything else, so that a second server is
-    // told one is running rather than being told about the terminal it is not
-    // sitting in.
+    // Bind both sockets first, so that a second server is told that one is
+    // already running, and not about the terminal that it does not sit in.
     let (control_socket, control_listener) = control::Socket::bind(control::CONTROL_SOCKET)?;
     let (display_socket, display_listener) = display::listen()?;
 
@@ -92,12 +95,12 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
     let display: Display<Meowland> =
         Display::new().context("could not create a Wayland display")?;
     let nodes = gpu_buffers.nodes(render_node.as_deref())?;
-    // No terminal is attached yet, so the seat has nothing to tell clients
-    // about: what a terminal can do arrives with the terminal.
+    // No terminal is attached yet, so the seat has nothing to report. A
+    // terminal reports what it can do when it attaches.
     let state = Meowland::new(&display.handle(), &nodes)?;
-    // X11 clients are the satellite's business, not the compositor's: without
-    // it a Wayland client still gets a window, so this is a warning and not a
-    // reason to refuse to start.
+    // X11 is the job of the satellite. Without a satellite a Wayland client
+    // still gets a window, so a failed satellite is a warning and not a reason
+    // to refuse to start.
     let xwayland = match xwayland::Server::start(&socket_name) {
         Ok(server) => Some(server),
         Err(error) => {
@@ -106,8 +109,8 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
         }
     };
     let (terminal_sender, terminal_events) = channel();
-    // The loop comes first, because the app registers a pane's presenter events
-    // with it as panes attach.
+    // The loop comes first: the app registers a pane's presenter events with it
+    // when a pane attaches.
     let mut event_loop: Calloop<App> =
         Calloop::try_new().context("could not create an event loop")?;
     let handle = event_loop.handle();
@@ -159,116 +162,105 @@ pub fn run(settings: Settings, command: Vec<std::ffi::OsString>) -> anyhow::Resu
     result
 }
 
-/// Bind the Wayland socket clients inside the compositor will use.
 fn bind_socket() -> anyhow::Result<ListeningSocketSource> {
-    // The well-known name if it is free, otherwise whatever number the display
+    // The well-known name if it is free. Otherwise the number that the display
     // picks next.
     ListeningSocketSource::with_name("wayland-meowland")
         .or_else(|_| ListeningSocketSource::new_auto())
         .context("could not bind a Wayland socket")
 }
 
-/// Everything the event loop owns.
+/// Everything that the event loop owns.
 struct App {
-    /// Kept separate from `state`: dispatching needs both at once.
+    /// Kept apart from `state`, because dispatching needs both at once.
     display: Display<Meowland>,
     state: Meowland,
     xwayland: Option<xwayland::Server>,
     socket_name: String,
-    /// The log file, shared with every client this server starts: their own
-    /// output cannot go to the terminal the server is drawn on.
+    /// The log file, shared with every client that this server starts. The
+    /// output of a client cannot go to the terminal that shows the server.
     log: File,
-    /// The panes attached at the moment, by the ID each was given.
+    /// The panes that are attached now, by the ID that each was given.
     ///
-    /// A pane is one terminal: it asks to be shown a window and is drawn that
-    /// window, with a presenter of its own writing to its own socket. Nothing
-    /// about one pane is another's business.
+    /// Panes are independent: several of them can show the same window.
     panes: HashMap<u64, Pane>,
-    /// What a pane's reader says comes through here, stamped with the pane it
-    /// came from.
     terminal_sender: Sender<FromTerminal>,
-    /// Readers of terminals that are connecting or attached, kept so that they
-    /// can be let go of rather than left running.
+    /// The reader of each pane, kept so that the pane can join it.
     readers: HashMap<u64, JoinHandle<()>>,
-    /// Handed out to each pane that connects, so that what one says can be told
-    /// from what another says - and from what a pane that has gone said.
+    /// Handed to each pane that connects, so that messages from two panes are
+    /// told apart.
     next_pane: u64,
-    /// Where sources are registered, and where a pane's are removed again when
-    /// it goes.
     handle: LoopHandle<'static, Self>,
     /// Removes the sockets when the event loop ends.
     _sockets: (control::Socket, control::Socket),
     children: Vec<Child>,
-    /// Whether to stop once the clients this server started are gone.
+    /// Whether to stop once the clients that this server started are gone.
     ///
-    /// A server started to run a command is a server that exists for it: the
-    /// terminal that asked should come back when the command exits. One started
-    /// to be a server - `meowland run` with no command, or a client connecting
-    /// on its own - is one until the quit binding, `meowland quit` or a signal
-    /// says otherwise, however many clients come and go.
+    /// A server that was started for a command stops when that command exits,
+    /// so the terminal that asked for it comes back. A server that was started
+    /// to be a server stays up until the quit binding, `meowland quit` or a
+    /// signal stops it, however many clients come and go.
     quit_when_empty: bool,
-    /// The client command from the command line, if any.
     command: Vec<std::ffi::OsString>,
     quitting: bool,
     signal: Option<LoopSignal>,
     /// Whether a one-shot frame timer is already armed.
     frame_scheduled: bool,
-    /// When the last successfully presented frame *began*, which is the clock
-    /// the frame cap runs from.
+    /// When the last presented frame began. The frame cap runs from this clock.
     last_frame_started: Option<Instant>,
-    /// What the frames of the last second cost, so that a slow frame rate can
-    /// be told apart from a slow terminal.
+    /// What the frames of the last second cost, so that a slow frame rate is
+    /// told apart from a slow terminal.
     frames: FrameStats,
 }
 
 /// One terminal attached to this server.
 ///
-/// The pane's own state - which window it shows, its geometry, the frame it is
-/// drawn into - lives in the compositor, keyed by this ID (`Meowland::views`),
-/// which is also the key it is held under here. What is here is the socket, the
-/// thread writing frames to it, and the thread reading what the user does at
-/// it.
+/// The compositor holds the state of the pane, which is the window that it
+/// shows, its geometry and the frame that it is drawn into, keyed by this ID
+/// (`Meowland::views`). The pane is held under the same ID here.
 #[derive(Debug)]
 struct Pane {
-    /// Kept to shut the socket down when the pane is let go, which is what ends
-    /// its reader.
+    /// Kept to shut the socket down when the pane is let go, which ends its
+    /// reader.
     stream: UnixStream,
-    /// Writes this pane's frames, and compresses them, on a thread of its own.
     presenter: Presenter,
-    /// The thread reading this pane's terminal, joined when it is let go.
     reader: Option<JoinHandle<()>>,
-    /// The registration of this pane's presenter events, removed with it.
+    /// The registration of this pane's presenter events, removed with the pane.
     drawn: RegistrationToken,
 }
 
 /// What a terminal that is connecting or attached says to a server.
 #[derive(Debug)]
 enum FromTerminal {
-    /// A terminal said who it is and what it wants to be shown, which is
-    /// answered by drawing on it or by saying why not.
+    /// A terminal said who it is and what it asks to be shown. The server
+    /// answers by drawing on it or by saying why not.
     Hello {
         pane: u64,
         version: u32,
         show: display::Show,
         capabilities: Capabilities,
-        /// The half of its socket the server writes to.
+        /// The half of its socket that the server writes to.
         stream: UnixStream,
     },
-    /// Something the user did.
-    Input { pane: u64, input: Input },
-    /// The terminal was resized, and this is what it can do now.
+    Input {
+        pane: u64,
+        input: Input,
+    },
     Resized {
         pane: u64,
         capabilities: Capabilities,
     },
-    /// It has written the frame it was sent, so the next one may follow.
-    Drawn { pane: u64 },
-    /// It is on its way out, whether it said so or its socket ended.
-    Left { pane: u64 },
+    /// The terminal wrote the frame that it was sent, so the next frame may
+    /// follow.
+    Drawn {
+        pane: u64,
+    },
+    Left {
+        pane: u64,
+    },
 }
 
 impl FromTerminal {
-    /// Which terminal said this.
     const fn pane(&self) -> u64 {
         match self {
             Self::Hello { pane, .. }
@@ -281,7 +273,6 @@ impl FromTerminal {
 }
 
 impl App {
-    /// Answer one request from the control socket.
     fn control_request(&mut self, request: &[u8]) -> control::Reply {
         match control::Command::decode(request) {
             Some(control::Command::List) => control::Reply::Windows(self.state.windows().collect()),
@@ -297,10 +288,8 @@ impl App {
                     }
                 }
             }
-            // The server goes away with everything that was started under it,
-            // which is what makes a server worth having: a server that
-            // outlived its clients and could not be stopped would be one
-            // nobody could get rid of.
+            // Quit stops the whole server, and every client that the server
+            // started goes with it.
             Some(control::Command::Quit) => {
                 tracing::info!("the server was asked to stop");
                 self.quit();
@@ -310,12 +299,12 @@ impl App {
         }
     }
 
-    /// Draw a scheduled frame for every pane that has something to draw, and
-    /// flush protocol replies.
+    /// Draw a frame for every pane that has something to draw, then flush
+    /// replies.
     fn present_frame(&mut self) {
         let started = Instant::now();
-        // The panes are drawn one at a time and each has a presenter of its
-        // own: one terminal being slow holds up nothing but itself.
+        // Each pane has a presenter of its own, so a slow terminal holds up
+        // only itself.
         let Self {
             state,
             panes,
@@ -327,19 +316,19 @@ impl App {
                 continue;
             }
             let cost = state.present_view(*pane, &mut attached.presenter);
-            // The cap runs from when the frame began rather than when it
-            // finished: the work happens *inside* the interval, so counting it
-            // as well would put the compositor's own cost on the client's
-            // latency and drop the frame rate with it.
+            // The cap runs from when the frame began, not from when it
+            // finished. The work happens inside the interval, so counting the
+            // work as well would add the cost of the compositor to the latency
+            // of the client, and would lower the frame rate.
             frames.record(&cost);
         }
         self.last_frame_started = Some(started);
         self.flush_clients();
     }
 
-    /// Everything that follows a change to the server's state, whatever it was:
-    /// the panes that are done, the replies clients are owed, and the frame
-    /// that shows the result.
+    /// Everything that follows a change of server state: the panes that are
+    /// done, the replies that clients are owed, and the frame that shows the
+    /// result.
     fn settled(&mut self) {
         self.end_closed_panes();
         self.flush_clients();
@@ -347,11 +336,8 @@ impl App {
         self.schedule_frame();
     }
 
-    /// Let go of the panes whose window is gone.
-    ///
-    /// A pane showing one client has nothing left to be when that client
-    /// closes, so its terminal goes back to whoever was using it - quietly,
-    /// because that is what closing an app looks like anywhere else.
+    /// Let go of the panes whose window is gone. The pane is detached without a
+    /// reason, which is what a closed application looks like.
     fn end_closed_panes(&mut self) {
         for pane in self.state.take_closed_views() {
             tracing::info!(pane, "the window it was showing is gone");
@@ -359,13 +345,11 @@ impl App {
         }
     }
 
-    /// Arm a frame if any pane has something to draw.
     fn schedule_frame(&mut self) {
         let handle = self.handle.clone();
         schedule_frame(&handle, self);
     }
 
-    /// Whether any pane has something to draw and a presenter free to take it.
     fn panes_pending(&self) -> bool {
         self.panes.iter().any(|(pane, attached)| {
             self.state
@@ -380,11 +364,10 @@ impl App {
         }
     }
 
-    /// Take in a terminal that wants to show this server.
+    /// Take in a terminal and read it on a thread of its own.
     ///
-    /// What it says is read on a thread of its own: reading it here would be
-    /// waiting for a terminal in the thread that draws frames for the one
-    /// already attached.
+    /// Reading it here would make the thread that draws frames for the attached
+    /// terminal wait for a new terminal.
     fn accept_terminal(&mut self, stream: UnixStream) {
         self.next_pane += 1;
         let pane = self.next_pane;
@@ -407,12 +390,10 @@ impl App {
         }
     }
 
-    /// Handle what a terminal says.
     fn on_terminal(&mut self, message: FromTerminal) {
-        // A pane that is not one of ours: it was turned away, or it has gone
-        // and its reader had one more thing to say. A hello is how a pane
-        // arrives, so it is the one message that can come from a pane that is
-        // not here yet.
+        // Ignore a message from a pane that is not attached. The pane was
+        // turned away, or it has gone and its reader said one more thing. A
+        // hello is the one message that a pane can send before it is attached.
         let pane = message.pane();
         if !matches!(message, FromTerminal::Hello { .. }) && !self.has_pane(pane) {
             return;
@@ -445,17 +426,10 @@ impl App {
         }
     }
 
-    /// Whether this message came from a pane that is still attached.
     fn has_pane(&self, pane: u64) -> bool {
         self.panes.contains_key(&pane)
     }
 
-    /// Answer a terminal that said hello: attach it, or say why not.
-    ///
-    /// Panes are independent, so nothing is refused for another pane's sake:
-    /// as many terminals as want to can be attached at once, showing the same
-    /// window or one each. The one thing that cannot be answered is a window ID
-    /// no window has.
     fn attach_pane(
         &mut self,
         pane: u64,
@@ -478,8 +452,8 @@ impl App {
         };
         if let Some(reason) = refusal {
             tracing::info!(%reason, "turned a terminal away");
-            // The reader is the one that said hello, and there is nothing left
-            // for it to read: the socket goes, and it with it.
+            // The reader is the thread that said hello, and it has nothing left
+            // to read. The socket goes, and the reader with it.
             drop(self.readers.remove(&pane));
             let _ = display::write_to(
                 &mut stream,
@@ -493,12 +467,10 @@ impl App {
             tracing::warn!("a terminal said hello that was not being read");
             return;
         };
-        // The greeting is the first thing written on the socket, so it is said
-        // here rather than handed to the presenter with everything else.
+        // The greeting is the first thing written on the socket, so it is
+        // written here and not handed to the presenter with the rest.
         let _ = display::write_to(&mut stream, display::encode_client(ToClient::Welcome));
 
-        // Frames are written, and compressed, on a thread of this pane's own:
-        // one terminal being slow must not hold up another.
         let draw_on = match stream.try_clone() {
             Ok(half) => half,
             Err(error) => {
@@ -526,9 +498,8 @@ impl App {
                                 attached.presenter.recycle(frame);
                             }
                         }
-                        // A presenter that has stopped is one pane that will not
-                        // be drawn again; the others, and the windows, are not
-                        // affected.
+                        // A stopped presenter leaves one pane that is not drawn
+                        // again. Other panes and windows are unaffected.
                         ChannelEvent::Msg(PresenterEvent::Failed(error)) => {
                             tracing::error!(%error, pane, "presentation failed");
                         }
@@ -556,10 +527,7 @@ impl App {
         );
     }
 
-    /// Let a pane go.
-    ///
-    /// The other panes and the windows are untouched: a pane is a place to look
-    /// at a window, and what it was looking at stays what it was.
+    /// Let a pane go. The windows and the other panes are unchanged.
     fn detach_pane(&mut self, pane: u64, reason: Option<&str>) {
         let Some(mut attached) = self.panes.remove(&pane) else {
             return;
@@ -569,8 +537,8 @@ impl App {
                 .presenter
                 .detach(ToClient::Detached(reason.to_owned()));
         }
-        // Stop writing before the socket goes: what undoes the takeover has to
-        // be the last thing this terminal is sent.
+        // Stop the presenter before the socket closes, so that the escape that
+        // undoes the takeover is the last thing sent to the terminal.
         attached.presenter.finish();
         self.handle.remove(attached.drawn);
         let _ = attached.stream.shutdown(std::net::Shutdown::Both);
@@ -582,23 +550,19 @@ impl App {
         self.state.detach_view(pane);
     }
 
-    /// The terminal this pane is in changed size, or what it can do.
     fn resize_pane(&mut self, pane: u64, capabilities: &Capabilities) {
         let Some(attached) = self.panes.get(&pane) else {
             return;
         };
-        // Whatever the terminal kept from before the resize is not this pane's
-        // any more, and the wipe has to land after the frames already handed
-        // over for the same reason.
+        // What the terminal kept from before the resize is no longer this
+        // pane's, and the wipe must land after the frames already handed over.
         attached.presenter.clear();
         self.state.resize_view(pane, capabilities);
     }
 
-    /// Handle something the user did at a pane.
-    ///
-    /// Everything is in the terms of the pane it happened in: the bindings act
-    /// on the window that pane shows, typing gives that window the keyboard,
-    /// and the pointer is somewhere in that pane's own geometry.
+    /// Everything is in the terms of the pane that it happened in. The bindings
+    /// act on the window that the pane shows, typing gives that window the
+    /// keyboard, and the pointer has a position in the geometry of the pane.
     fn on_input(&mut self, pane: u64, input: Input) {
         match input {
             Input::Key(key) => self.state.key(pane, key),
@@ -608,9 +572,10 @@ impl App {
         }
     }
 
-    /// Run the client the command line asked for, before the loop starts, so
-    /// that a command that cannot start is reported to whoever started the
-    /// server rather than leaving one with nothing to draw.
+    /// Run the client from the command line before the loop starts.
+    ///
+    /// A command that cannot start is then reported to whoever started the
+    /// server, instead of leaving a server with nothing to draw.
     fn start_client(&mut self) -> anyhow::Result<()> {
         let Some((program, _)) = self.command.split_first() else {
             return Ok(());
@@ -620,14 +585,11 @@ impl App {
         if let Err(error) = self.spawn_client(&command) {
             anyhow::bail!("could not start {program}: {error}");
         }
-        // Close the spawn-to-signalfd race for a client that exited
-        // immediately.
+        // Close the spawn-to-signalfd race when a client exits immediately.
         self.reap();
         Ok(())
     }
 
-    /// Run a client, with the environment a Wayland client expects inside
-    /// meowland and its output going where the server's own does.
     fn spawn_client(&mut self, command: &[std::ffi::OsString]) -> std::io::Result<()> {
         let Some((program, arguments)) = command.split_first() else {
             return Ok(());
@@ -646,8 +608,8 @@ impl App {
             .stdout(self.client_output())
             .stderr(self.client_output());
         // meowland is not an X11 server. Without a satellite there is no X
-        // display to give a client, and inheriting one would put its window on
-        // a display outside this server.
+        // display to give a client, and an inherited display would put the
+        // window of the client on a display outside this server.
         match &self.xwayland {
             Some(server) => child.env("DISPLAY", server.display()),
             None => child.env_remove("DISPLAY"),
@@ -658,13 +620,13 @@ impl App {
         Ok(())
     }
 
-    /// Where a client's own output goes.
+    /// Where the output of a client goes.
     ///
-    /// Not the terminal. The server is drawn on it, so text written there
-    /// lands in the cells the frame is placed on - and a newline among them
-    /// scrolls the whole frame out from under itself. The log is where the
-    /// server's own output goes, so a client that prints why it failed can
-    /// still be read about afterwards.
+    /// Not the terminal. The server draws on it, so text written there lands in
+    /// the cells that the frame occupies, and a newline scrolls the whole frame
+    /// away. The output goes to the log, which is where the output of the
+    /// server goes, and a client that printed why it failed can be read about
+    /// afterwards.
     fn client_output(&self) -> Stdio {
         match self.log.try_clone() {
             Ok(file) => Stdio::from(file),
@@ -675,7 +637,6 @@ impl App {
         }
     }
 
-    /// Collect children that exited.
     fn reap(&mut self) {
         let satellite_exited =
             self.xwayland
@@ -707,7 +668,6 @@ impl App {
         });
     }
 
-    /// Stop once the clients of a server started for a command are gone.
     fn check_quit(&mut self) {
         if !self.quitting && self.quit_when_empty && self.children.is_empty() {
             tracing::info!("the client is gone");
@@ -715,7 +675,6 @@ impl App {
         }
     }
 
-    /// Leave the event loop.
     fn quit(&mut self) {
         if self.quitting {
             return;
@@ -726,7 +685,6 @@ impl App {
         }
     }
 
-    /// Let every pane go and stop the clients.
     fn shutdown(&mut self) {
         while let Some(pane) = self.panes.keys().copied().next() {
             self.detach_pane(pane, None);
@@ -744,9 +702,9 @@ impl App {
 
 /// Read what one terminal says, until it stops saying it.
 ///
-/// The terminal says who it is first, which is what the server answers by
-/// drawing on it or by turning it away; everything after that is what the user
-/// did, how the terminal changed, and how far the drawing has got.
+/// The terminal says who it is first, which the server answers. After that come
+/// what the user did, how the terminal changed, and how far the drawing has
+/// got.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the reader outlives whoever started it, so it owns its end of the channel rather than borrowing it"
@@ -757,8 +715,8 @@ fn read_terminal(
     pane: u64,
     write_half: UnixStream,
 ) {
-    // A terminal that connects and then says nothing is given up on rather
-    // than waited for: the server has frames to draw for the one that is
+    // Give up on a terminal that connects and then says nothing, rather than
+    // wait for it. The server has frames to draw for the terminal that is
     // attached.
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let hello = display::read_from(&mut stream);
@@ -796,7 +754,7 @@ fn read_terminal(
             }
             ToServer::Drawn => sender.send(FromTerminal::Drawn { pane }),
             ToServer::Bye => sender.send(FromTerminal::Left { pane }),
-            // Said once, at the start, and answered by then.
+            // A hello is said once, at the start, and is answered by then.
             ToServer::Hello { .. } => continue,
         };
         if sent.is_err() {
@@ -806,19 +764,15 @@ fn read_terminal(
     let _ = sender.send(FromTerminal::Left { pane });
 }
 
-/// Everything a server is reached through, once it is listening on all of it.
+/// Everything that a server is reached through.
 struct Sources {
-    /// Clients connect here.
     clients: ListeningSocketSource,
-    /// Terminals attach here.
     terminals: UnixListener,
-    /// Commands arrive here.
     commands: UnixListener,
-    /// Process signals arrive here.
     signals: Signals,
-    /// What the attached terminals say arrives here. What their presenters do
+    /// Where what the attached terminals say arrives. What their presenters do
     /// with the frames arrives on a source of its own, registered with the pane
-    /// it belongs to (`App::attach_pane`).
+    /// that it belongs to (`App::attach_pane`).
     said: Channel<FromTerminal>,
 }
 
@@ -835,7 +789,6 @@ fn install_sources(
     Ok(())
 }
 
-/// Watch the socket clients connect to.
 fn watch_clients(
     handle: &LoopHandle<'_, App>,
     socket: ListeningSocketSource,
@@ -850,8 +803,6 @@ fn watch_clients(
     Ok(())
 }
 
-/// Watch the display: dispatching what clients sent, answering them, and
-/// arming a frame when that leaves something to draw.
 fn watch_display(
     handle: &LoopHandle<'_, App>,
     display: &mut Display<Meowland>,
@@ -874,7 +825,6 @@ fn watch_display(
     Ok(())
 }
 
-/// Watch what the attached terminals say.
 fn watch_terminal(
     handle: &LoopHandle<'_, App>,
     terminal_events: Channel<FromTerminal>,
@@ -891,8 +841,6 @@ fn watch_terminal(
     Ok(())
 }
 
-/// Watch the things that reach a server: process signals, the socket commands
-/// arrive on, and the socket terminals attach on.
 fn watch_server(
     handle: &LoopHandle<'_, App>,
     signals: Signals,
@@ -916,18 +864,18 @@ fn watch_server(
                 loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            // The event loop is drawing frames, so a client
-                            // that connects and then says nothing is given up
-                            // on rather than waited for.
+                            // The event loop draws frames, so give up on a
+                            // connection that says nothing, rather than wait
+                            // for it.
                             let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
                             let mut request = Vec::new();
                             if let Err(error) = stream.read_to_end(&mut request) {
                                 tracing::warn!(%error, "could not read control request");
                                 continue;
                             }
-                            // A connection that said nothing wanted nothing: it
-                            // is how "is a server there?" is asked, and the
-                            // connection itself is the answer.
+                            // A connection that says nothing asks whether a
+                            // server is there. The connection itself is the
+                            // answer.
                             if request.is_empty() {
                                 continue;
                             }
@@ -966,10 +914,10 @@ fn watch_server(
 }
 
 /// What the frames of one second cost this thread, logged so that a slow frame
-/// rate can be attributed rather than guessed at: this is the thread that reads
-/// input, so time spent here is time a keystroke waits.
+/// rate is attributed and not guessed at. This is the thread that reads input,
+/// so time spent here is time that a keystroke waits.
 ///
-/// The presenter keeps its own count, of the compressing and the writing.
+/// The presenter keeps its own count of the compressing and the writing.
 #[derive(Debug, Default)]
 struct FrameStats {
     report: logging::Report,
@@ -1004,25 +952,22 @@ impl FrameStats {
     }
 }
 
-/// The earliest deadline that preserves the frame cap without adding idle
-/// latency.
+/// The earliest deadline that holds the frame cap and adds no idle latency.
 ///
-/// `last_frame_started` is when the previous frame *began*: a frame that takes
-/// longer than the interval is late, but the next one is not pushed out by the
-/// work it already paid for.
+/// `last_frame_started` is when the previous frame began. A frame that takes
+/// longer than the interval is late, but the next frame is not pushed out by
+/// the work that the late frame already paid for.
 fn frame_deadline(now: Instant, last_frame_started: Option<Instant>) -> Instant {
     last_frame_started
         .and_then(|started| started.checked_add(FRAME_INTERVAL))
         .map_or(now, |deadline| deadline.max(now))
 }
 
-/// Arm one frame deadline when new compositor state needs presentation.
 fn schedule_frame(handle: &LoopHandle<'_, App>, app: &mut App) {
     if app.quitting {
         return;
     }
-    // Nobody is looking: a server with no pane attached keeps running, but
-    // there is nothing to draw.
+    // A server with no pane attached keeps running, but it has nothing to draw.
     if app.frame_scheduled || !app.panes_pending() {
         return;
     }
@@ -1068,9 +1013,9 @@ mod tests {
 
     #[test]
     fn a_slow_frame_does_not_push_the_next_one_out() {
-        // A frame that took longer than the interval has already paid for its
-        // own time: the next one goes as soon as there is something to show,
-        // rather than a further interval after the work finished.
+        // A frame that took longer than the interval has paid for its own time.
+        // The next frame goes as soon as there is something to show, and not a
+        // further interval after the work finished.
         let now = Instant::now();
         let started = now
             .checked_sub(FRAME_INTERVAL + Duration::from_millis(10))

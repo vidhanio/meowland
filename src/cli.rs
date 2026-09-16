@@ -1,10 +1,8 @@
 //! What the command line says.
 //!
-//! Parsing and nothing else: every command comes out as values, and what those
-//! values mean is decided in `crate::start`. The one question here that is for
-//! the server rather than for the parser is completion - `attach` offers the
-//! IDs the running server actually has, which means asking it while the user
-//! is still typing.
+//! Parsing only: `crate::start` decides what the values mean. One question goes
+//! to the server, because completion of `attach` offers the window IDs that the
+//! running server has.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -17,7 +15,7 @@ use crate::{control, dmabuf};
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help,
     completion,
-    after_help = "Alt+Q asks the window this terminal is showing to close: closing the client it belongs to is what ends the terminal's showing, and with nothing shown it lets go of the terminal instead.\n\nA server outlives the terminals it is drawn on, and every terminal shows a window of its own choosing: `run` starts a server and shows the window its client opens, `attach` shows one here, and `list` and `quit` reach the server from anywhere else."
+    after_help = "Alt+Q asks the window shown here to close. The pane ends when that client goes away, and with no window shown Alt+Q releases the terminal instead.\n\nA server outlives the terminals that show it, and each terminal chooses one window: `run` starts a server if there is none and shows the window its client opens, `attach` shows one window here, and `list` and `quit` reach the server from anywhere else."
 )]
 pub struct Cli {
     #[usage(subcommand)]
@@ -26,15 +24,15 @@ pub struct Cli {
 
 #[derive(usage::Subcommands)]
 pub enum Action {
-    /// Run a client in the server, and show its window here
+    /// Run a client in the server and show its window here
     Run(Run),
-    /// Show a window of the server in this terminal
+    /// Show one window of the server in this terminal
     Attach(Attach),
-    /// Print the open windows and the IDs `attach` takes
+    /// Print the open windows and the IDs that `attach` takes
     List(List),
     /// Stop the server and everything running in it
     Quit(Quit),
-    /// Be the server: no terminal of its own, reached over its sockets
+    /// Be the server, with no terminal of its own
     Server(Server),
     /// Print a shell completion script
     Completions(Completions),
@@ -45,7 +43,7 @@ pub struct Run {
     #[usage(flatten)]
     pub settings: Settings,
 
-    /// Client command and arguments. Without one, only show the server.
+    /// Client command and its arguments. Without it, only show the server.
     #[usage(
         value_name = "COMMAND",
         value_hint = usage::ValueHint::CommandWithArguments,
@@ -54,7 +52,7 @@ pub struct Run {
     pub command: Vec<OsString>,
 }
 
-/// How a server is set up, by flags that fall back to environment variables.
+/// How a server is set up. Each flag falls back to an environment variable.
 #[derive(usage::Args)]
 #[usage(
     after_help = "Every setting has a command line flag and an environment variable; the flag wins."
@@ -70,8 +68,8 @@ pub struct Settings {
     )]
     pub gpu_buffers: dmabuf::Offer,
 
-    /// The node clients are told to render on, instead of the first one a
-    /// renderer can be built on
+    /// The render node to offer clients, instead of the first one with a
+    /// renderer
     #[usage(long, env = "MEOWLAND_RENDER_NODE", value_name = "PATH")]
     pub render_node: Option<PathBuf>,
 
@@ -85,11 +83,10 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The settings as the flags that carry them.
+    /// These settings as the flags that carry them.
     ///
-    /// A server is a process of its own, started by the command that found
-    /// there was none, so what was decided here has to be said there: the
-    /// server reads the same environment, but a flag is not in it.
+    /// A server is a separate process, so it must be told what this command
+    /// decided. It reads the same environment, but a flag is not in it.
     pub fn args(&self) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("--gpu-buffers"),
@@ -111,12 +108,11 @@ impl Settings {
     }
 }
 
-/// The server itself, which is what `run` starts when there is none.
+/// The server itself, which `run` starts when there is none.
 ///
-/// Not something a person asks for: it is how a server is spelled when the
-/// command that needs one starts it. A command here is what the server exists
-/// for - it runs the client itself and stops when the client is gone, which is
-/// how `meowland run foot` gives the terminal back when foot exits.
+/// Users do not type this command. It is how a command that needs a server
+/// starts one. The server exists for the command it is given: it runs the
+/// client and stops when the client is gone.
 #[derive(usage::Args)]
 #[usage(hide)]
 pub struct Server {
@@ -167,9 +163,8 @@ pub enum CompletionShell {
 
 /// The script a shell sources to complete meowland's own words.
 ///
-/// The script calls back into `meowland __complete_word__`, so what it offers
-/// is answered by this build: the IDs `attach` takes come from the server that
-/// is running now (`src/control.rs`).
+/// It calls back into `meowland __complete_word__`, so this build answers what
+/// is offered.
 pub fn script(shell: CompletionShell) -> String {
     Cli::completion_script(shell.into())
 }
@@ -187,12 +182,11 @@ impl From<CompletionShell> for usage::complete::Shell {
     }
 }
 
-/// The window IDs `attach` may be given, read from the running server.
+/// The window IDs that `attach` may be given, read from the running server.
 ///
-/// A shell asks this while the user is typing, so a server that is not running
-/// is an empty answer and not an error: there is nothing to complete, and a
-/// complaint printed into someone's half-finished command line would be worse
-/// than offering nothing.
+/// A shell asks this while the user types, so a server that is not running is
+/// an empty answer and not an error. A complaint printed into a half-finished
+/// command line is worse than offering nothing.
 fn attached_windows(
     _partial: &<Attach as usage::argv::spec::CommandArgs>::Partial,
     _ctx: &usage::complete::CompleteCtx<'_>,
@@ -203,8 +197,7 @@ fn attached_windows(
     windows
         .into_iter()
         .map(|window| {
-            // The title is what tells one window from another while typing:
-            // an app ID is the same for every window an app has.
+            // The title tells one window from another. An app ID does not.
             let mut description = if window.title.is_empty() {
                 window.label
             } else {

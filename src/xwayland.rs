@@ -1,4 +1,11 @@
-//! Lifecycle and X11 sockets for the xwayland-satellite sidecar.
+//! The X display and the xwayland-satellite child of a server.
+//!
+//! The server reserves one display number and opens the two listening sockets
+//! of that display. It passes the sockets to one `xwayland-satellite` child as
+//! `-listenfd` arguments, and the child answers X11 clients on the display.
+//!
+//! The reservation is the lock file `/tmp/.X<N>-lock`, which holds the PID of
+//! the owner.
 
 use std::{
     fs::{File, OpenOptions},
@@ -13,6 +20,7 @@ use rustix::{
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType},
 };
 
+/// The display numbers the server tries, in order.
 const DISPLAY_SLOTS: std::ops::RangeInclusive<u32> = 0..=32;
 const SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
 
@@ -24,7 +32,9 @@ pub enum Error {
     Spawn(#[source] std::io::Error),
 }
 
-/// One xwayland-satellite instance and the display reservation it owns.
+/// One xwayland-satellite child and the X display it reserved.
+///
+/// Dropping this stops the child and releases the display.
 #[derive(Debug)]
 pub struct Server {
     display: String,
@@ -38,6 +48,7 @@ impl Server {
         let (lock, listeners) = reserve_display().map_err(Error::Display)?;
         let x_display = format!(":{}", lock.number);
 
+        // The child takes the sockets as `-listenfd`, so it must inherit them.
         for listener in &listeners {
             fcntl_setfd(listener, FdFlags::empty())
                 .map_err(std::io::Error::from)
@@ -58,6 +69,7 @@ impl Server {
         }
         let child = command.spawn();
         let mut reset_error = None;
+        // The flag goes back on, so no later child inherits the sockets.
         for listener in &listeners {
             if let Err(error) = fcntl_setfd(listener, FdFlags::CLOEXEC) {
                 reset_error.get_or_insert_with(|| std::io::Error::from(error));
@@ -114,6 +126,7 @@ struct DisplayLock {
 }
 
 impl DisplayLock {
+    /// Create the lock file for one display, or take over a stale one.
     fn acquire(number: u32) -> std::io::Result<Self> {
         let path = lock_path(number);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -168,6 +181,10 @@ fn reserve_display() -> std::io::Result<(DisplayLock, Vec<UnixListener>)> {
     }))
 }
 
+/// Open the filesystem and abstract X sockets of one display.
+///
+/// X clients use either address. A socket file left by a dead display is
+/// removed first.
 fn open_listeners(number: u32) -> std::io::Result<Vec<UnixListener>> {
     let path = socket_path(number);
     let _ = std::fs::remove_file(&path);
@@ -192,6 +209,7 @@ fn open_listener(address: &SocketAddrUnix) -> std::io::Result<UnixListener> {
     Ok(UnixListener::from(fd))
 }
 
+/// Remove the lock file if its owner process is gone.
 fn remove_stale_lock(path: &Path) -> std::io::Result<()> {
     let mut contents = String::new();
     File::open(path)?.read_to_string(&mut contents)?;

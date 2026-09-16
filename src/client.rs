@@ -1,15 +1,13 @@
-//! Showing a server on the terminal this process is running in.
+//! Showing a server on the terminal this process runs in.
 //!
-//! This is the other end of [`crate::display`], and the only part of meowland
-//! that touches a terminal: it takes the terminal over, says what the terminal
-//! can do, writes out what the server sends it, and forwards what the user
-//! does. The server outlives this process - closing the terminal, or `Alt+Q`,
-//! leaves it running with its windows and its clients - which is what makes the
-//! two ends separate programs at all.
+//! This module is the other end of [`crate::display`], and the only part of
+//! meowland that touches a terminal. It takes the terminal over, reports what
+//! the terminal can do, writes out what the server sends, and forwards what the
+//! user does. The server outlives this process: closing the terminal, or
+//! `Alt+Q`, leaves the server running with its windows and its clients.
 //!
-//! Frames are written by a thread of their own, and it is the thread that waits
-//! for the terminal to take them: that wait is milliseconds, and the thread
-//! reading the user's keystrokes must not queue behind it.
+//! Frames go out on their own thread: the wait for the terminal is
+//! milliseconds, and the thread reading the user must not queue behind it.
 
 use std::{
     io::Write as _,
@@ -36,36 +34,35 @@ use crate::{
     tty::{self, Capabilities, Terminal},
 };
 
-/// How long the server has to answer a terminal that has just attached. It
-/// answers at once: a second is a server that is wedged, not a slow one.
+/// How long the server has to answer a terminal that attaches. It answers at
+/// once, so a second means it is wedged.
 const GREETING_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How often the terminal is checked for having gone away.
+/// How often the loop checks for a hangup.
 ///
-/// A closed terminal hangs its descriptors up and fails every read on them, and
-/// the thread reading input cannot report that: the terminal library's event
-/// source spins on the error instead of returning from the read. So the loop
-/// asks, and the reader is left spinning until this process ends.
+/// A closed terminal fails every read, which the input thread cannot report:
+/// the terminal library spins on the error. So the loop asks, and the reader
+/// spins until this process ends.
 const HANGUP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Show a window of the server in this terminal until something ends the
 /// attachment.
 ///
-/// What is shown is `show`: the window the server has the keyboard on, the
-/// newest one - following as others appear - or one by ID. Terminals are
-/// independent, so any number of them can be attached at once, showing the same
-/// window or one each; what ends here is one terminal's showing, never a window
-/// or another terminal's.
+/// `show` selects the window: the one the server has the keyboard on, the
+/// newest one, or one by ID. A terminal that asks for the newest window follows
+/// new windows as they appear. Terminals are independent, so any number of them
+/// can be attached at once, showing the same window or one each. Only one
+/// terminal's showing ends here, never a window or another terminal's.
 pub fn attach(show: Show) -> anyhow::Result<()> {
-    // Before the terminal is touched, because a server that is not there is
-    // not worth wiping a screen for.
+    // Before the terminal is touched: a server that is not there must not clear
+    // the screen.
     let mut stream = display::connect()?;
     let mut terminal = Terminal::new()?;
     let capabilities = terminal.activate()?.clone();
     tracing::info!(?capabilities, "terminal taken over");
 
     let departure = match greet(&mut stream, capabilities, show)? {
-        // The terminal goes with it, and is handed back on the way out.
+        // The terminal goes with it, and is given back on the way out.
         Greeting::Welcome => display_it(stream, terminal)?,
         Greeting::Refused(reason) => {
             drop(terminal);
@@ -77,17 +74,17 @@ pub fn attach(show: Show) -> anyhow::Result<()> {
         }
     };
 
-    // Said after the terminal is back, or the terminal it is said to is the
-    // compositor's screen rather than the user's.
+    // Reported after the terminal is back. Before that, the message goes to the
+    // compositor's screen, not the user's.
     match departure {
         Departure::Detached(reason) => {
             tracing::info!(%reason, "let go of the server");
             eprintln!("{reason}");
             Ok(())
         }
-        // Not an error: a server stops when the command it was started for is
-        // gone, and `meowland quit` stops one on purpose. The terminal is
-        // handed back and the shell that typed the command carries on.
+        // Not an error. A server stops when the command it was started for is
+        // gone, and `meowland quit` stops one on purpose. The terminal is given
+        // back, and the shell that typed the command carries on.
         Departure::ServerGone => {
             tracing::info!("the server stopped");
             Ok(())
@@ -100,15 +97,15 @@ pub fn attach(show: Show) -> anyhow::Result<()> {
     }
 }
 
-/// What the server said about the terminal that just attached.
+/// The server's answer to a terminal that attaches.
 enum Greeting {
     Welcome,
     Refused(String),
-    /// Nothing: the server stopped before it answered.
+    /// Nothing arrived: the server stopped before it answered.
     Gone,
 }
 
-/// Say hello, and read whether the server took the terminal on.
+/// Send hello, and read whether the server accepted the terminal.
 fn greet(
     stream: &mut UnixStream,
     capabilities: Capabilities,
@@ -135,13 +132,12 @@ fn greet(
     let reply = reply.context("could not read the server's answer")?;
     match reply.and_then(|(tag, payload)| display::decode_client(tag, payload)) {
         Some(ToClient::Welcome) => Ok(Greeting::Welcome),
-        // A refusal is an answer rather than a failure: what to print, and
-        // whether to complain, is the caller's to decide.
+        // A refusal is an answer, not a failure. The caller decides what to
+        // print.
         Some(ToClient::Detached(reason)) => Ok(Greeting::Refused(reason)),
-        // The socket ended without the server saying anything. A server stops
-        // when the command it was started for is gone, and a command that exits
-        // at once does it before a terminal has finished probing the terminal
-        // it was typed in.
+        // The socket ended before the server sent anything. A server stops when
+        // the command it was started for is gone, and a command that exits at
+        // once stops it before a pane has finished probing its terminal.
         None => Ok(Greeting::Gone),
         Some(ToClient::Bytes(_) | ToClient::Frame(_)) => {
             anyhow::bail!("the server sent pixels before it said hello")
@@ -152,17 +148,13 @@ fn greet(
 /// Why this terminal stopped showing the server.
 #[derive(Debug)]
 enum Departure {
-    /// The server let the terminal go, and said why.
+    /// The server let the terminal go, and gave the reason.
     Detached(String),
-    /// The server itself is gone.
     ServerGone,
-    /// The terminal was closed.
     TerminalGone,
-    /// A signal asked for the server to be left.
     Signal,
 }
 
-/// The state the event loop carries while a server is being shown.
 struct Showing {
     stream: UnixStream,
     terminal: Terminal,
@@ -171,7 +163,7 @@ struct Showing {
 }
 
 impl Showing {
-    /// Leave for `reason`; the first reason given is the one that counts.
+    /// Leave for `reason`. The first reason given is the one that counts.
     fn leave(&mut self, reason: Departure) {
         if self.departure.is_none() {
             self.departure = Some(reason);
@@ -184,7 +176,7 @@ impl Showing {
         }
     }
 
-    /// Send one message to the server, leaving if it cannot be sent.
+    /// Send one message to the server, and leave if it cannot be sent.
     fn send(&mut self, message: &ToServer) {
         if let Err(error) = display::write_to(&mut self.stream, display::encode(message)) {
             tracing::warn!(%error, "could not reach the server");
@@ -194,8 +186,8 @@ impl Showing {
     }
 }
 
-/// Write out what the server sends and forward what the user does, until one
-/// of them goes away. The terminal is handed back on the way out.
+/// Write frames out and forward input until one end goes away. The terminal is
+/// given back at the end.
 fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departure> {
     let mut event_loop: EventLoop<Showing> =
         EventLoop::try_new().context("could not make an event loop")?;
@@ -269,8 +261,8 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
         signal: Some(signal),
     };
     let result = event_loop.run(None, &mut showing, |_| {});
-    // The server is told this was on purpose, so that a terminal that is
-    // closed is not the same thing to it as a terminal that fell over.
+    // `Bye` reports that the terminal left on purpose, so a closed terminal is
+    // not the same thing to the server as one that fell over.
     let _ = display::write_to(&mut showing.stream, display::encode(&ToServer::Bye));
     let _ = showing.stream.shutdown(std::net::Shutdown::Both);
     writer.stop();
@@ -283,8 +275,8 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> anyhow::Result<Departur
 fn on_event(showing: &mut Showing, event: crossterm::event::Event) {
     use crossterm::event::Event;
 
-    // A resize is not something the server is told about as input: what it
-    // needs is what the terminal can do now, which is a probe away.
+    // A resize is not input. The server needs the capabilities the terminal has
+    // now, and `refresh` probes them.
     if let Event::Resize(_, _) = event {
         let capabilities = showing.terminal.refresh().clone();
         showing.send(&ToServer::Resized(capabilities));
@@ -295,7 +287,6 @@ fn on_event(showing: &mut Showing, event: crossterm::event::Event) {
     }
 }
 
-/// What the terminal should be told about one terminal event.
 fn input_for(event: crossterm::event::Event) -> Option<Input> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 
@@ -320,7 +311,7 @@ fn input_for(event: crossterm::event::Event) -> Option<Input> {
                     KeyEventKind::Release => KeyKind::Release,
                 },
                 // A modifier is state for everything typed while it is held,
-                // rather than a keystroke of its own.
+                // not a keystroke of its own.
                 modifier: matches!(key.code, KeyCode::Modifier(_)),
             }))
         }
@@ -344,7 +335,7 @@ fn input_for(event: crossterm::event::Event) -> Option<Input> {
             MouseEventKind::ScrollLeft => Pointer::ScrollLeft,
             MouseEventKind::ScrollRight => Pointer::ScrollRight,
         })),
-        // Pasted text is not typed, and has no keys of its own to forward.
+        // Pasted text is not typed and has no keys of its own to forward.
         Event::Paste(text) => Some(Input::Paste(text)),
         Event::FocusGained => Some(Input::Focus(true)),
         Event::FocusLost => Some(Input::Focus(false)),
@@ -352,24 +343,20 @@ fn input_for(event: crossterm::event::Event) -> Option<Input> {
     }
 }
 
-/// What the thread that writes frames tells the loop.
+/// What the frame-writing thread sends to the loop.
 #[derive(Debug)]
 enum FrameEvent {
-    /// The terminal has written the last frame.
     Drawn,
-    /// The server let this terminal go, and said why.
+    /// The server let this terminal go, and gave the reason.
     Detached(String),
-    /// The server is gone.
     Ended,
 }
 
-/// A thread of this process's own, for one of the two things that cannot happen
-/// on the loop: writing frames to the terminal, and reading the user at it.
+/// A thread of this process's own, for one of the two blocking jobs: sending
+/// frames to the terminal, or reading the user.
 ///
-/// Both are inside a blocking call - a write that the terminal sets the pace
-/// of, a read that has nothing to return until the user types - so neither can
-/// be the loop's own body, and both are left by asking rather than by waiting
-/// for them.
+/// A write goes at the terminal's pace; a read waits for the user to type.
+/// Neither can be the loop's own body, so each is left by asking.
 struct Worker {
     name: &'static str,
     stop: Arc<AtomicBool>,
@@ -398,11 +385,9 @@ impl Worker {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        // A thread inside a terminal that has hung up never comes back: it is
-        // spinning in the terminal library's read of it, or blocked writing to
-        // a pty nobody is reading, and waiting for it would be waiting forever.
-        // It holds nothing the rest of this process needs, and the process is
-        // leaving anyway.
+        // A thread inside a hung-up terminal never comes back: it spins in the
+        // terminal library's read, or blocks on a pty with no reader, so a join
+        // waits forever. It holds nothing this process needs.
         if tty::hung_up() {
             return;
         }
@@ -418,7 +403,6 @@ impl Drop for Worker {
     }
 }
 
-/// Write what the server sends to the terminal, until either end goes away.
 fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         let message = match display::read_from(&mut stream) {
@@ -436,13 +420,12 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
                 let _ = events.send(FrameEvent::Detached(reason));
                 return;
             }
-            // Nothing this build understands is nothing to stop for.
+            // A message this build does not understand is not a reason to stop.
             Some(ToClient::Welcome) | None => continue,
         };
         let phase = std::time::Instant::now();
-        // Taken per message rather than held for the session: a write that the
-        // terminal is not keeping up with must not keep the escapes that hand
-        // it back from being written.
+        // Taken per message, not held for the session: a write the terminal is
+        // slow to take must not block the escapes that give the terminal back.
         let mut stdout = std::io::stdout().lock();
         if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
             tracing::debug!(%error, "could not write to the terminal");
@@ -454,9 +437,8 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
             ms = phase.elapsed().as_secs_f64() * 1e3,
             "written to the terminal"
         );
-        // Only a frame is acknowledged: the server composes the next one
-        // against the screen this landed on, while an escape is not worth
-        // waiting for.
+        // Only a frame is acknowledged. The server composes the next frame
+        // against the screen this one landed on. An escape is not worth a wait.
         if frame && events.send(FrameEvent::Drawn).is_err() {
             return;
         }
@@ -464,8 +446,8 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
     let _ = events.send(FrameEvent::Ended);
 }
 
-/// Read terminal events forever. crossterm parses the escape sequences,
-/// including the kitty keyboard protocol extensions meowland asks for.
+/// crossterm parses the escape sequences, including the kitty keyboard protocol
+/// extensions meowland asks for.
 fn read_terminal(sender: &Sender<crossterm::event::Event>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         match crossterm::event::poll(Duration::from_millis(100)) {

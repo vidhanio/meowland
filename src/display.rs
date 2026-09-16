@@ -1,18 +1,4 @@
-//! The stream between a terminal and the server that draws on it.
-//!
-//! The server outlives the terminal that shows it. It holds the compositor, the
-//! windows and the clients, and it draws on the terminal that is attached at
-//! the moment. This module carries the attachment: the escapes the terminal
-//! writes, what the user did, and the two messages about the attachment, hello
-//! and detached.
-//!
-//! Every message is a one-byte tag, a length and a payload, both ways, on a
-//! stream open while the terminal is attached. The length makes adding a
-//! message safe: an unknown tag is skipped and the next message is read.
-//!
-//! This module carries data shapes only. A [`Capabilities`] is what the
-//! terminal side probed; an [`Input`] is what the user did, in the compositor's
-//! terms.
+//! Pane protocol: each message has a tag, length, and payload.
 
 use std::{
     io,
@@ -21,8 +7,6 @@ use std::{
 
 use crate::{control, tty::Capabilities};
 
-/// The guard removes the socket file when the server ends; a file from a killed
-/// server is taken over.
 pub fn listen() -> Result<(control::Socket, UnixListener), crate::Error> {
     control::Socket::bind(control::DISPLAY_SOCKET)
 }
@@ -31,14 +15,8 @@ pub fn connect() -> Result<UnixStream, crate::Error> {
     control::connect(control::DISPLAY_SOCKET)
 }
 
-/// A server outlives upgrades, so the two ends can be different builds; a pane
-/// that sends another version is refused, not read wrongly.
 pub const VERSION: u32 = 2;
 
-/// Which window a pane asks to be shown.
-///
-/// Panes are independent. The server draws the window each pane asks for, and
-/// two panes can show the same window or one each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Show {
     /// The window the server has focused, resolved when the pane attaches.
@@ -49,10 +27,8 @@ pub enum Show {
     Window(u64),
 }
 
-/// What a terminal sends to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToServer {
-    /// Attach this pane to the server, showing what [`Show`] asks for.
     Hello {
         version: u32,
         show: Show,
@@ -63,45 +39,27 @@ pub enum ToServer {
     /// The terminal has written the last frame, so the server may compose the
     /// next frame.
     Drawn,
-    /// The terminal is leaving on purpose.
     Bye,
 }
 
-/// What the server sends to the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToClient {
-    /// The server draws on this terminal from here on.
     Welcome,
-    /// Escapes for the terminal, which it writes exactly as they are.
     Bytes(Vec<u8>),
-    /// A frame, which the terminal writes and acknowledges with
-    /// [`ToServer::Drawn`].
-    ///
-    /// Escapes and frames arrive in order on one stream; only a frame is
-    /// acknowledged. With a frame in flight, the next frame the server composes
-    /// is the newest.
+    /// Acknowledged with [`ToServer::Drawn`].
     Frame(Vec<u8>),
-    /// This terminal is not the one the server draws on any more, and the
-    /// reason.
     Detached(String),
 }
 
-/// Something the user did at the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     Key(Key),
     Pointer(Pointer),
-    /// Pasted text, which is not typed and has no keys of its own.
     Paste(String),
-    /// Whether the terminal window has the user's attention.
     Focus(bool),
 }
 
-/// A key, already reduced to what the compositor counts in.
-///
-/// The terminal side has the key codes, so it reduces the key. From here on
-/// everything is evdev, which is what the compositor forwards and what key
-/// bindings are written against.
+/// Key code and modifier state sent to Wayland clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     pub code: u32,
@@ -123,7 +81,6 @@ pub enum KeyKind {
     Release,
 }
 
-/// Something the pointer did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pointer {
     Motion {
@@ -143,10 +100,8 @@ pub enum Pointer {
     ScrollRight,
 }
 
-/// One message, as it goes on the wire.
 type Message = (u8, Vec<u8>);
 
-/// One tag for each variant, in both directions.
 mod tag {
     pub const HELLO: u8 = 1;
     pub const INPUT: u8 = 2;
@@ -191,20 +146,17 @@ pub fn encode(message: &ToServer) -> Message {
     }
 }
 
-/// The payload is taken, not borrowed. A frame is the largest thing on this
-/// stream, and copying it would copy the screen.
+/// Take the payload to avoid copying frame data.
 pub fn encode_client(message: ToClient) -> Message {
     match message {
         ToClient::Welcome => (tag::WELCOME, Vec::new()),
-        // The escapes are the payload, and nothing describes what they are.
         ToClient::Bytes(bytes) => (tag::BYTES, bytes),
         ToClient::Frame(bytes) => (tag::FRAME, bytes),
         ToClient::Detached(reason) => (tag::DETACHED, reason.into_bytes()),
     }
 }
 
-/// An unknown tag is not an error. An upgrade looks like this from the older
-/// end, and the length lets the stream carry on.
+/// Ignore unknown tags to allow protocol extensions.
 pub fn decode(tag: u8, payload: &[u8]) -> Option<ToServer> {
     let mut read = Reader::new(payload);
     Some(match tag {
@@ -221,13 +173,11 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<ToServer> {
     })
 }
 
-/// The payload is taken, not borrowed, for the reason [`encode_client`] gives.
 pub fn decode_client(tag: u8, payload: Vec<u8>) -> Option<ToClient> {
     Some(match tag {
         tag::WELCOME => ToClient::Welcome,
         tag::BYTES => ToClient::Bytes(payload),
         tag::FRAME => ToClient::Frame(payload),
-        // The reason is the payload, as for the escapes above.
         tag::DETACHED => ToClient::Detached(String::from_utf8(payload).ok()?),
         _ => return None,
     })
@@ -369,7 +319,6 @@ fn put_capabilities(payload: &mut Vec<u8>, capabilities: &Capabilities) {
     }
 }
 
-/// Reads a payload field by field, and refuses to read past its end.
 #[derive(Debug)]
 struct Reader<'a> {
     payload: &'a [u8],
@@ -447,22 +396,15 @@ impl<'a> Reader<'a> {
 /// not this protocol.
 const MAXIMUM_MESSAGE: usize = 64 * 1024 * 1024;
 
-/// Write one message and flush it.
 pub fn write_to<W: io::Write>(writer: &mut W, message: Message) -> io::Result<()> {
     let (tag, payload) = message;
     write_message(writer, tag, &payload)
 }
 
-/// Write a frame and flush it.
-///
-/// A frame goes out from the buffer the encoder fills, which is kept between
-/// frames instead of built for each message. Handing it over would copy it
-/// ([`Encoder`]).
 pub fn write_frame<W: io::Write>(writer: &mut W, frame: &[u8]) -> io::Result<()> {
     write_message(writer, tag::FRAME, frame)
 }
 
-/// Write one message's tag, length and payload, and flush.
 fn write_message<W: io::Write>(writer: &mut W, tag: u8, payload: &[u8]) -> io::Result<()> {
     let mut header = [0u8; 5];
     header[0] = tag;
@@ -472,7 +414,6 @@ fn write_message<W: io::Write>(writer: &mut W, tag: u8, payload: &[u8]) -> io::R
     writer.flush()
 }
 
-/// Read one message, or `None` when the other end has gone.
 pub fn read_from<R: io::Read>(reader: &mut R) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut header = [0u8; 5];
     if !read_exactly(reader, &mut header)? {
@@ -492,7 +433,6 @@ pub fn read_from<R: io::Read>(reader: &mut R) -> io::Result<Option<(u8, Vec<u8>)
     Ok(Some((header[0], payload)))
 }
 
-/// Fill `bytes`, or say that the stream ended first.
 fn read_exactly<R: io::Read>(reader: &mut R, bytes: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0;
     while filled < bytes.len() {

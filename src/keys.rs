@@ -1,19 +1,4 @@
-//! Translation from terminal key events to Linux key codes.
-//!
-//! A Wayland client interprets keys itself: it gets an xkb keymap, key codes
-//! and modifier state. The terminal sends characters and modifier flags, which
-//! it already interpreted with the host keyboard layout. The compositor
-//! therefore translates in the opposite direction.
-//!
-//! The other half of that contract is fixed: clients are advertised a plain
-//! `us` keymap (see [`crate::compositor::Meowland::new`]), and each character
-//! is mapped back to the key code and shift state that produce it in that
-//! keymap. Typing is then independent of the layout, because the terminal
-//! decodes the physical layout and the compositor re-encodes the character in
-//! the keymap it promised.
-//!
-//! Only characters that a `us` layout can reach are typeable. Accented letters,
-//! emoji and CJK need an input method, which the compositor does not implement.
+//! Map terminal keys to Linux key codes for the advertised `us` keymap.
 
 use crossterm::event::{KeyCode, ModifierKeyCode};
 

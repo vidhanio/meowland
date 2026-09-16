@@ -1,17 +1,4 @@
-//! The process tree of the server, and how it is stopped.
-//!
-//! A server starts clients, and a client starts helpers of its own. Those
-//! helpers are not children of the server, so a server that stops its children
-//! one by one leaves them running. `xwayland-satellite` is the same case: it
-//! runs Xwayland, which is a grandchild of the server.
-//!
-//! So the tree is read from `/proc` and every process under the server is
-//! stopped: first with `SIGHUP`, then `SIGTERM`, then `SIGKILL`, each with a
-//! short grace period. The tree is read again before each signal, so a process
-//! that started something while the last one was being delivered is included.
-//!
-//! A process that daemonizes leaves the tree: it is re-parented to init, and no
-//! scan of `/proc` can tell it from anything else on the machine.
+//! Process tree discovery and shutdown.
 
 use std::{
     collections::HashMap,

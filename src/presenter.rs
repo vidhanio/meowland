@@ -1,22 +1,4 @@
-//! Handing frames to the attached terminal from a thread of its own.
-//!
-//! Composing a frame is cheap. Compressing it and writing it is not, and the
-//! terminal sets the pace once it starts. On the thread that reads input, every
-//! keystroke would wait behind the last frame, for milliseconds on every frame,
-//! for as long as something on the screen moves.
-//!
-//! The loop composes a frame, works out which tiles changed, copies those tiles
-//! and hands them over. The worker compresses them, escapes them and writes
-//! them to the terminal that is attached at the time. The loop never waits. If
-//! the worker is still busy, the frame is dropped rather than queued. A frame
-//! that is already out of date is worth less than the newest one. The tiles
-//! that were dropped stay due, so the next frame that the worker gets carries
-//! everything that the terminal has not seen.
-//!
-//! A server has no terminal of its own, so this is where attaching is felt. The
-//! worker writes into a socket while a terminal is attached, and holds nothing
-//! in between. What the terminal does with the bytes, which is to write them
-//! and to say when it has, belongs to the terminal side (`display`).
+//! Per-pane frame encoding and output thread.
 
 use std::{
     os::unix::net::UnixStream,
@@ -43,48 +25,31 @@ pub struct Frame {
     pub tiles: Vec<Placement>,
 }
 
-/// A frame, or an escape that must keep its place among frames, such as a
-/// screen wipe after a resize or the pointer shape.
 #[derive(Debug)]
 enum Message {
     Attach(Option<UnixStream>),
-    Configure {
-        shared_memory: bool,
-    },
+    Configure { shared_memory: bool },
     Tell(ToClient),
     Frame(Frame),
-    /// The terminal wrote the frame that it was sent, so the next frame may go.
     Drawn,
     Raw(Vec<u8>),
 }
 
-/// What the worker reports to the event loop.
 #[derive(Debug)]
 pub enum Event {
-    /// The one reusable frame is free for the next presentation.
     Ready(Frame),
     Failed(Error),
 }
 
-/// The thread that writes to whichever terminal is attached.
 #[derive(Debug)]
 pub struct Presenter {
-    /// Held, not sent through: dropping the sender ends the worker.
     messages: Option<MessageSender<Message>>,
-    /// Recycling both vectors keeps a steady stream of frames from allocating
-    /// pixels or placements for each frame.
     free: Option<Frame>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Presenter {
-    /// Start the worker, which writes nothing until a terminal attaches.
     pub fn new(events: EventSender<Event>) -> Result<Self, Error> {
-        // One frame is in flight at a time: a backlog of frames is a backlog of
-        // latency, and the newest frame replaces the ones before it. The single
-        // recyclable frame below bounds the frames. The channel stays
-        // unbounded, so a control escape is not discarded because the worker is
-        // writing a frame.
         let (messages, queue) = channel();
         let handle = thread::Builder::new()
             .name("meowland-presenter".into())
@@ -110,10 +75,7 @@ impl Presenter {
         self.raw(tty::Terminal::clear());
     }
 
-    /// A recycled frame to fill, if the worker has finished with it.
-    ///
-    /// `None` means that the worker is still busy and that this frame is
-    /// dropped. Dropping the frame is intended, so it is not an error.
+    /// Returns `None` while a frame is in flight.
     pub const fn frame(&mut self) -> Option<Frame> {
         self.free.take()
     }
@@ -127,10 +89,7 @@ impl Presenter {
         self.free = Some(frame);
     }
 
-    /// Hand over a frame, or take it back if the worker has stopped.
-    ///
-    /// The caller keeps the tiles that it could not hand over. They are still
-    /// due, and the next frame carries them with its own.
+    /// Returns the frame if the worker has stopped.
     pub fn present(&self, frame: Frame) -> Result<(), Frame> {
         let Some(messages) = &self.messages else {
             return Err(frame);
@@ -139,23 +98,14 @@ impl Presenter {
             .send(Message::Frame(frame))
             .map_err(|error| match error.0 {
                 Message::Frame(frame) => frame,
-                // The message that failed was the frame that was handed over,
-                // and nothing else is a frame.
                 _ => unreachable!("sent a frame"),
             })
     }
 
-    /// The terminal wrote the frame that it was sent, so the next frame may
-    /// follow.
-    ///
-    /// The server keeps one frame on its way at a time. While this frame is
-    /// written, the loop drops the frames that it would otherwise queue. The
-    /// tiles that they carried stay due for the frame that goes after.
     pub fn drawn(&self) {
         self.send(Message::Drawn);
     }
 
-    /// Show an escape in its turn, after the frames already handed over.
     pub fn raw(&self, bytes: Vec<u8>) {
         self.send(Message::Raw(bytes));
     }
@@ -166,9 +116,7 @@ impl Presenter {
         }
     }
 
-    /// Write everything already handed over, then stop the worker. The server
-    /// calls this before it drops the terminal, so that the escapes that undo
-    /// what the compositor did to the terminal are written last.
+    /// Drain queued messages before stopping the worker.
     pub fn finish(&mut self) {
         self.messages = None;
         if let Some(handle) = self.handle.take()
@@ -204,10 +152,6 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
     let mut out = Vec::new();
     let mut stats = Stats::default();
     let mut terminal: Option<UnixStream> = None;
-    // The frame that the terminal was sent and has not said that it wrote.
-    // Nothing else can be sent until the terminal says so, because any frame
-    // that the loop handed over in the meantime would show a screen that no
-    // longer looks like that.
     let mut in_flight: Option<Frame> = None;
     while let Ok(message) = queue.recv() {
         let mut frame = match message {
@@ -255,11 +199,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
         let written = match write_frame(&mut terminal, &out) {
             Ok(()) => phase.elapsed(),
             Err(error) => {
-                // A write to the socket fails when the terminal on the other
-                // end has gone, because it closed, or was killed, or its end of
-                // the pty closed. This thread does not stop for that. The loop
-                // hears the same thing from its reader and detaches, and the
-                // server runs until another terminal attaches.
+                // A disconnected pane does not stop the worker.
                 tracing::debug!(%error, "the attached terminal is gone");
                 terminal = None;
                 Duration::ZERO
@@ -268,8 +208,6 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
         frame.pixels.clear();
         frame.tiles.clear();
         if terminal.is_none() {
-            // The frame was not written, and the tiles are still due, so hand
-            // the frame back for the next frame to carry.
             if events.send(Event::Ready(frame)).is_err() {
                 return Ok(());
             }
@@ -298,10 +236,6 @@ fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<(
     display::write_to(terminal, display::encode_client(ToClient::Bytes(bytes)))
 }
 
-/// A frame is written as a frame, not as an escape.
-///
-/// It is the one message that the terminal answers, and the bytes are written
-/// in place because the frame is recycled afterwards.
 fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
@@ -309,16 +243,12 @@ fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Resu
     display::write_frame(terminal, bytes)
 }
 
-/// Something about the attachment itself, which is never a frame.
 fn tell(terminal: &mut Option<UnixStream>, message: ToClient) {
     if let Some(terminal) = terminal {
         let _ = display::write_to(terminal, display::encode_client(message));
     }
 }
 
-/// What the worker did in the last second, logged so that a frame rate is
-/// attributed. The time of this thread is spent in the terminal and in the
-/// compressor.
 #[derive(Debug, Default)]
 struct Stats {
     report: crate::logging::Report,

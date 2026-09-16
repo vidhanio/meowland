@@ -205,14 +205,17 @@ pub fn encode(message: &ToServer) -> Message {
 }
 
 /// A message as it is written.
-pub fn encode_client(message: &ToClient) -> Message {
+///
+/// The payload is taken rather than borrowed: a frame is the largest thing this
+/// stream carries, and copying one to send it would be a copy of the screen.
+pub fn encode_client(message: ToClient) -> Message {
     match message {
         ToClient::Welcome => (tag::WELCOME, Vec::new()),
-        // The escapes are the payload: wrapping them again would only cost a
-        // copy of the largest thing this stream carries.
-        ToClient::Bytes(bytes) => (tag::BYTES, bytes.clone()),
-        ToClient::Frame(bytes) => (tag::FRAME, bytes.clone()),
-        ToClient::Detached(reason) => (tag::DETACHED, reason.as_bytes().to_vec()),
+        // The escapes are the payload, and the terminal they are meant for is
+        // told nothing about what they are.
+        ToClient::Bytes(bytes) => (tag::BYTES, bytes),
+        ToClient::Frame(bytes) => (tag::FRAME, bytes),
+        ToClient::Detached(reason) => (tag::DETACHED, reason.into_bytes()),
     }
 }
 
@@ -237,13 +240,16 @@ pub fn decode(tag: u8, payload: &[u8]) -> Option<ToServer> {
 }
 
 /// Read a message, or `None` when it is not one this version knows.
-pub fn decode_client(tag: u8, payload: &[u8]) -> Option<ToClient> {
+///
+/// The payload is taken rather than borrowed, for the reason [`encode_client`]
+/// gives.
+pub fn decode_client(tag: u8, payload: Vec<u8>) -> Option<ToClient> {
     Some(match tag {
         tag::WELCOME => ToClient::Welcome,
-        tag::BYTES => ToClient::Bytes(payload.to_vec()),
-        tag::FRAME => ToClient::Frame(payload.to_vec()),
+        tag::BYTES => ToClient::Bytes(payload),
+        tag::FRAME => ToClient::Frame(payload),
         // The reason is the payload, like the escapes above.
-        tag::DETACHED => ToClient::Detached(String::from_utf8(payload.to_vec()).ok()?),
+        tag::DETACHED => ToClient::Detached(String::from_utf8(payload).ok()?),
         _ => return None,
     })
 }
@@ -465,13 +471,27 @@ impl<'a> Reader<'a> {
 const MAXIMUM_MESSAGE: usize = 64 * 1024 * 1024;
 
 /// Write one message and flush it.
-pub fn write_to<W: io::Write>(writer: &mut W, message: (u8, Vec<u8>)) -> io::Result<()> {
+pub fn write_to<W: io::Write>(writer: &mut W, message: Message) -> io::Result<()> {
     let (tag, payload) = message;
+    write_message(writer, tag, &payload)
+}
+
+/// Write a frame and flush it.
+///
+/// A frame is written from the buffer the encoder fills, which is the one
+/// payload that is kept between frames rather than built for its message, so it
+/// is the one that would be copied to be handed over ([`Encoder`]).
+pub fn write_frame<W: io::Write>(writer: &mut W, frame: &[u8]) -> io::Result<()> {
+    write_message(writer, tag::FRAME, frame)
+}
+
+/// Write one message's tag, length and payload, and flush.
+fn write_message<W: io::Write>(writer: &mut W, tag: u8, payload: &[u8]) -> io::Result<()> {
     let mut header = [0u8; 5];
     header[0] = tag;
     header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     writer.write_all(&header)?;
-    writer.write_all(&payload)?;
+    writer.write_all(payload)?;
     writer.flush()
 }
 
@@ -515,7 +535,7 @@ mod tests {
 
     use super::{
         Capabilities, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer, VERSION, decode,
-        decode_client, encode, encode_client, read_from, write_to,
+        decode_client, encode, encode_client, read_from, write_frame, write_to,
     };
 
     fn capabilities() -> Capabilities {
@@ -537,8 +557,8 @@ mod tests {
     }
 
     fn round_trip_client(message: ToClient) {
-        let (tag, payload) = encode_client(&message);
-        assert_eq!(decode_client(tag, &payload), Some(message));
+        let (tag, payload) = encode_client(message.clone());
+        assert_eq!(decode_client(tag, payload), Some(message));
     }
 
     #[test]
@@ -613,6 +633,25 @@ mod tests {
         round_trip_client(ToClient::Bytes(vec![0x1b, b'_', b'G', 0xff]));
         round_trip_client(ToClient::Frame(vec![0x1b, b'P', 0xff]));
         round_trip_client(ToClient::Detached("another terminal".to_owned()));
+    }
+
+    #[test]
+    fn a_frame_written_where_it_lies_is_the_frame_the_terminal_reads() {
+        // The presenter writes frames out of the buffer the encoder fills
+        // rather than out of a message built for each one, so what that
+        // shortcut puts on the wire has to be the message the other end is
+        // waiting for - a frame, and not an escape it never acknowledges.
+        let frame = b"\x1b[?2026h\x1b[7;3H\x1b_Ga=T,i=1;\x1b\\\x1b[?2026l";
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, frame).expect("writing to a Vec cannot fail");
+
+        let mut stream = Cursor::new(bytes);
+        let (tag, payload) = read_from(&mut stream).unwrap().expect("a message");
+        assert_eq!(
+            decode_client(tag, payload),
+            Some(ToClient::Frame(frame.to_vec()))
+        );
+        assert_eq!(read_from(&mut stream).unwrap(), None);
     }
 
     #[test]

@@ -6,11 +6,11 @@
 //! keyboard layout. So the compositor has to run that translation backwards.
 //!
 //! We do it by pinning the other half of the contract: clients are advertised a
-//! plain `us` layout keymap (see [`crate::compositor::KEYMAP`]), and characters
-//! are mapped back to the key code and shift state that produce them *in that
-//! keymap*. Typing is then layout independent: the terminal decodes the user's
-//! physical layout, and we re-encode the resulting character in the keymap we
-//! promised the client.
+//! plain `us` layout keymap (see [`crate::compositor::Meowland::new`]), and
+//! characters are mapped back to the key code and shift state that produce them
+//! *in that keymap*. Typing is then layout independent: the terminal decodes
+//! the user's physical layout, and we re-encode the resulting character in the
+//! keymap we promised the client.
 //!
 //! Consequence: only characters reachable on a `us` layout can be typed.
 //! Everything else (accented letters, emoji, CJK) would need an input method,

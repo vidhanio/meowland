@@ -70,6 +70,29 @@ impl Snapshot {
         )
     }
 
+    /// Take `pixels` as this snapshot.
+    ///
+    /// Every reader of a client buffer ends here - shared memory, a mapped GPU
+    /// buffer, a readback through the renderer - so the fields of a snapshot
+    /// are written in one place, whatever kind of buffer filled it.
+    pub fn fill(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+        scale: i32,
+        format: SourceFormat,
+    ) {
+        self.pixels.clear();
+        self.pixels.extend_from_slice(pixels);
+        self.width = width;
+        self.height = height;
+        self.stride = stride;
+        self.scale = scale;
+        self.format = format;
+    }
+
     pub fn image(&self) -> Image<'_> {
         Image {
             pixels: &self.pixels,
@@ -238,13 +261,7 @@ fn copy_dmabuf(
     // cannot be mapped is not a lost cause: the device that wrote it can still
     // read it.
     let copy = |pixels: &[u8], stride: u32, destination: &mut Snapshot| {
-        destination.pixels.clear();
-        destination.pixels.extend_from_slice(pixels);
-        destination.width = width;
-        destination.height = height;
-        destination.stride = stride;
-        destination.scale = scale;
-        destination.format = format;
+        destination.fill(pixels, stride, width, height, scale, format);
     };
     let mapped = dmabuf.format().modifier == Modifier::Linear
         && read_plane(dmabuf, |pixels, stride| copy(pixels, stride, destination)).is_ok();
@@ -304,13 +321,7 @@ fn copy_shm(
             reason = "shared memory is only reachable as a raw pointer; the slice is bounded and is copied out at once"
         )]
         let source = unsafe { std::slice::from_raw_parts(pointer.add(data.offset as usize), last) };
-        destination.pixels.clear();
-        destination.pixels.extend_from_slice(source);
-        destination.width = width;
-        destination.height = height;
-        destination.stride = stride as u32;
-        destination.scale = scale;
-        destination.format = format;
+        destination.fill(source, stride as u32, width, height, scale, format);
         tracing::debug!(
             width,
             height,

@@ -10,7 +10,10 @@
 //!
 //! [spec]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
-use std::io::Write as _;
+use std::{
+    io::Write as _,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::{Compression, write::ZlibEncoder};
@@ -31,9 +34,10 @@ const SHM_DIRECTORY: &str = "/dev/shm";
 /// The terminal takes one per transfer and unlinks it, so anything left is from
 /// a terminal that stopped reading - and an object is the size of the pixels it
 /// holds. The names carry this process's id, so nothing belonging to another
-/// compositor is at risk.
-pub fn discard_shared_memory() {
-    let prefix = format!("meowland-{}-", std::process::id());
+/// compositor is at risk - and the namespace, so that a pane's tiles are swept
+/// up without touching another pane's, which are still in use.
+fn discard_shared_memory(namespace: u32) {
+    let prefix = format!("meowland-{}-{namespace}-", std::process::id());
     let Ok(entries) = std::fs::read_dir(SHM_DIRECTORY) else {
         return;
     };
@@ -47,6 +51,17 @@ pub fn discard_shared_memory() {
     }
 }
 
+/// The namespace the startup probe's object is in, which no encoder uses.
+const PROBE_NAMESPACE: u32 = 0;
+
+/// The namespace of the next encoder to be made.
+///
+/// One per encoder, because a server draws on as many terminals at once as are
+/// attached to it: two panes' tiles may be in shared memory at the same time,
+/// and an object that one of them is still reading is not the other's to
+/// overwrite or take away.
+static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(PROBE_NAMESPACE + 1);
+
 /// The id the startup probe uses for the tile it sends out of shared memory, so
 /// that its answer can be told from the one the graphics query gives.
 pub const SHARED_PROBE_ID: u32 = 78;
@@ -56,7 +71,7 @@ pub const SHARED_PROBE_ID: u32 = 78;
 ///
 /// The returned guard removes the object if the terminal did not take it.
 pub fn shared_memory_probe(out: &mut Vec<u8>) -> Option<SharedProbe> {
-    let object = Shared::new(0);
+    let object = Shared::new(PROBE_NAMESPACE, 0);
     if object.write(&[0, 0, 0, 255]).is_err() {
         return None;
     }
@@ -91,8 +106,14 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(slot: u32) -> Self {
-        let name = format!("/meowland-{}-{slot}", std::process::id());
+    /// The object one tile of an encoder's namespace lives in.
+    ///
+    /// The name says whose it is - this process, and which of its encoders -
+    /// and which tile it holds, since a name per tile is what bounds what a
+    /// terminal that stopped reading can leave behind to the size of one
+    /// screen.
+    fn new(namespace: u32, slot: u32) -> Self {
+        let name = format!("/meowland-{}-{namespace}-{slot}", std::process::id());
         let path = format!("{SHM_DIRECTORY}{name}");
         let mut encoded_name = vec![0; base64::encoded_len(name.len(), true).expect("name fits")];
         let length = BASE64
@@ -163,21 +184,34 @@ pub struct Encoder {
     /// Whether the terminal reads tiles out of shared memory, which is what
     /// keeps the pixels off the pty.
     pub shared_memory: bool,
+    /// Which encoder this is, which is what its tiles' objects are named
+    /// after: two encoders' objects are never each other's.
+    namespace: u32,
     /// Stable names and encoded names for each tile, made once rather than on
     /// every frame.
     shared_objects: Vec<Shared>,
 }
 
-impl Default for Encoder {
-    fn default() -> Self {
+impl Encoder {
+    /// An encoder whose tiles go into shared memory objects of its own.
+    pub fn new() -> Self {
         Self {
             zlib: ZlibEncoder::new(Vec::new(), Compression::fast()),
             payload: Vec::new(),
             finished: false,
             compress: None,
             shared_memory: false,
+            namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             shared_objects: Vec::new(),
         }
+    }
+}
+
+impl Drop for Encoder {
+    /// Whatever the terminal did not take is this process's litter, and it is
+    /// the size of the pixels it holds.
+    fn drop(&mut self) {
+        discard_shared_memory(self.namespace);
     }
 }
 
@@ -304,16 +338,17 @@ impl Encoder {
 
         // The first tile of a frame decides for the rest of it: whether
         // compressing pays is a property of what the frame is *of*, and one
-        // tile answers for all of them.
-        // Whether compressing pays is a decision about the pty: with shared
-        // memory the pixels never travel through it, so the answer is no - it
-        // would be our time against the terminal's, and reading pixels costs
-        // the terminal less than inflating them.
+        // tile answers for all of them. With shared memory the pixels never
+        // travel through the pty, so the answer is no - it would be our time
+        // against the terminal's, and reading pixels costs the terminal less
+        // than inflating them.
         if self.shared_memory {
             let slot = placement.id as usize;
             while self.shared_objects.len() <= slot {
-                self.shared_objects
-                    .push(Shared::new(self.shared_objects.len() as u32));
+                self.shared_objects.push(Shared::new(
+                    self.namespace,
+                    self.shared_objects.len() as u32,
+                ));
             }
             transmit(
                 out,
@@ -348,12 +383,15 @@ impl Encoder {
     /// Compress `pixels`, leaving the result in the encoder's buffer.
     fn compress(&mut self, pixels: &[u8]) -> usize {
         if self.finished {
-            let mut compressed = self
+            // The frame before this one is still in the writer's buffer: it is
+            // taken back and cleared, so a steady stream of frames is one
+            // allocation for all of them.
+            let mut reused = self
                 .zlib
                 .reset(Vec::new())
                 .expect("resetting a Vec encoder cannot fail");
-            compressed.clear();
-            *self.zlib.get_mut() = compressed;
+            reused.clear();
+            *self.zlib.get_mut() = reused;
             self.finished = false;
         }
         self.zlib.get_mut().reserve(pixels.len() / 8);
@@ -384,7 +422,11 @@ fn transmit(
             // Out of shared memory: the pty still works, so this is not worth
             // failing a frame over.
             Err(err) => {
-                tracing::debug!(?err, "could not put a tile in shared memory");
+                tracing::debug!(
+                    ?err,
+                    path = %object.path,
+                    "could not put a tile in shared memory"
+                );
                 return direct(out, encoded, payload, placement, compressed);
             }
         }
@@ -607,7 +649,7 @@ mod tests {
         let (width, height) = (64, 48);
         let pixels = test_pixels(width, height);
         let mut out = Vec::new();
-        Encoder::default().transmit_and_place(
+        Encoder::new().transmit_and_place(
             &mut out,
             &pixels,
             Placement {
@@ -658,7 +700,7 @@ mod tests {
         // Flat content, so this is about reusing the encoder and nothing else:
         // what it decides about compressing is the subject of its own test.
         let flat: Vec<u8> = [1u8, 2, 3].repeat(16);
-        let mut encoder = Encoder::default();
+        let mut encoder = Encoder::new();
         let mut out = Vec::new();
         encoder.transmit_and_place(
             &mut out,
@@ -715,7 +757,7 @@ mod tests {
         let flat: Vec<u8> = [7u8, 8, 9].repeat(16);
         let other: Vec<u8> = [10u8, 11, 12].repeat(16);
 
-        let mut encoder = Encoder::default();
+        let mut encoder = Encoder::new();
         let mut out = Vec::new();
         for (index, pixels) in [&flat, &other].iter().enumerate() {
             encoder.transmit_and_place(
@@ -744,8 +786,8 @@ mod tests {
 
     #[test]
     fn a_shared_memory_transfer_names_the_object_in_its_payload() {
-        let name = format!("/meowland-{}-1", std::process::id());
-        let object = Shared::new(1);
+        let name = format!("/meowland-{}-1-1", std::process::id());
+        let object = Shared::new(1, 1);
         let mut out = Vec::new();
         placed(
             &mut out,
@@ -797,7 +839,7 @@ mod tests {
             })
             .collect();
 
-        let mut encoder = Encoder::default();
+        let mut encoder = Encoder::new();
         let mut out = Vec::new();
         encoder.transmit_and_place(
             &mut out,
@@ -834,218 +876,6 @@ mod tests {
         );
     }
 
-    /// Full-frame cost of each kind of content, for the record in the log.
-    #[test]
-    #[ignore = "measurement: run with --ignored --nocapture"]
-    fn cost_of_a_frame_by_content() {
-        use std::time::Instant;
-
-        let content = |kind: &str| -> Vec<u8> {
-            let mut state = 0x9e37_79b9u32;
-            (0..160 * 160 * crate::render::BYTES)
-                .map(|i| match kind {
-                    "text" => {
-                        if (i / 4 / 3 + i / 4 / 160 / 7) % 5 == 0 {
-                            0xd0
-                        } else {
-                            0x18
-                        }
-                    }
-                    "video" => {
-                        let pixel = i / 4;
-                        let (x, y) = (pixel % 160, pixel / 160);
-                        let a = ((x + y) / 4) % 64;
-                        (0x30 + a) as u8
-                    }
-                    _ => {
-                        state ^= state << 13;
-                        state ^= state >> 17;
-                        state ^= state << 5;
-                        (state >> 24) as u8
-                    }
-                })
-                .collect()
-        };
-
-        for kind in ["text", "video", "noise"] {
-            // `None` on every tile is what the encoder always did: compress
-            // everything. `Some(false)` is the other extreme, and `None` once
-            // (the shipped policy) decides from the first tile.
-            for forced in ["always", "as-is", "policy"] {
-                let pixels = content(kind);
-                let mut encoder = Encoder::default();
-                let mut out = Vec::new();
-                let mut bytes = 0;
-                let before = Instant::now();
-                for step in 0..30 {
-                    out.clear();
-                    // `always` is exactly what the encoder used to do: compress
-                    // every tile, whatever the content.
-                    if forced == "always" {
-                        encoder.compress(&pixels);
-                        let placement = Placement {
-                            id: step % 28,
-                            width: 160,
-                            height: 160,
-                            cols: 16,
-                            rows: 8,
-                            cell: (0, 0),
-                        };
-                        let payload = encoder.zlib.get_ref();
-                        transmit(
-                            &mut out,
-                            &mut encoder.payload,
-                            payload,
-                            placement,
-                            true,
-                            None,
-                        );
-                        bytes = out.len();
-                        continue;
-                    }
-                    encoder.compress = match forced {
-                        "as-is" => Some(false),
-                        _ => {
-                            if step == 0 {
-                                None
-                            } else {
-                                encoder.compress
-                            }
-                        }
-                    };
-                    encoder.transmit_and_place(
-                        &mut out,
-                        &pixels,
-                        Placement {
-                            id: step % 28,
-                            width: 160,
-                            height: 160,
-                            cols: 16,
-                            rows: 8,
-                            cell: (0, 0),
-                        },
-                    );
-                    bytes = out.len();
-                }
-                let ms = before.elapsed().as_secs_f64() * 1e3 / 30.0;
-                let mode = format!("{forced:>7}");
-                println!(
-                    "{kind:>5} {mode}: {ms:>5.2} ms/tile  {:>6.1} KiB/tile  (a screen = {:>5.1} ms, {:>5.1} MiB)",
-                    bytes as f64 / 1024.0,
-                    ms * 28.0,
-                    28.0 * bytes as f64 / (1024.0 * 1024.0),
-                );
-            }
-        }
-    }
-
-    /// One image of the whole screen against the tiles that make it up, for the
-    /// dense frame a film or a game produces.
-    #[test]
-    #[ignore = "measurement: run with --ignored --nocapture"]
-    fn cost_of_one_image_against_many_tiles() {
-        use std::time::Instant;
-
-        const SCREEN: (u32, u32) = (1000, 600);
-        const TILE: (u32, u32) = (160, 160);
-        let grid = (SCREEN.0.div_ceil(TILE.0), SCREEN.1.div_ceil(TILE.1));
-        let whole = film(SCREEN);
-        let mut encoder = Encoder::default();
-        let mut out = Vec::new();
-
-        let before = Instant::now();
-        for _ in 0..30 {
-            out.clear();
-            encoder.transmit_and_place(&mut out, &whole, whole_screen(SCREEN));
-        }
-        let one = before.elapsed().as_secs_f64() * 1e3 / 30.0;
-        let one_bytes = out.len();
-
-        let mut tile_pixels = Vec::new();
-        let before = Instant::now();
-        for _ in 0..30 {
-            out.clear();
-            for gy in 0..grid.1 {
-                for gx in 0..grid.0 {
-                    let placement = tile_placement(SCREEN, TILE, grid, (gx, gy));
-                    cut_out(&whole, SCREEN, placement, &mut tile_pixels);
-                    encoder.transmit_and_place(&mut out, &tile_pixels, placement);
-                }
-            }
-        }
-        let many = before.elapsed().as_secs_f64() * 1e3 / 30.0;
-        let many_bytes = out.len();
-
-        println!(
-            "one image: {one:>5.2} ms, {one_bytes:>7} bytes    {} tiles: {many:>5.2} ms, {many_bytes:>7} bytes",
-            grid.0 * grid.1,
-        );
-    }
-
-    /// Film-like pixels: gradients with a little grain, which is what makes a
-    /// frame expensive.
-    fn film(size: (u32, u32)) -> Vec<u8> {
-        let mut state = 0x5eed_1234u32;
-        (0..size.0 as usize * size.1 as usize * crate::render::BYTES)
-            .map(|i| {
-                let pixel = i / 3;
-                let (x, y) = (pixel % size.0 as usize, pixel / size.0 as usize);
-                if i % 3 == 2 {
-                    255
-                } else {
-                    let base = ((x / 4 + y / 4) % 64) as u8;
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    0x20 + base + (state % 8) as u8
-                }
-            })
-            .collect()
-    }
-
-    fn whole_screen(size: (u32, u32)) -> Placement {
-        Placement {
-            id: 0,
-            width: size.0,
-            height: size.1,
-            cols: size.0.div_ceil(10),
-            rows: size.1.div_ceil(20),
-            cell: (0, 0),
-        }
-    }
-
-    fn tile_placement(
-        size: (u32, u32),
-        tile: (u32, u32),
-        grid: (u32, u32),
-        at: (u32, u32),
-    ) -> Placement {
-        let (x, y) = (at.0 * tile.0, at.1 * tile.1);
-        Placement {
-            id: at.1 * grid.0 + at.0 + 1,
-            width: tile.0.min(size.0 - x),
-            height: tile.1.min(size.1 - y),
-            cols: TILE_CELLS.0,
-            rows: TILE_CELLS.1,
-            cell: (x / 10, y / 20),
-        }
-    }
-
-    /// The pixels of one tile, row by row, out of the frame it is part of.
-    fn cut_out(frame: &[u8], size: (u32, u32), placement: Placement, into: &mut Vec<u8>) {
-        into.clear();
-        for row in 0..placement.height {
-            let start = ((placement.cell.1 * 20 + row) * size.0 + placement.cell.0 * 10) as usize
-                * crate::render::BYTES;
-            into.extend_from_slice(
-                &frame[start..start + placement.width as usize * crate::render::BYTES],
-            );
-        }
-    }
-
-    /// The grid a frame is divided into, in cells rather than pixels.
-    const TILE_CELLS: (u32, u32) = (16, 8);
-
     #[test]
     fn every_chunk_is_a_whole_base64_line() {
         // Noise, so zlib cannot shrink the payload below one chunk.
@@ -1058,7 +888,7 @@ mod tests {
             pixels.extend_from_slice(&state.to_le_bytes()[..crate::render::BYTES]);
         }
         let mut out = Vec::new();
-        Encoder::default().transmit_and_place(
+        Encoder::new().transmit_and_place(
             &mut out,
             &pixels,
             Placement {

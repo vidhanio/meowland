@@ -43,10 +43,13 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle},
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
-    reexports::wayland_server::{
-        Client, DisplayHandle, Resource as _,
-        backend::{ClientData, ClientId, DisconnectReason, ObjectId},
-        protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
+        wayland_server::{
+            Client, DisplayHandle, Resource as _,
+            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
+            protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+        },
     },
     utils::{Logical, Point, SERIAL_COUNTER, Serial, Transform},
     wayland::{
@@ -75,6 +78,7 @@ use smithay::{
 
 use crate::{
     buffer::Snapshot,
+    control,
     display::{self, Key, Pointer},
     keys, kitty,
     presenter::Presenter,
@@ -190,8 +194,9 @@ pub struct View {
     /// Tiles whose newest pixels this pane's terminal has not been handed,
     /// because its presenter was busy with the frame before them.
     pending: PendingTiles,
-    /// Tiles that changed since the last frame this pane was given.
-    dirty: Vec<Rect>,
+    /// Tiles that changed since the last frame this pane was given, by the
+    /// numbering its grid gives them.
+    dirty: Vec<usize>,
     /// The window changed, or the terminal changed size: draw it all again.
     scene_dirty: bool,
     /// The terminal is owed an escape that is not a frame: the pointer shape,
@@ -281,15 +286,6 @@ struct Window {
     /// that it has it, and never resizes what it draws. Answering the request
     /// is the whole of what fullscreen means here.
     fullscreen: bool,
-}
-
-/// A window exposed through the local control socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WindowInfo {
-    pub id: u64,
-    pub label: String,
-    pub title: String,
-    pub active: bool,
 }
 
 /// The compositor.
@@ -477,12 +473,13 @@ impl Meowland {
             .map(|window| window.surface.wl_surface().clone())
     }
 
-    /// Return the stable IDs currently accepted by `attach`.
-    pub fn windows(&self) -> impl Iterator<Item = WindowInfo> + '_ {
+    /// A window as everything outside the compositor sees it: what `list`
+    /// prints and what `attach` takes.
+    pub fn windows(&self) -> impl Iterator<Item = control::Window> + '_ {
         self.windows
             .iter()
             .enumerate()
-            .map(|(index, window)| WindowInfo {
+            .map(|(index, window)| control::Window {
                 id: window.id,
                 label: window.label.clone().unwrap_or_default(),
                 title: window.title.clone().unwrap_or_default(),
@@ -508,10 +505,8 @@ impl Meowland {
         // changed, and the frame it is owed is what it draws its new look for.
         let id = self.windows[index].id;
         tracing::debug!(id, "focused");
-        for view in &mut self.views {
-            if view.window == Some(id) {
-                view.scene_dirty = true;
-            }
+        for view in self.views_of(id) {
+            view.scene_dirty = true;
         }
     }
 
@@ -576,6 +571,14 @@ impl Meowland {
     /// The pane with this ID.
     fn view(&self, id: u64) -> Option<usize> {
         self.views.iter().position(|view| view.id == id)
+    }
+
+    /// Every pane showing this window, which is what a change to the window is
+    /// owed to.
+    fn views_of(&mut self, window: u64) -> impl Iterator<Item = &mut View> {
+        self.views
+            .iter_mut()
+            .filter(move |view| view.window == Some(window))
     }
 
     /// Which window each pane shows, from what it asked for.
@@ -714,10 +717,8 @@ impl Meowland {
             // The terminals showing it are told what to call themselves, which
             // is not a frame but still something they are owed.
             let id = window.id;
-            for view in &mut self.views {
-                if view.window == Some(id) {
-                    view.escapes_dirty = true;
-                }
+            for view in self.views_of(id) {
+                view.escapes_dirty = true;
             }
         }
     }
@@ -747,16 +748,16 @@ impl Meowland {
             );
             window.surface.with_pending_state(|state| {
                 state.size = Some(size.into());
-                state.states.set(xdg_state::MAXIMIZED);
+                state.states.set(XdgState::Maximized);
                 if window.fullscreen {
-                    state.states.set(xdg_state::FULLSCREEN);
+                    state.states.set(XdgState::Fullscreen);
                 } else {
-                    state.states.unset(xdg_state::FULLSCREEN);
+                    state.states.unset(XdgState::Fullscreen);
                 }
                 if self.active == Some(index) {
-                    state.states.set(xdg_state::ACTIVATED);
+                    state.states.set(XdgState::Activated);
                 } else {
-                    state.states.unset(xdg_state::ACTIVATED);
+                    state.states.unset(XdgState::Activated);
                 }
             });
             tracing::debug!(
@@ -829,8 +830,7 @@ impl Meowland {
     /// stay due and the next frame carries them.
     fn hand_over(&mut self, pane: usize, presenter: &mut Presenter, cost: &mut Cost) {
         let view = &mut self.views[pane];
-        for tile in view.dirty.drain(..) {
-            let index = view.tiles.index(tile);
+        for index in view.dirty.drain(..) {
             view.pending.mark(index);
         }
         if view.pending.is_empty() {
@@ -1274,15 +1274,6 @@ const fn tile_size(cell: (u32, u32)) -> (u32, u32) {
     (cell.0 * TILE_CELLS.0, cell.1 * TILE_CELLS.1)
 }
 
-/// xdg-shell state names, spelled out once.
-mod xdg_state {
-    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-
-    pub const ACTIVATED: xdg_toplevel::State = xdg_toplevel::State::Activated;
-    pub const FULLSCREEN: xdg_toplevel::State = xdg_toplevel::State::Fullscreen;
-    pub const MAXIMIZED: xdg_toplevel::State = xdg_toplevel::State::Maximized;
-}
-
 /// What a client calls its window: its app ID, and its title.
 ///
 /// This is only ever read to answer `list` and to name the terminal that is
@@ -1541,16 +1532,14 @@ impl CompositorHandler for Meowland {
         // surface that is not a toplevel is a sub-surface or a popup, which
         // belongs to a window this cannot name from here, so every pane draws
         // again for those.
-        let committed = match self.index_of(surface) {
-            Some(index) => Some(self.windows[index].id),
-            None => None,
-        };
+        let window = self.index_of(surface);
+        let shown = window.map(|index| self.windows[index].id);
         for view in &mut self.views {
-            if committed.is_none_or(|id| view.window == Some(id)) {
+            if shown.is_none_or(|id| view.window == Some(id)) {
                 view.scene_dirty = true;
             }
         }
-        if first_pixels && let Some(index) = self.index_of(surface) {
+        if first_pixels && let Some(index) = window {
             // Whatever the client asked for, a window with nothing on it is not
             // worth looking at - and some clients open windows they never draw
             // in at all, which must not leave a pane without the window it
@@ -1772,13 +1761,11 @@ impl XdgShellHandler for Meowland {
         surface.send_repositioned(token);
     }
 
-    fn maximize_request(&mut self, surface: ToplevelSurface) {
-        let _ = surface;
+    fn maximize_request(&mut self, _surface: ToplevelSurface) {
         self.configure_windows();
     }
 
-    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        let _ = surface;
+    fn unmaximize_request(&mut self, _surface: ToplevelSurface) {
         self.configure_windows();
     }
 
@@ -1845,12 +1832,6 @@ impl XdgShellHandler for Meowland {
         }
         self.configure_windows();
         self.sync_outputs();
-        if was_active {
-            let surface = self.active_surface();
-            let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
-        }
-        self.configure_windows();
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {

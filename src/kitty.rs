@@ -194,7 +194,11 @@ pub struct Placement {
     pub id: ImageId,
     pub width: u32,
     pub height: u32,
+    /// The number of columns in the cell rectangle. Set both `cols` and
+    /// `rows` to zero to keep the tile at its native pixel dimensions.
     pub cols: u32,
+    /// The number of rows in the cell rectangle. Set both `cols` and
+    /// `rows` to zero to keep the tile at its native pixel dimensions.
     pub rows: u32,
     /// The cell of the tile's first pixel. The cursor must be there before the
     /// image is placed.
@@ -466,8 +470,14 @@ fn describe(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: O
     let separator = if medium.is_empty() { "" } else { "," };
     let _ = write!(
         out,
-        "a=T,f=24,{compression}{medium}{separator}s={width},v={height},i={id},p={id},c={cols},r={rows},C=1,z={Z_ABOVE_TEXT},q=2,"
+        "a=T,f=24,{compression}{medium}{separator}s={width},v={height},i={id},p={id},"
     );
+    // A partial edge tile must retain its native pixels. c/r would scale it
+    // to the next whole cell and stretch it over the frame edge.
+    if cols > 0 && rows > 0 {
+        let _ = write!(out, "c={cols},r={rows},");
+    }
+    let _ = write!(out, "C=1,z={Z_ABOVE_TEXT},q=2,");
 }
 
 #[cfg(test)]
@@ -651,6 +661,44 @@ mod tests {
         );
         assert_eq!(put, (7, 7, 6, 4));
         assert_eq!(transmitted.3, &pixels);
+    }
+
+    #[test]
+    fn a_partial_tile_keeps_native_pixel_dimensions() {
+        let (width, height) = (7, 9);
+        let pixels = test_pixels(width, height);
+        let mut out = Vec::new();
+        Encoder::new().transmit_and_place(
+            &mut out,
+            &pixels,
+            Placement {
+                id: ImageId::new(8),
+                width,
+                height,
+                cols: 0,
+                rows: 0,
+                cell: (3, 4),
+            },
+        );
+
+        let text = std::str::from_utf8(&out).expect("graphics escapes are ASCII");
+        assert!(!text.contains(",c="));
+        assert!(!text.contains(",r="));
+        assert!(matches!(
+            decode(&out).as_slice(),
+            [
+                Command::Transmit {
+                    width: 7,
+                    height: 9,
+                    ..
+                },
+                Command::Put {
+                    cols: 0,
+                    rows: 0,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]

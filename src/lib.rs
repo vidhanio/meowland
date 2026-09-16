@@ -23,7 +23,6 @@ mod xwayland;
 use std::{
     ffi::OsString,
     io::Read as _,
-    os::unix::process::CommandExt as _,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -52,7 +51,11 @@ pub fn start() -> Result<(), Error> {
         Action::List(_) => list_windows(),
         Action::Server(server) => match server.action {
             cli::ServerAction::Start(start) => {
-                server::run(start.settings)?;
+                if process::is_detached() {
+                    server::run(start.settings)?;
+                } else {
+                    start_server(&start.settings)?;
+                }
                 Ok(())
             }
             cli::ServerAction::Stop(_) => stop_server(),
@@ -132,16 +135,16 @@ fn server_running() -> bool {
 
 fn start_server(settings: &cli::Settings) -> Result<(), Error> {
     let program = std::env::current_exe()?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(["server", "start"])
         .args(settings.args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // Keep terminal hangups from signaling the server.
-        .process_group(0)
         // Capture startup errors before logging is initialized.
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    process::spawn_detached(&mut command);
+    let mut child = command.spawn()?;
 
     let deadline = Instant::now() + SERVER_START_TIMEOUT;
     let started = loop {

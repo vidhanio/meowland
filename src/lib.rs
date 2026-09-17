@@ -9,6 +9,9 @@
 //!   the server only in messages.
 //! - [`client`] is one terminal pane: it hands over the terminal, sends what
 //!   the user did, and writes the frames the server sends back.
+//!
+//! [`protocol`] is what they say to each other, and [`render`] and [`kitty`]
+//! are what a frame is made of and how a terminal is told about it.
 
 mod cli;
 mod client;

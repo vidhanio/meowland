@@ -28,7 +28,9 @@ use calloop::{
 use self::terminal::Terminal;
 use crate::{
     Error, keys,
-    protocol::pane::{self, Capabilities, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer},
+    protocol::pane::{
+        self, Capabilities, Hello, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer,
+    },
 };
 
 /// How long the pane waits for the server to answer its hello.
@@ -90,7 +92,7 @@ fn greet(
 ) -> Result<Greeting, Error> {
     pane::write_to(
         stream,
-        pane::encode(&ToServer::Hello {
+        &ToServer::Hello(Hello {
             version: pane::VERSION,
             show,
             capabilities,
@@ -98,11 +100,10 @@ fn greet(
     )?;
 
     stream.set_read_timeout(Some(GREETING_TIMEOUT))?;
-    let reply = pane::read_from(stream);
+    let reply = pane::read_for_pane(stream);
     stream.set_read_timeout(None)?;
 
-    let reply = reply?;
-    match reply.and_then(|(tag, payload)| pane::decode_client(tag, payload)) {
+    match reply? {
         Some(ToClient::Welcome) => Ok(Greeting::Welcome),
         Some(ToClient::Detached(reason)) => Ok(Greeting::Refused(reason)),
         None => Ok(Greeting::Gone),
@@ -189,7 +190,7 @@ fn run(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
         signal: Some(signal),
     };
     let result = event_loop.run(None, &mut showing, |_| {});
-    let _ = pane::write_to(&mut showing.stream, pane::encode(&ToServer::Bye));
+    let _ = pane::write_to(&mut showing.stream, &ToServer::Bye);
     let _ = showing.stream.shutdown(std::net::Shutdown::Both);
     writer.stop();
     input_thread.stop();
@@ -227,7 +228,7 @@ impl Showing {
     }
 
     fn send(&mut self, message: &ToServer) {
-        if let Err(error) = pane::write_to(&mut self.stream, pane::encode(message)) {
+        if let Err(error) = pane::write_to(&mut self.stream, message) {
             tracing::warn!(%error, "could not reach the server");
             self.leave(Departure::ServerGone);
             self.stop();
@@ -365,7 +366,7 @@ impl Drop for Worker {
 /// through.
 fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
-        let message = match pane::read_from(&mut stream) {
+        let message = match pane::read_for_pane(&mut stream) {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(error) => {
@@ -373,14 +374,14 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
                 break;
             }
         };
-        let (bytes, frame) = match pane::decode_client(message.0, message.1) {
-            Some(ToClient::Bytes(bytes)) => (bytes, false),
-            Some(ToClient::Frame(bytes)) => (bytes, true),
-            Some(ToClient::Detached(reason)) => {
+        let (bytes, frame) = match message {
+            ToClient::Bytes(bytes) => (bytes, false),
+            ToClient::Frame(bytes) => (bytes, true),
+            ToClient::Detached(reason) => {
                 let _ = events.send(FrameEvent::Detached(reason));
                 return;
             }
-            Some(ToClient::Welcome) | None => continue,
+            ToClient::Welcome => continue,
         };
         let phase = std::time::Instant::now();
         // Taken per message, not held for the session: a write the terminal is

@@ -62,13 +62,16 @@ no pane is not configured. Focused windows receive `Activated`; windows that
 requested fullscreen receive `Fullscreen`.
 
 The control and pane sockets are owner-only files in `$XDG_RUNTIME_DIR`. The
-Wayland socket is `wayland-meowland`. `src/protocol/pane.rs` defines the pane
-protocol: one frame in flight per pane, with ordered frames and escapes. Only
-frames are acknowledged. The terminal side uses separate threads for input,
-output, and hangup checks.
+Wayland socket is `wayland-meowland`. `src/protocol/` defines both protocols:
+every message is a kind, a length, and a body, where the body is bincode except
+for a frame or an escape, which are bytes already. A message of a kind a build
+does not know is skipped rather than ending the conversation, so bump the
+protocol version whenever a message changes. The terminal side uses separate
+threads for input, output, and hangup checks.
 
 Client stdout and stderr go to `$XDG_RUNTIME_DIR/meowland.log`, not the pane.
-Window titles and `list` output must filter terminal control characters.
+Window titles are printed by `list` with their control characters replaced, so a
+client cannot write escapes into the terminal reading it.
 Shared-memory graphics transfers use pane-specific object names.
 
 On stop, ask every window to close (`xdg_toplevel.close`) and give the clients

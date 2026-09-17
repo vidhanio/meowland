@@ -185,7 +185,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 continue;
             }
             Message::Tell(message) => {
-                tell(&mut terminal, message);
+                tell(&mut terminal, &message);
                 continue;
             }
             Message::Drawn => {
@@ -193,7 +193,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 continue;
             }
             Message::Raw(bytes) => {
-                write(&mut terminal, bytes)?;
+                write(&mut terminal, &bytes)?;
                 continue;
             }
             Message::Frame { frame, tiles } => (frame, tiles),
@@ -287,23 +287,23 @@ fn placement(tile: Tile, cell: (u32, u32)) -> Placement {
     }
 }
 
-fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<()> {
+fn write(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    pane::write_to(terminal, pane::encode_client(ToClient::Bytes(bytes)))
+    ToClient::write_bytes(terminal, bytes)
 }
 
 fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    pane::write_frame(terminal, bytes)
+    ToClient::write_frame(terminal, bytes)
 }
 
-fn tell(terminal: &mut Option<UnixStream>, message: ToClient) {
+fn tell(terminal: &mut Option<UnixStream>, message: &ToClient) {
     if let Some(terminal) = terminal {
-        let _ = pane::write_to(terminal, pane::encode_client(message));
+        let _ = pane::write_for_pane(terminal, message);
     }
 }
 
@@ -350,9 +350,12 @@ impl Stats {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixStream;
+
     use super::*;
     use crate::{
         kitty::ImageId,
+        protocol::pane::{self, ToClient},
         render::{Image, Rect, SourceFormat},
     };
 
@@ -399,5 +402,56 @@ mod tests {
             image: ImageId::new(image),
             rect,
         }
+    }
+
+    fn capabilities() -> Capabilities {
+        Capabilities {
+            cell: (10, 20),
+            cells: (120, 40),
+            pixels: (1200, 800),
+            terminal: None,
+            graphics: true,
+            keyboard: true,
+            pixel_mouse: false,
+            shared_memory: false,
+        }
+    }
+
+    #[test]
+    fn what_a_presenter_writes_is_what_a_terminal_takes() {
+        // The whole of a pane's way out: a frame goes to the socket as the
+        // bytes the terminal takes, and comes back when the pane has them.
+        let (pane, terminal) = UnixStream::pair().expect("a socket pair");
+        let (events, freed) = calloop::channel::channel();
+        let presenter = Presenter::new(events).expect("a presenter");
+        presenter.attach(pane, &capabilities());
+
+        let mut frame = Frame::new(160, 160);
+        frame.clear([9, 9, 9]);
+        let tiles = vec![tile(Rect::new(0, 0, 160, 160), 1)];
+        presenter.present(frame, tiles);
+
+        let mut terminal = std::io::BufReader::new(terminal);
+        let message = pane::read_for_pane(&mut terminal)
+            .expect("a message")
+            .expect("the frame");
+        let ToClient::Frame(escapes) = message else {
+            panic!("a pane is sent a frame, not {message:?}");
+        };
+        assert!(
+            escapes.starts_with(b"\x1b[?2026h"),
+            "a frame is one synchronized update"
+        );
+        assert!(escapes.ends_with(b"\x1b[?2026l"));
+        assert!(escapes.windows(b"a=T,f=24".len()).any(|w| w == b"a=T,f=24"));
+
+        // The pane has written it, so the frame is the compositor's again.
+        presenter.drawn();
+        let free = freed.recv().expect("the frame comes back");
+        let Event::Free { frame, tiles } = free else {
+            panic!("{free:?}");
+        };
+        assert_eq!(frame.width, 160);
+        assert_eq!(tiles.len(), 1);
     }
 }

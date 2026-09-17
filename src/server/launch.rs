@@ -1,12 +1,11 @@
 //! Starting a client program on this server's Wayland socket.
 
 use std::{
-    ffi::OsString,
     fs::File,
     process::{Child, Command, Stdio},
 };
 
-use crate::server::process;
+use crate::{protocol::control::Argument, server::process};
 
 /// Start a program as a client of this server.
 ///
@@ -18,7 +17,7 @@ use crate::server::process;
 /// The child's output goes to the log with the server's, not to a pane: a pane
 /// shows one window, and the terminal in it belongs to meowland.
 pub fn start(
-    command: &[OsString],
+    command: &[Argument],
     wayland_display: &str,
     x_display: Option<&str>,
     log: &File,
@@ -29,9 +28,9 @@ pub fn start(
             "no program to start",
         ));
     };
-    let mut child = Command::new(program);
+    let mut child = Command::new(program.as_os_str());
     child
-        .args(arguments)
+        .args(arguments.iter().map(Argument::as_os_str))
         .env("WAYLAND_DISPLAY", wayland_display)
         .env("XDG_SESSION_TYPE", "wayland")
         .env("GDK_BACKEND", "wayland")

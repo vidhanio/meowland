@@ -55,11 +55,15 @@ impl Server {
         if request.is_empty() {
             return;
         }
-        let reply = self.request(&request).encode();
-        if let Err(error) = stream.write_all(reply.as_bytes())
-            && error.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            tracing::warn!(%error, "could not answer control request");
+        match self.request(&request).encode() {
+            Ok(reply) => {
+                if let Err(error) = stream.write_all(&reply)
+                    && error.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    tracing::warn!(%error, "could not answer control request");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not encode the answer"),
         }
     }
 
@@ -79,10 +83,10 @@ impl Server {
     }
 
     /// Start a client program, and let it draw here.
-    fn run(&mut self, argv: &[std::ffi::OsString]) -> control::Reply {
+    fn run(&mut self, argv: &[control::Argument]) -> control::Reply {
         let program = argv.first().map_or_else(
             || "the client".to_owned(),
-            |program| program.to_string_lossy().into_owned(),
+            control::Argument::to_string_lossy,
         );
         let x_display = self
             .xwayland

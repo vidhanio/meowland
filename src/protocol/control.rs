@@ -6,22 +6,25 @@
 
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{Read as _, Write as _},
     os::unix::{
-        ffi::OsStringExt as _,
+        ffi::OsStrExt as _,
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
 };
 
-use crate::{Error, protocol::WindowId};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    Error,
+    protocol::{WindowId, decode, encode},
+};
 
 pub const CONTROL_SOCKET: &str = "meowland-control";
 pub const DISPLAY_SOCKET: &str = "meowland-display";
-
-const ARGUMENT_SEPARATOR: u8 = 0;
 
 /// The server's end of a socket. Dropping this removes the socket file.
 #[derive(Debug)]
@@ -58,48 +61,48 @@ impl Drop for Socket {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     List,
-    Run(Vec<OsString>),
+    Run(Vec<Argument>),
     Stop,
 }
 
 impl Command {
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::List => b"list".to_vec(),
-            Self::Stop => b"stop".to_vec(),
-            Self::Run(argv) => {
-                let mut request = b"run".to_vec();
-                for argument in argv {
-                    request.push(ARGUMENT_SEPARATOR);
-                    request.extend_from_slice(argument.as_encoded_bytes());
-                }
-                request
-            }
-        }
+    pub fn encode(&self) -> std::io::Result<Vec<u8>> {
+        encode(self)
     }
 
     pub fn decode(request: &[u8]) -> Option<Self> {
-        if request == b"list" {
-            return Some(Self::List);
-        }
-        if request == b"stop" {
-            return Some(Self::Stop);
-        }
-        let mut fields = request.split(|byte| *byte == ARGUMENT_SEPARATOR);
-        if fields.next() != Some(b"run".as_slice()) {
-            return None;
-        }
-        let argv = fields
-            .map(|field| OsString::from_vec(field.to_vec()))
-            .collect::<Vec<_>>();
-        (!argv.is_empty()).then_some(Self::Run(argv))
+        decode(request).ok()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One argument of a command line: the bytes a shell gave, which are not
+/// necessarily text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Argument(Vec<u8>);
+
+impl Argument {
+    /// The argument as a program's own argv takes it.
+    pub fn as_os_str(&self) -> &OsStr {
+        OsStr::from_bytes(&self.0)
+    }
+
+    /// The argument as text, for a message to a person.
+    pub fn to_string_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
+    }
+}
+
+impl From<&OsString> for Argument {
+    fn from(argument: &OsString) -> Self {
+        Self(argument.as_bytes().to_vec())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
     pub id: WindowId,
     pub label: String,
@@ -107,42 +110,7 @@ pub struct Window {
     pub active: bool,
 }
 
-impl Window {
-    /// Remove controls before sending names to a terminal.
-    fn line(&self) -> String {
-        format!(
-            "{}\t{}\t{}\t{}\n",
-            self.id,
-            Self::clean_name(&self.label),
-            Self::clean_name(&self.title),
-            if self.active { "active" } else { "idle" }
-        )
-    }
-
-    fn parse(line: &str) -> Option<Self> {
-        let mut fields = line.split('\t');
-        Some(Self {
-            id: fields.next()?.parse().ok()?,
-            label: Self::clean_name(fields.next()?),
-            title: Self::clean_name(fields.next()?),
-            active: fields.next()? == "active",
-        })
-    }
-
-    fn clean_name(name: &str) -> String {
-        name.chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     Windows(Vec<Window>),
     Ok,
@@ -150,57 +118,27 @@ pub enum Reply {
 }
 
 impl Reply {
-    /// Prefix the window list with its length to distinguish it from EOF.
-    pub fn encode(&self) -> String {
-        match self {
-            Self::Windows(windows) => {
-                let mut reply = format!("windows {}\n", windows.len());
-                for window in windows {
-                    reply.push_str(&window.line());
-                }
-                reply
-            }
-            Self::Ok => "ok\n".to_owned(),
-            Self::Failed(reason) => format!("error: {reason}\n"),
-        }
+    pub fn encode(&self) -> std::io::Result<Vec<u8>> {
+        encode(self)
     }
 
-    pub fn decode(response: &str) -> Self {
-        if response == "ok\n" {
-            return Self::Ok;
-        }
-        if let Some(reason) = response.strip_prefix("error: ") {
-            return Self::Failed(reason.trim().to_owned());
-        }
-        let Some(header) = response.lines().next() else {
+    /// What the server said, or a reason why it made no sense.
+    pub fn decode(response: &[u8]) -> Self {
+        if response.is_empty() {
             return Self::Failed("the server stopped before it answered".to_owned());
-        };
-        let Some(count) = header
-            .strip_prefix("windows ")
-            .and_then(|count| count.parse::<usize>().ok())
-        else {
-            return Self::Failed("the server sent something unrecognised".to_owned());
-        };
-        let windows = response
-            .lines()
-            .skip(1)
-            .filter_map(Window::parse)
-            .collect::<Vec<_>>();
-        if windows.len() == count {
-            Self::Windows(windows)
-        } else {
-            Self::Failed("the window list was cut short".to_owned())
         }
+        decode(response)
+            .unwrap_or_else(|_| Self::Failed("the server sent something unrecognised".to_owned()))
     }
 }
 
 pub fn request(command: &Command) -> Result<Reply, Error> {
     let mut stream = connect(CONTROL_SOCKET)?;
-    stream.write_all(&command.encode())?;
+    stream.write_all(&command.encode()?)?;
     // EOF marks the end of the request.
     stream.shutdown(std::net::Shutdown::Write)?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
     Ok(Reply::decode(&response))
 }
 
@@ -226,39 +164,43 @@ pub fn connect(name: &str) -> Result<UnixStream, Error> {
 mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
 
-    use super::{Command, Reply, Window};
+    use super::{Argument, Command, Reply, Window};
     use crate::protocol::WindowId;
 
-    #[test]
-    fn a_run_request_carries_an_argv_unchanged() {
-        let argv = vec![
-            OsString::from("foot"),
-            OsString::from("-T"),
-            OsString::from("two words"),
-            OsString::from("line\nbreak\ttab"),
-            OsString::from_vec(vec![0xff, 0xfe]),
-        ];
-        let encoded = Command::Run(argv.clone()).encode();
-        assert_eq!(Command::decode(&encoded), Some(Command::Run(argv)));
+    fn round_trip(command: &Command) {
+        let request = command.encode().expect("a command encodes");
+        assert_eq!(Command::decode(&request).as_ref(), Some(command));
     }
 
     #[test]
-    fn a_run_request_needs_a_command() {
-        assert_eq!(Command::decode(b"run"), None);
+    fn a_run_request_carries_an_argv_unchanged() {
+        let argv = [
+            "foot",
+            "-T",
+            "two words",
+            "line\nbreak\ttab",
+            "a\0null",
+            "\u{fffd}",
+        ]
+        .map(OsString::from)
+        .into_iter()
+        .chain([OsString::from_vec(vec![0xff, 0xfe])])
+        .map(|argument| Argument::from(&argument))
+        .collect::<Vec<_>>();
+        round_trip(&Command::Run(argv));
     }
 
     #[test]
     fn the_other_requests_survive_a_round_trip() {
-        for command in [Command::List, Command::Stop] {
-            assert_eq!(Command::decode(&command.encode()), Some(command));
-        }
+        round_trip(&Command::List);
+        round_trip(&Command::Stop);
         assert_eq!(Command::decode(b""), None);
         assert_eq!(Command::decode(b"lately"), None);
     }
 
     #[test]
     fn a_window_list_survives_a_round_trip() {
-        let windows = vec![
+        let reply = Reply::Windows(vec![
             Window {
                 id: WindowId::new(1),
                 label: "foot".to_owned(),
@@ -277,63 +219,30 @@ mod tests {
                 title: String::new(),
                 active: false,
             },
-            Window {
-                id: WindowId::new(4),
-                label: "bad\x1b[2J\rname".to_owned(),
-                title: "control\u{7f}character".to_owned(),
-                active: false,
-            },
-        ];
-        let reply = Reply::Windows(windows.clone());
-        let decoded = Reply::decode(&reply.encode());
-        let mut expected = windows;
-        expected[1].label = "two lines here".to_owned();
-        expected[1].title = "and tabs here".to_owned();
-        expected[3].label = "bad [2J name".to_owned();
-        expected[3].title = "control character".to_owned();
-        assert_eq!(decoded, Reply::Windows(expected));
-    }
-
-    #[test]
-    fn a_window_list_from_an_older_server_cannot_print_terminal_controls() {
-        let reply = Reply::decode("windows 1\n1\tapp\x1b[2J\ttitle\u{7f}\tidle\n");
-        assert_eq!(
-            reply,
-            Reply::Windows(vec![Window {
-                id: WindowId::new(1),
-                label: "app [2J".to_owned(),
-                title: "title ".to_owned(),
-                active: false,
-            }])
-        );
+        ]);
+        let encoded = reply.encode().expect("a reply encodes");
+        assert_eq!(Reply::decode(&encoded), reply);
     }
 
     #[test]
     fn no_windows_is_an_answer_and_no_bytes_is_not() {
+        let reply = Reply::Windows(Vec::new());
+        assert_eq!(Reply::decode(&reply.encode().unwrap()), reply);
         assert_eq!(
-            Reply::decode(&Reply::Windows(Vec::new()).encode()),
-            Reply::Windows(Vec::new())
-        );
-        assert_eq!(
-            Reply::decode(""),
+            Reply::decode(b""),
             Reply::Failed("the server stopped before it answered".to_owned())
         );
         assert_eq!(
-            Reply::decode("2\n1\tfoot\t~ /code\tactive\n"),
+            Reply::decode(b"windows 2\n"),
             Reply::Failed("the server sent something unrecognised".to_owned())
-        );
-        assert_eq!(
-            Reply::decode("windows 2\n1\tfoot\tactive\n"),
-            Reply::Failed("the window list was cut short".to_owned())
         );
     }
 
     #[test]
     fn a_refusal_and_an_acceptance_survive_a_round_trip() {
-        assert_eq!(Reply::decode(&Reply::Ok.encode()), Reply::Ok);
-        assert_eq!(
-            Reply::decode(&Reply::Failed("no window has that ID".to_owned()).encode()),
-            Reply::Failed("no window has that ID".to_owned())
-        );
+        for reply in [Reply::Ok, Reply::Failed("no window has that ID".to_owned())] {
+            let encoded = reply.encode().expect("a reply encodes");
+            assert_eq!(Reply::decode(&encoded), reply);
+        }
     }
 }

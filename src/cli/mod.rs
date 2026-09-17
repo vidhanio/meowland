@@ -228,10 +228,32 @@ fn attached_windows(
 mod tests {
     use std::{
         ffi::{OsStr, OsString},
+        os::unix::ffi::OsStrExt as _,
         path::PathBuf,
     };
 
     use super::{Action, Cli, Settings};
+
+    #[test]
+    fn a_command_carries_the_bytes_a_shell_gave_it() {
+        // An argument is not text: it is whatever bytes the shell had, and
+        // `run` hands them to the client as they are.
+        let parsed = Cli::parse_from(
+            [
+                OsStr::new("run"),
+                OsStr::new("program"),
+                OsStr::new("plain"),
+                OsStr::from_bytes(b"not \xff text"),
+            ]
+            .as_slice(),
+        )
+        .expect("settings and a client command should parse");
+
+        let Action::Run(run) = parsed.action else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.command[2].as_bytes(), b"not \xff text".as_slice());
+    }
 
     #[test]
     fn settings_are_flags_before_the_command() {

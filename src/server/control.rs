@@ -1,6 +1,7 @@
 //! The control socket: what a command line asks a running server to do.
 
 use std::{
+    ffi::OsString,
     io::{Read as _, Write as _},
     os::unix::net::{UnixListener, UnixStream},
     time::Duration,
@@ -83,10 +84,10 @@ impl Server {
     }
 
     /// Start a client program, and let it draw here.
-    fn run(&mut self, argv: &[control::Argument]) -> control::Reply {
+    fn run(&mut self, argv: &[OsString]) -> control::Reply {
         let program = argv.first().map_or_else(
             || "the client".to_owned(),
-            control::Argument::to_string_lossy,
+            |program| program.to_string_lossy().into_owned(),
         );
         let x_display = self
             .xwayland

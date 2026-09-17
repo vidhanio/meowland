@@ -5,9 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use nutype::nutype;
 use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::{Error, types::DeviceId};
+use crate::Error;
+
+/// A Linux device number associated with a render node.
+#[nutype(const_fn, derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display))]
+pub struct DeviceId(u64);
 
 /// How clients are offered GPU buffers.
 ///

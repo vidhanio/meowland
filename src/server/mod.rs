@@ -10,6 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod presenter;
+pub mod process;
+pub mod xwayland;
+
 use calloop::signals::{Signal, Signals};
 use smithay::{
     reexports::{
@@ -28,19 +32,20 @@ use smithay::{
 use crate::{
     Error,
     cli::Settings,
-    compositor::{Cost, Meowland},
-    control, display,
-    display::{Input, ToClient, ToServer},
     logging,
-    presenter::{Event as PresenterEvent, Presenter},
-    process,
-    tty::Capabilities,
-    types::{PaneId, ProcessId, ProtocolVersion},
-    xwayland,
+    protocol::{
+        PaneId, ProtocolVersion, control,
+        pane::{self, Capabilities, Input, Show, ToClient, ToServer},
+    },
+    server::{
+        presenter::{Event as PresenterEvent, Presenter},
+        process::ProcessId,
+    },
+    wayland::state::{Cost, Meowland},
 };
 
 const FRAME_INTERVAL: Duration =
-    Duration::from_nanos(1_000_000_000_000 / crate::compositor::REFRESH_MILLIHZ as u64);
+    Duration::from_nanos(1_000_000_000_000 / crate::wayland::state::REFRESH_MILLIHZ as u64);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -54,7 +59,7 @@ pub fn run(settings: Settings) -> Result<(), Error> {
     let log = logging::init(log.as_deref(), log_level.as_deref())?;
 
     let (control_socket, control_listener) = control::Socket::bind(control::CONTROL_SOCKET)?;
-    let (display_socket, display_listener) = display::listen()?;
+    let (display_socket, display_listener) = pane::listen()?;
 
     let signals = Signals::new(&[
         Signal::SIGTERM,
@@ -160,7 +165,7 @@ enum FromTerminal {
     Hello {
         pane: PaneId,
         version: ProtocolVersion,
-        show: display::Show,
+        show: Show,
         capabilities: Capabilities,
         stream: UnixStream,
     },
@@ -337,16 +342,16 @@ impl App {
         &mut self,
         pane: PaneId,
         version: ProtocolVersion,
-        show: display::Show,
+        show: Show,
         capabilities: &Capabilities,
         mut stream: UnixStream,
     ) {
-        let refusal = if version != display::VERSION {
+        let refusal = if version != pane::VERSION {
             Some(format!(
                 "this server speaks version {} of the protocol, and this terminal speaks {version}",
-                display::VERSION
+                pane::VERSION
             ))
-        } else if let display::Show::Window(id) = show
+        } else if let Show::Window(id) = show
             && !self.state.has_window(id)
         {
             Some("no window has that ID".to_owned())
@@ -356,10 +361,7 @@ impl App {
         if let Some(reason) = refusal {
             tracing::info!(%reason, "turned a terminal away");
             drop(self.readers.remove(&pane));
-            let _ = display::write_to(
-                &mut stream,
-                display::encode_client(ToClient::Detached(reason)),
-            );
+            let _ = pane::write_to(&mut stream, pane::encode_client(ToClient::Detached(reason)));
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
@@ -369,7 +371,7 @@ impl App {
             return;
         };
         // Welcome must precede presenter output.
-        let _ = display::write_to(&mut stream, display::encode_client(ToClient::Welcome));
+        let _ = pane::write_to(&mut stream, pane::encode_client(ToClient::Welcome));
 
         let draw_on = match stream.try_clone() {
             Ok(half) => half,
@@ -589,7 +591,7 @@ fn read_terminal(
     write_half: UnixStream,
 ) {
     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
-    let hello = display::read_from(&mut stream);
+    let hello = pane::read_from(&mut stream);
     let _ = stream.set_read_timeout(None);
     let Some(ToServer::Hello {
         version,
@@ -598,7 +600,7 @@ fn read_terminal(
     }) = hello
         .ok()
         .flatten()
-        .and_then(|(tag, payload)| display::decode(tag, &payload))
+        .and_then(|(tag, payload)| pane::decode(tag, &payload))
     else {
         return;
     };
@@ -613,8 +615,8 @@ fn read_terminal(
         return;
     }
 
-    while let Ok(Some((tag, payload))) = display::read_from(&mut stream) {
-        let Some(message) = display::decode(tag, &payload) else {
+    while let Ok(Some((tag, payload))) = pane::read_from(&mut stream) {
+        let Some(message) = pane::decode(tag, &payload) else {
             continue;
         };
         let sent = match message {

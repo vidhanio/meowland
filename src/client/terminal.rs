@@ -1,4 +1,4 @@
-//! Terminal capability probing and mode setup.
+//! The terminal a pane takes over: what it can do, and the modes it is put in.
 
 use std::{
     io::{self, IsTerminal as _, Read as _, Write as _},
@@ -9,32 +9,9 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 use crate::{
     Error,
-    kitty::{GRAPHICS_PROBE_ID, SHARED_PROBE_ID},
-    types::ImageId,
+    kitty::{GRAPHICS_PROBE_ID, ImageId, SHARED_PROBE_ID},
+    protocol::pane::Capabilities,
 };
-
-/// What the terminal reported it can do. Each field is one independent answer.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each of these is an independent thing a terminal can do"
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Capabilities {
-    /// The size of one character cell, in pixels.
-    pub cell: (u32, u32),
-    /// The terminal's character grid: `(columns, rows)` in cells.
-    pub cells: (u32, u32),
-    /// `(width, height)` of the whole drawing area in pixels.
-    pub pixels: (u32, u32),
-    pub terminal: Option<String>,
-    pub graphics: bool,
-    pub keyboard: bool,
-    /// Whether mouse reporting uses pixels (`SGR-Pixels`) instead of cells.
-    pub pixel_mouse: bool,
-    /// Whether the terminal reads tiles out of shared memory, which keeps their
-    /// pixels off the pty.
-    pub shared_memory: bool,
-}
 
 /// The cell size assumed when the terminal reports none. A wrong guess
 /// distorts pixels, not layout, because images are scaled into a cell
@@ -74,29 +51,6 @@ pub struct Terminal {
     capabilities: Capabilities,
     entered: bool,
 }
-
-/// The escape that names the window a terminal is in.
-///
-/// A client supplies the title, so control characters are removed: they would
-/// let the client write escapes into the terminal that shows it. The title is
-/// also cut to `MAXIMUM_TITLE`.
-pub fn title(title: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(title.len() + 8);
-    out.extend_from_slice(b"\x1b]2;");
-    out.extend(
-        title
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(MAXIMUM_TITLE)
-            .collect::<String>()
-            .bytes(),
-    );
-    out.push(b'\x07');
-    out
-}
-
-/// How much of a client's title a terminal is told.
-const MAXIMUM_TITLE: usize = 256;
 
 pub fn is_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -156,21 +110,6 @@ impl Terminal {
             }
         }
         &self.capabilities
-    }
-
-    /// The escapes that wipe the screen, every image and every cell.
-    ///
-    /// The compositor sends these after a resize, where stale pixels and stale
-    /// cell contents cannot be told apart from live ones. The bytes are
-    /// returned because the presenter writes them, after the frames already
-    /// promised.
-    pub fn clear() -> Vec<u8> {
-        let mut out = Vec::new();
-        crate::kitty::delete_all(&mut out);
-        // `CSI 2J` also drops every image the terminal holds, and homes the
-        // cursor.
-        out.extend_from_slice(b"\x1b[2J\x1b[H");
-        out
     }
 
     fn enter(&mut self) -> io::Result<()> {
@@ -499,14 +438,6 @@ mod tests {
         let capabilities = resolve_capabilities(&parsed.probe, Some((124, 67, 1240, 1340)));
         assert!(capabilities.graphics);
         assert!(!capabilities.shared_memory);
-    }
-
-    #[test]
-    fn a_title_escape_carries_no_escapes_of_its_own() {
-        let escape = title("\x1b]2;gotcha\x07\u{9b}31mred");
-        assert_eq!(escape, b"\x1b]2;]2;gotcha31mred\x07");
-        assert_eq!(title(""), b"\x1b]2;\x07");
-        assert!(title(&"x".repeat(MAXIMUM_TITLE * 2)).len() < MAXIMUM_TITLE + 8);
     }
 
     #[test]

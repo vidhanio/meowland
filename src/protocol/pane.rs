@@ -1,4 +1,8 @@
-//! Pane protocol: each message has a tag, length, and payload.
+//! The pane protocol: each message has a tag, length, and payload.
+//!
+//! One terminal pane holds one end of a socket to the server, and this is what
+//! crosses it. The pane sends what the terminal reported and what the user did;
+//! the server sends the escapes and the frames the pane writes to the terminal.
 
 use std::{
     io,
@@ -7,11 +11,7 @@ use std::{
 
 use evdev::KeyCode;
 
-use crate::{
-    control,
-    tty::Capabilities,
-    types::{ProtocolVersion, WindowId},
-};
+use crate::protocol::{ProtocolVersion, WindowId, control};
 
 pub fn listen() -> Result<(control::Socket, UnixListener), crate::Error> {
     control::Socket::bind(control::DISPLAY_SOCKET)
@@ -22,6 +22,29 @@ pub fn connect() -> Result<UnixStream, crate::Error> {
 }
 
 pub const VERSION: ProtocolVersion = ProtocolVersion::new(2);
+
+/// What the terminal reported it can do. Each field is one independent answer.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each of these is an independent thing a terminal can do"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The size of one character cell, in pixels.
+    pub cell: (u32, u32),
+    /// The terminal's character grid: `(columns, rows)` in cells.
+    pub cells: (u32, u32),
+    /// `(width, height)` of the whole drawing area in pixels.
+    pub pixels: (u32, u32),
+    pub terminal: Option<String>,
+    pub graphics: bool,
+    pub keyboard: bool,
+    /// Whether mouse reporting uses pixels (`SGR-Pixels`) instead of cells.
+    pub pixel_mouse: bool,
+    /// Whether the terminal reads tiles out of shared memory, which keeps their
+    /// pixels off the pty.
+    pub shared_memory: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Show {

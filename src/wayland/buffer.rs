@@ -118,7 +118,7 @@ pub fn snapshot(
     scale: i32,
     limit: Option<(u32, u32)>,
     destination: &mut Snapshot,
-    gpu: Option<&mut crate::gpu::Renderer>,
+    gpu: Option<&mut crate::wayland::gpu::Renderer>,
 ) -> bool {
     if let Some(copied) = copy_dmabuf(buffer, scale, limit, destination, gpu) {
         return copied;
@@ -129,7 +129,7 @@ pub fn snapshot(
 /// Check readability before accepting a GPU buffer.
 pub fn dmabuf_readable(
     dmabuf: &Dmabuf,
-    gpu: Option<&mut crate::gpu::Renderer>,
+    gpu: Option<&mut crate::wayland::gpu::Renderer>,
 ) -> Result<(), Unreadable> {
     if dmabuf_format(dmabuf.format()).is_none() {
         return Err(Unreadable::Layout(dmabuf.format()));
@@ -190,7 +190,7 @@ fn copy_dmabuf(
     scale: i32,
     limit: Option<(u32, u32)>,
     destination: &mut Snapshot,
-    gpu: Option<&mut crate::gpu::Renderer>,
+    gpu: Option<&mut crate::wayland::gpu::Renderer>,
 ) -> Option<bool> {
     let dmabuf = get_dmabuf(buffer).ok()?;
     let Some(format) = dmabuf_format(dmabuf.format()) else {

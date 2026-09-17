@@ -1,4 +1,4 @@
-//! Kitty graphics protocol encoding.
+//! Kitty graphics protocol encoding, and the escapes that go with it.
 
 use std::{
     io::Write as _,
@@ -7,9 +7,15 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::{Compression, write::ZlibEncoder};
+use nutype::nutype;
 use smithay::input::pointer::CursorIcon;
 
-use crate::types::ImageId;
+/// An image ID in the kitty graphics protocol.
+///
+/// A tile keeps its ID across frames, so the terminal replaces the image it
+/// already has instead of drawing a second one.
+#[nutype(const_fn, derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display))]
+pub struct ImageId(u32);
 
 /// Maximum size of a base64 plot line, mandated by the protocol.
 const CHUNK: usize = 4096;
@@ -277,6 +283,43 @@ pub fn cursor_to(out: &mut Vec<u8>, col: u32, row: u32) {
 pub fn delete_all(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
 }
+
+/// The escapes that wipe the screen, every image and every cell.
+///
+/// The server sends these to a pane after a resize, where stale pixels and
+/// stale cell contents cannot be told apart from live ones. The bytes are
+/// returned because the presenter writes them, after the frames already
+/// promised.
+pub fn clear() -> Vec<u8> {
+    let mut out = Vec::new();
+    delete_all(&mut out);
+    // `CSI 2J` also drops every image the terminal holds, and homes the cursor.
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    out
+}
+
+/// The escape that names the window a terminal is in.
+///
+/// A client supplies the title, so control characters are removed: they would
+/// let the client write escapes into the terminal that shows it. The title is
+/// also cut to `MAXIMUM_TITLE`.
+pub fn title(title: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(title.len() + 8);
+    out.extend_from_slice(b"\x1b]2;");
+    out.extend(
+        title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAXIMUM_TITLE)
+            .collect::<String>()
+            .bytes(),
+    );
+    out.push(b'\x07');
+    out
+}
+
+/// How much of a client's title a terminal is told.
+const MAXIMUM_TITLE: usize = 256;
 
 /// Transmit `pixels` as the image `id`, and place it in the cell rectangle at
 /// the cursor.
@@ -950,6 +993,19 @@ mod tests {
         let mut out = Vec::new();
         delete_all(&mut out);
         assert_eq!(decode(&out), vec![Command::DeleteAll]);
+    }
+
+    #[test]
+    fn a_title_escape_carries_no_escapes_of_its_own() {
+        let escape = title("\x1b]2;gotcha\x07\u{9b}31mred");
+        assert_eq!(escape, b"\x1b]2;]2;gotcha31mred\x07");
+        assert_eq!(title(""), b"\x1b]2;\x07");
+        assert!(title(&"x".repeat(MAXIMUM_TITLE * 2)).len() < MAXIMUM_TITLE + 8);
+    }
+
+    #[test]
+    fn wiping_the_screen_drops_every_image_first() {
+        assert_eq!(clear(), b"\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[2J\x1b[H");
     }
 
     #[test]

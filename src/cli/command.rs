@@ -15,7 +15,7 @@ use crate::{
     client, logging,
     protocol::{
         WindowId,
-        control::{self, Argument, Reply},
+        control::{self, Reply},
         pane::Show,
     },
     server::process,
@@ -86,8 +86,7 @@ fn give_command(settings: &Settings, command: &[OsString]) -> Result<(), Error> 
     if command.is_empty() {
         return Ok(());
     }
-    let arguments = command.iter().map(Argument::from).collect();
-    accepted(control::request(&control::Command::Run(arguments))?)
+    accepted(control::request(&control::Command::Run(command.to_vec()))?)
 }
 
 fn server_running() -> bool {

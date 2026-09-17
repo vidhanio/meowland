@@ -6,13 +6,10 @@
 
 use std::{
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs,
     io::{Read as _, Write as _},
-    os::unix::{
-        ffi::OsStrExt as _,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
 };
 
@@ -64,7 +61,9 @@ impl Drop for Socket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     List,
-    Run(Vec<Argument>),
+    /// Run a program as a client. Its arguments are what a shell gave, which is
+    /// not necessarily text, so they cross as the OS strings they are.
+    Run(Vec<OsString>),
     Stop,
 }
 
@@ -75,30 +74,6 @@ impl Command {
 
     pub fn decode(request: &[u8]) -> Option<Self> {
         decode(request).ok()
-    }
-}
-
-/// One argument of a command line: the bytes a shell gave, which are not
-/// necessarily text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Argument(Vec<u8>);
-
-impl Argument {
-    /// The argument as a program's own argv takes it.
-    pub fn as_os_str(&self) -> &OsStr {
-        OsStr::from_bytes(&self.0)
-    }
-
-    /// The argument as text, for a message to a person.
-    pub fn to_string_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.0).into_owned()
-    }
-}
-
-impl From<&OsString> for Argument {
-    fn from(argument: &OsString) -> Self {
-        Self(argument.as_bytes().to_vec())
     }
 }
 
@@ -164,7 +139,7 @@ pub fn connect(name: &str) -> Result<UnixStream, Error> {
 mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
 
-    use super::{Argument, Command, Reply, Window};
+    use super::{Command, Reply, Window};
     use crate::protocol::WindowId;
 
     fn round_trip(command: &Command) {
@@ -174,6 +149,8 @@ mod tests {
 
     #[test]
     fn a_run_request_carries_an_argv_unchanged() {
+        // Arguments are what a shell gave: spaces, newlines, a NUL, and bytes
+        // that are not text at all.
         let argv = [
             "foot",
             "-T",
@@ -185,7 +162,6 @@ mod tests {
         .map(OsString::from)
         .into_iter()
         .chain([OsString::from_vec(vec![0xff, 0xfe])])
-        .map(|argument| Argument::from(&argument))
         .collect::<Vec<_>>();
         round_trip(&Command::Run(argv));
     }

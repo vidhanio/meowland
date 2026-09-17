@@ -15,7 +15,7 @@ use crate::{
     client, logging,
     protocol::{
         WindowId,
-        control::{self, Reply},
+        control::{self, Argument, Reply},
         pane::Show,
     },
     server::process,
@@ -86,7 +86,8 @@ fn give_command(settings: &Settings, command: &[OsString]) -> Result<(), Error> 
     if command.is_empty() {
         return Ok(());
     }
-    accepted(control::request(&control::Command::Run(command.to_vec()))?)
+    let arguments = command.iter().map(Argument::from).collect();
+    accepted(control::request(&control::Command::Run(arguments))?)
 }
 
 fn server_running() -> bool {
@@ -158,10 +159,10 @@ pub(super) fn list() -> Result<(), Error> {
     for window in windows {
         let mut fields = vec![window.id.to_string()];
         if !window.label.is_empty() {
-            fields.push(window.label);
+            fields.push(printable(&window.label));
         }
         if !window.title.is_empty() {
-            fields.push(window.title);
+            fields.push(printable(&window.title));
         }
         if window.active {
             fields.push("active".to_owned());
@@ -171,7 +172,36 @@ pub(super) fn list() -> Result<(), Error> {
     Ok(())
 }
 
+/// A name as a terminal may be shown it.
+///
+/// A client supplies these, so control characters are removed: printed as they
+/// are, they would be escapes the terminal acts on.
+fn printable(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Stop the server, and every client it started.
 pub(super) fn stop() -> Result<(), Error> {
     accepted(control::request(&control::Command::Stop)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::printable;
+
+    #[test]
+    fn a_window_name_cannot_print_terminal_controls() {
+        assert_eq!(printable("app\x1b[2J"), "app [2J");
+        assert_eq!(printable("two\nlines\there"), "two lines here");
+        assert_eq!(printable("title\u{7f}"), "title ");
+        assert_eq!(printable("~ /code"), "~ /code");
+    }
 }

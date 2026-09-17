@@ -90,7 +90,7 @@ fn greet(
     capabilities: Capabilities,
     show: Show,
 ) -> Result<Greeting, Error> {
-    pane::write_to(
+    pane::write(
         stream,
         &ToServer::Hello(Hello {
             version: pane::VERSION,
@@ -100,14 +100,19 @@ fn greet(
     )?;
 
     stream.set_read_timeout(Some(GREETING_TIMEOUT))?;
-    let reply = pane::read_for_pane(stream);
+    let reply = pane::read::<_, ToClient>(stream);
     stream.set_read_timeout(None)?;
 
-    match reply? {
-        Some(ToClient::Welcome) => Ok(Greeting::Welcome),
-        Some(ToClient::Detached(reason)) => Ok(Greeting::Refused(reason)),
-        None => Ok(Greeting::Gone),
-        Some(ToClient::Bytes(_) | ToClient::Frame(_)) => Err(Error::PixelsFirst),
+    match reply {
+        Ok(ToClient::Welcome) => Ok(Greeting::Welcome),
+        Ok(ToClient::Detached(reason)) => Ok(Greeting::Refused(reason)),
+        // A server that says nothing, or stops mid-sentence, is a server that
+        // is not there: either way there is no window for this pane.
+        Err(error) => {
+            tracing::debug!(%error, "the server did not answer the hello");
+            Ok(Greeting::Gone)
+        }
+        Ok(ToClient::Bytes(_) | ToClient::Frame(_)) => Err(Error::PixelsFirst),
     }
 }
 
@@ -190,7 +195,7 @@ fn run(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
         signal: Some(signal),
     };
     let result = event_loop.run(None, &mut showing, |_| {});
-    let _ = pane::write_to(&mut showing.stream, &ToServer::Bye);
+    let _ = pane::write(&mut showing.stream, &ToServer::Bye);
     let _ = showing.stream.shutdown(std::net::Shutdown::Both);
     writer.stop();
     input_thread.stop();
@@ -228,7 +233,7 @@ impl Showing {
     }
 
     fn send(&mut self, message: &ToServer) {
-        if let Err(error) = pane::write_to(&mut self.stream, message) {
+        if let Err(error) = pane::write(&mut self.stream, message) {
             tracing::warn!(%error, "could not reach the server");
             self.leave(Departure::ServerGone);
             self.stop();
@@ -366,9 +371,10 @@ impl Drop for Worker {
 /// through.
 fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
-        let message = match pane::read_for_pane(&mut stream) {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
+        let message = match pane::read::<_, ToClient>(&mut stream) {
+            Ok(message) => message,
+            // A message this build cannot read, and a server that has gone,
+            // end the same way: there is nothing more for this terminal.
             Err(error) => {
                 tracing::debug!(%error, "the server stopped sending frames");
                 break;

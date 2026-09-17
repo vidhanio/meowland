@@ -63,10 +63,10 @@ requested fullscreen receive `Fullscreen`.
 
 The control and pane sockets are owner-only files in `$XDG_RUNTIME_DIR`. The
 Wayland socket is `wayland-meowland`. `src/protocol/` defines both protocols:
-a message is bincode, except for a frame or an escape, which are bytes already.
-The pane protocol puts a kind and a length in front of each message, so that one
-a build does not know is skipped rather than ending the conversation. Bump the
-pane protocol version whenever a message changes. The terminal side uses
+a message is bincode, except that a frame or an escape is a byte string, so it
+is written out of the buffer it was built in rather than a byte at a time.
+Bump the pane protocol version whenever a message changes: a build that does not
+know one cannot skip it, and the connection is what ends. The terminal side uses
 separate threads for input, output, and hangup checks.
 
 Client stdout and stderr go to `$XDG_RUNTIME_DIR/meowland.log`, not the pane.

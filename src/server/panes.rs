@@ -22,7 +22,7 @@ use crate::{
     Error, kitty,
     protocol::{
         PaneId, ProtocolVersion,
-        pane::{self, Capabilities, Hello, Input, Show, ToClient, ToServer},
+        pane::{self, Capabilities, Hello, Input, Show, ToServer},
     },
     server::{Server, presenter, presenter::Presenter, watch},
     wayland::message::Command,
@@ -197,7 +197,7 @@ impl Server {
         if let Some(reason) = refusal {
             tracing::info!(%reason, "turned a terminal away");
             drop(self.readers.remove(&pane));
-            let _ = pane::write_for_pane(&mut stream, &ToClient::Detached(reason));
+            let _ = pane::write_detached(&mut stream, &reason);
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return;
         }
@@ -207,7 +207,7 @@ impl Server {
             return;
         };
         // Welcome must precede presenter output.
-        let _ = pane::write_for_pane(&mut stream, &ToClient::Welcome);
+        let _ = pane::write_welcome(&mut stream);
 
         let draw_on = match stream.try_clone() {
             Ok(half) => half,
@@ -277,9 +277,7 @@ impl Server {
             return;
         };
         if let Some(reason) = reason {
-            attached
-                .presenter
-                .detach(ToClient::Detached(reason.to_owned()));
+            attached.presenter.detach(reason);
         }
         // Drain the presenter before closing the socket.
         attached.presenter.finish();
@@ -345,13 +343,13 @@ fn read_pane(
     write_half: UnixStream,
 ) {
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
-    let hello = pane::read_from(&mut stream);
+    let hello = pane::read::<_, ToServer>(&mut stream);
     let _ = stream.set_read_timeout(None);
-    let Some(ToServer::Hello(Hello {
+    let Ok(ToServer::Hello(Hello {
         version,
         show,
         capabilities,
-    })) = hello.ok().flatten()
+    })) = hello
     else {
         return;
     };
@@ -366,7 +364,7 @@ fn read_pane(
         return;
     }
 
-    while let Ok(Some(message)) = pane::read_from(&mut stream) {
+    while let Ok(message) = pane::read::<_, ToServer>(&mut stream) {
         let sent = match message {
             ToServer::Input(input) => sender.send(FromPane::Input { pane, input }),
             ToServer::Resized(capabilities) => {
@@ -433,7 +431,7 @@ mod tests {
         let (sender, messages) = calloop::channel::channel();
         let reader = thread::spawn(move || read_pane(server, sender, PaneId::new(7), write_half));
 
-        pane::write_to(
+        pane::write(
             &mut pane,
             &ToServer::Hello(Hello {
                 version: pane::VERSION,
@@ -455,10 +453,10 @@ mod tests {
         assert_eq!(version, pane::VERSION);
         assert_eq!(show, Show::Newest);
 
-        pane::write_to(&mut pane, &ToServer::Input(Input::Focus(true))).expect("an input goes out");
+        pane::write(&mut pane, &ToServer::Input(Input::Focus(true))).expect("an input goes out");
         assert!(matches!(heard(&messages), FromPane::Input { .. }));
 
-        pane::write_to(&mut pane, &ToServer::Drawn).expect("an acknowledgement goes out");
+        pane::write(&mut pane, &ToServer::Drawn).expect("an acknowledgement goes out");
         assert!(matches!(heard(&messages), FromPane::Drawn { .. }));
 
         // A terminal that closes is a pane that has left.

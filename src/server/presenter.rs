@@ -18,7 +18,7 @@ use calloop::channel::Sender as EventSender;
 use crate::{
     Error,
     kitty::{self, Encoder, Placement},
-    protocol::pane::{self, Capabilities, ToClient},
+    protocol::pane::{self, Capabilities},
     render::{BYTES, Frame, Tile},
 };
 
@@ -52,8 +52,12 @@ struct InFlight {
 enum Message {
     Attach(Option<UnixStream>),
     Configure(Config),
-    Tell(ToClient),
-    Frame { frame: Frame, tiles: Vec<Tile> },
+    /// Let go of the pane, and say why.
+    Detached(String),
+    Frame {
+        frame: Frame,
+        tiles: Vec<Tile>,
+    },
     Drawn,
     Raw(Vec<u8>),
 }
@@ -102,8 +106,8 @@ impl Presenter {
         }));
     }
 
-    pub fn detach(&self, reason: ToClient) {
-        self.send(Message::Tell(reason));
+    pub fn detach(&self, reason: &str) {
+        self.send(Message::Detached(reason.to_owned()));
         self.send(Message::Attach(None));
     }
 
@@ -184,8 +188,8 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 encoder.shared_memory = config.shared_memory;
                 continue;
             }
-            Message::Tell(message) => {
-                tell(&mut terminal, &message);
+            Message::Detached(reason) => {
+                write_detached(&mut terminal, &reason)?;
                 continue;
             }
             Message::Drawn => {
@@ -291,20 +295,21 @@ fn write(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()>
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    ToClient::write_bytes(terminal, bytes)
+    pane::write_bytes(terminal, bytes)
 }
 
 fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    ToClient::write_frame(terminal, bytes)
+    pane::write_frame(terminal, bytes)
 }
 
-fn tell(terminal: &mut Option<UnixStream>, message: &ToClient) {
-    if let Some(terminal) = terminal {
-        let _ = pane::write_for_pane(terminal, message);
-    }
+fn write_detached(terminal: &mut Option<UnixStream>, reason: &str) -> std::io::Result<()> {
+    let Some(terminal) = terminal else {
+        return Ok(());
+    };
+    pane::write_detached(terminal, reason)
 }
 
 /// What the frames of one second cost this thread, logged so that a slow
@@ -432,9 +437,7 @@ mod tests {
         presenter.present(frame, tiles);
 
         let mut terminal = std::io::BufReader::new(terminal);
-        let message = pane::read_for_pane(&mut terminal)
-            .expect("a message")
-            .expect("the frame");
+        let message = pane::read::<_, ToClient>(&mut terminal).expect("a message");
         let ToClient::Frame(escapes) = message else {
             panic!("a pane is sent a frame, not {message:?}");
         };

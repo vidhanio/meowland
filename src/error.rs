@@ -41,6 +41,8 @@ pub enum Error {
     },
     #[error("the presenter thread panicked")]
     PresenterPanicked,
+    #[error("the compositor thread panicked")]
+    CompositorPanicked,
     #[error("the server did not come up: {0}")]
     NoServer(String),
     #[error("{0}")]

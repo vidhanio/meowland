@@ -1,4 +1,9 @@
 //! Per-pane frame encoding and output thread.
+//!
+//! The compositor draws a pane's whole screen and sends it with the tiles that
+//! changed; this thread cuts those tiles out, encodes them as kitty graphics,
+//! and writes them to the pane's socket. It runs on a thread of its own, so a
+//! slow terminal holds up only its own pane.
 
 use std::{
     os::unix::net::UnixStream,
@@ -13,37 +18,61 @@ use calloop::channel::Sender as EventSender;
 use crate::{
     Error,
     kitty::{self, Encoder, Placement},
-    protocol::pane::{self, ToClient},
+    protocol::pane::{self, Capabilities, ToClient},
+    render::{BYTES, Frame, Tile},
 };
 
-/// One frame on its way to the terminal: the pixels of the tiles that changed,
-/// laid end to end, and the position of each tile.
-#[derive(Debug, Default)]
-pub struct Frame {
-    pub pixels: Vec<u8>,
-    pub tiles: Vec<Placement>,
+/// The cell size and shared-memory support of the terminal a pane is in.
+#[derive(Debug, Clone, Copy)]
+struct Config {
+    cell: (u32, u32),
+    shared_memory: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // Until a pane says otherwise: a cell size that is wrong only distorts
+        // pixels, and no shared memory, which is what an unknown terminal
+        // takes.
+        Self {
+            cell: (10, 20),
+            shared_memory: false,
+        }
+    }
+}
+
+/// One frame on its way to the terminal, with the tiles it was diffed against.
+#[derive(Debug)]
+struct InFlight {
+    frame: Frame,
+    tiles: Vec<Tile>,
 }
 
 #[derive(Debug)]
 enum Message {
     Attach(Option<UnixStream>),
-    Configure { shared_memory: bool },
+    Configure(Config),
     Tell(ToClient),
-    Frame(Frame),
+    Frame { frame: Frame, tiles: Vec<Tile> },
     Drawn,
     Raw(Vec<u8>),
 }
 
+/// What the presenter has to say to the server.
 #[derive(Debug)]
 pub enum Event {
-    Ready(Frame),
+    /// A frame the terminal has taken, and its tile list, for the compositor to
+    /// draw the next one into.
+    Free {
+        frame: Frame,
+        tiles: Vec<Tile>,
+    },
     Failed(Error),
 }
 
 #[derive(Debug)]
 pub struct Presenter {
     messages: Option<MessageSender<Message>>,
-    free: Option<Frame>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -55,14 +84,22 @@ impl Presenter {
             .spawn(move || worker(queue, &events))?;
         Ok(Self {
             messages: Some(messages),
-            free: Some(Frame::default()),
             handle: Some(handle),
         })
     }
 
-    pub fn attach(&self, terminal: UnixStream, shared_memory: bool) {
-        self.send(Message::Configure { shared_memory });
+    /// Give the presenter the terminal's socket, and what the terminal can do.
+    pub fn attach(&self, terminal: UnixStream, capabilities: &Capabilities) {
+        self.configure(capabilities);
         self.send(Message::Attach(Some(terminal)));
+    }
+
+    /// The terminal's cell size or shared-memory support changed.
+    pub fn configure(&self, capabilities: &Capabilities) {
+        self.send(Message::Configure(Config {
+            cell: capabilities.cell,
+            shared_memory: capabilities.shared_memory,
+        }));
     }
 
     pub fn detach(&self, reason: ToClient) {
@@ -74,33 +111,12 @@ impl Presenter {
         self.raw(kitty::clear());
     }
 
-    /// Returns `None` while a frame is in flight.
-    pub const fn frame(&mut self) -> Option<Frame> {
-        self.free.take()
+    /// Put the tiles of a frame on the terminal.
+    pub fn present(&self, frame: Frame, tiles: Vec<Tile>) {
+        self.send(Message::Frame { frame, tiles });
     }
 
-    pub const fn is_ready(&self) -> bool {
-        self.free.is_some()
-    }
-
-    pub fn recycle(&mut self, frame: Frame) {
-        debug_assert!(self.free.is_none());
-        self.free = Some(frame);
-    }
-
-    /// Returns the frame if the worker has stopped.
-    pub fn present(&self, frame: Frame) -> Result<(), Frame> {
-        let Some(messages) = &self.messages else {
-            return Err(frame);
-        };
-        messages
-            .send(Message::Frame(frame))
-            .map_err(|error| match error.0 {
-                Message::Frame(frame) => frame,
-                _ => unreachable!("sent a frame"),
-            })
-    }
-
+    /// The terminal has written the frame: the next one may come.
     pub fn drawn(&self) {
         self.send(Message::Drawn);
     }
@@ -144,25 +160,28 @@ fn worker(queue: Receiver<Message>, events: &EventSender<Event>) {
 
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "the worker outlives whoever started it, so it owns its ends of the channels rather than borrowing them"
+    reason = "the worker outlives whoever started it, so it owns its end of the channel rather than borrowing it"
 )]
 fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result<()> {
     let mut encoder = Encoder::new();
     let mut out = Vec::new();
+    let mut pixels = Vec::new();
     let mut stats = Stats::default();
+    let mut config = Config::default();
     let mut terminal: Option<UnixStream> = None;
-    let mut in_flight: Option<Frame> = None;
+    let mut in_flight: Option<InFlight> = None;
     while let Ok(message) = queue.recv() {
-        let mut frame = match message {
+        let (frame, tiles) = match message {
             Message::Attach(attached) => {
                 terminal = attached;
                 if terminal.is_none() {
-                    recycle(&mut in_flight, events)?;
+                    free(&mut in_flight, events)?;
                 }
                 continue;
             }
-            Message::Configure { shared_memory } => {
-                encoder.shared_memory = shared_memory;
+            Message::Configure(configuration) => {
+                config = configuration;
+                encoder.shared_memory = config.shared_memory;
                 continue;
             }
             Message::Tell(message) => {
@@ -170,26 +189,26 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 continue;
             }
             Message::Drawn => {
-                recycle(&mut in_flight, events)?;
+                free(&mut in_flight, events)?;
                 continue;
             }
-            Message::Frame(frame) => frame,
             Message::Raw(bytes) => {
                 write(&mut terminal, bytes)?;
                 continue;
             }
+            Message::Frame { frame, tiles } => (frame, tiles),
         };
-        let tiles = frame.tiles.len();
+        let count = tiles.len();
 
+        // The tiles are cut out in the order they are listed: the compositor
+        // lists them in grid order and the id each one keeps is the terminal's.
         let phase = Instant::now();
         out.clear();
         Encoder::begin_frame(&mut out);
-        let mut offset = 0;
-        for placement in &frame.tiles {
-            let length = placement.bytes();
-            let tile = &frame.pixels[offset..offset + length];
-            offset += length;
-            encoder.transmit_and_place(&mut out, tile, *placement);
+        for tile in &tiles {
+            let placement = placement(*tile, config.cell);
+            cut(&frame, *tile, &mut pixels);
+            encoder.transmit_and_place(&mut out, &pixels, placement);
         }
         encoder.end_frame(&mut out);
         let spent_encoding = phase.elapsed();
@@ -204,28 +223,68 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 Duration::ZERO
             }
         };
-        frame.pixels.clear();
-        frame.tiles.clear();
         if terminal.is_none() {
-            if events.send(Event::Ready(frame)).is_err() {
+            if events.send(Event::Free { frame, tiles }).is_err() {
                 return Ok(());
             }
             continue;
         }
 
-        stats.record(tiles, out.len(), spent_encoding, written);
-        in_flight = Some(frame);
+        stats.record(count, out.len(), spent_encoding, written);
+        in_flight = Some(InFlight { frame, tiles });
     }
     Ok(())
 }
 
-fn recycle(in_flight: &mut Option<Frame>, events: &EventSender<Event>) -> std::io::Result<()> {
-    let Some(frame) = in_flight.take() else {
+/// Hand a frame the terminal has taken back to the compositor.
+fn free(in_flight: &mut Option<InFlight>, events: &EventSender<Event>) -> std::io::Result<()> {
+    let Some(InFlight { frame, tiles }) = in_flight.take() else {
         return Ok(());
     };
     events
-        .send(Event::Ready(frame))
+        .send(Event::Free { frame, tiles })
         .map_err(|_| std::io::Error::other("the event loop is gone"))
+}
+
+/// Copy one tile out of the frame, rows end to end.
+///
+/// The frame's rows are its whole width apart; a tile's are not.
+fn cut(frame: &Frame, tile: Tile, out: &mut Vec<u8>) {
+    let rect = tile.rect;
+    let stride = frame.width as usize * BYTES;
+    let length = rect.width as usize * BYTES;
+    out.clear();
+    out.reserve(length * rect.height as usize);
+    for row in 0..rect.height {
+        let start = (rect.y as usize + row as usize) * stride + rect.x as usize * BYTES;
+        out.extend_from_slice(&frame.pixels()[start..start + length]);
+    }
+}
+
+/// Where one tile goes on a pane's screen, and what it is called.
+///
+/// The name is the tile's, and a tile keeps its name across frames, so the same
+/// tile of the next frame replaces the image the terminal has.
+fn placement(tile: Tile, cell: (u32, u32)) -> Placement {
+    let (cell_width, cell_height) = (cell.0.max(1), cell.1.max(1));
+    let rect = tile.rect;
+    let cell_aligned =
+        rect.width.is_multiple_of(cell_width) && rect.height.is_multiple_of(cell_height);
+    let (cols, rows) = if cell_aligned {
+        (rect.width / cell_width, rect.height / cell_height)
+    } else {
+        (0, 0)
+    };
+    Placement {
+        id: tile.image,
+        width: rect.width,
+        height: rect.height,
+        // c/r would scale a partial edge tile to a whole cell rectangle.
+        // Zero leaves it at its native pixel size instead.
+        cols,
+        rows,
+        cell: (rect.x as u32 / cell_width, rect.y as u32 / cell_height),
+    }
 }
 
 fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<()> {
@@ -248,6 +307,9 @@ fn tell(terminal: &mut Option<UnixStream>, message: ToClient) {
     }
 }
 
+/// What the frames of one second cost this thread, logged so that a slow
+/// terminal is attributed and not guessed at. The compositor keeps its own
+/// count of the composing.
 #[derive(Debug, Default)]
 struct Stats {
     report: crate::logging::Report,
@@ -286,8 +348,56 @@ impl Stats {
     }
 }
 
-pub fn pointer_shape_bytes(shape: Option<&str>) -> Vec<u8> {
-    let mut out = Vec::new();
-    kitty::set_pointer_shape(&mut out, shape);
-    out
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        kitty::ImageId,
+        render::{Image, Rect, SourceFormat},
+    };
+
+    #[test]
+    fn partial_edge_tiles_keep_native_dimensions() {
+        let edge = placement(tile(Rect::new(0, 0, 7, 9), 1), (10, 20));
+        assert_eq!((edge.cols, edge.rows), (0, 0));
+
+        let full = placement(tile(Rect::new(0, 0, 160, 160), 2), (10, 20));
+        assert_eq!((full.cols, full.rows), (16, 8));
+    }
+
+    #[test]
+    fn a_tile_is_cut_out_of_the_frame_row_by_row() {
+        // A four by two frame whose pixels count 0..8, and the middle two of
+        // each row taken out: the rows of the tile end to end, not the frame's.
+        let bytes: Vec<u8> = (0u8..8)
+            .flat_map(|value| [value, value, value, 0xff])
+            .collect();
+        let mut frame = Frame::new(4, 2);
+        frame.draw(
+            &Image {
+                pixels: &bytes,
+                stride: 4 * 4,
+                width: 4,
+                height: 2,
+                format: SourceFormat::Xrgb8888,
+            },
+            Rect::new(0, 0, 4, 2),
+            Rect::new(0, 0, 4, 2),
+        );
+
+        let mut cut_out = Vec::new();
+        cut(&frame, tile(Rect::new(1, 0, 2, 2), 1), &mut cut_out);
+        assert_eq!(
+            cut_out,
+            vec![1, 1, 1, 2, 2, 2, 5, 5, 5, 6, 6, 6],
+            "two pixels of the first row, then two of the second"
+        );
+    }
+
+    fn tile(rect: Rect, image: u32) -> Tile {
+        Tile {
+            image: ImageId::new(image),
+            rect,
+        }
+    }
 }

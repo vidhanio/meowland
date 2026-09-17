@@ -5,13 +5,9 @@ mod compose;
 mod input;
 mod snapshot;
 
-use std::{
-    collections::HashMap,
-    os::unix::net::UnixStream,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, os::unix::net::UnixStream, sync::Arc, time::Instant};
 
+use calloop::channel::Sender;
 use evdev::KeyCode;
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
@@ -53,70 +49,20 @@ use smithay::{
     },
 };
 
-use self::compose::{placement, send_frame_callbacks, tile_size};
+use self::compose::{send_frame_callbacks, tile_size};
 use crate::{
     Error, kitty,
     protocol::{
-        PaneId, WindowId, control,
+        PaneId, WindowId,
         pane::{Capabilities, Show},
     },
-    render::{BYTES, Frame, Tiles},
-    server::presenter::Presenter,
-    wayland::buffer::Snapshot,
+    render::{Frame, Tile, Tiles},
+    wayland::{buffer::Snapshot, message::Event},
 };
 
 pub const REFRESH_MILLIHZ: i32 = 60_000;
 
 const TILE_CELLS: (u32, u32) = (16, 8);
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Cost {
-    pub tiles: usize,
-    pub sent: usize,
-    pub compose: Duration,
-}
-
-#[derive(Debug)]
-struct PendingTiles {
-    flags: Vec<bool>,
-    count: usize,
-}
-
-impl PendingTiles {
-    fn new(count: usize) -> Self {
-        Self {
-            flags: vec![false; count],
-            count: 0,
-        }
-    }
-
-    fn mark(&mut self, index: usize) {
-        if !self.flags[index] {
-            self.flags[index] = true;
-            self.count += 1;
-        }
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    const fn len(&self) -> usize {
-        self.count
-    }
-
-    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.flags
-            .iter()
-            .enumerate()
-            .filter_map(|(index, due)| due.then_some(index))
-    }
-
-    fn clear(&mut self) {
-        self.flags.fill(false);
-        self.count = 0;
-    }
-}
 
 /// Per-pane rendering state.
 #[expect(
@@ -124,21 +70,29 @@ impl PendingTiles {
     reason = "each of these is an independent thing about one pane"
 )]
 #[derive(Debug)]
-pub struct View {
+struct View {
     id: PaneId,
     capabilities: Capabilities,
     window: Option<WindowId>,
     follow: bool,
-    frame: Frame,
+    /// The frame this pane draws into, while the presenter is not holding it.
+    frame: Option<Frame>,
     tiles: Tiles,
-    pending: PendingTiles,
-    dirty: Vec<usize>,
+    /// The list the next frame's tiles are gathered in, kept across frames so
+    /// that a steady stream of them uses one allocation.
+    dirty: Vec<Tile>,
+    /// The frame and the tile grid no longer match the capabilities.
+    stale_layout: bool,
     scene_dirty: bool,
+    /// The terminal is owed the title or the pointer shape it was last told of,
+    /// or both.
     escapes_dirty: bool,
+    /// What this pane's terminal was last told, so that it is told again only
+    /// when that changes.
     pointer_shape: Option<&'static str>,
     title: Option<String>,
-    detaching: bool,
-    done: bool,
+    /// This pane has nothing left to show, and the server has been told.
+    leaving: bool,
 }
 
 impl View {
@@ -150,21 +104,35 @@ impl View {
             capabilities: capabilities.clone(),
             window: None,
             follow: true,
-            pending: PendingTiles::new(tiles.tile_count()),
+            frame: Some(frame),
             tiles,
-            frame,
             dirty: Vec::new(),
+            stale_layout: false,
             scene_dirty: true,
-            escapes_dirty: false,
+            escapes_dirty: true,
             pointer_shape: None,
             title: None,
-            detaching: false,
-            done: false,
+            leaving: false,
         }
     }
 
-    const fn should_present(&self, presenter_ready: bool) -> bool {
-        self.scene_dirty || self.escapes_dirty || (!self.pending.is_empty() && presenter_ready)
+    /// Whether this pane has something to do now: something to tell its
+    /// terminal, or a scene to draw and a frame to draw it in.
+    const fn is_due(&self) -> bool {
+        !self.leaving && (self.escapes_dirty || (self.scene_dirty && self.frame.is_some()))
+    }
+
+    /// Bring the frame and its tile grid back in step with the capabilities.
+    fn relayout(&mut self) {
+        let Some(frame) = &mut self.frame else {
+            return;
+        };
+        if !self.stale_layout {
+            return;
+        }
+        frame.resize(self.capabilities.pixels.0, self.capabilities.pixels.1);
+        self.tiles = Tiles::new(frame, tile_size(self.capabilities.cell));
+        self.stale_layout = false;
     }
 
     fn index(&self, windows: &[Window]) -> Option<usize> {
@@ -186,8 +154,10 @@ struct Window {
     fullscreen: bool,
 }
 
-pub struct Meowland {
-    compositor_state: CompositorState,
+pub struct Compositor {
+    /// The `wl_compositor` global: the state every surface of a client is made
+    /// from.
+    surfaces: CompositorState,
     shm_state: ShmState,
     xdg_shell_state: XdgShellState,
     seat_state: SeatState<Self>,
@@ -229,23 +199,27 @@ pub struct Meowland {
 
     snapshots: HashMap<ObjectId, Snapshot>,
     plan: Vec<(WlSurface, Point<i32, Logical>)>,
+
+    /// What the server is told.
+    events: Sender<Event>,
 }
 
-impl std::fmt::Debug for Meowland {
+impl std::fmt::Debug for Compositor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Meowland")
+        f.debug_struct("Compositor")
             .field("windows", &self.windows.len())
             .field("active", &self.active)
             .finish_non_exhaustive()
     }
 }
 
-impl Meowland {
+impl Compositor {
     pub fn new(
         display: &DisplayHandle,
         nodes: &[crate::dmabuf::RenderNode],
+        events: Sender<Event>,
     ) -> Result<Self, Error> {
-        let compositor_state = CompositorState::new::<Self>(display);
+        let surfaces = CompositorState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, []);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
@@ -303,7 +277,7 @@ impl Meowland {
         };
 
         Ok(Self {
-            compositor_state,
+            surfaces,
             shm_state,
             xdg_shell_state,
             seat_state,
@@ -329,6 +303,7 @@ impl Meowland {
             views: Vec::new(),
             snapshots: HashMap::new(),
             plan: Vec::new(),
+            events,
         })
     }
 
@@ -338,7 +313,7 @@ impl Meowland {
 
     pub fn insert_client(&mut self, stream: UnixStream) -> std::io::Result<()> {
         self.display_handle
-            .insert_client(stream, Arc::new(MeowlandClient::default()))?;
+            .insert_client(stream, Arc::new(ClientState::default()))?;
         Ok(())
     }
 
@@ -346,18 +321,6 @@ impl Meowland {
         self.active
             .and_then(|index| self.windows.get(index))
             .map(|window| window.surface.wl_surface().clone())
-    }
-
-    pub fn windows(&self) -> impl Iterator<Item = control::Window> + '_ {
-        self.windows
-            .iter()
-            .enumerate()
-            .map(|(index, window)| control::Window {
-                id: window.id,
-                label: window.label.clone().unwrap_or_default(),
-                title: window.title.clone().unwrap_or_default(),
-                active: self.active == Some(index),
-            })
     }
 
     pub fn active_window(&self) -> Option<WindowId> {
@@ -380,13 +343,19 @@ impl Meowland {
         for view in self.views_of(id) {
             view.scene_dirty = true;
         }
+        let _ = self.events.send(Event::Focused { window: Some(id) });
     }
 
     pub fn attach_view(&mut self, id: PaneId, show: Show, capabilities: &Capabilities) {
         let (window, follow) = self.resolve(show);
         let mut view = View::new(id, capabilities);
-        view.window = window;
+        // The server checks a window asked for by ID before it sends this, but
+        // a pane attaches one message later: the window may have closed since,
+        // and a view holding a window that is gone would never be released by
+        // `toplevel_destroyed`.
+        view.window = window.filter(|id| self.has_window(*id));
         view.follow = follow;
+        let gone = view.window.is_none() && !follow;
         if self.views.is_empty() {
             self.describe_output(capabilities);
         }
@@ -394,6 +363,32 @@ impl Meowland {
         self.views.push(view);
         self.configure_windows();
         self.sync_outputs();
+        let pane = self.views.len() - 1;
+        self.mark_escapes(pane);
+        if gone {
+            // Only a window asked for by ID can be missing: the other ways of
+            // choosing one fall back to following the newest window.
+            self.leave(pane, Some("no window has that ID".to_owned()));
+        }
+    }
+
+    /// Ask every window to close, the way a window manager does.
+    ///
+    /// This is a request, not a command: the client decides what closing means
+    /// for it, and a client that would rather ask its user first may. So this
+    /// is what the server sends when it is stopping, and the signals that
+    /// follow are for whatever is left.
+    pub fn close_windows(&self) {
+        tracing::info!(windows = self.windows.len(), "asked every window to close");
+        for window in &self.windows {
+            tracing::debug!(id = %window.id, "asked to close");
+            window.surface.send_close();
+        }
+    }
+
+    /// Whether the compositor has this window.
+    fn has_window(&self, window: WindowId) -> bool {
+        self.windows.iter().any(|known| known.id == window)
     }
 
     pub fn detach_view(&mut self, id: PaneId) {
@@ -408,26 +403,22 @@ impl Meowland {
         self.sync_outputs();
     }
 
+    /// The terminal this pane is in now reports these capabilities.
+    ///
+    /// The frame itself is resized when the presenter gives it back, if it is
+    /// out: a frame already on its way to the terminal is at the old size.
     pub fn resize_view(&mut self, id: PaneId, capabilities: &Capabilities) {
         let Some(index) = self.view(id) else {
             return;
         };
         let first = index == 0;
-        let view = &mut self.views[index];
-        view.capabilities.clone_from(capabilities);
-        view.frame
-            .resize(capabilities.pixels.0, capabilities.pixels.1);
-        view.tiles = Tiles::new(&view.frame, tile_size(capabilities.cell));
-        view.pending = PendingTiles::new(view.tiles.tile_count());
-        view.scene_dirty = true;
+        self.views[index].capabilities.clone_from(capabilities);
+        self.views[index].stale_layout = true;
+        self.views[index].scene_dirty = true;
         if first {
             self.describe_output(capabilities);
         }
         self.configure_windows();
-    }
-
-    pub fn has_window(&self, id: WindowId) -> bool {
-        self.windows.iter().any(|window| window.id == id)
     }
 
     fn view(&self, id: PaneId) -> Option<usize> {
@@ -479,26 +470,156 @@ impl Meowland {
         }
     }
 
-    pub fn should_present_view(&self, id: PaneId, presenter_ready: bool) -> bool {
-        self.view(id)
-            .is_some_and(|index| self.views[index].should_present(presenter_ready))
+    /// Whether a pane has something to draw and a frame to draw it in.
+    pub fn any_due(&self) -> bool {
+        self.views.iter().any(View::is_due)
     }
 
-    pub fn take_detach_request(&mut self, id: PaneId) -> bool {
-        let Some(index) = self.view(id) else {
-            return false;
-        };
-        std::mem::replace(&mut self.views[index].detaching, false)
-    }
-
-    pub fn take_closed_views(&mut self) -> Vec<PaneId> {
-        let mut closed = Vec::new();
-        for view in &mut self.views {
-            if std::mem::replace(&mut view.done, false) {
-                closed.push(view.id);
+    /// Draw a frame for every pane that is due, and hand it to the server.
+    ///
+    /// A frame goes to the server with the tiles that changed in it, and comes
+    /// back with the list those tiles were gathered in, so that a pane drawing
+    /// at a steady rate allocates nothing per frame.
+    pub fn present(&mut self) -> usize {
+        let mut sent = 0;
+        for index in 0..self.views.len() {
+            if !self.views[index].is_due() {
+                continue;
             }
+            // Escapes go out once per frame at most, so a client that changes
+            // its cursor on every mouse move cannot queue them up faster than
+            // the terminal reads them.
+            self.announce(index);
+            self.views[index].relayout();
+            if !self.views[index].scene_dirty {
+                continue;
+            }
+            let pane = self.views[index].id;
+            // The presenter may still have the frame: what is owed the
+            // terminal goes anyway, and the scene waits for the frame.
+            let Some(mut frame) = self.views[index].frame.take() else {
+                continue;
+            };
+            self.draw(index, &mut frame);
+
+            let mut tiles = std::mem::take(&mut self.views[index].dirty);
+            self.views[index].tiles.diff(&frame, &mut tiles);
+            self.views[index].scene_dirty = false;
+            // The client is told it may draw again whether or not anything of
+            // its showing on the screen changed: a client that waited for this
+            // callback would otherwise never draw again.
+            self.frame_callbacks(index);
+            if tiles.is_empty() {
+                // The same pixels are already on the terminal, so it is not
+                // told to draw them again.
+                self.views[index].frame = Some(frame);
+                self.views[index].dirty = tiles;
+                continue;
+            }
+            sent += tiles.len();
+            tracing::trace!(pane = %pane, tiles = tiles.len(), "composed a frame");
+            let _ = self.events.send(Event::Frame { pane, frame, tiles });
         }
-        closed
+        sent
+    }
+
+    /// A frame the presenter is done with, to draw the next one into.
+    pub fn recycle(&mut self, pane: PaneId, frame: Frame, tiles: Vec<Tile>) {
+        let Some(index) = self.view(pane) else {
+            return;
+        };
+        self.views[index].frame = Some(frame);
+        self.views[index].dirty = tiles;
+        self.views[index].relayout();
+    }
+
+    /// Send the frame callbacks the window this pane shows waits for.
+    ///
+    /// A client driven by animation draws one frame per callback, so this paces
+    /// it: it is told when a frame of its window is on its way to a terminal.
+    fn frame_callbacks(&self, pane: usize) {
+        let time = self.time();
+        let Some(window) = self.views[pane].index(&self.windows) else {
+            return;
+        };
+        let surface = self.windows[window].surface.wl_surface().clone();
+        send_frame_callbacks(&surface, time);
+        for (popup, _) in PopupManager::popups_for_surface(&surface) {
+            send_frame_callbacks(popup.wl_surface(), time);
+        }
+    }
+
+    /// Note that this pane's terminal is owed the title or the pointer shape.
+    ///
+    /// Called wherever one of them can have changed, and not per frame: what
+    /// the terminal is owed is one escape, however often it changed.
+    fn mark_escapes(&mut self, pane: usize) {
+        if self.views[pane].escapes_dirty {
+            return;
+        }
+        let wanted = self.wanted_escapes(pane);
+        let view = &self.views[pane];
+        if view.pointer_shape != wanted.0 || view.title.as_ref() != wanted.1.as_ref() {
+            self.views[pane].escapes_dirty = true;
+        }
+    }
+
+    /// What this pane's terminal should be told: the pointer shape to draw and
+    /// what to call itself.
+    ///
+    /// The shape names come from the clients, through
+    /// `wp_cursor_shape_manager_v1`, and the terminal draws the pointer itself.
+    /// A cursor sent as an image cannot be described to the terminal, so the
+    /// terminal's default pointer stands in. A window that has no title leaves
+    /// the terminal's own title alone.
+    fn wanted_escapes(&self, pane: usize) -> (Option<&'static str>, Option<String>) {
+        let shape = match &self.cursor {
+            CursorImageStatus::Named(icon) => Some(kitty::pointer_shape(*icon)),
+            CursorImageStatus::Surface(_) | CursorImageStatus::Hidden => None,
+        };
+        let title = self.views[pane]
+            .index(&self.windows)
+            .and_then(|window| self.windows[window].title.clone());
+        (shape, title)
+    }
+
+    /// Tell the terminal showing this pane what it is owed.
+    fn announce(&mut self, pane: usize) {
+        if !std::mem::replace(&mut self.views[pane].escapes_dirty, false) {
+            return;
+        }
+        let pane_id = self.views[pane].id;
+        let (shape, title) = self.wanted_escapes(pane);
+        if self.views[pane].pointer_shape != shape {
+            self.views[pane].pointer_shape = shape;
+            let _ = self.events.send(Event::Pointer {
+                pane: pane_id,
+                shape,
+            });
+        }
+        // A window with no title leaves the terminal's own title alone, but
+        // what it is not told is recorded all the same: otherwise it would be
+        // looked at again on every later change.
+        let told = std::mem::replace(&mut self.views[pane].title, title.clone());
+        if let Some(title) = title
+            && told.as_ref() != Some(&title)
+        {
+            let _ = self.events.send(Event::Title {
+                pane: pane_id,
+                title,
+            });
+        }
+    }
+
+    /// This pane has nothing left to show, so its terminal is released.
+    fn leave(&mut self, pane: usize, reason: Option<String>) {
+        if std::mem::replace(&mut self.views[pane].leaving, true) {
+            return;
+        }
+        let _ = self.events.send(Event::PaneDone {
+            pane: self.views[pane].id,
+            reason,
+        });
     }
 
     fn index_of(&self, surface: &WlSurface) -> Option<usize> {
@@ -553,10 +674,18 @@ impl Meowland {
         let renamed = window.title != title;
         window.label = label.or_else(|| title.clone());
         window.title = title;
+        let id = window.id;
+        let (label, title) = (window.label.clone(), window.title.clone());
+        let _ = self.events.send(Event::Named {
+            window: id,
+            label,
+            title,
+        });
         if renamed {
-            let id = window.id;
-            for view in self.views_of(id) {
-                view.escapes_dirty = true;
+            for index in 0..self.views.len() {
+                if self.views[index].window == Some(id) {
+                    self.mark_escapes(index);
+                }
             }
         }
     }
@@ -612,119 +741,6 @@ impl Meowland {
             let _ = window.surface.send_configure();
         }
     }
-
-    pub fn present_view(&mut self, id: PaneId, presenter: &mut Presenter) -> Cost {
-        let Some(index) = self.view(id) else {
-            return Cost::default();
-        };
-        let phase = Instant::now();
-        if self.views[index].scene_dirty {
-            self.compose(index);
-            let View {
-                tiles,
-                frame,
-                dirty,
-                ..
-            } = &mut self.views[index];
-            tiles.diff(frame, dirty);
-        } else {
-            self.views[index].dirty.clear();
-        }
-        let mut cost = Cost {
-            tiles: self.views[index].dirty.len(),
-            compose: phase.elapsed(),
-            ..Cost::default()
-        };
-
-        self.views[index].scene_dirty = false;
-        self.views[index].escapes_dirty = false;
-        self.draw_pointer_shape(index, presenter);
-        self.name_terminal(index, presenter);
-        self.hand_over(index, presenter, &mut cost);
-
-        // Send callbacks even if the presenter dropped the frame.
-        let time = self.time();
-        if let Some(window) = self.views[index].index(&self.windows) {
-            let surface = self.windows[window].surface.wl_surface().clone();
-            send_frame_callbacks(&surface, time);
-            for (popup, _) in PopupManager::popups_for_surface(&surface) {
-                send_frame_callbacks(popup.wl_surface(), time);
-            }
-        }
-        cost
-    }
-
-    fn hand_over(&mut self, pane: usize, presenter: &mut Presenter, cost: &mut Cost) {
-        let view = &mut self.views[pane];
-        for index in view.dirty.drain(..) {
-            view.pending.mark(index);
-        }
-        if view.pending.is_empty() {
-            return;
-        }
-        let Some(mut frame) = presenter.frame() else {
-            return;
-        };
-
-        // The tiles are copied in the order they are listed, so the presenter
-        // can cut them apart without knowing the frame layout.
-        frame.pixels.clear();
-        frame.tiles.clear();
-        frame.tiles.reserve(view.pending.len());
-        let stride = view.frame.width as usize * BYTES;
-        for index in view.pending.indices() {
-            let tile = view.tiles.tile(&view.frame, index);
-            for row in 0..tile.height {
-                let start = (tile.y as usize + row as usize) * stride + tile.x as usize * BYTES;
-                frame.pixels.extend_from_slice(
-                    &view.frame.pixels()[start..start + tile.width as usize * BYTES],
-                );
-            }
-            frame
-                .tiles
-                .push(placement(tile, view.capabilities.cell, index));
-        }
-
-        cost.sent = frame.tiles.len();
-        match presenter.present(frame) {
-            Ok(()) => view.pending.clear(),
-            // The tiles stay due, so the wait loses nothing.
-            Err(frame) => presenter.recycle(frame),
-        }
-    }
-
-    /// Tell the terminal which pointer shape the focused client asked for.
-    ///
-    /// The shape names come from the clients, through
-    /// `wp_cursor_shape_manager_v1`, and the terminal draws the pointer
-    /// itself.
-    fn draw_pointer_shape(&mut self, pane: usize, presenter: &Presenter) {
-        let shape = match &self.cursor {
-            CursorImageStatus::Named(icon) => Some(kitty::pointer_shape(*icon)),
-            // A cursor sent as an image cannot be described to the terminal, so the
-            // terminal's default pointer stands in.
-            CursorImageStatus::Surface(_) | CursorImageStatus::Hidden => None,
-        };
-        if self.views[pane].pointer_shape != shape {
-            presenter.raw(crate::server::presenter::pointer_shape_bytes(shape));
-            self.views[pane].pointer_shape = shape;
-        }
-    }
-
-    /// Tell the terminal showing a pane's window what to call itself.
-    ///
-    /// The title is the client's, and the terminal title is the one place
-    /// outside the frame where a client is visible.
-    fn name_terminal(&mut self, pane: usize, presenter: &Presenter) {
-        let title = self.views[pane]
-            .index(&self.windows)
-            .and_then(|window| self.windows[window].title.clone());
-        if title.is_none() || self.views[pane].title == title {
-            return;
-        }
-        presenter.raw(crate::kitty::title(title.as_deref().unwrap_or_default()));
-        self.views[pane].title = title;
-    }
 }
 
 fn output_mode(capabilities: &Capabilities) -> Mode {
@@ -760,27 +776,27 @@ fn window_names(surface: &ToplevelSurface) -> (Option<String>, Option<String>) {
 }
 
 #[derive(Debug, Default)]
-struct MeowlandClient {
+struct ClientState {
     compositor_state: CompositorClientState,
 }
 
-impl ClientData for MeowlandClient {
+impl ClientData for ClientState {
     fn initialized(&self, _client: ClientId) {}
 
     fn disconnected(&self, _client: ClientId, _reason: DisconnectReason) {}
 }
 
-impl CompositorHandler for Meowland {
+impl CompositorHandler for Compositor {
     fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
+        &mut self.surfaces
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
         // Every client that reaches this point was inserted here with this data
         // attached.
         &client
-            .get_data::<MeowlandClient>()
-            .expect("clients are always inserted with MeowlandClient data")
+            .get_data::<ClientState>()
+            .expect("clients are always inserted with ClientState data")
             .compositor_state
     }
 
@@ -836,6 +852,11 @@ impl CompositorHandler for Meowland {
                 self.configure_windows();
                 self.sync_outputs();
                 self.activate_index(index);
+                for pane in 0..self.views.len() {
+                    if self.views[pane].window == Some(id) {
+                        self.mark_escapes(pane);
+                    }
+                }
             }
         }
         tracing::debug!(id = ?surface.id(), "committed");
@@ -846,17 +867,17 @@ impl CompositorHandler for Meowland {
     }
 }
 
-impl ShmHandler for Meowland {
+impl ShmHandler for Compositor {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
     }
 }
 
-impl smithay::wayland::buffer::BufferHandler for Meowland {
+impl smithay::wayland::buffer::BufferHandler for Compositor {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
-impl DmabufHandler for Meowland {
+impl DmabufHandler for Compositor {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
     }
@@ -890,7 +911,7 @@ impl DmabufHandler for Meowland {
     }
 }
 
-impl XdgShellHandler for Meowland {
+impl XdgShellHandler for Compositor {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
@@ -908,6 +929,15 @@ impl XdgShellHandler for Meowland {
             entered: false,
             last_interacted: None,
             fullscreen: false,
+        });
+        let (label, title) = (
+            self.windows.last().and_then(|w| w.label.clone()),
+            self.windows.last().and_then(|w| w.title.clone()),
+        );
+        let _ = self.events.send(Event::Named {
+            window: id,
+            label,
+            title,
         });
         // A window that has not drawn yet is not shown. Panes that follow the
         // newest window take it when it first has pixels (`commit`),
@@ -1002,24 +1032,27 @@ impl XdgShellHandler for Meowland {
             Some(active) if was_active => Some(active.min(self.windows.len() - 1)),
             active => active,
         };
-        // A pane that was given this window has nothing left to show, so it is
-        // done. It goes when `take_closed_views` answers this, and its
-        // terminal is released. A pane that follows the newest window
-        // shows whatever is next.
-        for view in &mut self.views {
-            if view.window != Some(gone) {
+        let _ = self.events.send(Event::Closed { window: gone });
+        // A pane that was given this window has nothing left to show, so its
+        // terminal is released. A pane that follows the newest window shows
+        // whatever is next.
+        for index in 0..self.views.len() {
+            if self.views[index].window != Some(gone) {
                 continue;
             }
-            view.window = None;
-            view.scene_dirty = true;
-            if !view.follow {
-                view.done = true;
+            self.views[index].window = None;
+            self.views[index].scene_dirty = true;
+            let follow = self.views[index].follow;
+            if !follow {
+                self.leave(index, None);
             }
         }
         if was_active {
             let keyboard = self.keyboard.clone();
             keyboard.set_focus(self, self.active_surface(), SERIAL_COUNTER.next_serial());
         }
+        let active = self.active.map(|index| self.windows[index].id);
+        let _ = self.events.send(Event::Focused { window: active });
         self.configure_windows();
         self.sync_outputs();
     }
@@ -1033,9 +1066,9 @@ impl XdgShellHandler for Meowland {
     }
 }
 
-impl OutputHandler for Meowland {}
+impl OutputHandler for Compositor {}
 
-impl SeatHandler for Meowland {
+impl SeatHandler for Compositor {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
@@ -1046,26 +1079,26 @@ impl SeatHandler for Meowland {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.cursor = image;
-        // Every pane is owed the new shape, so each one draws it again.
-        for view in &mut self.views {
-            view.escapes_dirty = true;
+        // Every pane's terminal is owed the new shape.
+        for index in 0..self.views.len() {
+            self.mark_escapes(index);
         }
     }
 }
 
 /// The cursor-shape protocol requires this. meowland has no tablets, so the
 /// default is enough.
-impl smithay::wayland::tablet_manager::TabletSeatHandler for Meowland {}
+impl smithay::wayland::tablet_manager::TabletSeatHandler for Compositor {}
 
-impl SelectionHandler for Meowland {
+impl SelectionHandler for Compositor {
     type SelectionUserData = ();
 }
 
-impl ClientDndGrabHandler for Meowland {}
+impl ClientDndGrabHandler for Compositor {}
 
-impl ServerDndGrabHandler for Meowland {}
+impl ServerDndGrabHandler for Compositor {}
 
-impl DataDeviceHandler for Meowland {
+impl DataDeviceHandler for Compositor {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
     }
@@ -1117,20 +1150,20 @@ fn advertise_render_nodes(
         "offering GPU buffers to clients"
     );
     let feedback = DmabufFeedbackBuilder::new(node.device.into_inner(), formats).build()?;
-    Ok(Some(state.create_global_with_default_feedback::<Meowland>(
-        display, &feedback,
-    )))
+    Ok(Some(
+        state.create_global_with_default_feedback::<Compositor>(display, &feedback),
+    ))
 }
 
-delegate_compositor!(Meowland);
-delegate_shm!(Meowland);
-delegate_dmabuf!(Meowland);
-delegate_xdg_shell!(Meowland);
-delegate_output!(Meowland);
-delegate_seat!(Meowland);
-delegate_data_device!(Meowland);
-delegate_cursor_shape!(Meowland);
-delegate_viewporter!(Meowland);
+delegate_compositor!(Compositor);
+delegate_shm!(Compositor);
+delegate_dmabuf!(Compositor);
+delegate_xdg_shell!(Compositor);
+delegate_output!(Compositor);
+delegate_seat!(Compositor);
+delegate_data_device!(Compositor);
+delegate_cursor_shape!(Compositor);
+delegate_viewporter!(Compositor);
 
 #[cfg(test)]
 mod tests {
@@ -1150,6 +1183,66 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_that_asked_for_a_window_that_is_gone_is_released() {
+        // The server checks the ID before it sends the attach, but the window
+        // may close in between: a pane left holding it would show nothing
+        // forever, because nothing is left to tell it that the window went.
+        let display =
+            smithay::reexports::wayland_server::Display::<Compositor>::new().expect("display");
+        let (events, announced) = calloop::channel::channel();
+        let mut state = Compositor::new(&display.handle(), &[], events).expect("compositor");
+        let pane = PaneId::new(1);
+        state.attach_view(
+            pane,
+            Show::Window(WindowId::new(7)),
+            &capabilities((800, 600)),
+        );
+
+        let released = std::iter::from_fn(|| announced.try_recv().ok())
+            .any(|event| matches!(event, Event::PaneDone { pane: done, reason: Some(_) } if done == pane));
+        assert!(released, "the pane is released with a reason to show");
+
+        // Following the newest window is not the same thing: there is nothing
+        // to show yet, but something may still come.
+        let (events, announced) = calloop::channel::channel();
+        let mut state = Compositor::new(&display.handle(), &[], events).expect("compositor");
+        let pane = PaneId::new(2);
+        state.attach_view(pane, Show::Newest, &capabilities((800, 600)));
+        assert!(
+            std::iter::from_fn(|| announced.try_recv().ok())
+                .all(|event| !matches!(event, Event::PaneDone { .. })),
+            "a pane waiting for a window is not released"
+        );
+    }
+
+    #[test]
+    fn a_pane_whose_frame_is_out_is_still_told_what_its_terminal_owes() {
+        // The frame is in the presenter's hands and the pane is owed an escape:
+        // the escape goes out, the frame stays out, and nothing is drawn.
+        let display =
+            smithay::reexports::wayland_server::Display::<Compositor>::new().expect("display");
+        let (events, announced) = calloop::channel::channel();
+        let mut state = Compositor::new(&display.handle(), &[], events).expect("compositor");
+        let pane = PaneId::new(1);
+        state.attach_view(pane, Show::Newest, &capabilities((800, 600)));
+        assert!(state.present() > 0, "the first frame draws the backdrop");
+        assert!(
+            state.views[0].frame.is_none(),
+            "the presenter has the frame"
+        );
+
+        // Standing in for a cursor or title change while the frame is out.
+        state.views[0].escapes_dirty = true;
+        assert_eq!(state.present(), 0, "nothing to draw without a frame");
+        assert!(state.views[0].frame.is_none(), "the frame is still out");
+        assert!(
+            !state.views[0].escapes_dirty,
+            "what the terminal is owed went out"
+        );
+        let _ = announced;
+    }
+
+    #[test]
     fn configured_view_prefers_the_most_recently_interacted_pane() {
         let window = WindowId::new(1);
         let mut first = View::new(PaneId::new(1), &capabilities((800, 600)));
@@ -1159,11 +1252,11 @@ mod tests {
         let views = vec![first, second];
 
         assert_eq!(
-            Meowland::configured_view(&views, window, Some(PaneId::new(2))).map(|view| view.id),
+            Compositor::configured_view(&views, window, Some(PaneId::new(2))).map(|view| view.id),
             Some(PaneId::new(2))
         );
         assert_eq!(
-            Meowland::configured_view(&views, window, Some(PaneId::new(3))).map(|view| view.id),
+            Compositor::configured_view(&views, window, Some(PaneId::new(3))).map(|view| view.id),
             Some(PaneId::new(1))
         );
     }

@@ -10,18 +10,32 @@ use smithay::{
     utils::{Logical, Point, SERIAL_COUNTER},
 };
 
-use super::Meowland;
+use super::Compositor;
 use crate::{
     keys,
     protocol::{
         PaneId,
-        pane::{Key, Pointer},
+        pane::{Input, Key, Pointer},
     },
 };
 
 pub const BINDING_MODIFIER: crossterm::event::KeyModifiers = crossterm::event::KeyModifiers::ALT;
 
-impl Meowland {
+impl Compositor {
+    /// What the user did in this pane, as the pane reported it.
+    pub fn input(&mut self, pane: PaneId, input: Input) {
+        match input {
+            Input::Key(key) => self.key(pane, key),
+            Input::Pointer(pointer) => self.pointer(pane, pointer),
+            Input::Paste(text) => {
+                self.interact(pane);
+                self.paste(&text);
+            }
+            Input::Focus(true) => self.interact(pane),
+            Input::Focus(false) => {}
+        }
+    }
+
     /// Handle a key the terminal reported.
     ///
     /// Terminals do not have to report key releases. So a press is treated as a
@@ -108,12 +122,12 @@ impl Meowland {
                 if self.pane_window(pane).is_some() {
                     self.close_window(pane);
                 } else if let Some(index) = self.view(pane) {
-                    self.views[index].detaching = true;
+                    self.leave(index, None);
                 }
             }
             KeyCode::KEY_W => {
                 if let Some(index) = self.view(pane) {
-                    self.views[index].detaching = true;
+                    self.leave(index, None);
                 }
             }
             _ => return false,
@@ -310,7 +324,10 @@ impl Meowland {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::pane::{Capabilities, Show};
+    use crate::{
+        protocol::pane::{Capabilities, Show},
+        wayland::message::Event,
+    };
 
     fn capabilities(pixels: (u32, u32)) -> Capabilities {
         Capabilities {
@@ -326,14 +343,20 @@ mod tests {
     }
 
     #[test]
-    fn alt_w_requests_pane_detach() {
+    fn alt_w_releases_the_pane() {
         let display =
-            smithay::reexports::wayland_server::Display::<Meowland>::new().expect("display");
-        let mut state = Meowland::new(&display.handle(), &[]).expect("compositor");
+            smithay::reexports::wayland_server::Display::<Compositor>::new().expect("display");
+        let (events, released) = calloop::channel::channel();
+        let mut state = Compositor::new(&display.handle(), &[], events).expect("compositor");
         let pane = PaneId::new(1);
         state.attach_view(pane, Show::Focused, &capabilities((800, 600)));
 
         assert!(state.binding(pane, BINDING_MODIFIER, KeyCode::KEY_W));
-        assert!(state.take_detach_request(pane));
+        let told = std::iter::from_fn(|| released.try_recv().ok())
+            .any(|event| matches!(event, Event::PaneDone { pane: done, .. } if done == pane));
+        assert!(
+            told,
+            "the server is told that the pane has nothing left to show"
+        );
     }
 }

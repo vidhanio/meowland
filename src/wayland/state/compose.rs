@@ -18,22 +18,21 @@ use smithay::{
     },
 };
 
-use super::{Meowland, TILE_CELLS, View};
+use super::{Compositor, TILE_CELLS};
 use crate::{
-    kitty::{self, ImageId},
     render::{Frame, Rect},
     wayland::buffer::Snapshot,
 };
 
 const BACKDROP: [u8; 3] = [0x14, 0x16, 0x1b];
 
-impl Meowland {
+impl Compositor {
     /// Repaint one pane from the window it shows.
     ///
     /// Reading geometry needs `&self` and drawing needs the frame, so the
     /// drawing order is planned first and painted afterwards.
-    pub(super) fn compose(&mut self, pane: usize) {
-        self.views[pane].frame.clear(BACKDROP);
+    pub(super) fn draw(&mut self, pane: usize, frame: &mut Frame) {
+        frame.clear(BACKDROP);
 
         self.plan.clear();
         if let Some(window) = self.views[pane].index(&self.windows) {
@@ -50,7 +49,6 @@ impl Meowland {
             }
         }
 
-        let View { frame, .. } = &mut self.views[pane];
         for (surface, position) in &self.plan {
             draw_tree(frame, &self.snapshots, surface, *position);
         }
@@ -64,10 +62,13 @@ impl Meowland {
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
         let window = self.views[pane].index(&self.windows)?;
-        if !self.views[pane]
-            .frame
-            .bounds()
-            .contains(point.x as i32, point.y as i32)
+        if !Rect::new(
+            0,
+            0,
+            self.views[pane].capabilities.pixels.0,
+            self.views[pane].capabilities.pixels.1,
+        )
+        .contains(point.x as i32, point.y as i32)
         {
             return None;
         }
@@ -80,31 +81,6 @@ impl Meowland {
             }
         }
         surface_under(&self.snapshots, &surface, point, Point::from((0, 0)))
-    }
-}
-
-/// Where one tile goes on a pane's screen, and what it is called.
-///
-/// The name is a tile of that terminal's frame, so the same tile of the next
-/// frame replaces the image the terminal has.
-pub(super) fn placement(tile: Rect, cell: (u32, u32), index: usize) -> kitty::Placement {
-    let (cell_width, cell_height) = (cell.0.max(1), cell.1.max(1));
-    let cell_aligned =
-        tile.width.is_multiple_of(cell_width) && tile.height.is_multiple_of(cell_height);
-    let (cols, rows) = if cell_aligned {
-        (tile.width / cell_width, tile.height / cell_height)
-    } else {
-        (0, 0)
-    };
-    kitty::Placement {
-        id: ImageId::new(index as u32 + 1),
-        width: tile.width,
-        height: tile.height,
-        // c/r would scale a partial edge tile to a whole cell rectangle.
-        // Zero leaves it at its native pixel size instead.
-        cols,
-        rows,
-        cell: (tile.x as u32 / cell_width, tile.y as u32 / cell_height),
     }
 }
 
@@ -279,18 +255,4 @@ pub(super) fn send_frame_callbacks(surface: &WlSurface, time: u32) {
         },
         |_, _, ()| true,
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn partial_edge_tiles_keep_native_dimensions() {
-        let edge = placement(Rect::new(0, 0, 7, 9), (10, 20), 0);
-        assert_eq!((edge.cols, edge.rows), (0, 0));
-
-        let full = placement(Rect::new(0, 0, 160, 160), (10, 20), 1);
-        assert_eq!((full.cols, full.rows), (16, 8));
-    }
 }

@@ -10,24 +10,29 @@ use smithay::{
     },
 };
 
-use super::Meowland;
+use super::Compositor;
 use crate::wayland::buffer::Snapshot;
 
 /// Take a copy of the buffer a surface committed, and hand it straight back.
 ///
 /// This is the moment client memory is read: from here on the surface is
-/// composited from [`super::Meowland::snapshots`], so a client that
+/// composited from [`super::Compositor::snapshots`], so a client that
 /// reuses its buffer cannot tear a frame.
-impl Meowland {
+impl Compositor {
     /// The biggest screen any pane has, which bounds the copy of a client
     /// buffer: nothing bigger can be shown.
+    ///
+    /// The capabilities are what the pane is, not what it currently holds: a
+    /// frame the presenter has is a frame this cannot see.
     ///
     /// With no pane attached there is no bound, and the copy is the buffer's
     /// own size.
     fn snapshot_limit(&self) -> Option<(u32, u32)> {
         let (width, height) = self.views.iter().fold((0, 0), |largest, view| {
-            let bounds = view.frame.bounds();
-            (largest.0.max(bounds.width), largest.1.max(bounds.height))
+            (
+                largest.0.max(view.capabilities.pixels.0),
+                largest.1.max(view.capabilities.pixels.1),
+            )
         });
         (width > 0 && height > 0).then_some((width, height))
     }

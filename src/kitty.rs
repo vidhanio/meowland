@@ -234,6 +234,14 @@ pub fn set_pointer_shape(out: &mut Vec<u8>, shape: Option<&str>) {
     }
 }
 
+/// The escape that sets the terminal's pointer shape, or resets it to the
+/// terminal's own default.
+pub fn pointer_shape_bytes(shape: Option<&str>) -> Vec<u8> {
+    let mut out = Vec::new();
+    set_pointer_shape(&mut out, shape);
+    out
+}
+
 /// The [pointer shape name][names] that stands for a Wayland cursor icon.
 ///
 /// [names]: https://sw.kovidgoyal.net/kitty/pointer-shapes/#pointer-shape-names

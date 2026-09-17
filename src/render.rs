@@ -1,5 +1,7 @@
 //! Blend premultiplied client pixels into an RGB frame and diff its tiles.
 
+use crate::kitty::ImageId;
+
 pub const BYTES4: usize = 4;
 
 pub const BYTES: usize = 3;
@@ -229,11 +231,23 @@ fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     }
 }
 
+/// One tile of a frame, as the terminal is told about it.
+///
+/// A frame's tiles are cut out by the compositor and put on the terminal by the
+/// presenter, so this is what they pass: where the tile is, and the image the
+/// terminal keeps it under. A tile keeps its image across frames, so the
+/// terminal replaces the image it already has instead of drawing another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tile {
+    pub image: ImageId,
+    pub rect: Rect,
+}
+
 /// Tracks changed tiles between frames.
 #[derive(Debug)]
 pub struct Tiles {
-    pub size: (u32, u32),
-    pub grid: (u32, u32),
+    size: (u32, u32),
+    grid: (u32, u32),
     previous: Vec<u8>,
     /// Whether the next [`Tiles::diff`] should report every tile as changed.
     stale: bool,
@@ -254,8 +268,9 @@ impl Tiles {
         }
     }
 
-    /// Fill `changed` with tile indices in grid order.
-    pub fn diff(&mut self, frame: &Frame, changed: &mut Vec<usize>) {
+    /// Fill `changed` with the tiles that differ from the last diff, in grid
+    /// order.
+    pub fn diff(&mut self, frame: &Frame, changed: &mut Vec<Tile>) {
         if self.previous.len() != frame.pixels.len() {
             self.stale = true;
             self.previous.resize(frame.pixels.len(), 0);
@@ -263,20 +278,23 @@ impl Tiles {
         changed.clear();
         changed.reserve(self.tile_count());
         for index in 0..self.tile_count() {
-            let tile = self.tile(frame, index);
-            if self.stale || self.tile_differs(frame, tile) {
-                changed.push(index);
-                self.update_previous(frame, tile);
+            let rect = self.tile(frame, index);
+            if self.stale || self.tile_differs(frame, rect) {
+                changed.push(Tile {
+                    image: ImageId::new(index as u32 + 1),
+                    rect,
+                });
+                self.update_previous(frame, rect);
             }
         }
         self.stale = false;
     }
 
-    pub const fn tile_count(&self) -> usize {
+    const fn tile_count(&self) -> usize {
         self.grid.0 as usize * self.grid.1 as usize
     }
 
-    pub fn tile(&self, frame: &Frame, index: usize) -> Rect {
+    fn tile(&self, frame: &Frame, index: usize) -> Rect {
         let grid_x = index as u32 % self.grid.0;
         let grid_y = index as u32 / self.grid.0;
         let x = grid_x * self.size.0;
@@ -509,10 +527,16 @@ mod tests {
             Rect::new(40, 40, 2, 2),
         );
         tiles.diff(&frame, &mut changed);
-        assert_eq!(changed, vec![3], "only the tile holding the change");
-        assert_eq!(tiles.tile(&frame, 3), Rect::new(32, 32, 32, 32));
+        assert_eq!(
+            changed,
+            vec![Tile {
+                image: ImageId::new(4),
+                rect: Rect::new(32, 32, 32, 32),
+            }],
+            "only the tile holding the change, under the image it keeps"
+        );
         tiles.diff(&frame, &mut changed);
-        assert_eq!(changed, [] as [usize; 0]);
+        assert_eq!(changed, [] as [Tile; 0]);
     }
 
     #[test]

@@ -3,19 +3,34 @@
 ## Architecture
 
 `meowland` is a Wayland compositor that draws windows in a terminal with the
-kitty graphics protocol. `src/server.rs` owns the server; `src/client.rs` owns
-one attached terminal, called a pane. Panes are independent and each shows one
+kitty graphics protocol. `src/server/` owns the server; `src/client/` owns one
+attached terminal, called a pane. Panes are independent and each shows one
 window. The server stays running after panes detach.
 
-`Meowland` in `src/compositor.rs` owns protocol state, windows, input routing,
-and presentation. Keep that state in one place. Each toplevel fills its pane;
-there is no tiling. An empty pane follows the newest window once it has pixels.
+The compositor runs on a thread of its own, in `src/wayland/`, and the server
+reaches it only in messages: `src/wayland/message.rs` is the whole of the
+interface. The compositor holds the Wayland clients, their surfaces, and the
+frames those add up to; the server holds the panes, the control socket, the
+client programs, and xwayland-satellite. Nothing on one side reaches into the
+other, so composing a frame never makes an input event wait.
 
-Both `wl_shm` and `zwp_linux_dmabuf_v1` produce a CPU-side `Snapshot`. Advertise
-GPU buffers only when the renderer can read them back; refusing an advertised
-buffer can leave a client without a window. CPU composition is shared by both
-paths. The input thread composes frames; each pane's presenter thread compresses
-and sends them. Drop frames while a presenter is busy, but keep their tiles due.
+`Compositor` in `src/wayland/state/mod.rs` owns protocol state, windows, input
+routing, and composition. Keep that state in one place. Each toplevel fills its
+pane; there is no tiling. An empty pane follows the newest window once it has
+pixels.
+
+A pane has one frame. The compositor draws into it, sends it with the tiles that
+changed, and cannot draw that pane again until the presenter gives it back. So
+frames are dropped while a pane's terminal is behind, but the tiles due are not:
+the next frame is diffed against the last one that was sent. The compositor
+sends frame callbacks when it draws, so clients are paced by what the terminal
+can take.
+
+Both `wl_shm` and `zwp_linux_dmabuf_v1` produce a CPU-side `Snapshot`.
+Advertise GPU buffers only when the renderer can read them back; refusing an
+advertised buffer can leave a client without a window. CPU composition is shared
+by both paths. Each pane's presenter thread cuts the changed tiles out, compresses
+them, and writes them to the terminal's socket.
 
 `wp_viewporter` is applied during drawing. X11 clients require
 xwayland-satellite. If it is unavailable, do not pass an inherited `DISPLAY` to
@@ -47,18 +62,21 @@ no pane is not configured. Focused windows receive `Activated`; windows that
 requested fullscreen receive `Fullscreen`.
 
 The control and pane sockets are owner-only files in `$XDG_RUNTIME_DIR`. The
-Wayland socket is `wayland-meowland`. `src/display.rs` defines the pane protocol:
-one frame in flight per pane, with ordered frames and escapes. Only frames are
-acknowledged. The terminal side uses separate threads for input, output, and
-hangup checks.
+Wayland socket is `wayland-meowland`. `src/protocol/pane.rs` defines the pane
+protocol: one frame in flight per pane, with ordered frames and escapes. Only
+frames are acknowledged. The terminal side uses separate threads for input,
+output, and hangup checks.
 
 Client stdout and stderr go to `$XDG_RUNTIME_DIR/meowland.log`, not the pane.
 Window titles and `list` output must filter terminal control characters.
 Shared-memory graphics transfers use pane-specific object names.
 
-On stop, detach panes, then signal the server's process tree with `SIGHUP`,
-`SIGTERM`, and `SIGKILL`, rescanning before each signal. Daemonized processes
-outside the tree are not included.
+On stop, ask every window to close (`xdg_toplevel.close`) and give the clients
+that honour it a moment to leave, then detach the panes, signal the server's
+process tree with `SIGHUP`, `SIGTERM`, and `SIGKILL` — rescanning before each
+signal, because unix does not stop children when their parent exits — and then
+join the compositor thread. Daemonized processes outside the tree are not
+included.
 
 ## Development
 

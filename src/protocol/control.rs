@@ -1,4 +1,8 @@
-//! Control socket and command protocol.
+//! The control socket, and what the command line says to a running server.
+//!
+//! A request is one connection: it is written, the write end is shut down, and
+//! the answer is read back. A connection that says nothing asks whether a
+//! server is there, and the connection itself is the answer.
 
 use std::{
     env,
@@ -12,7 +16,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{Error, types::WindowId};
+use crate::{Error, protocol::WindowId};
 
 pub const CONTROL_SOCKET: &str = "meowland-control";
 pub const DISPLAY_SOCKET: &str = "meowland-display";
@@ -223,7 +227,7 @@ mod tests {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
 
     use super::{Command, Reply, Window};
-    use crate::types::WindowId;
+    use crate::protocol::WindowId;
 
     #[test]
     fn a_run_request_carries_an_argv_unchanged() {

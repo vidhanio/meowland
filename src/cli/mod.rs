@@ -1,6 +1,37 @@
+//! The command line: the flags, the subcommands, and what each one does.
+
+mod command;
+
 use std::{ffi::OsString, path::PathBuf};
 
-use crate::{control, dmabuf, types::WindowId};
+use crate::{
+    Error, client, dmabuf,
+    protocol::{WindowId, control, pane::Show},
+    server,
+};
+
+/// Do what the command line says.
+pub fn execute(action: Action) -> Result<(), Error> {
+    match action {
+        Action::Run(run) => command::run(run),
+        Action::Attach(attach) => client::attach(attach.window.map_or(Show::Focused, Show::Window)),
+        Action::List(_) => command::list(),
+        Action::Server(server) => match server.action {
+            ServerAction::Start(start) => {
+                if server::process::is_detached() {
+                    server::run(start.settings)
+                } else {
+                    command::start_server(&start.settings)
+                }
+            }
+            ServerAction::Stop(_) => command::stop(),
+        },
+        Action::Completions(completions) => {
+            print!("{}", script(completions.shell));
+            Ok(())
+        }
+    }
+}
 
 /// A Wayland compositor in a terminal.
 #[derive(usage::Cli)]

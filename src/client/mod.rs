@@ -1,4 +1,11 @@
-//! Terminal-side pane connection.
+//! One terminal pane: the terminal end of the pane protocol.
+//!
+//! A pane takes over the terminal it was started in, says hello to the server
+//! over the pane socket, and from then on writes the frames the server sends it
+//! and sends back what the user did. A pane is a process of its own, so the
+//! server outlives it.
+
+pub mod terminal;
 
 use std::{
     io::Write as _,
@@ -18,27 +25,28 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 
+use self::terminal::Terminal;
 use crate::{
-    Error,
-    display::{self, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer},
-    keys,
-    tty::{self, Capabilities, Terminal},
+    Error, keys,
+    protocol::pane::{self, Capabilities, Input, Key, KeyKind, Pointer, Show, ToClient, ToServer},
 };
 
+/// How long the pane waits for the server to answer its hello.
 const GREETING_TIMEOUT: Duration = Duration::from_secs(1);
 
-// Crossterm can spin after a terminal closes instead of reporting EOF.
+/// Crossterm can spin after a terminal closes instead of reporting EOF.
 const HANGUP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Show a window in this terminal, until the terminal or the server is gone.
 pub fn attach(show: Show) -> Result<(), Error> {
     // Connect before taking over the terminal.
-    let mut stream = display::connect()?;
-    let mut terminal = Terminal::new()?;
+    let mut stream = pane::connect()?;
+    let mut terminal = terminal::Terminal::new()?;
     let capabilities = terminal.activate()?.clone();
     tracing::info!(?capabilities, "terminal taken over");
 
     let departure = match greet(&mut stream, capabilities, show)? {
-        Greeting::Welcome => display_it(stream, terminal)?,
+        Greeting::Welcome => run(stream, terminal)?,
         Greeting::Refused(reason) => {
             drop(terminal);
             Departure::Detached(reason)
@@ -74,26 +82,27 @@ enum Greeting {
     Gone,
 }
 
+/// Say hello, and hear whether this pane may show a window here.
 fn greet(
     stream: &mut UnixStream,
     capabilities: Capabilities,
     show: Show,
 ) -> Result<Greeting, Error> {
-    display::write_to(
+    pane::write_to(
         stream,
-        display::encode(&ToServer::Hello {
-            version: display::VERSION,
+        pane::encode(&ToServer::Hello {
+            version: pane::VERSION,
             show,
             capabilities,
         }),
     )?;
 
     stream.set_read_timeout(Some(GREETING_TIMEOUT))?;
-    let reply = display::read_from(stream);
+    let reply = pane::read_from(stream);
     stream.set_read_timeout(None)?;
 
     let reply = reply?;
-    match reply.and_then(|(tag, payload)| display::decode_client(tag, payload)) {
+    match reply.and_then(|(tag, payload)| pane::decode_client(tag, payload)) {
         Some(ToClient::Welcome) => Ok(Greeting::Welcome),
         Some(ToClient::Detached(reason)) => Ok(Greeting::Refused(reason)),
         None => Ok(Greeting::Gone),
@@ -101,6 +110,7 @@ fn greet(
     }
 }
 
+/// Why the pane stopped showing its window.
 #[derive(Debug)]
 enum Departure {
     Detached(String),
@@ -109,36 +119,8 @@ enum Departure {
     Signal,
 }
 
-struct Showing {
-    stream: UnixStream,
-    terminal: Terminal,
-    departure: Option<Departure>,
-    signal: Option<LoopSignal>,
-}
-
-impl Showing {
-    fn leave(&mut self, reason: Departure) {
-        if self.departure.is_none() {
-            self.departure = Some(reason);
-        }
-    }
-
-    fn stop(&self) {
-        if let Some(signal) = &self.signal {
-            signal.stop();
-        }
-    }
-
-    fn send(&mut self, message: &ToServer) {
-        if let Err(error) = display::write_to(&mut self.stream, display::encode(message)) {
-            tracing::warn!(%error, "could not reach the server");
-            self.leave(Departure::ServerGone);
-            self.stop();
-        }
-    }
-}
-
-fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
+/// Write frames until either end is gone, and report why it ended.
+fn run(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
     let mut event_loop: EventLoop<Showing> = EventLoop::try_new()?;
     let signal = event_loop.get_signal();
     let handle = event_loop.handle();
@@ -181,7 +163,7 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error
         .insert_source(
             Timer::from_duration(HANGUP_INTERVAL),
             |_, (), showing: &mut Showing| {
-                if tty::hung_up() {
+                if terminal::hung_up() {
                     showing.leave(Departure::TerminalGone);
                     showing.stop();
                 }
@@ -207,7 +189,7 @@ fn display_it(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error
         signal: Some(signal),
     };
     let result = event_loop.run(None, &mut showing, |_| {});
-    let _ = display::write_to(&mut showing.stream, display::encode(&ToServer::Bye));
+    let _ = pane::write_to(&mut showing.stream, pane::encode(&ToServer::Bye));
     let _ = showing.stream.shutdown(std::net::Shutdown::Both);
     writer.stop();
     input_thread.stop();
@@ -219,6 +201,37 @@ fn watch<T: std::fmt::Debug>(source: &'static str, refused: T) -> Error {
     Error::Watch {
         source,
         cause: format!("{refused:?}").into(),
+    }
+}
+
+/// One pane that is showing something: its socket, its terminal, and why it is
+/// on its way out.
+struct Showing {
+    stream: UnixStream,
+    terminal: Terminal,
+    departure: Option<Departure>,
+    signal: Option<LoopSignal>,
+}
+
+impl Showing {
+    fn leave(&mut self, reason: Departure) {
+        if self.departure.is_none() {
+            self.departure = Some(reason);
+        }
+    }
+
+    fn stop(&self) {
+        if let Some(signal) = &self.signal {
+            signal.stop();
+        }
+    }
+
+    fn send(&mut self, message: &ToServer) {
+        if let Err(error) = pane::write_to(&mut self.stream, pane::encode(message)) {
+            tracing::warn!(%error, "could not reach the server");
+            self.leave(Departure::ServerGone);
+            self.stop();
+        }
     }
 }
 
@@ -235,6 +248,10 @@ fn on_event(showing: &mut Showing, event: crossterm::event::Event) {
     }
 }
 
+/// What the terminal reported, as the server is told about it.
+///
+/// The terminal reduces a key to a code and a shift here, because it has the
+/// key codes and the keymap.
 fn input_for(event: crossterm::event::Event) -> Option<Input> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 
@@ -288,6 +305,7 @@ fn input_for(event: crossterm::event::Event) -> Option<Input> {
     }
 }
 
+/// What the thread that writes frames has to say.
 #[derive(Debug)]
 enum FrameEvent {
     Drawn,
@@ -295,6 +313,8 @@ enum FrameEvent {
     Ended,
 }
 
+/// A thread that is stopped by a flag, because it may be inside a read that
+/// never returns.
 struct Worker {
     name: &'static str,
     stop: Arc<AtomicBool>,
@@ -326,7 +346,7 @@ impl Worker {
         // A thread inside a hung-up terminal never comes back: it spins in the
         // terminal library's read, or blocks on a pty with no reader, so a join
         // waits forever. It holds nothing this process needs.
-        if tty::hung_up() {
+        if terminal::hung_up() {
             return;
         }
         if handle.join().is_err() {
@@ -341,9 +361,11 @@ impl Drop for Worker {
     }
 }
 
+/// Write the escapes the server sends to the terminal, and say when a frame is
+/// through.
 fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
-        let message = match display::read_from(&mut stream) {
+        let message = match pane::read_from(&mut stream) {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(error) => {
@@ -351,7 +373,7 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
                 break;
             }
         };
-        let (bytes, frame) = match display::decode_client(message.0, message.1) {
+        let (bytes, frame) = match pane::decode_client(message.0, message.1) {
             Some(ToClient::Bytes(bytes)) => (bytes, false),
             Some(ToClient::Frame(bytes)) => (bytes, true),
             Some(ToClient::Detached(reason)) => {
@@ -381,6 +403,7 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
     let _ = events.send(FrameEvent::Ended);
 }
 
+/// Read the terminal's input, and hand it to the event loop.
 fn read_terminal(sender: &Sender<crossterm::event::Event>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         match crossterm::event::poll(Duration::from_millis(100)) {

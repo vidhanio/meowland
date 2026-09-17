@@ -146,7 +146,7 @@ impl Renderer {
         dmabuf: &Dmabuf,
         format: SourceFormat,
         scale: i32,
-        destination: &mut crate::buffer::Snapshot,
+        destination: &mut crate::wayland::buffer::Snapshot,
     ) -> Result<(), Error> {
         let (width, height) = (dmabuf.width(), dmabuf.height());
         let size = Size::<i32, BufferCoords>::from((width as i32, height as i32));

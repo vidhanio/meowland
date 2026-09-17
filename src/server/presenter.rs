@@ -12,9 +12,8 @@ use calloop::channel::Sender as EventSender;
 
 use crate::{
     Error,
-    display::{self, ToClient},
     kitty::{self, Encoder, Placement},
-    tty,
+    protocol::pane::{self, ToClient},
 };
 
 /// One frame on its way to the terminal: the pixels of the tiles that changed,
@@ -72,7 +71,7 @@ impl Presenter {
     }
 
     pub fn clear(&self) {
-        self.raw(tty::Terminal::clear());
+        self.raw(kitty::clear());
     }
 
     /// Returns `None` while a frame is in flight.
@@ -233,19 +232,19 @@ fn write(terminal: &mut Option<UnixStream>, bytes: Vec<u8>) -> std::io::Result<(
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    display::write_to(terminal, display::encode_client(ToClient::Bytes(bytes)))
+    pane::write_to(terminal, pane::encode_client(ToClient::Bytes(bytes)))
 }
 
 fn write_frame(terminal: &mut Option<UnixStream>, bytes: &[u8]) -> std::io::Result<()> {
     let Some(terminal) = terminal else {
         return Ok(());
     };
-    display::write_frame(terminal, bytes)
+    pane::write_frame(terminal, bytes)
 }
 
 fn tell(terminal: &mut Option<UnixStream>, message: ToClient) {
     if let Some(terminal) = terminal {
-        let _ = display::write_to(terminal, display::encode_client(message));
+        let _ = pane::write_to(terminal, pane::encode_client(message));
     }
 }
 

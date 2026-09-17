@@ -1,7 +1,12 @@
-//! Wayland protocol state, input routing, and frame composition.
+//! The compositor's Wayland state: its windows, their surfaces, and the panes
+//! that show them.
+
+mod compose;
+mod input;
+mod snapshot;
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     os::unix::net::UnixStream,
     sync::Arc,
     time::{Duration, Instant},
@@ -9,17 +14,14 @@ use std::{
 
 use evdev::KeyCode;
 use smithay::{
-    backend::{
-        allocator::dmabuf::Dmabuf,
-        input::{ButtonState, KeyState},
-    },
+    backend::allocator::dmabuf::Dmabuf,
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
     delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig},
-        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle},
+        keyboard::{KeyboardHandle, XkbConfig},
+        pointer::{CursorImageStatus, PointerHandle},
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
@@ -32,11 +34,7 @@ use smithay::{
     },
     utils::{Logical, Point, SERIAL_COUNTER, Serial, Transform},
     wayland::{
-        compositor::{
-            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
-            with_surface_tree_downward,
-        },
+        compositor::{CompositorClientState, CompositorHandler, CompositorState, with_states},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         output::{OutputHandler, OutputManagerState},
@@ -47,33 +45,29 @@ use smithay::{
             },
         },
         shell::xdg::{
-            PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
-            XdgShellState, XdgToplevelSurfaceData,
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
-        viewporter::{ViewportCachedState, ViewporterState, ensure_viewport_valid},
+        viewporter::ViewporterState,
     },
 };
 
+use self::compose::{placement, send_frame_callbacks, tile_size};
 use crate::{
-    Error,
-    buffer::Snapshot,
-    control,
-    display::{self, Key, Pointer},
-    keys, kitty,
-    presenter::Presenter,
-    render::{BYTES, Frame, Rect, Tiles},
-    tty::Capabilities,
-    types::{ImageId, PaneId, WindowId},
+    Error, kitty,
+    protocol::{
+        PaneId, WindowId, control,
+        pane::{Capabilities, Show},
+    },
+    render::{BYTES, Frame, Tiles},
+    server::presenter::Presenter,
+    wayland::buffer::Snapshot,
 };
 
 pub const REFRESH_MILLIHZ: i32 = 60_000;
 
 const TILE_CELLS: (u32, u32) = (16, 8);
-
-pub const BINDING_MODIFIER: crossterm::event::KeyModifiers = crossterm::event::KeyModifiers::ALT;
-
-const BACKDROP: [u8; 3] = [0x14, 0x16, 0x1b];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cost {
@@ -201,7 +195,7 @@ pub struct Meowland {
     /// Kept alive so the render nodes stay described to clients; never read.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
     dmabuf_global: Option<DmabufGlobal>,
-    gpu: Option<crate::gpu::Renderer>,
+    gpu: Option<crate::wayland::gpu::Renderer>,
 
     /// Kept alive so the `zxdg_output_manager_v1` global stays advertised.
     #[expect(dead_code, reason = "the state object is what keeps the global alive")]
@@ -388,7 +382,7 @@ impl Meowland {
         }
     }
 
-    pub fn attach_view(&mut self, id: PaneId, show: display::Show, capabilities: &Capabilities) {
+    pub fn attach_view(&mut self, id: PaneId, show: Show, capabilities: &Capabilities) {
         let (window, follow) = self.resolve(show);
         let mut view = View::new(id, capabilities);
         view.window = window;
@@ -446,11 +440,11 @@ impl Meowland {
             .filter(move |view| view.window == Some(window))
     }
 
-    fn resolve(&self, show: display::Show) -> (Option<WindowId>, bool) {
+    fn resolve(&self, show: Show) -> (Option<WindowId>, bool) {
         match show {
-            display::Show::Window(id) => (Some(id), false),
-            display::Show::Newest => (self.windows.last().map(|window| window.id), true),
-            display::Show::Focused => self.active_window().map_or_else(
+            Show::Window(id) => (Some(id), false),
+            Show::Newest => (self.windows.last().map(|window| window.id), true),
+            Show::Focused => self.active_window().map_or_else(
                 || (self.windows.last().map(|window| window.id), true),
                 |id| (Some(id), false),
             ),
@@ -712,7 +706,7 @@ impl Meowland {
             CursorImageStatus::Surface(_) | CursorImageStatus::Hidden => None,
         };
         if self.views[pane].pointer_shape != shape {
-            presenter.raw(crate::presenter::pointer_shape_bytes(shape));
+            presenter.raw(crate::server::presenter::pointer_shape_bytes(shape));
             self.views[pane].pointer_shape = shape;
         }
     }
@@ -728,347 +722,8 @@ impl Meowland {
         if title.is_none() || self.views[pane].title == title {
             return;
         }
-        presenter.raw(crate::tty::title(title.as_deref().unwrap_or_default()));
+        presenter.raw(crate::kitty::title(title.as_deref().unwrap_or_default()));
         self.views[pane].title = title;
-    }
-
-    /// Repaint one pane from the window it shows.
-    ///
-    /// Reading geometry needs `&self` and drawing needs the frame, so the
-    /// drawing order is planned first and painted afterwards.
-    fn compose(&mut self, pane: usize) {
-        self.views[pane].frame.clear(BACKDROP);
-
-        self.plan.clear();
-        if let Some(window) = self.views[pane].index(&self.windows) {
-            let surface = self.windows[window].surface.wl_surface().clone();
-            if self.snapshots.contains_key(&surface.id()) {
-                self.plan.push((surface.clone(), Point::from((0, 0))));
-                let geometry = geometry_offset(&surface);
-                for (popup, location) in PopupManager::popups_for_surface(&surface) {
-                    self.plan.push((
-                        popup.wl_surface().clone(),
-                        geometry + location - popup.geometry().loc,
-                    ));
-                }
-            }
-        }
-
-        let View { frame, .. } = &mut self.views[pane];
-        for (surface, position) in &self.plan {
-            draw_tree(frame, &self.snapshots, surface, *position);
-        }
-    }
-
-    /// The surface under a point, in the coordinates of the window the pane
-    /// shows.
-    fn surface_at(
-        &self,
-        pane: usize,
-        point: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        let window = self.views[pane].index(&self.windows)?;
-        if !self.views[pane]
-            .frame
-            .bounds()
-            .contains(point.x as i32, point.y as i32)
-        {
-            return None;
-        }
-        let surface = self.windows[window].surface.wl_surface().clone();
-        let geometry = geometry_offset(&surface);
-        for (popup, location) in PopupManager::popups_for_surface(&surface) {
-            let origin = geometry + location - popup.geometry().loc;
-            if let Some(under) = surface_under(&self.snapshots, popup.wl_surface(), point, origin) {
-                return Some(under);
-            }
-        }
-        surface_under(&self.snapshots, &surface, point, Point::from((0, 0)))
-    }
-
-    /// Handle a key the terminal reported.
-    ///
-    /// Terminals do not have to report key releases. So a press is treated as a
-    /// whole keystroke: press the key, release it, and let the terminal's
-    /// auto-repeat produce the repeats. A held key cannot otherwise be told
-    /// from one that was never released, and the client would repeat it
-    /// forever.
-    ///
-    /// The terminal reduces the key to a code and a shift first
-    /// (`crate::display`), because it has the key codes and the keymap.
-    /// Typing in a pane gives its window the keyboard, and the bindings act
-    /// on that window.
-    pub fn key(&mut self, pane: PaneId, key: Key) {
-        use display::KeyKind;
-
-        let modifiers = crossterm::event::KeyModifiers::from_bits_truncate(key.modifiers);
-        self.sync_modifiers(modifiers);
-        let stroke = keys::KeyStroke {
-            code: key.code,
-            shift: key.shift,
-        };
-        tracing::debug!(?key, code = stroke.code.code(), "key");
-
-        // Modifier keys are *state* for everything typed while they are held,
-        // so they follow the terminal's flags, not a keystroke.
-        if key.modifier {
-            match key.kind {
-                KeyKind::Press => self.press_modifier(stroke.code),
-                KeyKind::Repeat => {}
-                KeyKind::Release => self.release_modifier(stroke.code),
-            }
-            return;
-        }
-
-        match key.kind {
-            KeyKind::Press | KeyKind::Repeat => {
-                if !self.binding(pane, modifiers, stroke.code) {
-                    self.focus_pane(pane);
-                    self.type_stroke(stroke);
-                }
-            }
-            // The press already released this key.
-            KeyKind::Release => {}
-        }
-    }
-
-    /// Press a key and release it, holding shift while its symbol needs it.
-    fn type_stroke(&mut self, stroke: keys::KeyStroke) {
-        let synthesized_shift = stroke.shift && !self.is_pressed(keys::modifier::LEFT_SHIFT);
-        if synthesized_shift {
-            self.press_modifier(keys::modifier::LEFT_SHIFT);
-        }
-        self.forward_key(stroke.code, KeyState::Pressed);
-        self.forward_key(stroke.code, KeyState::Released);
-        if synthesized_shift {
-            self.release_modifier(keys::modifier::LEFT_SHIFT);
-        }
-    }
-
-    /// Handle compositor bindings before a key reaches a client.
-    ///
-    /// A binding acts on the pane the key was typed in, so it closes the window
-    /// that pane shows or detaches the pane.
-    fn binding(
-        &mut self,
-        pane: PaneId,
-        modifiers: crossterm::event::KeyModifiers,
-        code: KeyCode,
-    ) -> bool {
-        use crossterm::event::KeyModifiers as M;
-        if !modifiers.contains(BINDING_MODIFIER)
-            || modifiers.contains(M::CONTROL)
-            || modifiers.contains(M::SUPER)
-        {
-            return false;
-        }
-        // Linux input event codes, as the terminal reports them
-        // (`keys::for_char`): `KEY_Q` and `KEY_W`.
-        match code {
-            KeyCode::KEY_Q => {
-                // Close the window this pane shows, if it has one. Closing a
-                // client ends its pane; a pane with nothing to
-                // show releases its terminal instead.
-                if self.pane_window(pane).is_some() {
-                    self.close_window(pane);
-                } else if let Some(index) = self.view(pane) {
-                    self.views[index].detaching = true;
-                }
-            }
-            KeyCode::KEY_W => {
-                if let Some(index) = self.view(pane) {
-                    self.views[index].detaching = true;
-                }
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    /// Type text into the focused client, one keystroke per character.
-    ///
-    /// Text arrives as characters and clients take key presses, so each
-    /// character is matched to the stroke that produces it.
-    pub fn paste(&mut self, text: &str) {
-        for c in text.chars() {
-            let stroke = match c {
-                '\n' | '\r' => keys::for_key(crossterm::event::KeyCode::Enter),
-                _ => keys::for_char(c),
-            };
-            if let Some(stroke) = stroke {
-                self.type_stroke(stroke);
-            } else {
-                tracing::debug!(?c, "character has no key code in the advertised keymap");
-            }
-        }
-    }
-
-    fn sync_modifiers(&mut self, modifiers: crossterm::event::KeyModifiers) {
-        use crossterm::event::KeyModifiers as M;
-        for (flag, code) in [
-            (M::SHIFT, keys::modifier::LEFT_SHIFT),
-            (M::CONTROL, keys::modifier::LEFT_CTRL),
-            (M::ALT, keys::modifier::LEFT_ALT),
-            (M::SUPER, keys::modifier::LEFT_META),
-        ] {
-            if modifiers.contains(flag) {
-                self.press_modifier(code);
-            } else {
-                self.release_modifier(code);
-            }
-        }
-    }
-
-    fn press_modifier(&mut self, code: KeyCode) {
-        if !self.is_pressed(code) {
-            self.forward_key(code, KeyState::Pressed);
-        }
-    }
-
-    fn release_modifier(&mut self, code: KeyCode) {
-        if self.is_pressed(code) {
-            self.forward_key(code, KeyState::Released);
-        }
-    }
-
-    fn is_pressed(&self, code: KeyCode) -> bool {
-        self.pressed.contains(&code)
-    }
-
-    /// Hand a key to the focused client.
-    ///
-    /// The rest of this module counts keys as the terminal and `KEY_*` do
-    /// (evdev); the seat counts as XKB does, eight codes further along, so
-    /// the conversion happens here and nowhere else. Confusing the two is
-    /// not a loud failure: it types the neighbouring key.
-    fn forward_key(&mut self, code: KeyCode, state: KeyState) {
-        tracing::debug!(code = code.code(), ?state, "forwarding key");
-        if state == KeyState::Pressed {
-            if !self.pressed.contains(&code) {
-                self.pressed.push(code);
-            }
-        } else {
-            self.pressed.retain(|pressed| *pressed != code);
-        }
-        let keyboard = self.keyboard.clone();
-        let serial = SERIAL_COUNTER.next_serial();
-        let time = self.time();
-        keyboard.input(
-            self,
-            Keycode::from(u32::from(code.code()) + keys::XKB_OFFSET),
-            state,
-            serial,
-            time,
-            |_, _, _| FilterResult::<()>::Forward,
-        );
-    }
-
-    /// Handle a mouse event in a pane, in the cells the terminal reports.
-    pub fn pointer(&mut self, pane: PaneId, pointer: Pointer) {
-        let Some(index) = self.view(pane) else {
-            return;
-        };
-        match pointer {
-            Pointer::Motion { column, row } => {
-                let position = self.cell_position(index, column, row);
-                self.pointer_motion(index, position);
-            }
-            Pointer::Button {
-                column,
-                row,
-                button,
-                pressed,
-            } => {
-                // A click goes to the window the pane shows, so give it the
-                // keyboard.
-                self.focus_pane(pane);
-                let position = self.cell_position(index, column, row);
-                self.pointer_motion(index, position);
-                self.pointer_button(button, pressed);
-            }
-            Pointer::ScrollUp | Pointer::ScrollLeft => {
-                self.focus_pane(pane);
-                self.pointer_axis(index, -15.0);
-            }
-            Pointer::ScrollDown | Pointer::ScrollRight => {
-                self.focus_pane(pane);
-                self.pointer_axis(index, 15.0);
-            }
-        }
-    }
-
-    /// Where an event at a terminal cell happened, in the pixels that pane
-    /// draws in.
-    fn cell_position(&self, pane: usize, column: u16, row: u16) -> Point<f64, Logical> {
-        let capabilities = &self.views[pane].capabilities;
-        if capabilities.pixel_mouse {
-            return (f64::from(column), f64::from(row)).into();
-        }
-        let (cell_width, cell_height) = capabilities.cell;
-        (
-            f64::mul_add(
-                f64::from(column),
-                f64::from(cell_width),
-                f64::from(cell_width) / 2.0,
-            ),
-            f64::mul_add(
-                f64::from(row),
-                f64::from(cell_height),
-                f64::from(cell_height) / 2.0,
-            ),
-        )
-            .into()
-    }
-
-    fn pointer_motion(&mut self, pane: usize, position: Point<f64, Logical>) {
-        self.pointer_position = position;
-        // The seat takes the pointer position in *output* coordinates and the
-        // origin of the focused surface, and subtracts the two to get
-        // the client's position.
-        let event = MotionEvent {
-            location: position,
-            serial: SERIAL_COUNTER.next_serial(),
-            time: self.time(),
-        };
-        let pointer = self.pointer.clone();
-        if let Some((surface, origin)) = self.surface_at(pane, position) {
-            pointer.motion(self, Some((surface, origin.to_f64())), &event);
-        } else {
-            pointer.motion(self, None, &event);
-        }
-        pointer.frame(self);
-    }
-
-    fn pointer_button(&mut self, button: KeyCode, pressed: bool) {
-        let pointer = self.pointer.clone();
-        let event = ButtonEvent {
-            serial: SERIAL_COUNTER.next_serial(),
-            time: self.time(),
-            button: u32::from(button.code()),
-            state: if pressed {
-                ButtonState::Pressed
-            } else {
-                ButtonState::Released
-            },
-        };
-        pointer.button(self, &event);
-        pointer.frame(self);
-    }
-
-    fn pointer_axis(&mut self, pane: usize, vertical: f64) {
-        let pointer = self.pointer.clone();
-        if let Some((surface, origin)) = self.surface_at(pane, self.pointer_position) {
-            let event = MotionEvent {
-                location: self.pointer_position,
-                serial: SERIAL_COUNTER.next_serial(),
-                time: self.time(),
-            };
-            pointer.motion(self, Some((surface, origin.to_f64())), &event);
-        }
-        let frame =
-            AxisFrame::new(self.time()).value(smithay::backend::input::Axis::Vertical, vertical);
-        pointer.axis(self, frame);
-        pointer.frame(self);
     }
 }
 
@@ -1078,35 +733,6 @@ fn output_mode(capabilities: &Capabilities) -> Mode {
         // A terminal has no refresh rate. Frame callbacks pace clients here.
         refresh: REFRESH_MILLIHZ,
     }
-}
-
-/// Where one tile goes on a pane's screen, and what it is called.
-///
-/// The name is a tile of that terminal's frame, so the same tile of the next
-/// frame replaces the image the terminal has.
-fn placement(tile: Rect, cell: (u32, u32), index: usize) -> kitty::Placement {
-    let (cell_width, cell_height) = (cell.0.max(1), cell.1.max(1));
-    let cell_aligned =
-        tile.width.is_multiple_of(cell_width) && tile.height.is_multiple_of(cell_height);
-    let (cols, rows) = if cell_aligned {
-        (tile.width / cell_width, tile.height / cell_height)
-    } else {
-        (0, 0)
-    };
-    kitty::Placement {
-        id: ImageId::new(index as u32 + 1),
-        width: tile.width,
-        height: tile.height,
-        // c/r would scale a partial edge tile to a whole cell rectangle.
-        // Zero leaves it at its native pixel size instead.
-        cols,
-        rows,
-        cell: (tile.x as u32 / cell_width, tile.y as u32 / cell_height),
-    }
-}
-
-const fn tile_size(cell: (u32, u32)) -> (u32, u32) {
-    (cell.0 * TILE_CELLS.0, cell.1 * TILE_CELLS.1)
 }
 
 /// What a client calls its window: its app ID and its title.
@@ -1131,175 +757,6 @@ fn window_names(surface: &ToplevelSurface) -> (Option<String>, Option<String>) {
         };
         (named(&app_id), named(&title))
     })
-}
-
-/// Where the toplevel's window geometry starts, relative to its surface origin.
-///
-/// Popup positions arrive relative to that rectangle.
-fn geometry_offset(surface: &WlSurface) -> Point<i32, Logical> {
-    with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<SurfaceCachedState>()
-            .current()
-            .geometry
-            .map_or_else(|| (0, 0).into(), |geometry| geometry.loc)
-    })
-}
-
-/// Blend a surface tree into the frame, with the tree's root at `location`.
-///
-/// Both traversal closures receive the *parent's* accumulated location, so each
-/// one adds its own offset.
-fn draw_tree(
-    frame: &mut Frame,
-    snapshots: &HashMap<ObjectId, Snapshot>,
-    surface: &WlSurface,
-    location: Point<i32, Logical>,
-) {
-    with_surface_tree_downward(
-        surface,
-        location,
-        |_, states, location| TraversalAction::DoChildren(*location + subsurface_offset(states)),
-        |surface, states, location| {
-            draw_surface(
-                frame,
-                snapshots,
-                surface,
-                states,
-                *location + subsurface_offset(states),
-            );
-        },
-        |_, _, _| true,
-    );
-}
-
-/// Blend one surface of a tree into the frame, from its committed copy.
-fn draw_surface(
-    frame: &mut Frame,
-    snapshots: &HashMap<ObjectId, Snapshot>,
-    surface: &WlSurface,
-    states: &SurfaceData,
-    location: Point<i32, Logical>,
-) {
-    // A surface with nothing committed, or with a detached buffer, draws
-    // nothing.
-    let Some(snapshot) = snapshots.get(&surface.id()) else {
-        return;
-    };
-    let viewport = *states.cached_state.get::<ViewportCachedState>().current();
-    let scale = f64::from(snapshot.scale.max(1));
-    let src = viewport.src.map_or_else(
-        || Rect::new(0, 0, snapshot.width, snapshot.height),
-        |src| {
-            Rect::new(
-                (src.loc.x * scale).floor() as i32,
-                (src.loc.y * scale).floor() as i32,
-                (src.size.w * scale).ceil() as u32,
-                (src.size.h * scale).ceil() as u32,
-            )
-        },
-    );
-    let (width, height) = viewport.size().map_or_else(
-        || snapshot.logical_size(),
-        |size| (size.w.max(1), size.h.max(1)),
-    );
-    frame.draw(
-        &snapshot.image(),
-        src,
-        Rect::new(location.x, location.y, width as u32, height as u32),
-    );
-}
-
-fn subsurface_offset(states: &SurfaceData) -> Point<i32, Logical> {
-    states
-        .cached_state
-        .get::<SubsurfaceCachedState>()
-        .current()
-        .location
-}
-
-/// The topmost surface of a tree that a point hits, in the client's
-/// coordinates.
-///
-/// The point arrives in output coordinates and `origin` is a screen position. A
-/// surface accepts input only inside its input region; with no region, the
-/// whole surface accepts it.
-fn surface_under(
-    snapshots: &HashMap<ObjectId, Snapshot>,
-    surface: &WlSurface,
-    point: Point<f64, Logical>,
-    origin: Point<i32, Logical>,
-) -> Option<(WlSurface, Point<i32, Logical>)> {
-    use std::cell::RefCell;
-
-    let found = RefCell::new(None);
-    // Downward order is topmost first, the order a click must be matched in.
-    with_surface_tree_downward(
-        surface,
-        origin,
-        |_, states, location| TraversalAction::DoChildren(*location + subsurface_offset(states)),
-        |surface, states, location| {
-            if found.borrow().is_some() {
-                return;
-            }
-            let location = *location + subsurface_offset(states);
-            let Some(snapshot) = snapshots.get(&surface.id()) else {
-                return;
-            };
-            let viewport = *states.cached_state.get::<ViewportCachedState>().current();
-            let size = viewport.size().map_or_else(
-                || snapshot.logical_size(),
-                |size| (size.w.max(1), size.h.max(1)),
-            );
-            if accepts_input(states, point - location.to_f64(), size) {
-                *found.borrow_mut() = Some((surface.clone(), location));
-            }
-        },
-        |_, _, _| found.borrow().is_none(),
-    );
-    found.into_inner()
-}
-
-/// Whether a surface accepts input at a point, given in that surface's own
-/// coordinates.
-///
-/// A client can cut its sensitive area out with `wl_surface.set_input_region`;
-/// with no region the whole surface counts, as the protocol says.
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "the input region is borrowed out of the cached state, so the guard outlives the check"
-)]
-fn accepts_input(states: &SurfaceData, local: Point<f64, Logical>, size: (i32, i32)) -> bool {
-    let mut state = states.cached_state.get::<SurfaceAttributes>();
-    let attributes = state.current();
-    attributes.input_region.as_ref().map_or_else(
-        || {
-            local.x >= 0.0
-                && local.y >= 0.0
-                && local.x < f64::from(size.0)
-                && local.y < f64::from(size.1)
-        },
-        |region| region.contains((local.x.floor() as i32, local.y.floor() as i32)),
-    )
-}
-
-/// Send the frame callbacks a surface tree waits for, and clear them.
-///
-/// A client driven by animation draws one frame per callback, so this paces it.
-fn send_frame_callbacks(surface: &WlSurface, time: u32) {
-    with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, ()| TraversalAction::DoChildren(()),
-        |_, states, ()| {
-            let mut state = states.cached_state.get::<SurfaceAttributes>();
-            for callback in state.current().frame_callbacks.drain(..) {
-                callback.done(time);
-            }
-        },
-        |_, _, ()| true,
-    );
 }
 
 #[derive(Debug, Default)]
@@ -1389,90 +846,6 @@ impl CompositorHandler for Meowland {
     }
 }
 
-/// Take a copy of the buffer a surface committed, and hand it straight back.
-///
-/// This is the moment client memory is read: from here on the surface is
-/// composited from [`Meowland::snapshots`], so a client that reuses its buffer
-/// cannot tear a frame.
-impl Meowland {
-    /// The biggest screen any pane has, which bounds the copy of a client
-    /// buffer: nothing bigger can be shown.
-    ///
-    /// With no pane attached there is no bound, and the copy is the buffer's
-    /// own size.
-    fn snapshot_limit(&self) -> Option<(u32, u32)> {
-        let (width, height) = self.views.iter().fold((0, 0), |largest, view| {
-            let bounds = view.frame.bounds();
-            (largest.0.max(bounds.width), largest.1.max(bounds.height))
-        });
-        (width > 0 && height > 0).then_some((width, height))
-    }
-
-    fn snapshot(&mut self, surface: &WlSurface) {
-        let limit = self.snapshot_limit();
-
-        let committed = with_states(surface, |states| {
-            // The cached state is borrowed only for the reads that need it, so
-            // the copy below holds no lock.
-            let (buffer, scale) = {
-                let mut state = states.cached_state.get::<SurfaceAttributes>();
-                let current = state.current();
-                let buffer = current.buffer.take();
-                let scale = current.buffer_scale;
-                // A snapshot copies the whole buffer, so all accumulated damage
-                // is consumed. Left here it would make Smithay
-                // keep every damage rectangle across later
-                // commits.
-                current.damage.clear();
-                current.buffer_delta = None;
-                drop(state);
-                (buffer, scale)
-            };
-            buffer.map(|buffer| (buffer, scale))
-        });
-        match committed {
-            Some((BufferAssignment::NewBuffer(buffer), scale)) => {
-                let copied = match self.snapshots.entry(surface.id()) {
-                    Entry::Occupied(mut entry) => crate::buffer::snapshot(
-                        &buffer,
-                        scale,
-                        limit,
-                        entry.get_mut(),
-                        self.gpu.as_mut(),
-                    ),
-                    Entry::Vacant(entry) => {
-                        let mut snapshot = Snapshot::empty();
-                        let copied = crate::buffer::snapshot(
-                            &buffer,
-                            scale,
-                            limit,
-                            &mut snapshot,
-                            self.gpu.as_mut(),
-                        );
-                        if copied {
-                            entry.insert(snapshot);
-                        }
-                        copied
-                    }
-                };
-                if !copied {
-                    tracing::debug!(format = ?buffer, "buffer is not one we can composite");
-                } else if let Some(snapshot) = self.snapshots.get(&surface.id()) {
-                    let size = snapshot.logical_size();
-                    with_states(surface, |states| {
-                        ensure_viewport_valid(states, size.into());
-                    });
-                }
-                buffer.release();
-            }
-            Some((BufferAssignment::Removed, _)) => {
-                self.snapshots.remove(&surface.id());
-            }
-            None => {}
-        }
-    }
-}
-
 impl ShmHandler for Meowland {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
@@ -1500,7 +873,7 @@ impl DmabufHandler for Meowland {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        match crate::buffer::dmabuf_readable(&dmabuf, self.gpu.as_mut()) {
+        match crate::wayland::buffer::dmabuf_readable(&dmabuf, self.gpu.as_mut()) {
             Ok(()) => {
                 if let Err(err) = notifier.successful::<Self>() {
                     tracing::debug!(?err, "the client that offered a GPU buffer is gone");
@@ -1705,9 +1078,9 @@ impl DataDeviceHandler for Meowland {
 /// offered GPU buffers, and on which device.
 fn bring_up_renderer(
     nodes: &[crate::dmabuf::RenderNode],
-) -> Option<(crate::gpu::Renderer, crate::dmabuf::RenderNode)> {
+) -> Option<(crate::wayland::gpu::Renderer, crate::dmabuf::RenderNode)> {
     for node in nodes {
-        match crate::gpu::Renderer::new(&node.path) {
+        match crate::wayland::gpu::Renderer::new(&node.path) {
             Ok(renderer) => return Some((renderer, node.clone())),
             Err(err) => {
                 tracing::info!(?err, path = %node.path.display(), "no renderer on this render node");
@@ -1727,7 +1100,7 @@ fn bring_up_renderer(
 fn advertise_render_nodes(
     display: &DisplayHandle,
     state: &mut DmabufState,
-    gpu: Option<(&crate::gpu::Renderer, &crate::dmabuf::RenderNode)>,
+    gpu: Option<(&crate::wayland::gpu::Renderer, &crate::dmabuf::RenderNode)>,
 ) -> Result<Option<DmabufGlobal>, Error> {
     let Some((gpu, node)) = gpu else {
         return Ok(None);
@@ -1793,25 +1166,5 @@ mod tests {
             Meowland::configured_view(&views, window, Some(PaneId::new(3))).map(|view| view.id),
             Some(PaneId::new(1))
         );
-    }
-
-    #[test]
-    fn partial_edge_tiles_keep_native_dimensions() {
-        let edge = placement(Rect::new(0, 0, 7, 9), (10, 20), 0);
-        assert_eq!((edge.cols, edge.rows), (0, 0));
-
-        let full = placement(Rect::new(0, 0, 160, 160), (10, 20), 1);
-        assert_eq!((full.cols, full.rows), (16, 8));
-    }
-    #[test]
-    fn alt_w_requests_pane_detach() {
-        let display =
-            smithay::reexports::wayland_server::Display::<Meowland>::new().expect("display");
-        let mut state = Meowland::new(&display.handle(), &[]).expect("compositor");
-        let pane = PaneId::new(1);
-        state.attach_view(pane, display::Show::Focused, &capabilities((800, 600)));
-
-        assert!(state.binding(pane, BINDING_MODIFIER, KeyCode::KEY_W));
-        assert!(state.take_detach_request(pane));
     }
 }

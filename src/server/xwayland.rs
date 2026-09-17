@@ -8,12 +8,20 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
 };
 
+use nutype::nutype;
 use rustix::{
     io::{Errno, FdFlags, fcntl_setfd},
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType},
 };
 
-use crate::{Error, types::XDisplayNumber};
+use crate::Error;
+
+/// An X11 display number reserved for xwayland-satellite.
+#[nutype(
+    const_fn,
+    derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)
+)]
+pub struct XDisplayNumber(u32);
 
 /// The display numbers the server tries, in order.
 const DISPLAY_SLOTS: std::ops::RangeInclusive<u32> = 0..=32;
@@ -52,7 +60,7 @@ impl Server {
                 .arg("-listenfd")
                 .arg(listener.as_raw_fd().to_string());
         }
-        crate::process::spawn_unblocked(&mut command);
+        crate::server::process::spawn_unblocked(&mut command);
         let child = command.spawn();
         let mut reset_error = None;
         // The flag goes back on, so no later child inherits the sockets.

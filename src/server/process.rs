@@ -7,12 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use nutype::nutype;
 use rustix::{
     process::{Pid, Signal, kill_process, test_kill_process},
     runtime::{How, KernelSigSet, kernel_sigprocmask},
 };
 
-use crate::types::ProcessId;
+/// A process ID used while walking and stopping the server's process tree.
+#[nutype(const_fn, derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display))]
+pub struct ProcessId(u32);
+
 /// How long each signal is given before the next one is sent.
 ///
 /// Long enough for a client to close its windows and exit, and short enough

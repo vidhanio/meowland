@@ -387,6 +387,7 @@ mod tests {
             keyboard: true,
             pixel_mouse: false,
             shared_memory: false,
+            patches: true,
         }
     }
 

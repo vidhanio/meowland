@@ -31,7 +31,7 @@ pub fn connect() -> Result<UnixStream, crate::Error> {
 /// Bump it whenever these messages change: a build that does not know one of
 /// them can only read on and let the connection end, so a pane and a server
 /// that disagree are turned away rather than half-understood.
-pub const VERSION: ProtocolVersion = ProtocolVersion::new(4);
+pub const VERSION: ProtocolVersion = ProtocolVersion::new(5);
 
 /// What the terminal reported it can do. Each field is one independent answer.
 #[expect(
@@ -54,6 +54,10 @@ pub struct Capabilities {
     /// Whether the terminal reads frames out of shared memory, which keeps
     /// their pixels off the pty.
     pub shared_memory: bool,
+    /// Whether the terminal answered the query for the size of one of its
+    /// cells in pixels. Placing a patch in the right cell takes that answer:
+    /// a terminal that did not give one gets whole frames.
+    pub patches: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +255,7 @@ mod tests {
             keyboard: true,
             pixel_mouse: false,
             shared_memory: true,
+            patches: true,
         }
     }
 

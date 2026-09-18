@@ -20,7 +20,7 @@ use smithay::{
 
 use super::Compositor;
 use crate::{
-    render::{Frame, Rect},
+    render::{Frame, Rect, SourceFormat},
     wayland::buffer::Snapshot,
 };
 
@@ -32,12 +32,20 @@ impl Compositor {
     /// Reading geometry needs `&self` and drawing needs the frame, so the
     /// drawing order is planned first and painted afterwards.
     pub(super) fn draw(&mut self, pane: usize, frame: &mut Frame) {
-        frame.clear(BACKDROP);
-
         self.plan.clear();
+        let bounds = frame.bounds();
+        let mut covered = false;
         if let Some(window) = self.views[pane].index(&self.windows) {
             let surface = self.windows[window].surface.wl_surface().clone();
-            if self.snapshots.contains_key(&surface.id()) {
+            if let Some(snapshot) = self.snapshots.get(&surface.id()) {
+                let (src, size) = with_states(&surface, |states| placement(states, snapshot));
+                covered = covers(
+                    bounds,
+                    snapshot.format,
+                    (snapshot.width, snapshot.height),
+                    src,
+                    size,
+                );
                 self.plan.push((surface.clone(), Point::from((0, 0))));
                 let geometry = geometry_offset(&surface);
                 for (popup, location) in PopupManager::popups_for_surface(&surface) {
@@ -47,6 +55,12 @@ impl Compositor {
                     ));
                 }
             }
+        }
+        // A window that covers the pane with opaque pixels leaves no backdrop
+        // to be seen, so there is none to lay down under it: a screen's worth
+        // of pixels is written once per frame instead of twice.
+        if !covered {
+            frame.clear(BACKDROP);
         }
 
         for (surface, position) in &self.plan {
@@ -164,6 +178,21 @@ fn draw_surface(
     let Some(snapshot) = snapshots.get(&surface.id()) else {
         return;
     };
+    let (src, (width, height)) = placement(states, snapshot);
+    frame.draw(
+        &snapshot.image(),
+        src,
+        Rect::new(location.x, location.y, width, height),
+    );
+}
+
+/// Which pixels of a surface's committed copy are drawn, and how large the
+/// picture is: the viewport's source rectangle, and the size it takes.
+///
+/// Both are what `wp_viewporter` asks for, and both are in whole buffer pixels
+/// when they came from the viewport: a source rectangle covers as many pixels
+/// as it names, and a destination is at least one pixel either way.
+fn placement(states: &SurfaceData, snapshot: &Snapshot) -> (Rect, (u32, u32)) {
     let viewport = *states.cached_state.get::<ViewportCachedState>().current();
     let scale = f64::from(snapshot.scale.max(1));
     let src = viewport.src.map_or_else(
@@ -181,11 +210,27 @@ fn draw_surface(
         || snapshot.logical_size(),
         |size| (size.w.max(1), size.h.max(1)),
     );
-    frame.draw(
-        &snapshot.image(),
-        src,
-        Rect::new(location.x, location.y, width as u32, height as u32),
-    );
+    (src, (width as u32, height as u32))
+}
+
+/// Whether a surface's committed copy covers the whole of `bounds`, drawn where
+/// the pane draws a window's own surface.
+///
+/// That takes all three: no alpha to blend with, no crop of the buffer, and a
+/// destination no smaller than the frame. A surface that does leaves no
+/// backdrop to be seen under it, and the frame does not have to be laid down
+/// with one.
+fn covers(
+    bounds: Rect,
+    format: SourceFormat,
+    buffer: (u32, u32),
+    src: Rect,
+    size: (u32, u32),
+) -> bool {
+    format.opaque()
+        && src == Rect::new(0, 0, buffer.0, buffer.1)
+        && size.0 >= bounds.width
+        && size.1 >= bounds.height
 }
 
 fn subsurface_offset(states: &SurfaceData) -> Point<i32, Logical> {
@@ -277,4 +322,73 @@ pub(super) fn send_frame_callbacks(surface: &WlSurface, time: u32) {
         },
         |_, _, ()| true,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pane of 80 by 64 pixels, and a buffer that could fill it.
+    const BOUNDS: Rect = Rect::new(0, 0, 80, 64);
+
+    fn covers_from(format: SourceFormat, buffer: (u32, u32), src: Rect, size: (u32, u32)) -> bool {
+        covers(BOUNDS, format, buffer, src, size)
+    }
+
+    #[test]
+    fn a_window_the_size_of_the_pane_covers_it() {
+        // What a video or a browser fills a pane with: the whole buffer, no
+        // alpha, drawn at the pane's own size.
+        assert!(covers_from(
+            SourceFormat::Xrgb8888,
+            (80, 64),
+            Rect::new(0, 0, 80, 64),
+            (80, 64)
+        ));
+        // Drawn larger, or from a larger buffer, still leaves no backdrop.
+        assert!(covers_from(
+            SourceFormat::Xrgb8888,
+            (80, 64),
+            Rect::new(0, 0, 80, 64),
+            (160, 128)
+        ));
+        assert!(covers_from(
+            SourceFormat::Xbgr8888,
+            (160, 128),
+            Rect::new(0, 0, 160, 128),
+            (80, 64)
+        ));
+    }
+
+    #[test]
+    fn a_window_that_leaves_the_backdrop_visible_does_not_cover() {
+        // Alpha: whatever the pixels say, the backdrop shows through.
+        assert!(!covers_from(
+            SourceFormat::Argb8888,
+            (80, 64),
+            Rect::new(0, 0, 80, 64),
+            (80, 64)
+        ));
+        // A crop of the buffer: the pixels outside the source keep what the
+        // frame had.
+        assert!(!covers_from(
+            SourceFormat::Xrgb8888,
+            (80, 64),
+            Rect::new(8, 0, 72, 64),
+            (80, 64)
+        ));
+        // Smaller than the pane, however large its buffer is.
+        assert!(!covers_from(
+            SourceFormat::Xrgb8888,
+            (80, 64),
+            Rect::new(0, 0, 80, 64),
+            (79, 64)
+        ));
+        assert!(!covers_from(
+            SourceFormat::Xrgb8888,
+            (80, 64),
+            Rect::new(0, 0, 80, 64),
+            (80, 63)
+        ));
+    }
 }

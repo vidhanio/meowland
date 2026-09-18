@@ -7,18 +7,17 @@
 //! they send each other these.
 //!
 //! A pane's frame goes round: the compositor draws into the frame while it has
-//! it, and sends it with the tiles that changed; the server hands it to that
-//! pane's presenter, which puts the tiles on the terminal and gives the frame
-//! back once the terminal has them. So a pane has one frame, and a scene that
-//! changes while it is out waits for it: frames are dropped, but the tiles due
-//! are not.
+//! it and sends it whole; the server hands it to that pane's presenter, which
+//! puts it on the terminal and gives the frame back once the terminal has it.
+//! So a pane has one frame, and a scene that changes while it is out waits for
+//! it: frames are dropped, not queued.
 
 use crate::{
     protocol::{
         PaneId, WindowId,
         pane::{Capabilities, Input, Show},
     },
-    render::{Frame, Tile},
+    render::Frame,
 };
 
 /// What the server tells the compositor.
@@ -44,12 +43,8 @@ pub enum Command {
     /// is how the server stops, so that a client exits on its own terms, with
     /// the children of its own.
     Close,
-    /// A frame the presenter is done with, and its tile list, to be used again.
-    Frame {
-        pane: PaneId,
-        frame: Frame,
-        tiles: Vec<Tile>,
-    },
+    /// A frame the presenter is done with, to be used again.
+    Frame { pane: PaneId, frame: Frame },
 }
 
 /// What the compositor tells the server.
@@ -78,10 +73,6 @@ pub enum Event {
         pane: PaneId,
         shape: Option<&'static str>,
     },
-    /// A frame for this pane, and the tiles that changed in it.
-    Frame {
-        pane: PaneId,
-        frame: Frame,
-        tiles: Vec<Tile>,
-    },
+    /// A frame for this pane.
+    Frame { pane: PaneId, frame: Frame },
 }

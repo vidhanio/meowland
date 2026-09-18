@@ -293,9 +293,9 @@ fn input_for(event: crossterm::event::Event) -> Option<Input> {
                 column: mouse.column,
                 row: mouse.row,
                 button: match button {
-                    MouseButton::Left => keys::button::LEFT,
-                    MouseButton::Right => keys::button::RIGHT,
-                    MouseButton::Middle => keys::button::MIDDLE,
+                    MouseButton::Left => evdev::KeyCode::BTN_LEFT,
+                    MouseButton::Right => evdev::KeyCode::BTN_RIGHT,
+                    MouseButton::Middle => evdev::KeyCode::BTN_MIDDLE,
                 },
                 pressed: matches!(mouse.kind, MouseEventKind::Down(_)),
             },

@@ -84,14 +84,14 @@ impl Compositor {
 
     /// Press a key and release it, holding shift while its symbol needs it.
     fn type_stroke(&mut self, stroke: keys::KeyStroke) {
-        let synthesized_shift = stroke.shift && !self.is_pressed(keys::modifier::LEFT_SHIFT);
+        let synthesized_shift = stroke.shift && !self.is_pressed(KeyCode::KEY_LEFTSHIFT);
         if synthesized_shift {
-            self.press_modifier(keys::modifier::LEFT_SHIFT);
+            self.press_modifier(KeyCode::KEY_LEFTSHIFT);
         }
         self.forward_key(stroke.code, KeyState::Pressed);
         self.forward_key(stroke.code, KeyState::Released);
         if synthesized_shift {
-            self.release_modifier(keys::modifier::LEFT_SHIFT);
+            self.release_modifier(KeyCode::KEY_LEFTSHIFT);
         }
     }
 
@@ -156,10 +156,10 @@ impl Compositor {
     fn sync_modifiers(&mut self, modifiers: crossterm::event::KeyModifiers) {
         use crossterm::event::KeyModifiers as M;
         for (flag, code) in [
-            (M::SHIFT, keys::modifier::LEFT_SHIFT),
-            (M::CONTROL, keys::modifier::LEFT_CTRL),
-            (M::ALT, keys::modifier::LEFT_ALT),
-            (M::SUPER, keys::modifier::LEFT_META),
+            (M::SHIFT, KeyCode::KEY_LEFTSHIFT),
+            (M::CONTROL, KeyCode::KEY_LEFTCTRL),
+            (M::ALT, KeyCode::KEY_LEFTALT),
+            (M::SUPER, KeyCode::KEY_LEFTMETA),
         ] {
             if modifiers.contains(flag) {
                 self.press_modifier(code);
@@ -271,7 +271,6 @@ impl Compositor {
     }
 
     fn pointer_motion(&mut self, pane: usize, position: Point<f64, Logical>) {
-        self.pointer_position = position;
         // The seat takes the pointer position in *output* coordinates and the
         // origin of the focused surface, and subtracts the two to get
         // the client's position.
@@ -307,9 +306,12 @@ impl Compositor {
 
     fn pointer_axis(&mut self, pane: usize, vertical: f64) {
         let pointer = self.pointer.clone();
-        if let Some((surface, origin)) = self.surface_at(pane, self.pointer_position) {
+        // The wheel has no position of its own: it acts where the pointer is,
+        // which the seat's pointer handle knows.
+        let position = pointer.current_location();
+        if let Some((surface, origin)) = self.surface_at(pane, position) {
             let event = MotionEvent {
-                location: self.pointer_position,
+                location: position,
                 serial: SERIAL_COUNTER.next_serial(),
                 time: self.time(),
             };

@@ -99,14 +99,21 @@ impl Frame {
         &self.pixels
     }
 
+    /// Exchange this frame's storage with another buffer.
+    ///
+    /// Whoever keeps the last screen a terminal was sent swaps its buffer in
+    /// here, so that remembering a frame costs no copy. Both buffers hold whole
+    /// pixels afterwards; nothing else about either is promised.
+    pub const fn swap_pixels(&mut self, other: &mut Vec<u8>) {
+        std::mem::swap(&mut self.pixels, other);
+    }
+
     pub const fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)
     }
 
     pub fn clear(&mut self, color: [u8; 3]) {
-        for pixel in self.pixels.as_chunks_mut::<BYTES>().0 {
-            pixel.copy_from_slice(&color);
-        }
+        fill(&mut self.pixels, color);
     }
 
     /// Draw `src` into `dst` with nearest-neighbor scaling and frame clipping.

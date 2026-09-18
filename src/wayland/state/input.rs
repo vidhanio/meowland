@@ -73,7 +73,7 @@ impl Compositor {
         match key.kind {
             KeyKind::Press | KeyKind::Repeat => {
                 if !self.binding(pane, modifiers, stroke.code) {
-                    self.focus_pane(pane);
+                    self.interact(pane);
                     self.type_stroke(stroke);
                 }
             }
@@ -231,17 +231,17 @@ impl Compositor {
             } => {
                 // A click goes to the window the pane shows, so give it the
                 // keyboard.
-                self.focus_pane(pane);
+                self.interact(pane);
                 let position = self.cell_position(index, column, row);
                 self.pointer_motion(index, position);
                 self.pointer_button(button, pressed);
             }
             Pointer::ScrollUp | Pointer::ScrollLeft => {
-                self.focus_pane(pane);
+                self.interact(pane);
                 self.pointer_axis(index, -15.0);
             }
             Pointer::ScrollDown | Pointer::ScrollRight => {
-                self.focus_pane(pane);
+                self.interact(pane);
                 self.pointer_axis(index, 15.0);
             }
         }

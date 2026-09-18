@@ -37,7 +37,10 @@ impl Compositor {
         (width > 0 && height > 0).then_some((width, height))
     }
 
-    pub(super) fn snapshot(&mut self, surface: &WlSurface) {
+    /// Copy what the surface committed, and say whether it has pixels now that
+    /// it did not have before: that is when the window it belongs to takes a
+    /// pane.
+    pub(super) fn snapshot(&mut self, surface: &WlSurface) -> bool {
         let limit = self.snapshot_limit();
 
         let committed = with_states(surface, |states| {
@@ -61,14 +64,20 @@ impl Compositor {
         });
         match committed {
             Some((BufferAssignment::NewBuffer(buffer), scale)) => {
-                let copied = match self.snapshots.entry(surface.id()) {
-                    Entry::Occupied(mut entry) => crate::wayland::buffer::snapshot(
-                        &buffer,
-                        scale,
-                        limit,
-                        entry.get_mut(),
-                        self.gpu.as_mut(),
-                    ),
+                // The copy goes into the surface's own snapshot, which is made
+                // here for a surface that has none yet. `size` is the size the
+                // copy left behind, and is `None` when there was no copy.
+                let (size, first) = match self.snapshots.entry(surface.id()) {
+                    Entry::Occupied(mut entry) => {
+                        let copied = crate::wayland::buffer::snapshot(
+                            &buffer,
+                            scale,
+                            limit,
+                            entry.get_mut(),
+                            self.gpu.as_mut(),
+                        );
+                        (copied.then(|| entry.get().logical_size()), false)
+                    }
                     Entry::Vacant(entry) => {
                         let mut snapshot = Snapshot::empty();
                         let copied = crate::wayland::buffer::snapshot(
@@ -78,26 +87,28 @@ impl Compositor {
                             &mut snapshot,
                             self.gpu.as_mut(),
                         );
+                        let size = copied.then(|| snapshot.logical_size());
                         if copied {
                             entry.insert(snapshot);
                         }
-                        copied
+                        (size, copied)
                     }
                 };
-                if !copied {
-                    tracing::debug!(format = ?buffer, "buffer is not one we can composite");
-                } else if let Some(snapshot) = self.snapshots.get(&surface.id()) {
-                    let size = snapshot.logical_size();
+                if let Some(size) = size {
                     with_states(surface, |states| {
                         ensure_viewport_valid(states, size.into());
                     });
+                } else {
+                    tracing::debug!(format = ?buffer, "buffer is not one we can composite");
                 }
                 buffer.release();
+                first
             }
             Some((BufferAssignment::Removed, _)) => {
                 self.snapshots.remove(&surface.id());
+                false
             }
-            None => {}
+            None => false,
         }
     }
 }

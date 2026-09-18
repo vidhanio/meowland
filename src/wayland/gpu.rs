@@ -161,12 +161,12 @@ impl Renderer {
     /// not necessarily a buffer that the driver will draw into. It is
     /// whatever the client's driver allocated. A texture that this renderer
     /// made is.
-    fn with_pixels<T>(
+    fn with_pixels(
         &mut self,
         dmabuf: &Dmabuf,
         region: Rectangle<i32, BufferCoords>,
-        consume: impl FnOnce(&[u8], u32) -> T,
-    ) -> Result<T, Error> {
+        consume: impl FnOnce(&[u8], u32),
+    ) -> Result<(), Error> {
         let texture = self
             .renderer
             .import_dmabuf(dmabuf, None)
@@ -232,9 +232,9 @@ impl Renderer {
                 actual: pixels.len(),
             });
         }
-        let consumed = consume(pixels, region.size.w as u32 * 4);
+        consume(pixels, region.size.w as u32 * 4);
 
         self.staging = Some(staging);
-        Ok(consumed)
+        Ok(())
     }
 }

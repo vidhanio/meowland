@@ -31,14 +31,23 @@ const WINDOW_POLL: Duration = Duration::from_millis(50);
 /// Start a client, wait for its window, and show it here.
 pub(super) fn run(run: crate::cli::Run) -> Result<(), Error> {
     let crate::cli::Run { settings, command } = run;
-    let before = newest_window().unwrap_or(None);
+    // The window the server gains while this waits is the one the command
+    // makes, so what it has now is asked for before the command goes in. A
+    // command that starts nothing is waited for no longer than it is asked
+    // for: that is the outer `None`, and the inner one is a server with no
+    // window yet.
+    let before = if command.is_empty() {
+        None
+    } else {
+        Some(newest_window().unwrap_or(None))
+    };
     give_command(&settings, &command)?;
     if !client::terminal::is_terminal() {
         return Ok(());
     }
-    if command.is_empty() {
+    let Some(before) = before else {
         return client::attach(Show::Newest);
-    }
+    };
     let show = match appeared(before, WINDOW_WAIT) {
         Window::Appeared(id) => Show::Window(id),
         Window::None => Show::Newest,

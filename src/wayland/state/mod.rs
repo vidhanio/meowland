@@ -627,8 +627,12 @@ impl Compositor {
         self.views[index].index(&self.windows)
     }
 
-    fn focus_pane(&mut self, pane: PaneId) -> Option<usize> {
-        let index = self.view(pane)?;
+    /// Give the keyboard to the window this pane shows, and remember that the
+    /// pane was the one in use.
+    pub fn interact(&mut self, pane: PaneId) {
+        let Some(index) = self.view(pane) else {
+            return;
+        };
         if let Some(window) = self.views[index].index(&self.windows) {
             let changed = self.windows[window].last_interacted != Some(pane);
             self.windows[window].last_interacted = Some(pane);
@@ -640,12 +644,6 @@ impl Compositor {
                 self.activate_index(window);
             }
         }
-        Some(index)
-    }
-
-    /// Record that a terminal pane was actively used.
-    pub fn interact(&mut self, pane: PaneId) {
-        let _ = self.focus_pane(pane);
     }
 
     fn relabel(&mut self, surface: &ToplevelSurface) {
@@ -804,9 +802,7 @@ impl CompositorHandler for Compositor {
         // first commit carries no buffer, it is how the client asks to
         // be configured; an unmap hides the window; and a redraw is the
         // window that was already showing.
-        let drawn = self.snapshots.contains_key(&surface.id());
-        self.snapshot(surface);
-        let first_pixels = !drawn && self.snapshots.contains_key(&surface.id());
+        let first_pixels = self.snapshot(surface);
         // The panes that draw this surface draw again. A surface that is not a
         // toplevel is a sub-surface, a popup or a cursor: the first two are
         // drawn only by the panes whose window holds them, and a cursor by

@@ -150,12 +150,33 @@ impl Frame {
         if last_row as u32 >= image.height || image.pixels.len() < needed {
             return false;
         }
-        let swap = matches!(
-            image.format,
-            SourceFormat::Abgr8888 | SourceFormat::Xbgr8888
-        );
+        let at = (base_x as usize, base_y as usize);
+        // Which way round the image names its channels is the image's, and is
+        // settled before the rows are walked: a pixel the frame takes costs no
+        // branch.
+        match image.format {
+            SourceFormat::Abgr8888 | SourceFormat::Xbgr8888 => {
+                self.copy_rows::<false>(image, clipped, at);
+            }
+            SourceFormat::Argb8888 | SourceFormat::Xrgb8888 => {
+                self.copy_rows::<true>(image, clipped, at);
+            }
+        }
+        true
+    }
+
+    /// Copy the rows of an image that lies the way the frame's pixels do, from
+    /// `at` in the image. `REVERSED` is set when the image names its channels
+    /// the other way round from the frame.
+    fn copy_rows<const REVERSED: bool>(
+        &mut self,
+        image: &Image<'_>,
+        clipped: Rect,
+        at: (usize, usize),
+    ) {
+        let (base_x, base_y) = at;
         for row in 0..clipped.height as usize {
-            let source_start = (base_y as usize + row) * image.stride + base_x as usize * BYTES4;
+            let source_start = (base_y + row) * image.stride + base_x * BYTES4;
             let source =
                 &image.pixels[source_start..source_start + clipped.width as usize * BYTES4];
             let frame_start = (clipped.y as usize + row) * self.width as usize * BYTES
@@ -168,14 +189,13 @@ impl Frame {
                 .iter()
                 .zip(destination.as_chunks_mut::<BYTES>().0)
             {
-                *destination = if swap {
-                    [source[0], source[1], source[2]]
-                } else {
+                *destination = if REVERSED {
                     [source[2], source[1], source[0]]
+                } else {
+                    [source[0], source[1], source[2]]
                 };
             }
         }
-        true
     }
 
     /// Draw an image that is scaled into the frame, a row at a time.
@@ -205,30 +225,35 @@ impl Frame {
             image.format,
             SourceFormat::Abgr8888 | SourceFormat::Xbgr8888
         );
+        // Everything about a row that does not depend on which row it is: where
+        // the first pixel it draws sits in the image, and the lengths of the
+        // slices either side of it.
+        let numerator = numerator_x + first * across;
+        let start_x = numerator.div_euclid(columns);
+        let start_error = numerator.rem_euclid(columns);
+        let row_length = image.width as usize * BYTES4;
+        let frame_stride = self.width as usize * BYTES;
+        let frame_x = (clipped.x as usize + first as usize) * BYTES;
+        let length = (last - first) as usize * BYTES;
+        let height = i64::from(image.height);
         let mut row_numerator = numerator_y;
         for row in 0..clipped.height as usize {
             let image_y = row_numerator.div_euclid(rows);
             row_numerator += down;
-            if image_y < 0 || image_y >= i64::from(image.height) {
+            if image_y < 0 || image_y >= height {
                 continue;
             }
             let source_row = image_y as usize * image.stride;
-            let Some(source) = image
-                .pixels
-                .get(source_row..source_row + image.width as usize * BYTES4)
-            else {
+            let Some(source) = image.pixels.get(source_row..source_row + row_length) else {
                 continue;
             };
-            let frame_start = (clipped.y as usize + row) * self.width as usize * BYTES
-                + (clipped.x as usize + first as usize) * BYTES;
-            let length = (last - first) as usize * BYTES;
+            let frame_start = (clipped.y as usize + row) * frame_stride + frame_x;
             let Some(destination) = self.pixels.get_mut(frame_start..frame_start + length) else {
                 continue;
             };
 
-            let numerator = numerator_x + first * across;
-            let mut image_x = numerator.div_euclid(columns);
-            let mut error = numerator.rem_euclid(columns);
+            let mut image_x = start_x;
+            let mut error = start_error;
             for pixel in destination.as_chunks_mut::<BYTES>().0 {
                 // `image_x` is inside the image: `first` and `last` are where
                 // it enters and leaves.

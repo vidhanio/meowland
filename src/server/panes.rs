@@ -354,7 +354,12 @@ fn read_pane(stream: UnixStream, sender: Sender<FromPane>, pane: PaneId, write_h
                 sender.send(FromPane::Resized { pane, capabilities })
             }
             ToServer::Drawn => sender.send(FromPane::Drawn { pane }),
-            ToServer::Bye => sender.send(FromPane::Left { pane }),
+            ToServer::Bye => {
+                // The terminal is leaving: the server hears it once, and
+                // nothing more is read from it.
+                let _ = sender.send(FromPane::Left { pane });
+                return;
+            }
             // The first message is read above, before the pane has a name.
             ToServer::Hello(_) => continue,
         };

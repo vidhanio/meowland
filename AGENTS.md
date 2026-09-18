@@ -32,8 +32,8 @@ has to round anything to a cell, so a patch cannot land anywhere but on the
 pixels it holds. A frame that changes too much of the screen, or that takes too
 many tiles, goes whole again, and a whole frame takes every tile with it. A
 patch takes the cell size the terminal itself reported, so a terminal that did
-not answer for it gets whole frames. The presenter is what keeps the frame it
-last sent and diffs against it; the compositor and the server protocol know
+not answer for it gets whole frames. The presenter is what keeps the pixels it
+last sent and diffs against them; the compositor and the server protocol know
 nothing of this.
 
 Both `wl_shm` and `zwp_linux_dmabuf_v1` produce a CPU-side `Snapshot`.

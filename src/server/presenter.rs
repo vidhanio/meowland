@@ -86,6 +86,10 @@ impl Config {
 pub enum Event {
     /// A frame the terminal has taken, for the compositor to draw the next one
     /// into.
+    ///
+    /// The pixels it holds are the screen from before the one just sent: the
+    /// presenter keeps what a terminal shows, and a frame is storage the
+    /// compositor paints over.
     Free {
         frame: Frame,
     },
@@ -192,7 +196,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
     let mut in_flight: Option<Frame> = None;
     let mut screen = Screen::default();
     while let Ok(message) = queue.recv() {
-        let frame = match message {
+        let mut frame = match message {
             Message::Attach(attached) => {
                 terminal = attached;
                 if terminal.is_none() {
@@ -269,6 +273,10 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
             }
         };
         Encoder::end_frame(&mut out);
+        // The frame is what the terminal will show, whatever the terminal does
+        // with it now: remembering it here is what the next frame is diffed
+        // against, and it costs a swap rather than a copy.
+        screen.keep(&mut frame);
         let spent_encoding = phase.elapsed();
 
         let phase = Instant::now();
@@ -355,10 +363,14 @@ impl Screen {
     }
 
     /// What to write for this frame, taking it as what the terminal will show.
+    ///
+    /// The screen is not updated here: what a frame carries is cut out of it
+    /// after this, and the screen takes the frame's pixels only once they have
+    /// gone out. [`Screen::keep`] is that step.
     fn plan(&mut self, frame: &Frame, config: &Config) -> Send {
         let grid = Grid::of(frame, config.cell);
         if !self.whole || grid != self.grid {
-            return self.whole(frame, grid);
+            return self.whole(grid);
         }
         let changed = changed(&grid, &self.previous, frame.pixels());
         if changed.is_empty() {
@@ -374,12 +386,11 @@ impl Screen {
             || held + changed.len() > MAXIMUM_LIVE
             || covered > screen
         {
-            return self.whole(frame, grid);
+            return self.whole(grid);
         }
         for index in &changed {
             self.placed[*index as usize] = true;
         }
-        self.previous.copy_from_slice(frame.pixels());
         Send::Patches {
             write: changed
                 .into_iter()
@@ -393,14 +404,28 @@ impl Screen {
     }
 
     /// Send the whole screen: the image replaces every tile with it.
-    fn whole(&mut self, frame: &Frame, grid: Grid) -> Send {
+    fn whole(&mut self, grid: Grid) -> Send {
         let delete = Grid::held(&self.placed);
         self.grid = grid;
         self.placed = vec![false; grid.count() as usize];
-        self.previous.clear();
-        self.previous.extend_from_slice(frame.pixels());
+        // The image the terminal holds is this screen once the frame is on its
+        // way; a frame that cannot be written resets the screen anyway.
         self.whole = true;
         Send::Whole { delete }
+    }
+
+    /// Take this frame's pixels as the screen the terminal now shows, and leave
+    /// the frame holding the screen before it.
+    ///
+    /// The frame goes back to the compositor, which paints the whole of it
+    /// before the next frame goes out, so what it holds on the way is nobody's
+    /// business. Swapping the two buffers is what keeps a screen's worth of
+    /// pixels from being copied per frame.
+    fn keep(&mut self, frame: &mut Frame) {
+        if self.previous.len() != frame.pixels().len() {
+            self.previous.resize(frame.pixels().len(), 0);
+        }
+        frame.swap_pixels(&mut self.previous);
     }
 }
 
@@ -880,15 +905,22 @@ mod tests {
         /// Present a frame, and hand the terminal whatever came of it.
         ///
         /// A frame the terminal already shows is not written at all; the frame
-        /// comes back either way.
+        /// comes back either way. What comes back holds the screen from before
+        /// the frame was presented, at the size it was presented at: the
+        /// presenter keeps the pixels the terminal was sent, and the compositor
+        /// paints the whole frame before the next one goes out.
         fn present(&mut self, frame: Frame) -> Option<String> {
-            let pixels = frame.pixels().to_vec();
+            let pixels = frame.pixels().len();
             self.presenter.present(frame);
             // The presenter writes a frame before it can see the ack for it, so
             // anything it wrote is in the socket by the time it is back.
             self.presenter.drawn();
             let back = self.wait();
-            assert_eq!(back.pixels(), pixels, "the frame is the one presented");
+            assert_eq!(
+                back.pixels().len(),
+                pixels,
+                "the frame comes back the size it was presented at"
+            );
             self.written()
         }
 

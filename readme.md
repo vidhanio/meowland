@@ -80,8 +80,8 @@ Frames are dropped while a pane's terminal is behind: the frame drawn next is
 the scene as it is then, so nothing that changed is lost. The frame itself is
 moved between the three threads and back, never copied, and its bytes go to the
 socket out of the buffer they were encoded in — a byte string, not a write per
-byte. The presenter keeps a copy of the frame it last sent, which is what a new
-frame is diffed against.
+byte. The presenter keeps the pixels it last sent, swapping each frame's buffer
+with its own, and that is what a new frame is diffed against.
 
 ## Input
 

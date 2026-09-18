@@ -230,10 +230,10 @@ impl Server {
             .clone()
             .insert_source(free, move |event, (), server| {
                 match event {
-                    // The terminal has taken the frame: the compositor draws the
-                    // next one into it.
-                    ChannelEvent::Msg(presenter::Event::Free { frame, tiles }) => {
-                        server.wayland.send(Command::Frame { pane, frame, tiles });
+                    // The terminal has taken the frame: the compositor draws
+                    // the next one into it.
+                    ChannelEvent::Msg(presenter::Event::Free { frame }) => {
+                        server.wayland.send(Command::Frame { pane, frame });
                     }
                     ChannelEvent::Msg(presenter::Event::Failed(error)) => {
                         tracing::error!(%error, pane = %pane, "presentation failed");
@@ -320,14 +320,9 @@ impl Server {
     }
 
     /// Hand a composed frame to its pane's presenter.
-    pub(super) fn present(
-        &self,
-        pane: PaneId,
-        frame: crate::render::Frame,
-        tiles: Vec<crate::render::Tile>,
-    ) {
+    pub(super) fn present(&self, pane: PaneId, frame: crate::render::Frame) {
         if let Some(attached) = self.panes.get(&pane) {
-            attached.presenter.present(frame, tiles);
+            attached.presenter.present(frame);
         }
     }
 }

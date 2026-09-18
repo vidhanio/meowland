@@ -132,7 +132,7 @@ impl Loop {
             }
             Command::Input { pane, input } => self.state.input(pane, input),
             Command::Close => self.state.close_windows(),
-            Command::Frame { pane, frame, tiles } => self.state.recycle(pane, frame, tiles),
+            Command::Frame { pane, frame } => self.state.recycle(pane, frame),
         }
     }
 
@@ -140,9 +140,9 @@ impl Loop {
     /// were told.
     fn present_frame(&mut self) {
         let started = Instant::now();
-        let tiles = self.state.present();
+        let sent = self.state.present();
         self.last_frame_started = Some(started);
-        self.frames.record(tiles, started.elapsed());
+        self.frames.record(sent, started.elapsed());
         self.flush();
     }
 
@@ -237,25 +237,25 @@ fn watch<T: std::fmt::Debug>(source: &'static str, refused: T) -> Error {
 #[derive(Debug, Default)]
 struct FrameStats {
     report: logging::Report,
-    frames: u32,
-    tiles: u64,
+    ticks: u32,
+    sent: u64,
     compose: Duration,
 }
 
 impl FrameStats {
-    fn record(&mut self, tiles: usize, compose: Duration) {
-        self.frames += 1;
-        self.tiles += tiles as u64;
+    fn record(&mut self, sent: usize, compose: Duration) {
+        self.ticks += 1;
+        self.sent += sent as u64;
         self.compose += compose;
 
         let Some(seconds) = self.report.due() else {
             return;
         };
-        let frames = f64::from(self.frames);
+        let ticks = f64::from(self.ticks);
         tracing::debug!(
-            fps = frames / seconds,
-            tiles = self.tiles / u64::from(self.frames),
-            compose_ms = self.compose.as_secs_f64() * 1e3 / frames,
+            fps = ticks / seconds,
+            sent = self.sent / u64::from(self.ticks),
+            compose_ms = self.compose.as_secs_f64() * 1e3 / ticks,
             "frames composed"
         );
         *self = Self {

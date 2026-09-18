@@ -219,7 +219,7 @@ impl Server {
             }
             Event::Title { pane, title } => self.title(pane, &title),
             Event::Pointer { pane, shape } => self.pointer_shape(pane, shape),
-            Event::Frame { pane, frame, tiles } => self.present(pane, frame, tiles),
+            Event::Frame { pane, frame } => self.present(pane, frame),
         }
     }
 

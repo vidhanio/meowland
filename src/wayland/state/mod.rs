@@ -49,20 +49,18 @@ use smithay::{
     },
 };
 
-use self::compose::{send_frame_callbacks, tile_size};
+use self::compose::{is_drawn, send_frame_callbacks};
 use crate::{
     Error, kitty,
     protocol::{
         PaneId, WindowId,
         pane::{Capabilities, Show},
     },
-    render::{Frame, Tile, Tiles},
+    render::Frame,
     wayland::{buffer::Snapshot, message::Event},
 };
 
 pub const REFRESH_MILLIHZ: i32 = 60_000;
-
-const TILE_CELLS: (u32, u32) = (16, 8);
 
 /// Per-pane rendering state.
 #[expect(
@@ -77,11 +75,7 @@ struct View {
     follow: bool,
     /// The frame this pane draws into, while the presenter is not holding it.
     frame: Option<Frame>,
-    tiles: Tiles,
-    /// The list the next frame's tiles are gathered in, kept across frames so
-    /// that a steady stream of them uses one allocation.
-    dirty: Vec<Tile>,
-    /// The frame and the tile grid no longer match the capabilities.
+    /// The frame no longer matches the capabilities.
     stale_layout: bool,
     scene_dirty: bool,
     /// The terminal is owed the title or the pointer shape it was last told of,
@@ -98,15 +92,12 @@ struct View {
 impl View {
     fn new(id: PaneId, capabilities: &Capabilities) -> Self {
         let frame = Frame::new(capabilities.pixels.0, capabilities.pixels.1);
-        let tiles = Tiles::new(&frame, tile_size(capabilities.cell));
         Self {
             id,
             capabilities: capabilities.clone(),
             window: None,
             follow: true,
             frame: Some(frame),
-            tiles,
-            dirty: Vec::new(),
             stale_layout: false,
             scene_dirty: true,
             escapes_dirty: true,
@@ -122,7 +113,7 @@ impl View {
         !self.leaving && (self.escapes_dirty || (self.scene_dirty && self.frame.is_some()))
     }
 
-    /// Bring the frame and its tile grid back in step with the capabilities.
+    /// Bring the frame back in step with the capabilities.
     fn relayout(&mut self) {
         let Some(frame) = &mut self.frame else {
             return;
@@ -131,7 +122,6 @@ impl View {
             return;
         }
         frame.resize(self.capabilities.pixels.0, self.capabilities.pixels.1);
-        self.tiles = Tiles::new(frame, tile_size(self.capabilities.cell));
         self.stale_layout = false;
     }
 
@@ -477,9 +467,9 @@ impl Compositor {
 
     /// Draw a frame for every pane that is due, and hand it to the server.
     ///
-    /// A frame goes to the server with the tiles that changed in it, and comes
-    /// back with the list those tiles were gathered in, so that a pane drawing
-    /// at a steady rate allocates nothing per frame.
+    /// A pane has one frame, and it is out while the presenter has it: what the
+    /// pane shows is drawn when the frame comes back, so a scene that changes
+    /// meanwhile waits rather than queues.
     pub fn present(&mut self) -> usize {
         let mut sent = 0;
         for index in 0..self.views.len() {
@@ -501,35 +491,24 @@ impl Compositor {
                 continue;
             };
             self.draw(index, &mut frame);
-
-            let mut tiles = std::mem::take(&mut self.views[index].dirty);
-            self.views[index].tiles.diff(&frame, &mut tiles);
             self.views[index].scene_dirty = false;
             // The client is told it may draw again whether or not anything of
             // its showing on the screen changed: a client that waited for this
             // callback would otherwise never draw again.
             self.frame_callbacks(index);
-            if tiles.is_empty() {
-                // The same pixels are already on the terminal, so it is not
-                // told to draw them again.
-                self.views[index].frame = Some(frame);
-                self.views[index].dirty = tiles;
-                continue;
-            }
-            sent += tiles.len();
-            tracing::trace!(pane = %pane, tiles = tiles.len(), "composed a frame");
-            let _ = self.events.send(Event::Frame { pane, frame, tiles });
+            sent += 1;
+            tracing::trace!(pane = %pane, "composed a frame");
+            let _ = self.events.send(Event::Frame { pane, frame });
         }
         sent
     }
 
     /// A frame the presenter is done with, to draw the next one into.
-    pub fn recycle(&mut self, pane: PaneId, frame: Frame, tiles: Vec<Tile>) {
+    pub fn recycle(&mut self, pane: PaneId, frame: Frame) {
         let Some(index) = self.view(pane) else {
             return;
         };
         self.views[index].frame = Some(frame);
-        self.views[index].dirty = tiles;
         self.views[index].relayout();
     }
 
@@ -823,14 +802,21 @@ impl CompositorHandler for Compositor {
         let drawn = self.snapshots.contains_key(&surface.id());
         self.snapshot(surface);
         let first_pixels = !drawn && self.snapshots.contains_key(&surface.id());
-        // The panes showing this window draw again. A surface that is not a
-        // toplevel is a sub-surface or a popup of a window that cannot
-        // be named from here, so every pane draws again for those.
+        // The panes that draw this surface draw again. A surface that is not a
+        // toplevel is a sub-surface, a popup or a cursor: the first two are
+        // drawn only by the panes whose window holds them, and a cursor by
+        // none. So what a pane shows is what says whether it draws again.
         let window = self.index_of(surface);
         let shown = window.map(|index| self.windows[index].id);
-        for view in &mut self.views {
-            if shown.is_none_or(|id| view.window == Some(id)) {
-                view.scene_dirty = true;
+        for index in 0..self.views.len() {
+            let drawn_by = match shown {
+                Some(id) => self.views[index].window == Some(id),
+                None => self.views[index]
+                    .index(&self.windows)
+                    .is_some_and(|at| is_drawn(self.windows[at].surface.wl_surface(), surface)),
+            };
+            if drawn_by {
+                self.views[index].scene_dirty = true;
             }
         }
         if first_pixels && let Some(index) = window {

@@ -45,8 +45,8 @@ frame never makes an input event wait.
 
 ## A frame
 
-A pane has one frame. The compositor draws into it, sends it with the tiles that
-changed, and cannot draw that pane again until the presenter gives it back.
+A pane has one frame. The compositor draws into it, sends it whole, and cannot
+draw that pane again until the presenter gives it back.
 
 ```mermaid
 sequenceDiagram
@@ -58,24 +58,24 @@ sequenceDiagram
 
     W->>C: commit
     Note over C: copy the client's buffer once, into a Snapshot
-    C->>C: on the 60 Hz tick: draw into the pane's frame,<br/>diff tiles against the last frame sent
-    C->>S: Event::Frame (frame and tile list moved)
-    S->>P: present(frame, tiles)
-    Note over P: copy the dirty tiles into a scratch buffer<br/>(a tile is rows, not a rectangle)
-    P->>T: one write: sync start, tile escapes, sync end
+    C->>C: on the 60 Hz tick: draw into the pane's frame
+    C->>S: Event::Frame (the frame moved)
+    S->>P: present(frame)
+    Note over P: encode the screen as one kitty image: zlib,<br/>or a shared memory object
+    P->>T: one write: sync start, image, sync end
     T->>T: write the bytes to the terminal
     T->>S: Drawn, over the pane socket
     S->>P: drawn()
-    P->>S: Free (frame and tile list moved back)
+    P->>S: Free (the frame moved back)
     S->>C: Command::Frame
     Note over C: the same buffer is drawn into again
 ```
 
-Frames are dropped while a pane's terminal is behind, but the tiles due are not:
-the next frame is diffed against the last one that was sent. The frame itself is
-moved between the three threads and back, never copied, and a frame's bytes go
-to the socket out of the buffer they were encoded in — `serialize_bytes`, not a
-write per byte.
+Frames are dropped while a pane's terminal is behind: the frame drawn next is
+the scene as it is then, so nothing that changed is lost. The frame itself is
+moved between the three threads and back, never copied, and its bytes go to the
+socket out of the buffer they were encoded in — a byte string, not a write per
+byte.
 
 ## Input
 

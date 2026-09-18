@@ -53,8 +53,8 @@ pub struct Capabilities {
     pub keyboard: bool,
     /// Whether mouse reporting uses pixels (`SGR-Pixels`) instead of cells.
     pub pixel_mouse: bool,
-    /// Whether the terminal reads tiles out of shared memory, which keeps their
-    /// pixels off the pty.
+    /// Whether the terminal reads frames out of shared memory, which keeps
+    /// their pixels off the pty.
     pub shared_memory: bool,
 }
 

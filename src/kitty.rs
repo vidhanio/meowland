@@ -8,12 +8,13 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use flate2::{Compression, write::ZlibEncoder};
 use nutype::nutype;
+use rustix::shm::{self, Mode, OFlags};
 use smithay::input::pointer::CursorIcon;
 
 /// An image ID in the kitty graphics protocol.
 ///
-/// A tile keeps its ID across frames, so the terminal replaces the image it
-/// already has instead of drawing a second one.
+/// A pane's frame keeps its ID, so the terminal replaces the image it already
+/// has instead of drawing a second one.
 #[nutype(const_fn, derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display))]
 pub struct ImageId(u32);
 
@@ -23,24 +24,30 @@ const CHUNK: usize = 4096;
 /// Z-index of the composited screen. A positive value draws above the terminal
 /// text.
 const Z_ABOVE_TEXT: i32 = 1;
+
+/// Where Linux keeps the objects `shm_open` names.
+///
+/// Nothing lists them the way [`std::fs`] lists a directory, and a run that was
+/// killed leaves its own behind, so this is the one place the filesystem is
+/// read: everything else goes through [`rustix::shm`].
 const SHM_DIRECTORY: &str = "/dev/shm";
 
-/// Remove every shared memory object this run left behind.
+/// Unlink every shared memory object this run left behind.
 ///
 /// The terminal takes one object per transfer and unlinks it. Anything left
-/// holds the pixels of one tile and was never read. The names carry the process
+/// holds one frame's pixels and was never read. The names carry the process
 /// id and the namespace, so no live object of another process is touched.
 fn discard_shared_memory(namespace: u32) {
-    let prefix = format!("meowland-{}-{namespace}-", std::process::id());
+    let prefix = format!("/meowland-{}-{namespace}-", std::process::id());
     let Ok(entries) = std::fs::read_dir(SHM_DIRECTORY) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with(&prefix)
-            && let Err(err) = std::fs::remove_file(entry.path())
+        let name = format!("/{}", entry.file_name().to_string_lossy());
+        if name.starts_with(&prefix)
+            && let Err(err) = shm::unlink(name.as_str())
         {
-            tracing::debug!(?err, "could not remove a shared memory object");
+            tracing::debug!(?err, name, "could not unlink a shared memory object");
         }
     }
 }
@@ -50,19 +57,25 @@ const PROBE_NAMESPACE: u32 = 0;
 
 /// The namespace of the next encoder.
 ///
-/// Each encoder has its own, so one pane's tiles never overwrite an object that
-/// another pane still reads.
+/// Each encoder has its own, so one pane's frames never overwrite an object
+/// that another pane still reads.
 static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(PROBE_NAMESPACE + 1);
 
 /// The image id of the probe's graphics support query. Its answer is the one
 /// that says whether the terminal speaks the protocol.
 pub const GRAPHICS_PROBE_ID: ImageId = ImageId::new(77);
 
-/// The image id of the probe's shared memory tile, distinct from the graphics
+/// The image id of the probe's shared memory object, distinct from the graphics
 /// query's id.
 pub const SHARED_PROBE_ID: ImageId = ImageId::new(78);
 
-/// Send a one-pixel tile out of shared memory, to test whether the terminal
+/// The image a pane's frames are sent under.
+///
+/// A pane has one frame on its terminal at a time, so one id does: the terminal
+/// replaces the image it holds as the next frame arrives.
+const FRAME_ID: ImageId = ImageId::new(1);
+
+/// Send a one-pixel image out of shared memory, to test whether the terminal
 /// reads one there. The guard removes the object if it did not.
 pub fn shared_memory_probe(out: &mut Vec<u8>) -> Option<SharedProbe> {
     let object = Shared::new(PROBE_NAMESPACE, 0);
@@ -85,34 +98,38 @@ impl Drop for SharedProbe {
     }
 }
 
-/// One tile's payload, in a shared memory object the terminal reads for itself.
+/// One frame's payload, in a shared memory object the terminal reads for
+/// itself.
 ///
 /// The escape carries the name only, so the pixels stay off the pty. The
 /// terminal unlinks the object after reading it, and the next transfer makes it
 /// again.
 #[derive(Debug)]
 struct Shared {
-    path: String,
+    /// The POSIX name, slash and all: what `shm_open` takes, and what the
+    /// escape carries base64'd.
+    name: String,
     encoded_name: Vec<u8>,
 }
 
 impl Shared {
-    /// The object that holds one tile of an encoder's namespace.
+    /// The object that holds one frame of an encoder's namespace.
     ///
-    /// The name gives the process, the encoder and the tile, which bounds what
-    /// a terminal that stopped reading leaves behind to one screen.
+    /// The name gives the process, the encoder and the slot, and an encoder
+    /// keeps one slot: an object the terminal has not read yet is left alone,
+    /// and that frame goes through the pty instead, which keeps both frames in
+    /// order.
     fn new(namespace: u32, slot: u32) -> Self {
         let name = format!("/meowland-{}-{namespace}-{slot}", std::process::id());
-        let path = format!("{SHM_DIRECTORY}{name}");
         let mut encoded_name = vec![0; base64::encoded_len(name.len(), true).expect("name fits")];
         let length = BASE64
             .encode_slice(name.as_bytes(), &mut encoded_name)
             .expect("the buffer has the exact encoded size");
         encoded_name.truncate(length);
-        Self { path, encoded_name }
+        Self { name, encoded_name }
     }
 
-    /// Write one tile into its object.
+    /// Write one frame into its object.
     ///
     /// An object the terminal still holds is never overwritten: creation fails,
     /// and that update goes through the pty instead, keeping both updates in
@@ -120,10 +137,10 @@ impl Shared {
     fn write(&self, payload: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
-        let file = rustix::fs::open(
-            self.path.as_str(),
-            rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL | rustix::fs::OFlags::RDWR,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        let file = shm::open(
+            self.name.as_str(),
+            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
         )
         .map_err(std::io::Error::from)?;
         rustix::fs::ftruncate(&file, payload.len() as u64).map_err(std::io::Error::from)?;
@@ -134,15 +151,13 @@ impl Shared {
     }
 
     fn unlink(&self) {
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                return;
-            }
-            tracing::debug!(
+        match shm::unlink(self.name.as_str()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(err) => tracing::debug!(
                 ?err,
-                path = self.path,
-                "could not remove a shared memory object"
-            );
+                name = self.name,
+                "could not unlink a shared memory object"
+            ),
         }
     }
 }
@@ -160,18 +175,14 @@ pub struct Encoder {
     zlib: ZlibEncoder<Vec<u8>>,
     payload: Vec<u8>,
     finished: bool,
-    /// Whether the frame is compressed, decided by its first tile. `None` means
-    /// no tile of the frame has arrived yet.
-    compress: Option<bool>,
-    /// Whether the terminal reads tiles out of shared memory, which keeps their
-    /// pixels off the pty.
+    /// Whether the terminal reads frames out of shared memory, which keeps
+    /// their pixels off the pty.
     pub shared_memory: bool,
-    /// Which encoder this is. The tiles' objects are named after it, so two
-    /// encoders never name the same object.
+    /// Which encoder this is. A pane's frames are named after it, so two panes
+    /// never name the same object.
     namespace: u32,
-    /// The name and encoded name of each tile, made once and reused every
-    /// frame.
-    shared_objects: Vec<Shared>,
+    /// The object this encoder's frames go through, made once and reused.
+    shared: Option<Shared>,
 }
 
 impl Encoder {
@@ -180,10 +191,9 @@ impl Encoder {
             zlib: ZlibEncoder::new(Vec::new(), Compression::fast()),
             payload: Vec::new(),
             finished: false,
-            compress: None,
             shared_memory: false,
             namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
-            shared_objects: Vec::new(),
+            shared: None,
         }
     }
 }
@@ -192,31 +202,6 @@ impl Drop for Encoder {
     /// Remove the objects the terminal did not take.
     fn drop(&mut self) {
         discard_shared_memory(self.namespace);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Placement {
-    pub id: ImageId,
-    pub width: u32,
-    pub height: u32,
-    /// The number of columns in the cell rectangle. Set both `cols` and
-    /// `rows` to zero to keep the tile at its native pixel dimensions.
-    pub cols: u32,
-    /// The number of rows in the cell rectangle. Set both `cols` and
-    /// `rows` to zero to keep the tile at its native pixel dimensions.
-    pub rows: u32,
-    /// The cell of the tile's first pixel. The cursor must be there before the
-    /// image is placed.
-    pub cell: (u32, u32),
-}
-
-impl Placement {
-    /// The compositor cuts tiles out of the frame buffer with this and the
-    /// presenter cuts them back up with it, so both sides must agree: a wrong
-    /// length reads past the buffer.
-    pub const fn bytes(self) -> usize {
-        self.width as usize * self.height as usize * crate::render::BYTES
     }
 }
 
@@ -329,13 +314,12 @@ pub fn title(title: &str) -> Vec<u8> {
 /// How much of a client's title a terminal is told.
 const MAXIMUM_TITLE: usize = 256;
 
-/// Transmit `pixels` as the image `id`, and place it in the cell rectangle at
-/// the cursor.
+/// Transmit a pane's whole frame as one image, at the top left of the screen.
 ///
-/// One command for both keeps an update cheap and flicker free: an image id is
-/// replaced atomically, so a tile can be re-sent on screen. `C=1` keeps the
-/// cursor still, so a placement never scrolls the terminal or moves the anchor
-/// of the next tile.
+/// One command transmits and places, which keeps an update cheap and flicker
+/// free: the image id is replaced atomically, so the terminal goes from the old
+/// frame to the new one. `C=1` keeps the cursor still, so a placement never
+/// scrolls the terminal.
 impl Encoder {
     /// Start a frame. The terminal buffers everything until
     /// [`Encoder::end_frame`], so a frame does not tear.
@@ -343,57 +327,36 @@ impl Encoder {
         out.extend_from_slice(b"\x1b[?2026h");
     }
 
-    /// End a frame. The first tile of the next frame decides whether that frame
-    /// is compressed.
-    pub fn end_frame(&mut self, out: &mut Vec<u8>) {
+    /// End a frame: the terminal shows it.
+    pub fn end_frame(out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[?2026l");
-        self.compress = None;
     }
 
-    /// Compress, if it pays, and transmit `pixels` as image `id` at the cursor.
-    pub fn transmit_and_place(&mut self, out: &mut Vec<u8>, pixels: &[u8], placement: Placement) {
-        debug_assert_eq!(pixels.len(), placement.bytes());
-        cursor_to(out, placement.cell.0, placement.cell.1);
+    /// Compress, if it pays, and send a screen of `pixels` to the terminal.
+    pub fn transmit(&mut self, out: &mut Vec<u8>, pixels: &[u8], size: (u32, u32)) {
+        debug_assert_eq!(
+            pixels.len(),
+            size.0 as usize * size.1 as usize * crate::render::BYTES,
+            "a frame's pixels are its size"
+        );
+        // The image is placed where the cursor is, at its own pixel size: the
+        // cursor is homed, so that is the top left of the screen.
+        cursor_to(out, 0, 0);
 
-        // The first tile decides the compression for the whole frame. With
-        // shared memory the pixels stay off the pty, so the answer is no:
-        // reading them costs less work than inflating them.
+        // With shared memory the pixels stay off the pty, so compressing them
+        // would be work the terminal did not ask for.
         if self.shared_memory {
-            let slot = placement.id.into_inner() as usize;
-            while self.shared_objects.len() <= slot {
-                self.shared_objects.push(Shared::new(
-                    self.namespace,
-                    self.shared_objects.len() as u32,
-                ));
-            }
-            transmit(
-                out,
-                &mut self.payload,
-                pixels,
-                placement,
-                false,
-                Some(&self.shared_objects[slot]),
-            );
+            let namespace = self.namespace;
+            let object = self.shared.get_or_insert_with(|| Shared::new(namespace, 0));
+            transmit(out, &mut self.payload, pixels, size, false, Some(object));
             return;
         }
-        let Some(compress) = self.compress else {
-            // One tile is compressed before the decision is known: that is
-            // what the decision costs.
-            let compressed_len = self.compress(pixels);
-            let worth = compressed_len * COMPRESSION_RATIO.1 < pixels.len() * COMPRESSION_RATIO.0;
-            self.compress = Some(worth);
-            let payload = if worth { self.zlib.get_ref() } else { pixels };
-            transmit(out, &mut self.payload, payload, placement, worth, None);
-            return;
-        };
-
-        if compress {
-            self.compress(pixels);
-            let payload = self.zlib.get_ref();
-            transmit(out, &mut self.payload, payload, placement, true, None);
-        } else {
-            transmit(out, &mut self.payload, pixels, placement, false, None);
-        }
+        // The frame is compressed before the decision is known: that is what
+        // the decision costs.
+        let compressed_len = self.compress(pixels);
+        let worth = compressed_len * COMPRESSION_RATIO.1 < pixels.len() * COMPRESSION_RATIO.0;
+        let payload = if worth { self.zlib.get_ref() } else { pixels };
+        transmit(out, &mut self.payload, payload, size, worth, None);
     }
 
     fn compress(&mut self, pixels: &[u8]) -> usize {
@@ -410,7 +373,7 @@ impl Encoder {
         }
         self.zlib.get_mut().reserve(pixels.len() / 8);
         // Compositor output is mostly flat color, so compressing usually
-        // shrinks a tile by an order of magnitude.
+        // shrinks a frame by an order of magnitude.
         self.zlib
             .write_all(pixels)
             .expect("writing to a Vec cannot fail");
@@ -426,7 +389,7 @@ fn transmit(
     out: &mut Vec<u8>,
     encoded: &mut Vec<u8>,
     payload: &[u8],
-    placement: Placement,
+    size: (u32, u32),
     compressed: bool,
     shared: Option<&Shared>,
 ) {
@@ -437,16 +400,16 @@ fn transmit(
             Err(err) => {
                 tracing::debug!(
                     ?err,
-                    path = %object.path,
-                    "could not put a tile in shared memory"
+                    name = %object.name,
+                    "could not put a frame in shared memory"
                 );
-                return direct(out, encoded, payload, placement, compressed);
+                return direct(out, encoded, payload, size, compressed);
             }
         }
-        placed(out, placement, compressed, "t=s", &object.encoded_name);
+        placed(out, size, compressed, "t=s", &object.encoded_name);
         return;
     }
-    direct(out, encoded, payload, placement, compressed);
+    direct(out, encoded, payload, size, compressed);
 }
 
 /// Send the payload base64'd inside the escape, in chunks of `CHUNK`.
@@ -454,16 +417,16 @@ fn direct(
     out: &mut Vec<u8>,
     encoded: &mut Vec<u8>,
     payload: &[u8],
-    placement: Placement,
+    size: (u32, u32),
     compressed: bool,
 ) {
     let payload = encode_base64(encoded, payload);
-    chunked(out, placement, compressed, payload);
+    chunked(out, size, compressed, payload);
 }
 
 fn encode_base64<'a>(encoded: &'a mut Vec<u8>, payload: &[u8]) -> &'a [u8] {
     let encoded_len =
-        base64::encoded_len(payload.len(), true).expect("a tile fits in address space");
+        base64::encoded_len(payload.len(), true).expect("a frame fits in address space");
     encoded.resize(encoded_len, 0);
     let length = BASE64
         .encode_slice(payload, encoded)
@@ -471,13 +434,13 @@ fn encode_base64<'a>(encoded: &'a mut Vec<u8>, payload: &[u8]) -> &'a [u8] {
     &encoded[..length]
 }
 
-fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &[u8]) {
+fn chunked(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, payload: &[u8]) {
     let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         out.extend_from_slice(b"\x1b_G");
         if first {
-            describe(out, placement, compressed, None);
+            describe(out, size, compressed, None);
             first = false;
         }
         out.extend_from_slice(if chunks.peek().is_some() {
@@ -491,9 +454,9 @@ fn chunked(out: &mut Vec<u8>, placement: Placement, compressed: bool, payload: &
 }
 
 /// One escape whose payload is a name, not pixels.
-fn placed(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: &str, payload: &[u8]) {
+fn placed(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, medium: &str, payload: &[u8]) {
     out.extend_from_slice(b"\x1b_G");
-    describe(out, placement, compressed, Some(medium));
+    describe(out, size, compressed, Some(medium));
     out.extend_from_slice(b";");
     out.extend_from_slice(payload);
     out.extend_from_slice(b"\x1b\\");
@@ -504,30 +467,22 @@ fn placed(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: &st
 /// `a=T` transmits the pixels and places them in one command, `f=24` says they
 /// are RGB, `o=z` says they are zlib compressed, and `t=s` says the payload is
 /// a shared memory object name instead of pixels. `s` and `v` are the size in
-/// pixels, `c` and `r` the same in cells, `i` the image id, `p` the placement
-/// id, `z` the z-index, `C=1` leaves the cursor still, and `q=2` suppresses the
-/// reply.
-fn describe(out: &mut Vec<u8>, placement: Placement, compressed: bool, medium: Option<&str>) {
-    let Placement {
-        id,
-        width,
-        height,
-        cols,
-        rows,
-        ..
-    } = placement;
+/// pixels, `i` and `p` name the image and its placement, `z` the z-index, `C=1`
+/// leaves the cursor still, and `q=2` suppresses the reply.
+///
+/// No `c` or `r` is sent: a cell rectangle would scale the frame, and a
+/// terminal whose cell size does not divide the pane's pixels would scale it
+/// away from the screen.
+fn describe(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, medium: Option<&str>) {
+    let (width, height) = size;
     let compression = if compressed { "o=z," } else { "" };
     let medium = medium.unwrap_or("");
     let separator = if medium.is_empty() { "" } else { "," };
+    let id = FRAME_ID;
     let _ = write!(
         out,
         "a=T,f=24,{compression}{medium}{separator}s={width},v={height},i={id},p={id},"
     );
-    // A partial edge tile must retain its native pixels. c/r would scale it
-    // to the next whole cell and stretch it over the frame edge.
-    if cols > 0 && rows > 0 {
-        let _ = write!(out, "c={cols},r={rows},");
-    }
     let _ = write!(out, "C=1,z={Z_ABOVE_TEXT},q=2,");
 }
 
@@ -665,22 +620,11 @@ mod tests {
     }
 
     #[test]
-    fn a_tile_round_trips_pixels_exactly() {
+    fn a_frame_round_trips_pixels_exactly() {
         let (width, height) = (64, 48);
         let pixels = test_pixels(width, height);
         let mut out = Vec::new();
-        Encoder::new().transmit_and_place(
-            &mut out,
-            &pixels,
-            Placement {
-                id: ImageId::new(7),
-                width,
-                height,
-                cols: 6,
-                rows: 4,
-                cell: (0, 0),
-            },
-        );
+        Encoder::new().transmit(&mut out, &pixels, (width, height));
 
         // This test covers the pixels surviving the trip, not the decision.
         let decoded = decode(&out);
@@ -706,50 +650,16 @@ mod tests {
             ),
             other => panic!("expected a transmission and its placement, got {other:?}"),
         };
+        let id = FRAME_ID.into_inner();
         assert_eq!(
             (transmitted.0, transmitted.1, transmitted.2),
-            (7, width, height)
+            (id, width, height)
         );
-        assert_eq!(put, (7, 7, 6, 4));
+        // The frame keeps its own pixel size: no cell rectangle scales it.
+        assert_eq!(put, (id, id, 0, 0));
         assert_eq!(transmitted.3, &pixels);
-    }
-
-    #[test]
-    fn a_partial_tile_keeps_native_pixel_dimensions() {
-        let (width, height) = (7, 9);
-        let pixels = test_pixels(width, height);
-        let mut out = Vec::new();
-        Encoder::new().transmit_and_place(
-            &mut out,
-            &pixels,
-            Placement {
-                id: ImageId::new(8),
-                width,
-                height,
-                cols: 0,
-                rows: 0,
-                cell: (3, 4),
-            },
-        );
-
         let text = std::str::from_utf8(&out).expect("graphics escapes are ASCII");
-        assert!(!text.contains(",c="));
-        assert!(!text.contains(",r="));
-        assert!(matches!(
-            decode(&out).as_slice(),
-            [
-                Command::Transmit {
-                    width: 7,
-                    height: 9,
-                    ..
-                },
-                Command::Put {
-                    cols: 0,
-                    rows: 0,
-                    ..
-                }
-            ]
-        ));
+        assert!(!text.contains(",c=") && !text.contains(",r="));
     }
 
     #[test]
@@ -758,48 +668,27 @@ mod tests {
         let flat: Vec<u8> = [1u8, 2, 3].repeat(16);
         let mut encoder = Encoder::new();
         let mut out = Vec::new();
-        encoder.transmit_and_place(
-            &mut out,
-            &flat,
-            Placement {
-                id: ImageId::new(1),
-                width: 4,
-                height: 4,
-                cols: 1,
-                rows: 1,
-                cell: (0, 0),
-            },
-        );
+        encoder.transmit(&mut out, &flat, (4, 4));
         out.clear();
         let flat: Vec<u8> = [4u8, 5, 6].repeat(16);
-        encoder.transmit_and_place(
-            &mut out,
-            &flat,
-            Placement {
-                id: ImageId::new(2),
-                width: 4,
-                height: 4,
-                cols: 1,
-                rows: 1,
-                cell: (0, 0),
-            },
-        );
+        encoder.transmit(&mut out, &flat, (4, 4));
 
+        let id = FRAME_ID.into_inner();
         assert_eq!(
             decode(&out),
             vec![
                 Command::Transmit {
-                    id: 2,
+                    id,
                     width: 4,
                     height: 4,
                     compressed: true,
                     pixels: [4u8, 5, 6].repeat(16),
                 },
                 Command::Put {
-                    id: 2,
-                    placement: 2,
-                    cols: 1,
-                    rows: 1,
+                    id,
+                    placement: id,
+                    cols: 0,
+                    rows: 0,
                     moves_cursor: false,
                 },
             ]
@@ -807,27 +696,15 @@ mod tests {
     }
 
     #[test]
-    fn every_tile_of_a_compressed_frame_carries_its_own_pixels() {
-        // Every tile of the frame is still its own picture. Reusing the
-        // decision must not reuse the bytes.
+    fn every_frame_carries_its_own_pixels() {
+        // A frame's compression says nothing about the next one's bytes.
         let flat: Vec<u8> = [7u8, 8, 9].repeat(16);
         let other: Vec<u8> = [10u8, 11, 12].repeat(16);
 
         let mut encoder = Encoder::new();
         let mut out = Vec::new();
-        for (index, pixels) in [&flat, &other].iter().enumerate() {
-            encoder.transmit_and_place(
-                &mut out,
-                pixels,
-                Placement {
-                    id: ImageId::new(index as u32),
-                    width: 4,
-                    height: 4,
-                    cols: 1,
-                    rows: 1,
-                    cell: (0, 0),
-                },
-            );
+        for pixels in [&flat, &other] {
+            encoder.transmit(&mut out, pixels, (4, 4));
         }
 
         let transmitted: Vec<Vec<u8>> = decode(&out)
@@ -845,20 +722,7 @@ mod tests {
         let name = format!("/meowland-{}-1-1", std::process::id());
         let object = Shared::new(1, 1);
         let mut out = Vec::new();
-        placed(
-            &mut out,
-            Placement {
-                id: ImageId::new(3),
-                width: 160,
-                height: 160,
-                cols: 16,
-                rows: 8,
-                cell: (0, 0),
-            },
-            true,
-            "t=s",
-            &object.encoded_name,
-        );
+        placed(&mut out, (160, 160), true, "t=s", &object.encoded_name);
 
         // The name is the payload, so nothing else comes after the separator.
         let text = std::str::from_utf8(&out).expect("escapes are ascii");
@@ -894,38 +758,64 @@ mod tests {
 
         let mut encoder = Encoder::new();
         let mut out = Vec::new();
-        encoder.transmit_and_place(
-            &mut out,
-            &noise,
-            Placement {
-                id: ImageId::new(1),
-                width: 160,
-                height: 160,
-                cols: 16,
-                rows: 8,
-                cell: (0, 0),
-            },
-        );
+        encoder.transmit(&mut out, &noise, (160, 160));
 
+        let id = FRAME_ID.into_inner();
         let commands = decode(&out);
         assert_eq!(
             commands,
             vec![
                 Command::Transmit {
-                    id: 1,
+                    id,
                     width: 160,
                     height: 160,
                     compressed: false,
                     pixels: noise,
                 },
                 Command::Put {
-                    id: 1,
-                    placement: 1,
-                    cols: 16,
-                    rows: 8,
+                    id,
+                    placement: id,
+                    cols: 0,
+                    rows: 0,
                     moves_cursor: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_frame_reads_out_of_shared_memory_when_the_terminal_can() {
+        let mut encoder = Encoder::new();
+        encoder.shared_memory = true;
+        let pixels = test_pixels(16, 8);
+        let mut out = Vec::new();
+        encoder.transmit(&mut out, &pixels, (16, 8));
+
+        // The escape names an object, and the pixels are in it.
+        let text = std::str::from_utf8(&out).expect("escapes are ASCII");
+        assert!(text.contains("t=s"), "{text}");
+        let (_, payload) = text
+            .trim_start_matches("\x1b[1;1H\x1b_G")
+            .trim_end_matches("\x1b\\")
+            .split_once(';')
+            .expect("the escape separates control data from its payload");
+        let name = String::from_utf8(BASE64.decode(payload).expect("the name is base64"))
+            .expect("the name is text");
+        assert_eq!(
+            name,
+            format!("/meowland-{}-{}-0", std::process::id(), encoder.namespace)
+        );
+        let path = format!("{SHM_DIRECTORY}{name}");
+        assert_eq!(
+            std::fs::read(&path).expect("the object holds the frame"),
+            pixels
+        );
+
+        // The object is the encoder's, and goes with it.
+        drop(encoder);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "{path} is left behind"
         );
     }
 
@@ -941,18 +831,7 @@ mod tests {
             pixels.extend_from_slice(&state.to_le_bytes()[..crate::render::BYTES]);
         }
         let mut out = Vec::new();
-        Encoder::new().transmit_and_place(
-            &mut out,
-            &pixels,
-            Placement {
-                id: ImageId::new(1),
-                width,
-                height,
-                cols: 20,
-                rows: 10,
-                cell: (0, 0),
-            },
-        );
+        Encoder::new().transmit(&mut out, &pixels, (width, height));
 
         let mut rest = std::str::from_utf8(&out).unwrap();
         let mut chunks = 0;

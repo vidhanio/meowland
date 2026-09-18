@@ -51,7 +51,7 @@ missing_debug_implementations = "warn"
 unsafe_code = "deny"
 
 [lints.clippy]
-# Pointer positions, tile rectangles and channel arithmetic convert between
+# Pointer positions, frame rectangles and channel arithmetic convert between
 # number types in bulk. The range is known from the invariants around the code,
 # not from the type.
 cast_possible_wrap = "allow"

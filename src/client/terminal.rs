@@ -173,7 +173,7 @@ struct Probe {
     pixels: Option<(u32, u32)>,
     terminal: Option<String>,
     graphics: bool,
-    /// Whether the terminal read the tile sent out of shared memory.
+    /// Whether the terminal read the one-pixel image sent out of shared memory.
     shared_memory: bool,
     keyboard: bool,
     /// Whether the terminal answered the `SGR-Pixels` mode query.
@@ -193,9 +193,9 @@ fn probe() -> io::Result<Probe> {
     );
     queries.extend_from_slice(b"\x1b[?u\x1b[?1016$p");
     stdout.write_all(&queries)?;
-    // A terminal does not announce shared memory support, so the probe sends a
-    // tile that way and sees whether the terminal read it. The guard removes
-    // the object again if it did not.
+    // A terminal does not announce shared memory support, so the probe sends
+    // one pixel that way and sees whether the terminal read it. The guard
+    // removes the object again if it did not.
     let mut shared_probe_bytes = Vec::new();
     let _shared_probe = crate::kitty::shared_memory_probe(&mut shared_probe_bytes);
     stdout.write_all(&shared_probe_bytes)?;
@@ -433,7 +433,7 @@ mod tests {
         // probe only when it read the object.
         let parsed = parse_responses(KITTY_RESPONSES_REMOTE);
         assert!(parsed.probe.graphics, "the graphics query was answered");
-        assert!(!parsed.probe.shared_memory, "the tile was not read");
+        assert!(!parsed.probe.shared_memory, "the image was not read");
 
         let capabilities = resolve_capabilities(&parsed.probe, Some((124, 67, 1240, 1340)));
         assert!(capabilities.graphics);

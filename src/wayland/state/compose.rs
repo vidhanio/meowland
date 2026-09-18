@@ -10,15 +10,15 @@ use smithay::{
     utils::{Logical, Point},
     wayland::{
         compositor::{
-            SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
-            with_surface_tree_downward,
+            SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, get_parent,
+            with_states, with_surface_tree_downward,
         },
         shell::xdg::SurfaceCachedState,
         viewporter::ViewportCachedState,
     },
 };
 
-use super::{Compositor, TILE_CELLS};
+use super::Compositor;
 use crate::{
     render::{Frame, Rect},
     wayland::buffer::Snapshot,
@@ -84,8 +84,30 @@ impl Compositor {
     }
 }
 
-pub(super) const fn tile_size(cell: (u32, u32)) -> (u32, u32) {
-    (cell.0 * TILE_CELLS.0, cell.1 * TILE_CELLS.1)
+/// Whether the pane that draws the window rooted at `root` also draws
+/// `surface`.
+///
+/// That is the window itself, a sub-surface of it, or a popup of either: what
+/// [`Compositor::draw`] puts in a pane's frame, and nothing else. A client's
+/// cursor surface, which commits on every mouse move, is none of them.
+pub(super) fn is_drawn(root: &WlSurface, surface: &WlSurface) -> bool {
+    below(root, surface)
+        || PopupManager::popups_for_surface(root)
+            .any(|(popup, _)| below(popup.wl_surface(), surface))
+}
+
+/// Whether `surface` is `root` or below it in its sub-surface tree.
+fn below(root: &WlSurface, surface: &WlSurface) -> bool {
+    let mut current = surface.clone();
+    loop {
+        if &current == root {
+            return true;
+        }
+        match get_parent(&current) {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Where the toplevel's window geometry starts, relative to its surface origin.

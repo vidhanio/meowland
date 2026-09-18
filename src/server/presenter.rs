@@ -24,21 +24,21 @@ use crate::{
     render::{BYTES, Frame, Rect},
 };
 
-/// The most patches one frame may carry. Past this the screen goes whole: a
-/// frame this broken up costs more in escapes than the pixels it saves.
-const MAXIMUM_PATCHES: usize = 16;
+/// One tile of a pane's screen, in cells.
+///
+/// A tile is a whole number of cells in both directions, which is what makes a
+/// patch foolproof: it is placed in the cell its top-left pixel is in, and that
+/// is the pixel it holds.
+const TILE: (u32, u32) = (8, 2);
 
-/// The most patches the terminal may be left holding. Each one is an image it
-/// keeps and a draw it makes, so the list is not let grow: the next frame is
-/// whole once it would.
-const MAXIMUM_LIVE: usize = 32;
+/// The most tiles one frame may carry. Past this the screen goes whole: a frame
+/// this broken up costs more in escapes than the pixels it saves.
+const MAXIMUM_PATCHES: usize = 32;
 
-/// The most of a screen's pixels one frame's patches may cover, as a fraction.
-const MAXIMUM_PATCHED: (u64, u64) = (1, 3);
-
-/// The most rows of change a frame is diffed into. A frame whose change is this
-/// scattered is a frame to send whole.
-const MAXIMUM_BANDS: usize = 64;
+/// The most tiles the terminal may be left holding. Each one is an image it
+/// keeps and a draw it makes, so the next frame is whole once they would be
+/// more than this, and a whole frame clears them.
+const MAXIMUM_LIVE: usize = 64;
 
 #[derive(Debug)]
 enum Message {
@@ -248,8 +248,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 encoder.transmit(&mut out, frame.pixels(), (frame.width, frame.height));
                 1
             }
-            Send::Patches { write, delete } => {
-                kitty::delete_images(&mut out, delete);
+            Send::Patches { write } => {
                 for plan in write {
                     cut(&frame, plan.rect, &mut patch);
                     encoder.transmit_patch(
@@ -323,50 +322,81 @@ fn write_detached(terminal: &mut Option<UnixStream>, reason: &str) -> std::io::R
     pane::write_detached(terminal, reason)
 }
 
-/// The frame the terminal shows, and what it took to show it.
+/// The frame the terminal shows, and the tiles that were sent over it.
 ///
-/// A pane's screen is one image of the whole frame; a frame after that goes as
-/// patches, images of the rectangles that changed, placed over it. So what the
-/// terminal shows is that image with the live patches on top, and what the next
-/// frame is compared against is the frame that put them there.
-#[derive(Debug)]
+/// A pane's screen is one image of the whole frame. After that a frame goes as
+/// tiles: images of the parts of the screen that changed, placed over the image
+/// the terminal holds. So what the terminal shows is that image with the tiles
+/// on top, and a whole frame, which replaces the image, takes them all with it.
+#[derive(Debug, Default)]
 struct Screen {
     /// The pixels the terminal was last sent.
     previous: Vec<u8>,
-    width: u32,
-    height: u32,
+    /// The grid those pixels were sent on.
+    grid: Grid,
     /// Whether the terminal's whole-screen image is those pixels. It is not
     /// until a frame goes whole: an attached terminal, a resize, or a wipe
     /// leaves a screen with nothing on it.
     whole: bool,
-    /// The patches placed over that image.
-    ///
-    /// No two of them overlap: a patch is drawn where it was placed, so two
-    /// that overlapped would make what the terminal shows depend on the order
-    /// it happened to draw them in.
-    live: Vec<Live>,
-    /// The id the next patch takes. Ids are not reused, and do not have to be:
-    /// four billion of them would pass before a wrap could name a live patch.
-    next: u32,
+    /// Which tiles the terminal holds, by index.
+    placed: Vec<bool>,
 }
 
-/// One patch the terminal holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Live {
-    id: ImageId,
-    rect: Rect,
-}
+impl Screen {
+    /// Forget what the terminal shows: the next frame is a whole one. Whatever
+    /// tiles it holds are gone with it, so nothing is left to delete.
+    fn reset(&mut self) {
+        self.whole = false;
+        self.placed.clear();
+    }
 
-impl Default for Screen {
-    fn default() -> Self {
-        Self {
-            previous: Vec::new(),
-            width: 0,
-            height: 0,
-            whole: false,
-            live: Vec::new(),
-            next: FIRST_PATCH_ID,
+    /// What to write for this frame, taking it as what the terminal will show.
+    fn plan(&mut self, frame: &Frame, config: &Config) -> Send {
+        let grid = Grid::of(frame, config.cell);
+        if !self.whole || grid != self.grid {
+            return self.whole(frame, grid);
         }
+        let changed = changed(&grid, &self.previous, frame.pixels());
+        if changed.is_empty() {
+            return Send::Nothing;
+        }
+        let held = self.placed.iter().filter(|placed| **placed).count();
+        // The pixels the tiles would carry, against the pixels a whole frame
+        // would: past that, the whole screen is the cheaper way to say it.
+        let covered = changed.len() as u64 * u64::from(grid.tile.0) * u64::from(grid.tile.1);
+        let screen = u64::from(grid.screen.0) * u64::from(grid.screen.1);
+        if !config.patches
+            || changed.len() > MAXIMUM_PATCHES
+            || held + changed.len() > MAXIMUM_LIVE
+            || covered > screen
+        {
+            return self.whole(frame, grid);
+        }
+        for index in &changed {
+            self.placed[*index as usize] = true;
+        }
+        self.previous.copy_from_slice(frame.pixels());
+        Send::Patches {
+            write: changed
+                .into_iter()
+                .map(|index| Plan {
+                    id: Grid::id(index),
+                    cell: grid.cell(index),
+                    rect: grid.rect(index),
+                })
+                .collect(),
+        }
+    }
+
+    /// Send the whole screen: the image replaces every tile with it.
+    fn whole(&mut self, frame: &Frame, grid: Grid) -> Send {
+        let delete = Grid::held(&self.placed);
+        self.grid = grid;
+        self.placed = vec![false; grid.count() as usize];
+        self.previous.clear();
+        self.previous.extend_from_slice(frame.pixels());
+        self.whole = true;
+        Send::Whole { delete }
     }
 }
 
@@ -375,241 +405,126 @@ impl Default for Screen {
 enum Send {
     /// Nothing: the terminal already shows this frame.
     Nothing,
-    /// The whole screen, as one image. `delete` are the patches it replaces.
+    /// The whole screen, as one image. `delete` are the tiles it replaces.
     Whole { delete: Vec<ImageId> },
-    /// Rectangles of it, over the image the terminal holds.
-    Patches {
-        write: Vec<Plan>,
-        delete: Vec<ImageId>,
-    },
+    /// Tiles of it, over the image the terminal holds.
+    Patches { write: Vec<Plan> },
 }
 
-/// One patch to write: which image, where it goes, and which rectangle of the
-/// frame it holds.
+/// One tile to write: which image, which cell it goes in, and which pixels.
 #[derive(Debug, Clone, Copy)]
 struct Plan {
     id: ImageId,
-    /// The cell the rectangle's top-left pixel is in.
     cell: (u32, u32),
     rect: Rect,
 }
 
-impl Screen {
-    /// Forget what the terminal shows: the next frame is a whole one.
-    fn reset(&mut self) {
-        self.whole = false;
-        self.live.clear();
-    }
-
-    /// What to write for this frame, taking it as what the terminal will show.
-    fn plan(&mut self, frame: &Frame, config: &Config) -> Send {
-        let pixels = frame.pixels();
-        if !self.whole || self.width != frame.width || self.height != frame.height {
-            return self.whole(frame);
-        }
-        let bands = changed(
-            &self.previous,
-            pixels,
-            frame.width,
-            frame.height,
-            config.cell,
-        );
-        if bands.is_empty() {
-            return Send::Nothing;
-        }
-        if !config.patches || bands.len() > MAXIMUM_BANDS {
-            return self.whole(frame);
-        }
-        let damaged = merged(bands);
-        if damaged.len() > MAXIMUM_PATCHES {
-            return self.whole(frame);
-        }
-        let assignment = self.assign(damaged, config);
-        let patched: u64 = assignment.write.iter().map(|plan| area(plan.rect)).sum();
-        let screen = u64::from(frame.width) * u64::from(frame.height);
-        if assignment.live.len() > MAXIMUM_LIVE
-            || patched * MAXIMUM_PATCHED.1 > screen * MAXIMUM_PATCHED.0
-        {
-            return self.whole(frame);
-        }
-        self.next = assignment.next;
-        self.live = assignment.live;
-        self.previous.copy_from_slice(pixels);
-        Send::Patches {
-            write: assignment.write,
-            delete: assignment.delete,
-        }
-    }
-
-    /// Send the whole screen: the image replaces every patch with it.
-    fn whole(&mut self, frame: &Frame) -> Send {
-        let delete = self.live.iter().map(|patch| patch.id).collect();
-        self.live.clear();
-        self.previous.clear();
-        self.previous.extend_from_slice(frame.pixels());
-        self.width = frame.width;
-        self.height = frame.height;
-        self.whole = true;
-        Send::Whole { delete }
-    }
-
-    /// Which patches the frame's damage is written as.
-    ///
-    /// A rectangle that meets a patch the terminal holds is written as that
-    /// patch, grown to hold both; the patches it grew over are deleted, because
-    /// a patch must not be left with another one's pixels over it.
-    fn assign(&self, damaged: Vec<Rect>, config: &Config) -> Assignment {
-        let mut assignment = Assignment {
-            write: Vec::new(),
-            delete: Vec::new(),
-            live: self.live.clone(),
-            next: self.next,
-        };
-        for region in damaged {
-            let touching: Vec<ImageId> = assignment
-                .live
-                .iter()
-                .filter(|patch| abuts(patch.rect, region))
-                .map(|patch| patch.id)
-                .collect();
-            if touching.is_empty() {
-                let id = ImageId::new(assignment.next);
-                assignment.next += 1;
-                assignment.live.push(Live { id, rect: region });
-                assignment.write.push(plan(id, region, config.cell));
-                continue;
-            }
-            // The smallest patch that meets it takes it in, so taking in one
-            // rectangle does not grow a patch that was already large.
-            let keep = assignment
-                .live
-                .iter()
-                .filter(|patch| touching.contains(&patch.id))
-                .min_by_key(|patch| area(patch.rect))
-                .map(|patch| patch.id)
-                .expect("a patch to grow");
-            let mut rect = region;
-            for patch in assignment
-                .live
-                .iter()
-                .filter(|patch| touching.contains(&patch.id))
-            {
-                rect = union(rect, patch.rect);
-            }
-            assignment
-                .live
-                .retain(|patch| !touching.contains(&patch.id) || patch.id == keep);
-            if let Some(patch) = assignment.live.iter_mut().find(|patch| patch.id == keep) {
-                patch.rect = rect;
-            }
-            assignment
-                .delete
-                .extend(touching.iter().copied().filter(|id| *id != keep));
-            assignment.write.push(plan(keep, rect, config.cell));
-        }
-        assignment
-    }
-}
-
-/// Which patches go out, which go away, and what the terminal is left holding.
-#[derive(Debug)]
-struct Assignment {
-    write: Vec<Plan>,
-    delete: Vec<ImageId>,
-    live: Vec<Live>,
-    next: u32,
-}
-
-/// Where a rectangle's image goes: the cell its top-left pixel is in.
-const fn plan(id: ImageId, rect: Rect, cell: (u32, u32)) -> Plan {
-    Plan {
-        id,
-        cell: (rect.x as u32 / cell.0, rect.y as u32 / cell.1),
-        rect,
-    }
-}
-
-/// The rectangles of `frame` whose pixels differ from `previous`, rounded out
-/// to whole cells.
+/// Where a frame sits in the pane's tile grid.
 ///
-/// One band per row of change, extended down while the row changes in the same
-/// columns: a line of text is one rectangle, not one per row of it.
-fn changed(previous: &[u8], frame: &[u8], width: u32, height: u32, cell: (u32, u32)) -> Vec<Rect> {
-    let stride = width as usize * BYTES;
-    let mut bands: Vec<Rect> = Vec::new();
-    for y in 0..height {
-        let row = y as usize * stride;
-        if frame[row..row + stride] == previous[row..row + stride] {
+/// A tile is a whole number of cells in both directions and the grid begins at
+/// the screen's top left, so the cell a tile is sent to is the cell its
+/// top-left pixel is in. Nothing here has to round anything to a cell: a patch
+/// cannot land anywhere but on the pixels it holds. The tiles at the right and
+/// bottom edges are what is left of the screen, which need not be a whole tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Grid {
+    /// The screen, in pixels.
+    screen: (u32, u32),
+    /// One tile, in pixels.
+    tile: (u32, u32),
+    /// How many tiles across.
+    columns: u32,
+}
+
+impl Grid {
+    const fn of(frame: &Frame, cell: (u32, u32)) -> Self {
+        let tile = (cell.0 * TILE.0, cell.1 * TILE.1);
+        Self {
+            screen: (frame.width, frame.height),
+            tile,
+            columns: frame.width.div_ceil(tile.0),
+        }
+    }
+
+    const fn rows(&self) -> u32 {
+        self.screen.1.div_ceil(self.tile.1)
+    }
+
+    const fn count(&self) -> u32 {
+        self.columns * self.rows()
+    }
+
+    /// The pixels one tile holds.
+    fn rect(&self, index: u32) -> Rect {
+        let (column, row) = (index % self.columns, index / self.columns);
+        let (x, y) = (column * self.tile.0, row * self.tile.1);
+        Rect::new(
+            x as i32,
+            y as i32,
+            self.tile.0.min(self.screen.0 - x),
+            self.tile.1.min(self.screen.1 - y),
+        )
+    }
+
+    /// The cell one tile's top-left pixel is in.
+    const fn cell(&self, index: u32) -> (u32, u32) {
+        (
+            (index % self.columns) * TILE.0,
+            (index / self.columns) * TILE.1,
+        )
+    }
+
+    /// The image one tile is sent under. A tile keeps its image while the grid
+    /// does, so sending a tile again replaces the one the terminal holds.
+    const fn id(index: u32) -> ImageId {
+        ImageId::new(FIRST_PATCH_ID + index)
+    }
+
+    /// The images of the tiles the terminal holds.
+    fn held(placed: &[bool]) -> Vec<ImageId> {
+        placed
+            .iter()
+            .enumerate()
+            .filter(|(_, placed)| **placed)
+            .map(|(index, _)| Self::id(index as u32))
+            .collect()
+    }
+}
+
+/// The tiles of `frame` whose pixels differ from `previous`.
+///
+/// A row the frame did not change costs one comparison and no more; the tiles
+/// are looked at only in the rows that changed. Finding one tile past
+/// `MAXIMUM_PATCHES` is enough: the frame goes whole then, and the rest of the
+/// screen does not have to be looked at.
+fn changed(grid: &Grid, previous: &[u8], frame: &[u8]) -> Vec<u32> {
+    let stride = grid.screen.0 as usize * BYTES;
+    let mut changed: Vec<u32> = Vec::new();
+    for row in 0..grid.screen.1 {
+        let at = row as usize * stride;
+        if frame[at..at + stride] == previous[at..at + stride] {
             continue;
         }
-        let mut first = width;
-        let mut last = 0;
-        for x in 0..width as usize {
-            let at = row + x * BYTES;
-            if frame[at..at + BYTES] != previous[at..at + BYTES] {
-                first = first.min(x as u32);
-                last = x as u32;
+        for column in 0..grid.columns {
+            let x = column * grid.tile.0;
+            let end = (x + grid.tile.0).min(grid.screen.0);
+            let (from, to) = (at + x as usize * BYTES, at + end as usize * BYTES);
+            if frame[from..to] == previous[from..to] {
+                continue;
             }
-        }
-        // A patch is placed by its cell, so it holds whole cells: the pixels a
-        // change did not reach are pixels the frame has anyway.
-        let left = first / cell.0 * cell.0;
-        let right = ((last + 1).div_ceil(cell.0) * cell.0).min(width);
-        match bands.last_mut() {
-            Some(band)
-                if band.x == left as i32
-                    && band.width == right - left
-                    && band.y as u32 + band.height == y =>
-            {
-                band.height += 1;
+            let index = (row / grid.tile.1) * grid.columns + column;
+            if !changed.contains(&index) {
+                changed.push(index);
+                if changed.len() > MAXIMUM_PATCHES {
+                    return changed;
+                }
             }
-            _ => bands.push(Rect::new(left as i32, y as i32, right - left, 1)),
         }
     }
-    bands
+    changed
 }
 
-/// Fold the rectangles that meet into one apiece, so that a screen changed in
-/// many places costs as few images as it can.
-fn merged(mut bands: Vec<Rect>) -> Vec<Rect> {
-    let mut index = 0;
-    while index < bands.len() {
-        let mut other = index + 1;
-        while other < bands.len() {
-            if abuts(bands[index], bands[other]) {
-                bands[index] = union(bands[index], bands[other]);
-                bands.remove(other);
-            } else {
-                other += 1;
-            }
-        }
-        index += 1;
-    }
-    bands
-}
-
-/// Whether two rectangles meet: they overlap, or share an edge.
-const fn abuts(a: Rect, b: Rect) -> bool {
-    a.x <= b.x + b.width as i32
-        && b.x <= a.x + a.width as i32
-        && a.y <= b.y + b.height as i32
-        && b.y <= a.y + a.height as i32
-}
-
-/// The smallest rectangle holding both.
-fn union(a: Rect, b: Rect) -> Rect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    let right = (a.x + a.width as i32).max(b.x + b.width as i32);
-    let bottom = (a.y + a.height as i32).max(b.y + b.height as i32);
-    Rect::new(x, y, (right - x) as u32, (bottom - y) as u32)
-}
-
-fn area(rect: Rect) -> u64 {
-    u64::from(rect.width) * u64::from(rect.height)
-}
-
-/// Copy one rectangle out of a frame, rows end to end.
+/// Copy one tile out of a frame, rows end to end.
 fn cut(frame: &Frame, rect: Rect, out: &mut Vec<u8>) {
     let stride = frame.width as usize * BYTES;
     let length = rect.width as usize * BYTES;
@@ -769,19 +684,20 @@ mod tests {
                 if let Some(body) = rest.strip_prefix("\x1b_G") {
                     let end = body.find("\x1b\\").expect("an unterminated escape");
                     let (control, payload) = body[..end].split_once(';').expect("a payload");
-                    let mut control = control.to_owned();
+                    let control = control.to_owned();
                     let mut payload = payload.to_owned();
+                    let mut more = control.contains("m=1");
                     rest = &body[end + 2..];
                     // A transmission comes in chunks of its own: the first
-                    // escape carries the control data, and the rest payload.
-                    while control.contains("m=1") {
+                    // escape carries the control data, the rest payload.
+                    while more {
                         let body = rest
                             .strip_prefix("\x1b_G")
                             .expect("the next chunk of a transmission");
                         let end = body.find("\x1b\\").expect("an unterminated escape");
                         let (next, chunk) = body[..end].split_once(';').expect("a payload");
                         payload.push_str(chunk);
-                        control = next.to_owned();
+                        more = next.contains("m=1");
                         rest = &body[end + 2..];
                     }
                     self.command(&control, &payload);
@@ -824,7 +740,7 @@ mod tests {
                         self.placed.retain(|image| image.id != id);
                     }
                 }
-                other => panic!("unexpected action {other:?}"),
+                other => panic!("unexpected action {other:?} in {control:?}"),
             }
         }
 
@@ -1048,6 +964,21 @@ mod tests {
     }
 
     #[test]
+    fn a_change_that_starts_between_cells_lands_where_it_belongs() {
+        let mut pane = Pane::new(&capabilities());
+        let mut frame = Frame::new(80, 64);
+        frame.clear([9, 9, 9]);
+        pane.present(frame);
+
+        // A hover highlight: a few rows that begin between two cells.
+        let mut next = frame_of(80, 64, &pane.shown());
+        paint(&mut next, Rect::new(24, 13, 16, 3), [200, 30, 30]);
+        let pixels = next.pixels().to_vec();
+        pane.present(next);
+        assert_eq!(pane.shown(), pixels, "the highlight is where it was drawn");
+    }
+
+    #[test]
     fn a_frame_the_terminal_already_shows_costs_nothing() {
         let mut pane = Pane::new(&capabilities());
         let mut frame = Frame::new(80, 64);
@@ -1062,31 +993,34 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_changed_in_a_corner_goes_as_a_patch() {
+    fn a_frame_changed_in_one_place_goes_as_a_tile() {
         let mut pane = Pane::new(&capabilities());
         let mut frame = Frame::new(80, 64);
         frame.clear([9, 9, 9]);
         assert!(pane.present(frame).is_some(), "the first frame is whole");
 
         let mut changed = frame_of(80, 64, &pane.shown());
-        // One cell's worth of pixels, in the middle of the screen.
+        // A few pixels in the middle of the screen: one tile holds them.
         paint(&mut changed, Rect::new(32, 24, 8, 8), [200, 30, 30]);
         let pixels = changed.pixels().to_vec();
 
-        let escapes = pane.present(changed).expect("a patch is written");
+        let escapes = pane.present(changed).expect("a tile is written");
         assert_eq!(escapes.matches("a=T,f=24").count(), 1);
         assert!(
-            escapes.contains(",s=8,v=8,"),
-            "the patch is the cell it changed: {escapes}"
+            escapes.contains(",s=64,v=16,"),
+            "the tile is whole cells: {escapes}"
         );
         assert!(
-            escapes.contains("\x1b[4;5H"),
-            "placed in the cell it belongs to: {escapes}"
+            escapes.contains("\x1b[3;1H"),
+            "placed in the cell it starts in: {escapes}"
         );
         assert_eq!(pane.shown(), pixels, "and the screen is the frame");
         assert!(
-            pane.terminal.placed_ids().contains(&2),
-            "the patch is its own image"
+            pane.terminal
+                .placed_ids()
+                .iter()
+                .any(|id| *id >= FIRST_PATCH_ID),
+            "the tile is its own image"
         );
     }
 
@@ -1104,21 +1038,21 @@ mod tests {
             match step % 8 {
                 // A corner changes.
                 0 | 4 => paint(&mut next, Rect::new(0, 0, 8, 8), [step, 1, 2]),
-                // A line is typed: one band, several cells wide.
-                1 => paint(&mut next, Rect::new(16, 32, 32, 8), [3, 4, step]),
+                // A line is typed: several cells wide, and not whole ones.
+                1 => paint(&mut next, Rect::new(16, 29, 32, 5), [3, 4, step]),
                 // A block is drawn over the middle of the screen.
                 2 => paint(&mut next, Rect::new(24, 16, 24, 24), [5, step, 6]),
                 // The whole screen is another scene: this one goes whole.
                 3 => paint(&mut next, Rect::new(0, 0, 80, 64), [step, 7, 8]),
-                // Two corners at once.
+                // Two tiles at once, one of them in the last column.
                 5 => {
                     paint(&mut next, Rect::new(0, 0, 8, 8), [step, 9, 10]);
                     paint(&mut next, Rect::new(72, 56, 8, 8), [11, step, 12]);
                 }
-                // The pointer moves along a row.
+                // The pointer moves along a row, in steps of one pixel.
                 6 => paint(
                     &mut next,
-                    Rect::new(8 + (u32::from(step) % 8) as i32 * 8, 48, 8, 8),
+                    Rect::new(9 + (u32::from(step) % 7) as i32, 50, 3, 3),
                     [13, 14, step],
                 ),
                 // Nothing changes at all.
@@ -1144,25 +1078,21 @@ mod tests {
     }
 
     #[test]
-    fn patches_do_not_pile_up_on_the_terminal() {
-        // A screen wide enough for more patches than the terminal may hold.
-        let mut pane = Pane::new(&capabilities_of((160, 128)));
-        let mut frame = Frame::new(160, 128);
+    fn the_tiles_the_terminal_holds_do_not_pile_up() {
+        // A screen with room for more tiles than the terminal may hold.
+        let (width, height) = (640, 256);
+        let mut pane = Pane::new(&capabilities_of((width, height)));
+        let mut frame = Frame::new(width, height);
         frame.clear([9, 9, 9]);
         pane.present(frame);
 
-        // Every other cell in both directions, so no change lands beside an
-        // earlier one: a patch that meets another is grown over it instead of
-        // being added, and that is the case this test is not.
+        // One tile at a time, each somewhere the frame has not changed before.
+        let grid = Grid::of(&Frame::new(width, height), capabilities().cell);
         let mut resets = 0;
-        for step in 0..40u32 {
-            let (x, y) = ((step % 10) * 2, (step / 10) * 2);
-            let mut next = frame_of(160, 128, &pane.shown());
-            paint(
-                &mut next,
-                Rect::new((x * 8) as i32, (y * 8) as i32, 8, 8),
-                [step as u8, 3, 4],
-            );
+        for step in 0..(MAXIMUM_LIVE as u32 + 8) {
+            let rect = grid.rect(step);
+            let mut next = frame_of(width, height, &pane.shown());
+            paint(&mut next, rect, [step as u8, 3, 4]);
             let pixels = next.pixels().to_vec();
             if pane
                 .present(next)
@@ -1177,7 +1107,7 @@ mod tests {
                 pane.terminal.placed_ids().len()
             );
         }
-        assert!(resets > 0, "the patches were never cleared");
+        assert!(resets > 0, "the tiles were never cleared");
     }
 
     #[test]

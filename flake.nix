@@ -31,6 +31,16 @@
           let
             craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (
               p:
+              p.rust-bin.stable.latest.default.override {
+                extensions = [
+                  "rust-src"
+                  "rust-analyzer"
+                ];
+              }
+            );
+
+            craneLibNightly = (inputs.crane.mkLib pkgs).overrideToolchain (
+              p:
               p.rust-bin.nightly.latest.default.override {
                 extensions = [
                   "rust-src"
@@ -39,7 +49,7 @@
               }
             );
 
-            src = craneLib.cleanCargoSource ./.;
+            src = craneLibNightly.cleanCargoSource ./.;
 
             nativeBuildInputs = [ pkgs.pkg-config ];
 
@@ -98,7 +108,7 @@
             packages.default = meowland;
 
             checks = {
-              clippy = craneLib.cargoClippy (
+              clippy = craneLibNightly.cargoClippy (
                 commonArgs
                 // {
                   inherit cargoArtifacts;
@@ -106,7 +116,7 @@
                 }
               );
 
-              test = craneLib.cargoTest (
+              test = craneLibNightly.cargoTest (
                 commonArgs
                 // {
                   inherit cargoArtifacts;
@@ -114,7 +124,7 @@
                 }
               );
 
-              fmt = craneLib.cargoFmt { inherit src; };
+              fmt = craneLibNightly.cargoFmt { inherit src; };
             };
 
             devShells.default = craneLib.devShell {
@@ -127,7 +137,6 @@
 
               packages = [
                 config.treefmt.build.wrapper
-                self'.packages.default
               ]
               ++ runtimeInputs;
 

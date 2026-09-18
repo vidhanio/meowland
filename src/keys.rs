@@ -21,44 +21,8 @@ pub struct KeyStroke {
 /// eight keys away from the one that was pressed.
 pub const XKB_OFFSET: u32 = 8;
 
-const fn stroke(code: u32, shift: bool) -> KeyStroke {
-    KeyStroke {
-        code: KeyCode::new(code as u16),
-        shift,
-    }
-}
-
-/// Mouse button codes, as the Wayland pointer protocol names them.
-pub mod button {
-    use super::KeyCode;
-    /// `BTN_LEFT`.
-    pub const LEFT: KeyCode = KeyCode::BTN_LEFT;
-    /// `BTN_RIGHT`.
-    pub const RIGHT: KeyCode = KeyCode::BTN_RIGHT;
-    /// `BTN_MIDDLE`.
-    pub const MIDDLE: KeyCode = KeyCode::BTN_MIDDLE;
-}
-
-/// Key codes for the modifier keys, so that a client sees real presses and not
-/// only modifier state.
-pub mod modifier {
-    use super::KeyCode;
-    /// `KEY_LEFTSHIFT`.
-    pub const LEFT_SHIFT: KeyCode = KeyCode::KEY_LEFTSHIFT;
-    /// `KEY_LEFTSHIFT`'s sibling.
-    pub const RIGHT_SHIFT: KeyCode = KeyCode::KEY_RIGHTSHIFT;
-    /// `KEY_LEFTCTRL`.
-    pub const LEFT_CTRL: KeyCode = KeyCode::KEY_LEFTCTRL;
-    /// `KEY_RIGHTCTRL`.
-    pub const RIGHT_CTRL: KeyCode = KeyCode::KEY_RIGHTCTRL;
-    /// `KEY_LEFTALT`.
-    pub const LEFT_ALT: KeyCode = KeyCode::KEY_LEFTALT;
-    /// `KEY_RIGHTALT`.
-    pub const RIGHT_ALT: KeyCode = KeyCode::KEY_RIGHTALT;
-    /// `KEY_LEFTMETA`.
-    pub const LEFT_META: KeyCode = KeyCode::KEY_LEFTMETA;
-    /// `KEY_RIGHTMETA`.
-    pub const RIGHT_META: KeyCode = KeyCode::KEY_RIGHTMETA;
+const fn stroke(code: KeyCode, shift: bool) -> KeyStroke {
+    KeyStroke { code, shift }
 }
 
 /// Map a character from the terminal to the `us` stroke that types it.
@@ -70,87 +34,135 @@ pub fn for_char(c: char) -> Option<KeyStroke> {
     }
 
     Some(match c {
-        '1'..='9' => stroke(2 + (c as u32 - '1' as u32), false),
-        '0' => stroke(11, false),
+        '1'..='9' => stroke(DIGITS[usize::from(c as u8 - b'1')], false),
+        '0' => stroke(KeyCode::KEY_0, false),
         // The shifted digit row, in the order the layout puts it.
-        '!' => stroke(2, true),
-        '@' => stroke(3, true),
-        '#' => stroke(4, true),
-        '$' => stroke(5, true),
-        '%' => stroke(6, true),
-        '^' => stroke(7, true),
-        '&' => stroke(8, true),
-        '*' => stroke(9, true),
-        '(' => stroke(10, true),
-        ')' => stroke(11, true),
-        '-' => stroke(12, false),
-        '_' => stroke(12, true),
-        '=' => stroke(13, false),
-        '+' => stroke(13, true),
-        '\t' => stroke(15, false),
-        '[' => stroke(26, false),
-        '{' => stroke(26, true),
-        ']' => stroke(27, false),
-        '}' => stroke(27, true),
-        '\r' => stroke(28, false),
-        ';' => stroke(39, false),
-        ':' => stroke(39, true),
-        '\'' => stroke(40, false),
-        '"' => stroke(40, true),
-        '`' => stroke(41, false),
-        '~' => stroke(41, true),
-        '\\' => stroke(43, false),
-        '|' => stroke(43, true),
-        ',' => stroke(51, false),
-        '<' => stroke(51, true),
-        '.' => stroke(52, false),
-        '>' => stroke(52, true),
-        '/' => stroke(53, false),
-        '?' => stroke(53, true),
-        ' ' => stroke(57, false),
+        '!' => stroke(KeyCode::KEY_1, true),
+        '@' => stroke(KeyCode::KEY_2, true),
+        '#' => stroke(KeyCode::KEY_3, true),
+        '$' => stroke(KeyCode::KEY_4, true),
+        '%' => stroke(KeyCode::KEY_5, true),
+        '^' => stroke(KeyCode::KEY_6, true),
+        '&' => stroke(KeyCode::KEY_7, true),
+        '*' => stroke(KeyCode::KEY_8, true),
+        '(' => stroke(KeyCode::KEY_9, true),
+        ')' => stroke(KeyCode::KEY_0, true),
+        '-' => stroke(KeyCode::KEY_MINUS, false),
+        '_' => stroke(KeyCode::KEY_MINUS, true),
+        '=' => stroke(KeyCode::KEY_EQUAL, false),
+        '+' => stroke(KeyCode::KEY_EQUAL, true),
+        '\t' => stroke(KeyCode::KEY_TAB, false),
+        '[' => stroke(KeyCode::KEY_LEFTBRACE, false),
+        '{' => stroke(KeyCode::KEY_LEFTBRACE, true),
+        ']' => stroke(KeyCode::KEY_RIGHTBRACE, false),
+        '}' => stroke(KeyCode::KEY_RIGHTBRACE, true),
+        '\r' => stroke(KeyCode::KEY_ENTER, false),
+        ';' => stroke(KeyCode::KEY_SEMICOLON, false),
+        ':' => stroke(KeyCode::KEY_SEMICOLON, true),
+        '\'' => stroke(KeyCode::KEY_APOSTROPHE, false),
+        '"' => stroke(KeyCode::KEY_APOSTROPHE, true),
+        '`' => stroke(KeyCode::KEY_GRAVE, false),
+        '~' => stroke(KeyCode::KEY_GRAVE, true),
+        '\\' => stroke(KeyCode::KEY_BACKSLASH, false),
+        '|' => stroke(KeyCode::KEY_BACKSLASH, true),
+        ',' => stroke(KeyCode::KEY_COMMA, false),
+        '<' => stroke(KeyCode::KEY_COMMA, true),
+        '.' => stroke(KeyCode::KEY_DOT, false),
+        '>' => stroke(KeyCode::KEY_DOT, true),
+        '/' => stroke(KeyCode::KEY_SLASH, false),
+        '?' => stroke(KeyCode::KEY_SLASH, true),
+        ' ' => stroke(KeyCode::KEY_SPACE, false),
         _ => return None,
     })
 }
 
 /// The key codes of `F1` to `F12`. The last two sit apart from the rest, so a
 /// table is shorter than arithmetic.
-const FUNCTION: [u32; 12] = [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88];
+const FUNCTION: [KeyCode; 12] = [
+    KeyCode::KEY_F1,
+    KeyCode::KEY_F2,
+    KeyCode::KEY_F3,
+    KeyCode::KEY_F4,
+    KeyCode::KEY_F5,
+    KeyCode::KEY_F6,
+    KeyCode::KEY_F7,
+    KeyCode::KEY_F8,
+    KeyCode::KEY_F9,
+    KeyCode::KEY_F10,
+    KeyCode::KEY_F11,
+    KeyCode::KEY_F12,
+];
 
 /// The key code of each letter, in alphabet order, on a `us` keyboard. There is
 /// no formula, because the letters lie in three rows.
-const LETTERS: [u32; 26] = [
-    30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45,
-    21, 44,
+const LETTERS: [KeyCode; 26] = [
+    KeyCode::KEY_A,
+    KeyCode::KEY_B,
+    KeyCode::KEY_C,
+    KeyCode::KEY_D,
+    KeyCode::KEY_E,
+    KeyCode::KEY_F,
+    KeyCode::KEY_G,
+    KeyCode::KEY_H,
+    KeyCode::KEY_I,
+    KeyCode::KEY_J,
+    KeyCode::KEY_K,
+    KeyCode::KEY_L,
+    KeyCode::KEY_M,
+    KeyCode::KEY_N,
+    KeyCode::KEY_O,
+    KeyCode::KEY_P,
+    KeyCode::KEY_Q,
+    KeyCode::KEY_R,
+    KeyCode::KEY_S,
+    KeyCode::KEY_T,
+    KeyCode::KEY_U,
+    KeyCode::KEY_V,
+    KeyCode::KEY_W,
+    KeyCode::KEY_X,
+    KeyCode::KEY_Y,
+    KeyCode::KEY_Z,
+];
+
+/// The key code of each digit key, `1` to `9`.
+const DIGITS: [KeyCode; 9] = [
+    KeyCode::KEY_1,
+    KeyCode::KEY_2,
+    KeyCode::KEY_3,
+    KeyCode::KEY_4,
+    KeyCode::KEY_5,
+    KeyCode::KEY_6,
+    KeyCode::KEY_7,
+    KeyCode::KEY_8,
+    KeyCode::KEY_9,
 ];
 
 /// Map the non-character keys the terminal reports.
 pub fn for_key(code: TerminalKeyCode) -> Option<KeyStroke> {
     Some(match code {
-        TerminalKeyCode::Esc => stroke(1, false),
-        TerminalKeyCode::Enter => stroke(28, false),
-        TerminalKeyCode::Tab => stroke(15, false),
-        TerminalKeyCode::BackTab => stroke(15, true),
-        TerminalKeyCode::Backspace => stroke(14, false),
-        TerminalKeyCode::Insert => stroke(110, false),
-        TerminalKeyCode::Delete => stroke(111, false),
-        TerminalKeyCode::Home => stroke(102, false),
-        TerminalKeyCode::End => stroke(107, false),
-        TerminalKeyCode::PageUp => stroke(104, false),
-        TerminalKeyCode::PageDown => stroke(109, false),
-        TerminalKeyCode::Up => stroke(103, false),
-        TerminalKeyCode::Down => stroke(108, false),
-        TerminalKeyCode::Left => stroke(105, false),
-        TerminalKeyCode::Right => stroke(106, false),
-        TerminalKeyCode::CapsLock => stroke(58, false),
-        TerminalKeyCode::ScrollLock => stroke(70, false),
-        TerminalKeyCode::NumLock => stroke(69, false),
-        TerminalKeyCode::PrintScreen => stroke(99, false),
-        TerminalKeyCode::Pause => stroke(119, false),
-        TerminalKeyCode::Menu => stroke(127, false),
+        TerminalKeyCode::Esc => stroke(KeyCode::KEY_ESC, false),
+        TerminalKeyCode::Enter => stroke(KeyCode::KEY_ENTER, false),
+        TerminalKeyCode::Tab => stroke(KeyCode::KEY_TAB, false),
+        TerminalKeyCode::BackTab => stroke(KeyCode::KEY_TAB, true),
+        TerminalKeyCode::Backspace => stroke(KeyCode::KEY_BACKSPACE, false),
+        TerminalKeyCode::Insert => stroke(KeyCode::KEY_INSERT, false),
+        TerminalKeyCode::Delete => stroke(KeyCode::KEY_DELETE, false),
+        TerminalKeyCode::Home => stroke(KeyCode::KEY_HOME, false),
+        TerminalKeyCode::End => stroke(KeyCode::KEY_END, false),
+        TerminalKeyCode::PageUp => stroke(KeyCode::KEY_PAGEUP, false),
+        TerminalKeyCode::PageDown => stroke(KeyCode::KEY_PAGEDOWN, false),
+        TerminalKeyCode::Up => stroke(KeyCode::KEY_UP, false),
+        TerminalKeyCode::Down => stroke(KeyCode::KEY_DOWN, false),
+        TerminalKeyCode::Left => stroke(KeyCode::KEY_LEFT, false),
+        TerminalKeyCode::Right => stroke(KeyCode::KEY_RIGHT, false),
+        TerminalKeyCode::CapsLock => stroke(KeyCode::KEY_CAPSLOCK, false),
+        TerminalKeyCode::ScrollLock => stroke(KeyCode::KEY_SCROLLLOCK, false),
+        TerminalKeyCode::NumLock => stroke(KeyCode::KEY_NUMLOCK, false),
+        TerminalKeyCode::PrintScreen => stroke(KeyCode::KEY_SYSRQ, false),
+        TerminalKeyCode::Pause => stroke(KeyCode::KEY_PAUSE, false),
+        TerminalKeyCode::Menu => stroke(KeyCode::KEY_COMPOSE, false),
         TerminalKeyCode::F(n) => stroke(*FUNCTION.get(usize::from(n).checked_sub(1)?)?, false),
-        TerminalKeyCode::Modifier(modifier) => {
-            stroke(u32::from(for_modifier(modifier)?.code()), false)
-        }
+        TerminalKeyCode::Modifier(modifier) => stroke(for_modifier(modifier)?, false),
         TerminalKeyCode::Char(c) => return for_char(c),
         _ => return None,
     })
@@ -159,14 +171,14 @@ pub fn for_key(code: TerminalKeyCode) -> Option<KeyStroke> {
 /// The key code of a modifier that the terminal reports as its own event.
 pub const fn for_modifier(modifier: ModifierKeyCode) -> Option<KeyCode> {
     Some(match modifier {
-        ModifierKeyCode::LeftShift => modifier::LEFT_SHIFT,
-        ModifierKeyCode::RightShift => modifier::RIGHT_SHIFT,
-        ModifierKeyCode::LeftControl => modifier::LEFT_CTRL,
-        ModifierKeyCode::RightControl => modifier::RIGHT_CTRL,
-        ModifierKeyCode::LeftAlt => modifier::LEFT_ALT,
-        ModifierKeyCode::RightAlt => modifier::RIGHT_ALT,
-        ModifierKeyCode::LeftSuper => modifier::LEFT_META,
-        ModifierKeyCode::RightSuper => modifier::RIGHT_META,
+        ModifierKeyCode::LeftShift => KeyCode::KEY_LEFTSHIFT,
+        ModifierKeyCode::RightShift => KeyCode::KEY_RIGHTSHIFT,
+        ModifierKeyCode::LeftControl => KeyCode::KEY_LEFTCTRL,
+        ModifierKeyCode::RightControl => KeyCode::KEY_RIGHTCTRL,
+        ModifierKeyCode::LeftAlt => KeyCode::KEY_LEFTALT,
+        ModifierKeyCode::RightAlt => KeyCode::KEY_RIGHTALT,
+        ModifierKeyCode::LeftSuper => KeyCode::KEY_LEFTMETA,
+        ModifierKeyCode::RightSuper => KeyCode::KEY_RIGHTMETA,
         _ => return None,
     })
 }
@@ -218,16 +230,16 @@ mod tests {
 
     #[test]
     fn letters_and_digits_are_where_the_us_layout_puts_them() {
-        assert_eq!(for_char('a'), Some(stroke(30, false)));
-        assert_eq!(for_char('l'), Some(stroke(38, false)));
-        assert_eq!(for_char('z'), Some(stroke(44, false)));
-        assert_eq!(for_char('m'), Some(stroke(50, false)));
-        assert_eq!(for_char('q'), Some(stroke(16, false)));
-        assert_eq!(for_char('A'), Some(stroke(30, true)));
-        assert_eq!(for_char('Z'), Some(stroke(44, true)));
-        assert_eq!(for_char('1'), Some(stroke(2, false)));
-        assert_eq!(for_char('0'), Some(stroke(11, false)));
-        assert_eq!(for_char(' '), Some(stroke(57, false)));
+        assert_eq!(for_char('a'), Some(stroke(KeyCode::KEY_A, false)));
+        assert_eq!(for_char('l'), Some(stroke(KeyCode::KEY_L, false)));
+        assert_eq!(for_char('z'), Some(stroke(KeyCode::KEY_Z, false)));
+        assert_eq!(for_char('m'), Some(stroke(KeyCode::KEY_M, false)));
+        assert_eq!(for_char('q'), Some(stroke(KeyCode::KEY_Q, false)));
+        assert_eq!(for_char('A'), Some(stroke(KeyCode::KEY_A, true)));
+        assert_eq!(for_char('Z'), Some(stroke(KeyCode::KEY_Z, true)));
+        assert_eq!(for_char('1'), Some(stroke(KeyCode::KEY_1, false)));
+        assert_eq!(for_char('0'), Some(stroke(KeyCode::KEY_0, false)));
+        assert_eq!(for_char(' '), Some(stroke(KeyCode::KEY_SPACE, false)));
     }
 
     #[test]
@@ -250,18 +262,42 @@ mod tests {
 
     #[test]
     fn named_keys_map_to_their_input_codes() {
-        assert_eq!(for_key(TerminalKeyCode::Esc), Some(stroke(1, false)));
-        assert_eq!(for_key(TerminalKeyCode::Enter), Some(stroke(28, false)));
-        assert_eq!(for_key(TerminalKeyCode::Backspace), Some(stroke(14, false)));
-        assert_eq!(for_key(TerminalKeyCode::Left), Some(stroke(105, false)));
-        assert_eq!(for_key(TerminalKeyCode::Down), Some(stroke(108, false)));
-        assert_eq!(for_key(TerminalKeyCode::F(1)), Some(stroke(59, false)));
-        assert_eq!(for_key(TerminalKeyCode::F(11)), Some(stroke(87, false)));
-        assert_eq!(for_key(TerminalKeyCode::F(12)), Some(stroke(88, false)));
+        assert_eq!(
+            for_key(TerminalKeyCode::Esc),
+            Some(stroke(KeyCode::KEY_ESC, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::Enter),
+            Some(stroke(KeyCode::KEY_ENTER, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::Backspace),
+            Some(stroke(KeyCode::KEY_BACKSPACE, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::Left),
+            Some(stroke(KeyCode::KEY_LEFT, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::Down),
+            Some(stroke(KeyCode::KEY_DOWN, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::F(1)),
+            Some(stroke(KeyCode::KEY_F1, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::F(11)),
+            Some(stroke(KeyCode::KEY_F11, false))
+        );
+        assert_eq!(
+            for_key(TerminalKeyCode::F(12)),
+            Some(stroke(KeyCode::KEY_F12, false))
+        );
         assert_eq!(
             for_key(TerminalKeyCode::Modifier(ModifierKeyCode::LeftShift)),
             Some(KeyStroke {
-                code: modifier::LEFT_SHIFT,
+                code: KeyCode::KEY_LEFTSHIFT,
                 shift: false,
             })
         );

@@ -21,6 +21,7 @@ flate2 = "1.1.10"
 evdev = "0.13.2"
 nutype = { version = "0.6.2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11.19"
 calloop = { version = "0.14.4", features = ["signals"] }
 rustix = { version = "1.1.4", features = ["net", "process", "runtime", "shm"] }
 smithay = { version = "0.7", default-features = false, features = [

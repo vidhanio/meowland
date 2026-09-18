@@ -137,7 +137,6 @@ struct Window {
     surface: ToplevelSurface,
     label: Option<String>,
     title: Option<String>,
-    entered: bool,
     /// The pane whose interaction most recently selected this window.
     last_interacted: Option<PaneId>,
     /// Sent back in the configure state.
@@ -181,7 +180,6 @@ pub struct Compositor {
     next_window_id: WindowId,
 
     pressed: Vec<KeyCode>,
-    pointer_position: Point<f64, Logical>,
     cursor: CursorImageStatus,
 
     /// Attach order determines which pane sizes the output.
@@ -288,7 +286,6 @@ impl Compositor {
             active: None,
             next_window_id: WindowId::new(1),
             pressed: Vec::new(),
-            pointer_position: (0.0, 0.0).into(),
             cursor: CursorImageStatus::default_named(),
             views: Vec::new(),
             snapshots: HashMap::new(),
@@ -443,14 +440,14 @@ impl Compositor {
         );
     }
 
-    fn sync_outputs(&mut self) {
+    /// Tell every window where it is drawn, now that the panes may have moved.
+    ///
+    /// The output keeps the set of surfaces it has entered, so a window that
+    /// was not moved is not told again.
+    fn sync_outputs(&self) {
         for index in 0..self.windows.len() {
             let id = self.windows[index].id;
             let shown = self.views.iter().any(|view| view.window == Some(id));
-            if shown == self.windows[index].entered {
-                continue;
-            }
-            self.windows[index].entered = shown;
             let surface = self.windows[index].surface.wl_surface().clone();
             if shown {
                 self.output.enter(&surface);
@@ -501,6 +498,14 @@ impl Compositor {
             let _ = self.events.send(Event::Frame { pane, frame });
         }
         sent
+    }
+
+    /// Drop what the popup manager remembers about popups that are gone.
+    ///
+    /// It keeps a tree per window that ever had one, and holds dead handles in
+    /// it until this is called, so it is called once per frame.
+    pub fn cleanup_popups(&mut self) {
+        self.popup_manager.cleanup();
     }
 
     /// A frame the presenter is done with, to draw the next one into.
@@ -912,7 +917,6 @@ impl XdgShellHandler for Compositor {
             surface,
             label: label.or_else(|| title.clone()),
             title,
-            entered: false,
             last_interacted: None,
             fullscreen: false,
         });

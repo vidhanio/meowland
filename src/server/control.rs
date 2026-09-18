@@ -3,11 +3,12 @@
 use std::{
     ffi::OsString,
     io::{Read as _, Write as _},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixStream,
     time::Duration,
 };
 
-use calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
+use calloop::LoopHandle;
+use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::{
     Error,
@@ -23,22 +24,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) fn install(
     handle: &LoopHandle<'static, Server>,
-    listener: UnixListener,
+    listener: ListeningSocketSource,
 ) -> Result<(), Error> {
     handle
-        .insert_source(
-            Generic::new(listener, Interest::READ, Mode::Level),
-            |_, listener, server: &mut Server| {
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => server.answer(stream),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok(PostAction::Continue)
-            },
-        )
+        .insert_source(listener, |stream, (), server: &mut Server| {
+            server.answer(stream);
+        })
         .map_err(|refused| watch("the control socket", refused))?;
     Ok(())
 }

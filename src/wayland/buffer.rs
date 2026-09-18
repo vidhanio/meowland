@@ -9,7 +9,10 @@ use smithay::{
         },
     },
     reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_shm::Format as ShmFormat},
-    wayland::{dmabuf::get_dmabuf, shm::with_buffer_contents},
+    wayland::{
+        dmabuf::get_dmabuf,
+        shm::{shm_format_to_fourcc, with_buffer_contents},
+    },
 };
 
 use crate::render::{Image, SourceFormat};
@@ -96,16 +99,25 @@ impl Snapshot {
     }
 }
 
+/// The layout of a client's shared memory buffer, if meowland can read it.
+///
+/// Both media end up in the same layout here: how a `wl_shm` format is named as
+/// a four-character code is the renderer's business, and this is the one place
+/// that says which of those codes are read.
 pub const fn shm_format(format: ShmFormat) -> Option<SourceFormat> {
-    match format {
-        ShmFormat::Argb8888 => Some(SourceFormat::Argb8888),
-        ShmFormat::Xrgb8888 => Some(SourceFormat::Xrgb8888),
-        _ => None,
+    match shm_format_to_fourcc(format) {
+        Some(code) => fourcc_format(code),
+        None => None,
     }
 }
 
 pub const fn dmabuf_format(format: DmabufFormat) -> Option<SourceFormat> {
-    match format.code {
+    fourcc_format(format.code)
+}
+
+/// The layouts meowland reads, by their four-character codes.
+const fn fourcc_format(code: Fourcc) -> Option<SourceFormat> {
+    match code {
         Fourcc::Argb8888 => Some(SourceFormat::Argb8888),
         Fourcc::Xrgb8888 => Some(SourceFormat::Xrgb8888),
         _ => None,

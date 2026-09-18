@@ -7,16 +7,17 @@
 //! the pane is there at all belongs here.
 
 use std::{
-    os::unix::net::{UnixListener, UnixStream},
+    io::BufReader,
+    os::unix::net::UnixStream,
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use calloop::{
-    Interest, LoopHandle, Mode, PostAction, RegistrationToken,
+    LoopHandle, RegistrationToken,
     channel::{Event as ChannelEvent, Sender, channel},
-    generic::Generic,
 };
+use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::{
     Error, kitty,
@@ -83,22 +84,12 @@ impl FromPane {
 
 pub(super) fn install(
     handle: &LoopHandle<'static, Server>,
-    listener: UnixListener,
+    listener: ListeningSocketSource,
 ) -> Result<(), Error> {
     handle
-        .insert_source(
-            Generic::new(listener, Interest::READ, Mode::Level),
-            |_, listener, server: &mut Server| {
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => server.accept_terminal(stream),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok(PostAction::Continue)
-            },
-        )
+        .insert_source(listener, |stream, (), server: &mut Server| {
+            server.accept_terminal(stream);
+        })
         .map_err(|refused| watch("the pane socket", refused))?;
     Ok(())
 }
@@ -331,15 +322,12 @@ impl Server {
     clippy::needless_pass_by_value,
     reason = "the reader outlives whoever started it, so it owns its end of the channel rather than borrowing it"
 )]
-fn read_pane(
-    mut stream: UnixStream,
-    sender: Sender<FromPane>,
-    pane: PaneId,
-    write_half: UnixStream,
-) {
+fn read_pane(stream: UnixStream, sender: Sender<FromPane>, pane: PaneId, write_half: UnixStream) {
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
+    // One read fills this, so a message's fields do not cost a read each.
+    let mut stream = BufReader::new(stream);
     let hello = pane::read::<_, ToServer>(&mut stream);
-    let _ = stream.set_read_timeout(None);
+    let _ = stream.get_ref().set_read_timeout(None);
     let Ok(ToServer::Hello(Hello {
         version,
         show,

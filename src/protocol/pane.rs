@@ -9,19 +9,17 @@
 //! A build that does not know a message cannot skip it, the way a kind byte
 //! would let it: bump [`VERSION`] whenever these messages change.
 
-use std::{
-    io,
-    os::unix::net::{UnixListener, UnixStream},
-};
+use std::{io, os::unix::net::UnixStream};
 
 use evdev::KeyCode;
 use serde::{Deserialize, Serialize};
+use smithay::wayland::socket::ListeningSocketSource;
 
 use super::{decoded, encoded};
 use crate::protocol::{ProtocolVersion, WindowId, control};
 
-pub fn listen() -> Result<(control::Socket, UnixListener), crate::Error> {
-    control::Socket::bind(control::DISPLAY_SOCKET)
+pub fn listen() -> Result<ListeningSocketSource, crate::Error> {
+    control::listen(control::DISPLAY_SOCKET)
 }
 
 pub fn connect() -> Result<UnixStream, crate::Error> {
@@ -90,9 +88,9 @@ pub enum ToServer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToClient {
     Welcome,
-    Bytes(#[serde(with = "bytes")] Vec<u8>),
+    Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Acknowledged with [`ToServer::Drawn`].
-    Frame(#[serde(with = "bytes")] Vec<u8>),
+    Frame(#[serde(with = "serde_bytes")] Vec<u8>),
     Detached(String),
 }
 
@@ -105,8 +103,8 @@ pub enum ToClient {
 #[derive(Debug, Serialize)]
 enum Written<'a> {
     Welcome,
-    Bytes(#[serde(with = "bytes")] &'a [u8]),
-    Frame(#[serde(with = "bytes")] &'a [u8]),
+    Bytes(#[serde(with = "serde_bytes")] &'a [u8]),
+    Frame(#[serde(with = "serde_bytes")] &'a [u8]),
     Detached(&'a str),
 }
 
@@ -208,50 +206,6 @@ fn put<W: io::Write, M: Serialize + ?Sized>(writer: &mut W, message: &M) -> io::
         crate::protocol::CODEC,
     ))
     .map(|_| ())
-}
-
-/// A byte string, which serde would otherwise treat as a sequence of numbers:
-/// a write and a read for each byte of a frame, rather than one for all of it.
-mod bytes {
-    use std::fmt;
-
-    use serde::{Deserializer, Serializer, de::Visitor};
-
-    pub(super) fn serialize<S, B>(bytes: &B, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        B: AsRef<[u8]> + ?Sized,
-    {
-        serializer.serialize_bytes(bytes.as_ref())
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
-        struct ByteString;
-
-        impl Visitor<'_> for ByteString {
-            type Value = Vec<u8>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a byte string")
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
-                Ok(bytes.to_vec())
-            }
-
-            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
-                Ok(bytes)
-            }
-
-            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Vec<u8>, E> {
-                Err(E::custom(format!("a byte string, not {text:?}")))
-            }
-        }
-
-        deserializer.deserialize_byte_buf(ByteString)
-    }
 }
 
 /// A key code, which serde does not know about: it is a number that names a

@@ -7,13 +7,13 @@
 use std::{
     env,
     ffi::OsString,
-    fs,
     io::{Read as _, Write as _},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixStream,
     path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize};
+use smithay::{reexports::wayland_server::BindError, wayland::socket::ListeningSocketSource};
 
 use crate::{
     Error,
@@ -23,39 +23,24 @@ use crate::{
 pub const CONTROL_SOCKET: &str = "meowland-control";
 pub const DISPLAY_SOCKET: &str = "meowland-display";
 
-/// The server's end of a socket. Dropping this removes the socket file.
-#[derive(Debug)]
-pub struct Socket {
-    path: PathBuf,
+/// The path of a socket in `$XDG_RUNTIME_DIR`, for the side that connects to
+/// one.
+pub fn path(name: &str) -> Result<PathBuf, Error> {
+    let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDirectory)?;
+    Ok(PathBuf::from(runtime).join(name))
 }
 
-impl Socket {
-    pub fn bind(name: &str) -> Result<(Self, UnixListener), Error> {
-        let path = Self::path(name)?;
-        match UnixStream::connect(&path) {
-            Ok(_) => return Err(Error::AlreadyRunning),
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                fs::remove_file(&path)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let listener = UnixListener::bind(&path)?;
-        let socket = Self { path };
-        listener.set_nonblocking(true)?;
-        Ok((socket, listener))
-    }
-
-    fn path(name: &str) -> Result<PathBuf, Error> {
-        let runtime = env::var_os("XDG_RUNTIME_DIR").ok_or(Error::NoRuntimeDirectory)?;
-        Ok(PathBuf::from(runtime).join(name))
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+/// Listen on a socket in `$XDG_RUNTIME_DIR`.
+///
+/// The socket file, the lock beside it, and the removal of a socket a dead
+/// server left behind are `ListeningSocket`'s: a server that is still alive
+/// holds the lock, so a second one is turned away rather than half-bound.
+pub fn listen(name: &str) -> Result<ListeningSocketSource, Error> {
+    ListeningSocketSource::with_name(name).map_err(|error| match error {
+        BindError::AlreadyInUse => Error::AlreadyRunning,
+        BindError::RuntimeDirNotSet => Error::NoRuntimeDirectory,
+        other => Error::Socket(other),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +103,7 @@ pub fn request(command: &Command) -> Result<Reply, Error> {
 }
 
 pub fn connect(name: &str) -> Result<UnixStream, Error> {
-    let path = Socket::path(name)?;
+    let path = path(name)?;
     match UnixStream::connect(&path) {
         Ok(stream) => Ok(stream),
         Err(error)

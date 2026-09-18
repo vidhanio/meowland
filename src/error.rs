@@ -7,8 +7,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error(transparent)]
     Calloop(#[from] calloop::Error),
-    #[error(transparent)]
-    WaylandSocket(#[from] smithay::reexports::wayland_server::BindError),
+    #[error("could not bind a socket: {0}")]
+    Socket(smithay::reexports::wayland_server::BindError),
     #[error(transparent)]
     Display(#[from] smithay::reexports::wayland_server::backend::InitError),
     #[error(transparent)]

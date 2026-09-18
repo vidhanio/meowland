@@ -140,6 +140,7 @@ impl Loop {
     /// were told.
     fn present_frame(&mut self) {
         let started = Instant::now();
+        self.state.cleanup_popups();
         let sent = self.state.present();
         self.last_frame_started = Some(started);
         self.frames.record(sent, started.elapsed());

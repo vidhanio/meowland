@@ -20,6 +20,7 @@ use calloop::{
     channel::{Channel, Event as ChannelEvent, Sender, channel},
     signals::{Signal, Signals},
 };
+use rustix::process::{Pid, getpid};
 use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::{
@@ -28,12 +29,11 @@ use crate::{
     logging,
     protocol::{
         PaneId,
-        control::{CONTROL_SOCKET, Socket},
+        control::{CONTROL_SOCKET, listen},
         pane,
     },
     server::{
         panes::{FromPane, Pane},
-        process::ProcessId,
         windows::Windows,
     },
     wayland::{
@@ -56,8 +56,8 @@ pub fn run(settings: Settings) -> Result<(), Error> {
     } = settings;
     let log = logging::init(log.as_deref(), log_level.as_deref())?;
 
-    let (control_socket, control_listener) = Socket::bind(CONTROL_SOCKET)?;
-    let (display_socket, pane_listener) = pane::listen()?;
+    let control_listener = listen(CONTROL_SOCKET)?;
+    let pane_listener = pane::listen()?;
     let signals = Signals::new(&[
         Signal::SIGTERM,
         Signal::SIGINT,
@@ -95,8 +95,6 @@ pub fn run(settings: Settings) -> Result<(), Error> {
         next_pane: PaneId::new(0),
         handle: handle.clone(),
         children: Vec::new(),
-        // Removes the sockets when the event loop ends.
-        _sockets: (control_socket, display_socket),
         stopping: false,
         signal: None,
     };
@@ -118,7 +116,7 @@ pub fn run(settings: Settings) -> Result<(), Error> {
 fn bind_socket() -> Result<ListeningSocketSource, Error> {
     ListeningSocketSource::with_name("wayland-meowland")
         .or_else(|_| ListeningSocketSource::new_auto())
-        .map_err(Error::WaylandSocket)
+        .map_err(Error::Socket)
 }
 
 /// The server: what it owns, and what it is in the middle of.
@@ -136,8 +134,6 @@ struct Server {
     readers: HashMap<PaneId, JoinHandle<()>>,
     next_pane: PaneId,
     handle: LoopHandle<'static, Self>,
-    /// Removes the sockets when the event loop ends.
-    _sockets: (Socket, Socket),
     children: Vec<Child>,
     stopping: bool,
     signal: Option<LoopSignal>,
@@ -180,7 +176,7 @@ impl Server {
         // that is in the middle of a request is the one thing that can hold its
         // thread up, and the signal below is what takes it away.
         for (signal, grace) in process::ESCALATION {
-            let mut tree = process::descendants_of(ProcessId::new(std::process::id()));
+            let mut tree = process::descendants_of(getpid());
             if tree.is_empty() {
                 break;
             }
@@ -227,11 +223,7 @@ impl Server {
     /// that do.
     fn close_clients(&mut self) {
         self.wayland.send(Command::Close);
-        let mut clients: Vec<ProcessId> = self
-            .children
-            .iter()
-            .map(|child| ProcessId::new(child.id()))
-            .collect();
+        let mut clients: Vec<Pid> = self.children.iter().map(Pid::from_child).collect();
         if clients.is_empty() {
             return;
         }

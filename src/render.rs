@@ -258,6 +258,28 @@ const fn ceil_div(a: i64, b: i64) -> i64 {
     -((-a).div_euclid(b))
 }
 
+/// The most pixels one store fills: eight, which is one tile's row of pixels.
+///
+/// Three bytes apiece no machine can write at all; eight pixels at once is a
+/// store or two.
+const WIDE: usize = 8 * BYTES;
+
+/// Fill a frame's pixels with one colour.
+fn fill(pixels: &mut [u8], color: [u8; BYTES]) {
+    let mut pattern = [0u8; WIDE];
+    for pixel in pattern.as_chunks_mut::<BYTES>().0 {
+        pixel.copy_from_slice(&color);
+    }
+    let (wide, tail) = pixels.as_chunks_mut::<WIDE>();
+    for chunk in wide {
+        chunk.copy_from_slice(&pattern);
+    }
+    // A frame's pixels are whole pixels, so the tail is whole ones as well.
+    for pixel in tail.as_chunks_mut::<BYTES>().0 {
+        pixel.copy_from_slice(&color);
+    }
+}
+
 /// Blend premultiplied source RGB over opaque destination RGB.
 fn blend(destination: &mut [u8], source: [u8; BYTES4]) {
     let alpha = u32::from(source[3]);

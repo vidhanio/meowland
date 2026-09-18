@@ -48,8 +48,10 @@ frame never makes an input event wait.
 A pane has one frame. The compositor draws into it and cannot draw that pane
 again until the presenter gives it back. The screen the terminal shows is one
 kitty image, and a frame that changes only part of it is sent as patches over
-that image, each placed in the cell it belongs to. A frame that changes too much
-of the screen, or a terminal that never reported its cell size, goes whole.
+that image: tiles of the screen, each a whole number of cells across and down,
+placed in the cell their top-left pixel is in — which is what keeps a patch on
+the pixels it holds. A frame that changes too much of the screen, or that takes
+too many tiles, goes whole.
 
 ```mermaid
 sequenceDiagram

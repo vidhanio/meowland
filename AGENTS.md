@@ -26,11 +26,15 @@ compositor sends frame callbacks when it draws, so clients are paced by what the
 terminal can take.
 
 The screen a pane shows is one kitty image. A frame that changes only part of it
-goes as patches over that image, each placed in the cell it belongs to, and a
-frame that changes too much of it goes whole again. A patch takes the cell size
-the terminal itself reported, so a terminal that did not answer for it gets
-whole frames. The presenter is what keeps the frame it last sent and diffs
-against it; the compositor and the server protocol know nothing of this.
+goes as patches over that image: tiles of the screen, each a whole number of
+cells across and down, placed in the cell their top-left pixel is in. Nothing
+has to round anything to a cell, so a patch cannot land anywhere but on the
+pixels it holds. A frame that changes too much of the screen, or that takes too
+many tiles, goes whole again, and a whole frame takes every tile with it. A
+patch takes the cell size the terminal itself reported, so a terminal that did
+not answer for it gets whole frames. The presenter is what keeps the frame it
+last sent and diffs against it; the compositor and the server protocol know
+nothing of this.
 
 Both `wl_shm` and `zwp_linux_dmabuf_v1` produce a CPU-side `Snapshot`.
 Advertise GPU buffers only when the renderer can read them back; refusing an

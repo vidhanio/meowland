@@ -19,17 +19,26 @@ routing, and composition. Keep that state in one place. Each toplevel fills its
 pane; there is no tiling. An empty pane follows the newest window once it has
 pixels.
 
-A pane has one frame. The compositor draws into it, sends it whole, and cannot
-draw that pane again until the presenter gives it back. So frames are dropped
-while a pane's terminal is behind; the frame drawn next is the scene as it is
-then. The compositor sends frame callbacks when it draws, so clients are paced
-by what the terminal can take.
+A pane has one frame. The compositor draws into it and cannot draw that pane
+again until the presenter gives it back. So frames are dropped while a pane's
+terminal is behind; the frame drawn next is the scene as it is then. The
+compositor sends frame callbacks when it draws, so clients are paced by what the
+terminal can take.
+
+The screen a pane shows is one kitty image. A frame that changes only part of it
+goes as patches over that image, each placed in the cell it belongs to, and a
+frame that changes too much of it goes whole again. A patch takes the cell size
+the terminal itself reported, so a terminal that did not answer for it gets
+whole frames. The presenter is what keeps the frame it last sent and diffs
+against it; the compositor and the server protocol know nothing of this.
 
 Both `wl_shm` and `zwp_linux_dmabuf_v1` produce a CPU-side `Snapshot`.
 Advertise GPU buffers only when the renderer can read them back; refusing an
 advertised buffer can leave a client without a window. CPU composition is shared
-by both paths. Each pane's presenter thread encodes the frame as one kitty
-image, compresses it, and writes it to the terminal's socket.
+by both paths. Each pane's presenter thread encodes what it sends and writes it
+to the terminal's socket: a whole screen goes through a shared memory object
+when the terminal reads one, and a patch — a fraction of a screen — goes
+compressed over the pty.
 
 `wp_viewporter` is applied during drawing. X11 clients require
 xwayland-satellite. If it is unavailable, do not pass an inherited `DISPLAY` to

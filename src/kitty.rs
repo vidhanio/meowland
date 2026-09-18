@@ -75,6 +75,34 @@ pub const SHARED_PROBE_ID: ImageId = ImageId::new(78);
 /// replaces the image it holds as the next frame arrives.
 const FRAME_ID: ImageId = ImageId::new(1);
 
+/// The first image id a patch may take. Id 1 is the pane's screen.
+pub const FIRST_PATCH_ID: u32 = 2;
+
+/// One rectangle of a frame, sent as its own image and placed over the image
+/// the terminal already has.
+///
+/// The rectangle's top-left pixel is the top-left pixel of `cell`, so a patch
+/// is placed by the cursor alone: no cell rectangle scales it, and nothing
+/// about it depends on where the pane is on the terminal's screen.
+#[derive(Debug, Clone, Copy)]
+pub struct Patch<'a> {
+    pub id: ImageId,
+    /// The cell the rectangle starts at.
+    pub cell: (u32, u32),
+    pub size: (u32, u32),
+    pub pixels: &'a [u8],
+}
+
+/// Delete images, and the pixels the terminal holds for them.
+///
+/// A patch that another one has grown over, or that the screen has been wiped
+/// with, is pixels the terminal would otherwise keep for nothing.
+pub fn delete_images(out: &mut Vec<u8>, ids: &[ImageId]) {
+    for id in ids {
+        let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\");
+    }
+}
+
 /// Send a one-pixel image out of shared memory, to test whether the terminal
 /// reads one there. The guard removes the object if it did not.
 pub fn shared_memory_probe(out: &mut Vec<u8>) -> Option<SharedProbe> {
@@ -348,7 +376,15 @@ impl Encoder {
         if self.shared_memory {
             let namespace = self.namespace;
             let object = self.shared.get_or_insert_with(|| Shared::new(namespace, 0));
-            transmit(out, &mut self.payload, pixels, size, false, Some(object));
+            transmit(
+                out,
+                &mut self.payload,
+                pixels,
+                size,
+                false,
+                Some(object),
+                FRAME_ID,
+            );
             return;
         }
         // The frame is compressed before the decision is known: that is what
@@ -356,7 +392,37 @@ impl Encoder {
         let compressed_len = self.compress(pixels);
         let worth = compressed_len * COMPRESSION_RATIO.1 < pixels.len() * COMPRESSION_RATIO.0;
         let payload = if worth { self.zlib.get_ref() } else { pixels };
-        transmit(out, &mut self.payload, payload, size, worth, None);
+        transmit(out, &mut self.payload, payload, size, worth, None, FRAME_ID);
+    }
+
+    /// Send one rectangle of a frame over the image the terminal holds.
+    ///
+    /// A patch goes the pty's way, compressed when it pays: it is a fraction of
+    /// a screen, so a shared memory object would cost more in opening and
+    /// unlinking than it saves in copying.
+    pub fn transmit_patch(&mut self, out: &mut Vec<u8>, patch: Patch<'_>) {
+        debug_assert_eq!(
+            patch.pixels.len(),
+            patch.size.0 as usize * patch.size.1 as usize * crate::render::BYTES,
+            "a patch's pixels are its size"
+        );
+        cursor_to(out, patch.cell.0, patch.cell.1);
+        let compressed_len = self.compress(patch.pixels);
+        let worth = compressed_len * COMPRESSION_RATIO.1 < patch.pixels.len() * COMPRESSION_RATIO.0;
+        let payload = if worth {
+            self.zlib.get_ref()
+        } else {
+            patch.pixels
+        };
+        transmit(
+            out,
+            &mut self.payload,
+            payload,
+            patch.size,
+            worth,
+            None,
+            patch.id,
+        );
     }
 
     fn compress(&mut self, pixels: &[u8]) -> usize {
@@ -392,6 +458,7 @@ fn transmit(
     size: (u32, u32),
     compressed: bool,
     shared: Option<&Shared>,
+    id: ImageId,
 ) {
     if let Some(object) = shared {
         match object.write(payload) {
@@ -403,13 +470,13 @@ fn transmit(
                     name = %object.name,
                     "could not put a frame in shared memory"
                 );
-                return direct(out, encoded, payload, size, compressed);
+                return direct(out, encoded, payload, size, compressed, id);
             }
         }
-        placed(out, size, compressed, "t=s", &object.encoded_name);
+        placed(out, size, compressed, "t=s", &object.encoded_name, id);
         return;
     }
-    direct(out, encoded, payload, size, compressed);
+    direct(out, encoded, payload, size, compressed, id);
 }
 
 /// Send the payload base64'd inside the escape, in chunks of `CHUNK`.
@@ -419,9 +486,10 @@ fn direct(
     payload: &[u8],
     size: (u32, u32),
     compressed: bool,
+    id: ImageId,
 ) {
     let payload = encode_base64(encoded, payload);
-    chunked(out, size, compressed, payload);
+    chunked(out, size, compressed, payload, id);
 }
 
 fn encode_base64<'a>(encoded: &'a mut Vec<u8>, payload: &[u8]) -> &'a [u8] {
@@ -434,13 +502,13 @@ fn encode_base64<'a>(encoded: &'a mut Vec<u8>, payload: &[u8]) -> &'a [u8] {
     &encoded[..length]
 }
 
-fn chunked(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, payload: &[u8]) {
+fn chunked(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, payload: &[u8], id: ImageId) {
     let mut chunks = payload.chunks(CHUNK).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         out.extend_from_slice(b"\x1b_G");
         if first {
-            describe(out, size, compressed, None);
+            describe(out, size, compressed, None, id);
             first = false;
         }
         out.extend_from_slice(if chunks.peek().is_some() {
@@ -454,9 +522,16 @@ fn chunked(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, payload: &[u8]
 }
 
 /// One escape whose payload is a name, not pixels.
-fn placed(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, medium: &str, payload: &[u8]) {
+fn placed(
+    out: &mut Vec<u8>,
+    size: (u32, u32),
+    compressed: bool,
+    medium: &str,
+    payload: &[u8],
+    id: ImageId,
+) {
     out.extend_from_slice(b"\x1b_G");
-    describe(out, size, compressed, Some(medium));
+    describe(out, size, compressed, Some(medium), id);
     out.extend_from_slice(b";");
     out.extend_from_slice(payload);
     out.extend_from_slice(b"\x1b\\");
@@ -473,12 +548,17 @@ fn placed(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, medium: &str, p
 /// No `c` or `r` is sent: a cell rectangle would scale the frame, and a
 /// terminal whose cell size does not divide the pane's pixels would scale it
 /// away from the screen.
-fn describe(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, medium: Option<&str>) {
+fn describe(
+    out: &mut Vec<u8>,
+    size: (u32, u32),
+    compressed: bool,
+    medium: Option<&str>,
+    id: ImageId,
+) {
     let (width, height) = size;
     let compression = if compressed { "o=z," } else { "" };
     let medium = medium.unwrap_or("");
     let separator = if medium.is_empty() { "" } else { "," };
-    let id = FRAME_ID;
     let _ = write!(
         out,
         "a=T,f=24,{compression}{medium}{separator}s={width},v={height},i={id},p={id},"
@@ -509,6 +589,10 @@ mod tests {
             moves_cursor: bool,
         },
         DeleteAll,
+        Delete {
+            id: u32,
+            kind: String,
+        },
     }
 
     fn decode(stream: &[u8]) -> Vec<Command> {
@@ -594,7 +678,13 @@ mod tests {
             });
         }
         if action == Some("d") {
-            commands.push(Command::DeleteAll);
+            commands.push(match field(header, "d") {
+                Some("A") => Command::DeleteAll,
+                kind => Command::Delete {
+                    id: number(header, "i", 0),
+                    kind: kind.unwrap_or("a").to_owned(),
+                },
+            });
         }
         assert!(!commands.is_empty(), "unexpected action {action:?}");
         commands
@@ -722,7 +812,14 @@ mod tests {
         let name = format!("/meowland-{}-1-1", std::process::id());
         let object = Shared::new(1, 1);
         let mut out = Vec::new();
-        placed(&mut out, (160, 160), true, "t=s", &object.encoded_name);
+        placed(
+            &mut out,
+            (160, 160),
+            true,
+            "t=s",
+            &object.encoded_name,
+            FRAME_ID,
+        );
 
         // The name is the payload, so nothing else comes after the separator.
         let text = std::str::from_utf8(&out).expect("escapes are ascii");
@@ -873,6 +970,60 @@ mod tests {
         set_pointer_shape(&mut out, Some("text"));
         set_pointer_shape(&mut out, None);
         assert_eq!(out, b"\x1b]22;text\x1b\\\x1b]22;\x1b\\");
+    }
+
+    #[test]
+    fn a_patch_is_placed_in_the_cell_it_belongs_to() {
+        // A rectangle of the screen goes as its own image: the cursor is moved
+        // to the cell its top-left pixel is in, and nothing scales it.
+        let (width, height) = (16, 8);
+        let pixels = test_pixels(width, height);
+        let id = ImageId::new(5);
+        let mut out = Vec::new();
+        Encoder::new().transmit_patch(
+            &mut out,
+            Patch {
+                id,
+                cell: (3, 2),
+                size: (width, height),
+                pixels: &pixels,
+            },
+        );
+
+        let text = std::str::from_utf8(&out).expect("escapes are ASCII");
+        assert!(text.starts_with("\x1b[3;4H"), "{text}");
+        assert!(!text.contains(",c=") && !text.contains(",r="));
+        assert_eq!(
+            decode(&out),
+            vec![
+                Command::Transmit {
+                    id: id.into_inner(),
+                    width,
+                    height,
+                    compressed: true,
+                    pixels,
+                },
+                Command::Put {
+                    id: id.into_inner(),
+                    placement: id.into_inner(),
+                    cols: 0,
+                    rows: 0,
+                    moves_cursor: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deleting_an_image_frees_its_pixels() {
+        // A patch the terminal no longer shows is pixels it should not keep:
+        // the capital form is the one that gives the data back.
+        let mut out = Vec::new();
+        delete_images(&mut out, &[ImageId::new(2), ImageId::new(7)]);
+        assert_eq!(
+            std::str::from_utf8(&out).expect("escapes are ASCII"),
+            "\x1b_Ga=d,d=I,i=2,q=2;\x1b\\\x1b_Ga=d,d=I,i=7,q=2;\x1b\\"
+        );
     }
 
     #[test]

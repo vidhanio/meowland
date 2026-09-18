@@ -403,6 +403,11 @@ fn resolve_capabilities(probe: &Probe, window: Option<(u32, u32, u32, u32)>) -> 
         terminal,
         graphics: probe.graphics,
         shared_memory: probe.shared_memory,
+        // A patch is placed in the cell its top-left pixel is in, so the pane
+        // needs the terminal's own answer for how large a cell is: a derived
+        // one can be a pixel out, and a patch placed a pixel out is a screen
+        // with the wrong pixels on it.
+        patches: probe.cell.is_some(),
         keyboard: probe.keyboard,
         pixel_mouse,
     }

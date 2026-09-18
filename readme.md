@@ -45,8 +45,11 @@ frame never makes an input event wait.
 
 ## A frame
 
-A pane has one frame. The compositor draws into it, sends it whole, and cannot
-draw that pane again until the presenter gives it back.
+A pane has one frame. The compositor draws into it and cannot draw that pane
+again until the presenter gives it back. The screen the terminal shows is one
+kitty image, and a frame that changes only part of it is sent as patches over
+that image, each placed in the cell it belongs to. A frame that changes too much
+of the screen, or a terminal that never reported its cell size, goes whole.
 
 ```mermaid
 sequenceDiagram
@@ -61,8 +64,8 @@ sequenceDiagram
     C->>C: on the 60 Hz tick: draw into the pane's frame
     C->>S: Event::Frame (the frame moved)
     S->>P: present(frame)
-    Note over P: encode the screen as one kitty image: zlib,<br/>or a shared memory object
-    P->>T: one write: sync start, image, sync end
+    Note over P: diff against the frame the terminal has:<br/>nothing, a few patches over it, or the whole screen
+    P->>T: one write: sync start, images, sync end
     T->>T: write the bytes to the terminal
     T->>S: Drawn, over the pane socket
     S->>P: drawn()
@@ -75,7 +78,8 @@ Frames are dropped while a pane's terminal is behind: the frame drawn next is
 the scene as it is then, so nothing that changed is lost. The frame itself is
 moved between the three threads and back, never copied, and its bytes go to the
 socket out of the buffer they were encoded in — a byte string, not a write per
-byte.
+byte. The presenter keeps a copy of the frame it last sent, which is what a new
+frame is diffed against.
 
 ## Input
 

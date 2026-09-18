@@ -341,6 +341,7 @@ mod tests {
             keyboard: true,
             pixel_mouse: true,
             shared_memory: false,
+            patches: true,
         }
     }
 

@@ -147,7 +147,8 @@ fn run(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
                 showing.leave(Departure::Detached(reason));
                 showing.stop();
             }
-            ChannelEvent::Msg(FrameEvent::Ended) | ChannelEvent::Closed => {
+            // The writer thread ending drops its sender, which is this.
+            ChannelEvent::Closed => {
                 showing.leave(Departure::ServerGone);
                 showing.stop();
             }
@@ -192,7 +193,7 @@ fn run(stream: UnixStream, terminal: Terminal) -> Result<Departure, Error> {
         stream,
         terminal,
         departure: None,
-        signal: Some(signal),
+        signal,
     };
     let result = event_loop.run(None, &mut showing, |_| {});
     let _ = pane::write(&mut showing.stream, &ToServer::Bye);
@@ -216,7 +217,7 @@ struct Showing {
     stream: UnixStream,
     terminal: Terminal,
     departure: Option<Departure>,
-    signal: Option<LoopSignal>,
+    signal: LoopSignal,
 }
 
 impl Showing {
@@ -227,9 +228,7 @@ impl Showing {
     }
 
     fn stop(&self) {
-        if let Some(signal) = &self.signal {
-            signal.stop();
-        }
+        self.signal.stop();
     }
 
     fn send(&mut self, message: &ToServer) {
@@ -316,7 +315,6 @@ fn input_for(event: crossterm::event::Event) -> Option<Input> {
 enum FrameEvent {
     Drawn,
     Detached(String),
-    Ended,
 }
 
 /// A thread that is stopped by a flag, because it may be inside a read that
@@ -395,7 +393,6 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
         let mut stdout = std::io::stdout().lock();
         if let Err(error) = stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
             tracing::debug!(%error, "could not write to the terminal");
-            let _ = events.send(FrameEvent::Ended);
             return;
         }
         tracing::trace!(
@@ -407,7 +404,6 @@ fn write_frames(mut stream: UnixStream, events: &Sender<FrameEvent>, stop: &Atom
             return;
         }
     }
-    let _ = events.send(FrameEvent::Ended);
 }
 
 /// Read the terminal's input, and hand it to the event loop.

@@ -234,8 +234,7 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
             Message::Frame(frame) => frame,
         };
 
-        let plan = screen.plan(&frame, &config);
-        if matches!(plan, Send::Nothing) {
+        let Some(plan) = screen.plan(&frame, &config) else {
             // The terminal shows this frame already, so this one costs nothing
             // and the compositor may draw the next at once.
             stats.skipped();
@@ -243,14 +242,12 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
                 return Ok(());
             }
             continue;
-        }
+        };
 
         let phase = Instant::now();
         out.clear();
         Encoder::begin_frame(&mut out);
         let patches = match &plan {
-            // Handled above: the frame costs nothing.
-            Send::Nothing => 0,
             Send::Whole { delete } => {
                 kitty::delete_images(&mut out, delete);
                 encoder.transmit(&mut out, frame.pixels(), (frame.width, frame.height));
@@ -364,17 +361,18 @@ impl Screen {
 
     /// What to write for this frame, taking it as what the terminal will show.
     ///
-    /// The screen is not updated here: what a frame carries is cut out of it
-    /// after this, and the screen takes the frame's pixels only once they have
-    /// gone out. [`Screen::keep`] is that step.
-    fn plan(&mut self, frame: &Frame, config: &Config) -> Send {
+    /// `None` is a frame the terminal already shows, which costs nothing. The
+    /// screen is not updated here: what a frame carries is cut out of it after
+    /// this, and the screen takes the frame's pixels only once they have gone
+    /// out. [`Screen::keep`] is that step.
+    fn plan(&mut self, frame: &Frame, config: &Config) -> Option<Send> {
         let grid = Grid::of(frame, config.cell);
         if !self.whole || grid != self.grid {
-            return self.whole(grid);
+            return Some(self.whole(grid));
         }
         let changed = changed(&grid, &self.previous, frame.pixels());
         if changed.is_empty() {
-            return Send::Nothing;
+            return None;
         }
         let held = self.placed.iter().filter(|placed| **placed).count();
         // The pixels the tiles would carry, against the pixels a whole frame
@@ -386,12 +384,12 @@ impl Screen {
             || held + changed.len() > MAXIMUM_LIVE
             || covered > screen
         {
-            return self.whole(grid);
+            return Some(self.whole(grid));
         }
         for index in &changed {
             self.placed[*index as usize] = true;
         }
-        Send::Patches {
+        Some(Send::Patches {
             write: changed
                 .into_iter()
                 .map(|index| Plan {
@@ -400,7 +398,7 @@ impl Screen {
                     rect: grid.rect(index),
                 })
                 .collect(),
-        }
+        })
     }
 
     /// Send the whole screen: the image replaces every tile with it.
@@ -432,8 +430,6 @@ impl Screen {
 /// What the presenter writes for one frame.
 #[derive(Debug)]
 enum Send {
-    /// Nothing: the terminal already shows this frame.
-    Nothing,
     /// The whole screen, as one image. `delete` are the tiles it replaces.
     Whole { delete: Vec<ImageId> },
     /// Tiles of it, over the image the terminal holds.

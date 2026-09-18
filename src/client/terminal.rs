@@ -57,13 +57,17 @@ pub fn is_terminal() -> bool {
 }
 
 impl Terminal {
-    /// Read the geometry without changing terminal state.
+    /// Take the terminal for a pane, before anything is asked of it.
+    ///
+    /// What the terminal can do is not known until it is asked, and asking it
+    /// means taking it over: [`Terminal::activate`] does both. Until then this
+    /// is a terminal that has said nothing.
     pub fn new() -> Result<Self, Error> {
         if !is_terminal() {
             return Err(Error::NotATerminal);
         }
         Ok(Self {
-            capabilities: resolve_capabilities(&Probe::default(), window_size()),
+            capabilities: resolve_capabilities(&Probe::default(), None),
             entered: false,
         })
     }

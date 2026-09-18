@@ -218,11 +218,11 @@ fn copy_dmabuf(
         return Some(false);
     }
 
-    let copy = |pixels: &[u8], stride: u32, destination: &mut Snapshot| {
-        destination.fill(pixels, stride, width, height, scale, format);
-    };
     let mapped = dmabuf.format().modifier == Modifier::Linear
-        && read_plane(dmabuf, |pixels, stride| copy(pixels, stride, destination)).is_ok();
+        && read_plane(dmabuf, |pixels, stride| {
+            destination.fill(pixels, stride, width, height, scale, format);
+        })
+        .is_ok();
     if mapped {
         tracing::debug!(width, height, ?format, scale, "mapped a client buffer");
         return Some(true);
@@ -300,8 +300,8 @@ fn copy_shm(
     }
 }
 
-/// Map a plane within a CPU access synchronization bracket.
-fn read_plane<T>(dmabuf: &Dmabuf, read: impl FnOnce(&[u8], u32) -> T) -> Result<T, Unreadable> {
+/// Map a plane within a CPU access synchronization bracket, and read it.
+fn read_plane(dmabuf: &Dmabuf, read: impl FnOnce(&[u8], u32)) -> Result<(), Unreadable> {
     if dmabuf.num_planes() != 1 {
         return Err(Unreadable::Planes(dmabuf.num_planes()));
     }
@@ -326,7 +326,8 @@ fn read_plane<T>(dmabuf: &Dmabuf, read: impl FnOnce(&[u8], u32) -> T) -> Result<
         reason = "a mapped buffer is only reachable as a raw pointer; the slice is bounded by the mapping and is copied out at once"
     )]
     let pixels = unsafe { std::slice::from_raw_parts(plane.mapping.ptr().cast::<u8>(), last) };
-    Ok(read(pixels, stride))
+    read(pixels, stride);
+    Ok(())
 }
 
 /// A mapped plane and the synchronization bracket that makes it readable.

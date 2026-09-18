@@ -150,10 +150,9 @@ impl Shared {
     fn new(namespace: u32, slot: u32) -> Self {
         let name = format!("/meowland-{}-{namespace}-{slot}", std::process::id());
         let mut encoded_name = vec![0; base64::encoded_len(name.len(), true).expect("name fits")];
-        let length = BASE64
+        BASE64
             .encode_slice(name.as_bytes(), &mut encoded_name)
             .expect("the buffer has the exact encoded size");
-        encoded_name.truncate(length);
         Self { name, encoded_name }
     }
 
@@ -496,10 +495,10 @@ fn encode_base64<'a>(encoded: &'a mut Vec<u8>, payload: &[u8]) -> &'a [u8] {
     let encoded_len =
         base64::encoded_len(payload.len(), true).expect("a frame fits in address space");
     encoded.resize(encoded_len, 0);
-    let length = BASE64
+    BASE64
         .encode_slice(payload, encoded)
         .expect("the payload buffer has the exact encoded size");
-    &encoded[..length]
+    encoded.as_slice()
 }
 
 fn chunked(out: &mut Vec<u8>, size: (u32, u32), compressed: bool, payload: &[u8], id: ImageId) {

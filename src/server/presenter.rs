@@ -204,6 +204,10 @@ fn run(queue: Receiver<Message>, events: &EventSender<Event>) -> std::io::Result
             }
             Message::Capabilities(what) => {
                 config = what;
+                // A whole frame goes through a shared memory object when the
+                // terminal reads those, which keeps its pixels off the pty and
+                // out of the compressor. A patch always goes the pty's way.
+                encoder.shared_memory = what.shared_memory;
                 continue;
             }
             Message::Detached(reason) => {

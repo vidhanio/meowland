@@ -4,12 +4,12 @@
 //! to know about raw mode, terminal escape sequences, or crossterm events.
 
 use std::{
+    env, fs,
     io::{self, Write},
     os::unix::net::UnixStream,
-    path::Path,
-    sync::mpsc::{self, TryRecvError},
-    thread,
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    process,
+    time::{Duration, Instant, SystemTime},
 };
 
 use crossterm::{
@@ -303,6 +303,106 @@ fn mouse_units(probe: &ProbeInfo) -> MouseUnits {
     }
 }
 
+/// Per-second frame counters, appended to the same log the server writes.
+///
+/// A pane's terminal is its display, so its own diagnostics cannot go there;
+/// the log is where a slow terminal is told apart from a slow compositor.
+struct PaneStats {
+    log: Option<fs::File>,
+    pid: u32,
+    window: Instant,
+    frames: u32,
+    drawn: u32,
+    bytes: u64,
+    encoded: Duration,
+    written: Duration,
+    dropped: u32,
+}
+
+impl PaneStats {
+    fn new(socket: &Path) -> Self {
+        let path = env::var_os("MEOWLAND_LOG").map_or_else(
+            || {
+                socket
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("meowland.log")
+            },
+            PathBuf::from,
+        );
+        Self {
+            log: fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok(),
+            pid: process::id(),
+            window: Instant::now(),
+            frames: 0,
+            drawn: 0,
+            bytes: 0,
+            encoded: Duration::ZERO,
+            written: Duration::ZERO,
+            dropped: 0,
+        }
+    }
+
+    fn line(&mut self, message: &str) {
+        let Some(file) = self.log.as_mut() else {
+            return;
+        };
+        let seconds = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let _ = writeln!(file, "{seconds} pane {}: {message}", self.pid);
+    }
+
+    /// What the terminal said about itself, and the size it is drawn at.
+    fn capabilities(&mut self, probe: &ProbeInfo, width: u32, height: u32) {
+        self.line(&format!(
+            "attached {width}x{height} cell={:?} terminal={:?} graphics={} shared_memory={} \
+             sgr_pixels={:?}",
+            probe.cell_width.zip(probe.cell_height),
+            probe.name,
+            probe.graphics,
+            probe.shared_memory,
+            probe.sgr_pixels,
+        ));
+    }
+
+    /// One frame taken from the compositor: what it cost to encode and to
+    /// write, and whether anything was written at all.
+    fn frame(&mut self, bytes: usize, dropped: bool, encoded: Duration, written: Duration) {
+        self.frames += 1;
+        self.drawn += u32::from(bytes > 0);
+        self.dropped += u32::from(dropped);
+        self.bytes += bytes as u64;
+        self.encoded += encoded;
+        self.written += written;
+        if self.window.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        let elapsed = self.window.elapsed().as_secs_f64();
+        let frames = std::mem::take(&mut self.frames);
+        let drawn = std::mem::take(&mut self.drawn);
+        let bytes = std::mem::take(&mut self.bytes);
+        let encoded = std::mem::take(&mut self.encoded);
+        let written = std::mem::take(&mut self.written);
+        let dropped = std::mem::take(&mut self.dropped);
+        self.window = Instant::now();
+        let per_frame = f64::from(frames.max(1));
+        self.line(&format!(
+            "frames={:.1}/s drawn={drawn} dropped={dropped} unchanged={} out={:.2}MB/s encode={:.1}ms \
+             write={:.1}ms",
+            f64::from(frames) / elapsed,
+            frames.saturating_sub(drawn).saturating_sub(dropped),
+            bytes as f64 / elapsed / 1e6,
+            encoded.as_secs_f64() * 1000.0 / per_frame,
+            written.as_secs_f64() * 1000.0 / per_frame,
+        ));
+    }
+}
+
 /// Attach this process's terminal to a pane socket and run until released.
 ///
 /// # Errors
@@ -316,7 +416,7 @@ fn mouse_units(probe: &ProbeInfo) -> MouseUnits {
               terminal guard"
 )]
 pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
-    let stream = UnixStream::connect(socket)?;
+    let mut stream = UnixStream::connect(socket)?;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let mut mode = TerminalGuard::enter()?;
     let (probe, shared) = terminal_probe()?;
@@ -346,47 +446,48 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
 
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
-    let (server_tx, server_rx) = mpsc::channel();
     let mut presenter = Presenter::new(probe.cell_width.zip(probe.cell_height), shared);
-    thread::Builder::new()
-        .name("meowland-pane-rx".into())
-        .spawn(move || {
-            let mut stream = stream;
-            while let Ok(message) = protocol::recv::<ServerToPane>(&mut stream) {
-                if server_tx.send(message).is_err() {
-                    break;
-                }
-            }
-        })?;
+    let mut stats = PaneStats::new(socket);
+    stats.capabilities(&probe, hello.width, hello.height);
 
     let handshake_deadline = Instant::now() + Duration::from_secs(1);
     let mut handshake_done = false;
     let stdin = io::stdin();
     let stdout = io::stdout();
     loop {
+        if !handshake_done && Instant::now() >= handshake_deadline {
+            return Err(anyhow::anyhow!("pane handshake timed out"));
+        }
+        // Wait on the terminal, the pane socket and the handshake in one go.
+        // Waiting on the socket itself, rather than on a relay thread's
+        // channel, is what lets a frame be drawn the moment it arrives.
         let mut fds = [
-            PollFd::new(&stdin, PollFlags::HUP | PollFlags::ERR),
+            PollFd::new(&stdin, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&stdout, PollFlags::HUP | PollFlags::ERR),
+            PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
         ];
-        let zero = Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        if poll(&mut fds, Some(&zero))? > 0
-            && fds
-                .iter()
-                .any(|fd| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR))
+        // The wait is open-ended once the handshake is answered: every source
+        // wakes the poll on its own, so there is nothing to poll for.
+        let timeout = (!handshake_done).then(|| {
+            let wait = handshake_deadline.saturating_duration_since(Instant::now());
+            Timespec {
+                tv_sec: wait.as_secs() as i64,
+                tv_nsec: wait.subsec_nanos().into(),
+            }
+        });
+        poll(&mut fds, timeout.as_ref())?;
+        if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR)
+            || fds[1].revents().intersects(PollFlags::HUP | PollFlags::ERR)
         {
             return Ok(());
         }
-        loop {
-            let message = match server_rx.try_recv() {
-                Ok(message) => message,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    mode.restore_with_message("server disconnected")?;
-                    return Ok(());
-                }
+        if fds[2]
+            .revents()
+            .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+        {
+            let Ok(message) = protocol::recv::<ServerToPane>(&mut stream) else {
+                mode.restore_with_message("server disconnected")?;
+                return Ok(());
             };
             match message {
                 ServerToPane::HelloOk => handshake_done = true,
@@ -397,19 +498,31 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
                 ServerToPane::Title(title) => set_title(&title),
                 ServerToPane::Cursor(shape) => set_cursor(shape.as_deref()),
                 ServerToPane::Frame { width, height, rgb } => {
+                    let started = Instant::now();
                     let update = presenter.present(width, height, rgb);
+                    let encoded = started.elapsed();
+                    let written = Instant::now();
                     if !update.is_empty() {
                         io::stdout().write_all(&update)?;
                         io::stdout().flush()?;
                     }
-                    protocol::send(&mut tx, &PaneToServer::Ack)?;
+                    stats.frame(
+                        update.len(),
+                        presenter.dropped(),
+                        encoded,
+                        written.elapsed(),
+                    );
+                    protocol::send(
+                        &mut tx,
+                        &PaneToServer::Ack {
+                            drawn: !presenter.dropped(),
+                        },
+                    )?;
                 }
             }
         }
-        if !handshake_done && Instant::now() >= handshake_deadline {
-            return Err(anyhow::anyhow!("pane handshake timed out"));
-        }
-        if event::poll(Duration::from_millis(16))? {
+        // Everything the terminal has already sent, not one event per wakeup.
+        while event::poll(Duration::ZERO)? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if let Some(code) = binding_code(key) {

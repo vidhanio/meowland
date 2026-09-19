@@ -79,7 +79,7 @@ fn frame_callbacks_wait_for_the_pane_ack() {
         "frame callback fired before the pane acknowledged"
     );
 
-    pane.send(&protocol::PaneToServer::Ack);
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
     let done = client.read_until(|message| message.object == callback);
     assert_eq!(done.opcode, 0);
 }
@@ -149,7 +149,7 @@ fn throughput_of_1080p_frames() {
 
     let mut pane = Pane::attach(&server, hello(width, height, Some((10, 20)), Show::Newest));
     let _ = pane.frame();
-    pane.send(&protocol::PaneToServer::Ack);
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
 
     let budget = Duration::from_secs(5);
     let start = Instant::now();
@@ -172,7 +172,7 @@ fn throughput_of_1080p_frames() {
         client.attach(&toplevel, buffer, width, height);
         let (frame_width, frame_height, _) = pane.frame();
         bytes += u64::from(frame_width) * u64::from(frame_height) * 3;
-        pane.send(&protocol::PaneToServer::Ack);
+        pane.send(&protocol::PaneToServer::Ack { drawn: true });
         frames += 1;
     }
     let elapsed = start.elapsed();
@@ -285,7 +285,7 @@ fn popup_is_drawn_where_the_window_geometry_puts_it() {
     assert_eq!(at(&frame, 4, 3), [200, 100, 50]);
 
     // A press outside the popup dismisses it, and the pane stops drawing it.
-    pane.send(&protocol::PaneToServer::Ack);
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
     pane.send(&protocol::PaneToServer::Input(protocol::Input::Pointer {
         x: 0.5,
         y: 0.5,

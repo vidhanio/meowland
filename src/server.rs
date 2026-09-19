@@ -352,10 +352,12 @@ impl Server<'_> {
                     });
                 }
             }
-            PaneToServer::Ack => {
+            PaneToServer::Ack { drawn } => {
                 if let Some(pane) = self.panes.get_mut(&id) {
                     pane.busy = false;
-                    let _ = self.commands.send(CompositorCommand::Ack { pane: id });
+                    let _ = self
+                        .commands
+                        .send(CompositorCommand::Ack { pane: id, drawn });
                 }
             }
         }

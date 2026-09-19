@@ -18,23 +18,11 @@ crossterm = { version = "0.29.0", default-features = false, features = [
   "events",
 ] }
 flate2 = "1.1.10"
-evdev = "0.13.2"
-nutype = { version = "0.6.2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"
-calloop = { version = "0.14.4", features = ["signals"] }
+signal-hook = "0.3"
 rustix = { version = "1.1.4", features = ["net", "process", "runtime", "shm"] }
-smithay = { version = "0.7", default-features = false, features = [
-  "desktop",
-  "renderer_gl",
-  "wayland_frontend",
-] }
-thiserror = "2.0.20"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = [
-  "env-filter",
-  "fmt",
-] }
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend"] }
 usage = { package = "usage-rs", version = "6.9.1", default-features = false, features = [
   "completions",
   "diagnostics",
@@ -46,9 +34,7 @@ usage = { package = "usage-rs", version = "6.9.1", default-features = false, fea
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 # missing_docs = "warn"
-# Not `forbid`: a client's buffer is read through a raw pointer, in shared
-# memory and in a mapped GPU buffer, and both reads need an `unsafe` slice
-# (`src/buffer.rs`).
+# The shm snapshot is the single local exception to this lint.
 unsafe_code = "deny"
 
 [lints.clippy]

@@ -830,6 +830,13 @@ impl Popup {
 /// The pane side of the protocol.
 pub struct Pane {
     stream: UnixStream,
+    /// The frame as received, band by band: the compositor sends only the rows
+    /// that changed, so a test composes them the way a pane does.
+    image: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// The first row and the row count of the last band.
+    band: (u32, u32),
 }
 
 impl Pane {
@@ -839,7 +846,13 @@ impl Pane {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         protocol::send(&mut stream, &PaneToServer::Hello(hello)).unwrap();
-        let mut pane = Self { stream };
+        let mut pane = Self {
+            stream,
+            image: Vec::new(),
+            width: 0,
+            height: 0,
+            band: (0, 0),
+        };
         match pane.recv() {
             ServerToPane::HelloOk => pane,
             other => panic!("pane handshake failed: {other:?}"),
@@ -850,20 +863,47 @@ impl Pane {
         protocol::recv(&mut self.stream).unwrap()
     }
 
-    pub fn send(&mut self, message: &PaneToServer) {
-        protocol::send(&mut self.stream, message).unwrap();
-    }
-
     /// The next frame, ignoring the title and pointer shape updates that can
-    /// arrive before it.
+    /// arrive before it.  Bands are composed into the frame they belong to, so
+    /// the whole picture comes back whichever rows moved.
     pub fn frame(&mut self) -> (u32, u32, Vec<u8>) {
         loop {
             match self.recv() {
-                ServerToPane::Frame { width, height, rgb } => return (width, height, rgb),
+                ServerToPane::Frame {
+                    width,
+                    height,
+                    y,
+                    rgb,
+                } => {
+                    self.apply(width, height, y, &rgb);
+                    return (self.width, self.height, self.image.clone());
+                }
                 ServerToPane::Title(_) | ServerToPane::Cursor(_) => {}
                 other => panic!("expected a frame, got {other:?}"),
             }
         }
+    }
+
+    /// The rows of the frame that arrived last: the first row and how many.
+    pub const fn band(&self) -> (u32, u32) {
+        self.band
+    }
+
+    fn apply(&mut self, width: u32, height: u32, y: u32, rgb: &[u8]) {
+        if self.width != width || self.height != height {
+            self.width = width;
+            self.height = height;
+            self.image.clear();
+            self.image.resize(width as usize * height as usize * 3, 0);
+        }
+        let stride = width as usize * 3;
+        let start = y as usize * stride;
+        self.image[start..start + rgb.len()].copy_from_slice(rgb);
+        self.band = (y, u32::try_from(rgb.len() / stride).unwrap_or(0));
+    }
+
+    pub fn send(&mut self, message: &PaneToServer) {
+        protocol::send(&mut self.stream, message).unwrap();
     }
 }
 

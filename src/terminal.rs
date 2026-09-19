@@ -535,9 +535,14 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
                 }
                 ServerToPane::Title(title) => set_title(&title),
                 ServerToPane::Cursor(shape) => set_cursor(shape.as_deref()),
-                ServerToPane::Frame { width, height, rgb } => {
+                ServerToPane::Frame {
+                    width,
+                    height,
+                    y,
+                    rgb,
+                } => {
                     let started = Instant::now();
-                    let update = presenter.present(width, height, rgb);
+                    let update = presenter.present(width, height, y, rgb);
                     let encoded = started.elapsed();
                     let written = Instant::now();
                     if !update.is_empty() {

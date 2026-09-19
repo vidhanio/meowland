@@ -8,6 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -114,8 +115,6 @@ pub enum Command {
         /// Whether the pane drew the frame it is acknowledging.
         drawn: bool,
     },
-    /// A frame buffer the pane is done with, given back for the next frame.
-    Recycle(Vec<u8>),
     CloseAll,
     CloseShown {
         pane: u64,
@@ -143,6 +142,8 @@ pub enum Event {
         pane: u64,
         width: u32,
         height: u32,
+        /// The first row `rgb` covers.
+        y: u32,
         rgb: Vec<u8>,
     },
     Release {
@@ -309,8 +310,9 @@ struct State {
     /// The pane `cursor` was last sent to, so a shape that is unchanged but
     /// belongs to another pane is still sent.
     cursor_shape_pane: Option<u64>,
-    /// Frame buffers handed back by the panes, reused for the next frame.
-    pool: Vec<Vec<u8>>,
+    /// The buffer a frame is composed into, kept so a pane that redraws does
+    /// not allocate (and fault in) a frame's worth of memory every time.
+    scratch: Vec<u8>,
     events: mpsc::Sender<Event>,
     started: Instant,
     shutdown: bool,
@@ -1073,7 +1075,7 @@ fn run(
         cursor_pane: None,
         cursor: None,
         cursor_shape_pane: None,
-        pool: Vec::new(),
+        scratch: Vec::new(),
         events,
         mode: Size::from((mode.size.w, mode.size.h)),
         started: Instant::now(),
@@ -1175,11 +1177,6 @@ fn handle_command(state: &mut State, command: Command) {
                 send_frame_callbacks(state, window);
             }
         }
-        Command::Recycle(rgb) => {
-            if state.pool.len() < 4 {
-                state.pool.push(rgb);
-            }
-        }
         Command::CloseAll => {
             for window in state.windows.values() {
                 window.surface.send_close();
@@ -1277,41 +1274,72 @@ fn dispatch_frames(state: &mut State) {
             }
             continue;
         }
-        let Some(buffer) = render_frame(state, pane) else {
+        if !render_frame(state, pane) {
             continue;
-        };
-        let (width, height, changed) = match state.panes.get_mut(&pane) {
+        }
+        let (width, height, rows) = match state.panes.get_mut(&pane) {
             Some(entry) => {
                 entry.next_frame = now + FRAME_INTERVAL;
-                (
-                    entry.width,
-                    entry.height,
-                    entry.shown_stale || entry.shown != buffer,
-                )
+                let stride = entry.width as usize * 3;
+                // The pane is only sent the rows that changed; one that was
+                // given a frame it did not draw is sent the whole of it again,
+                // since what its terminal shows is not what `shown` holds.
+                let rows = if entry.shown_stale {
+                    Some(0..entry.height as usize)
+                } else {
+                    changed_rows(&entry.shown, &state.scratch, stride)
+                };
+                (entry.width, entry.height, rows)
             }
             None => continue,
         };
-        if changed {
-            if let Some(entry) = state.panes.get_mut(&pane) {
-                entry.shown.clone_from(&buffer);
-                entry.frame = FrameState::InFlight;
-                entry.sent = now;
+        match rows {
+            Some(rows) => {
+                let stride = width as usize * 3;
+                let band = state.scratch[rows.start * stride..rows.end * stride].to_vec();
+                if let Some(entry) = state.panes.get_mut(&pane) {
+                    // Only the rows that go out have to be remembered.
+                    entry.shown.resize(state.scratch.len(), 0);
+                    entry.shown[rows.start * stride..rows.end * stride].copy_from_slice(&band);
+                    entry.frame = FrameState::InFlight;
+                    entry.sent = now;
+                }
+                let _ = state.events.send(Event::Frame {
+                    pane,
+                    width,
+                    height,
+                    y: u32::try_from(rows.start).unwrap_or(0),
+                    rgb: band,
+                });
             }
-            let _ = state.events.send(Event::Frame {
-                pane,
-                width,
-                height,
-                rgb: buffer,
-            });
-        } else {
-            // The pane already holds these pixels; the client is free to draw
-            // again without paying for a frame nobody would see.
-            if state.pool.len() < 4 {
-                state.pool.push(buffer);
+            None => {
+                // The pane already holds these pixels; the client is free to
+                // draw again without paying for a frame nobody would see.
+                send_frame_callbacks(state, window);
             }
-            send_frame_callbacks(state, window);
         }
     }
+}
+
+/// The rows of `buffer` that differ from `shown`, or `None` when the two are
+/// the same picture.  `shown` of another size is a frame that has to be sent
+/// whole.
+fn changed_rows(shown: &[u8], buffer: &[u8], stride: usize) -> Option<Range<usize>> {
+    let rows = buffer.len() / stride;
+    if shown.len() != buffer.len() {
+        return Some(0..rows);
+    }
+    let differs = |row: usize| {
+        shown[row * stride..(row + 1) * stride] != buffer[row * stride..(row + 1) * stride]
+    };
+    let first = (0..rows).find(|row| differs(*row))?;
+    // Searching from the end keeps a change near the top from scanning the
+    // whole frame twice.
+    let last = (first..rows)
+        .rev()
+        .find(|row| differs(*row))
+        .unwrap_or(first);
+    Some(first..last + 1)
 }
 
 /// Give up on frames no pane has acknowledged in [`ACK_TIMEOUT`].
@@ -1405,12 +1433,16 @@ fn send_frame_callbacks(state: &State, window: u64) -> bool {
     sent
 }
 
-/// Compose one pane's frame: the window it shows, its subsurfaces and its
+/// Compose one pane's frame into [`State::scratch`], reporting whether there
+/// was anything to compose: the window it shows, its subsurfaces and its
 /// popups, over an opaque backdrop.
-fn render_frame(state: &mut State, pane: u64) -> Option<Vec<u8>> {
-    let (window, width, height) = {
-        let entry = state.panes.get(&pane)?;
-        (entry.window, entry.width, entry.height)
+fn render_frame(state: &mut State, pane: u64) -> bool {
+    let Some((window, width, height)) = state
+        .panes
+        .get(&pane)
+        .map(|entry| (entry.window, entry.width, entry.height))
+    else {
+        return false;
     };
     // Drawing and the backdrop decision share one stack, so they cannot
     // disagree about what is on the pane.
@@ -1418,7 +1450,7 @@ fn render_frame(state: &mut State, pane: u64) -> Option<Vec<u8>> {
         .windows
         .get(&window)
         .map_or_default(|entry| surface_stack(&entry.surface.wl_surface().clone()));
-    let mut out = state.pool.pop().unwrap_or_default();
+    let mut out = std::mem::take(&mut state.scratch);
     out.resize(width as usize * height as usize * 3, 0);
     if !opaque_cover(state, &stack, width, height) {
         out.fill(0);
@@ -1426,7 +1458,8 @@ fn render_frame(state: &mut State, pane: u64) -> Option<Vec<u8>> {
     for (surface, origin) in &stack {
         blit(state, surface, *origin, &mut out, width, height);
     }
-    Some(out)
+    state.scratch = out;
+    true
 }
 
 /// Every surface a window draws, bottom to top, with the pane coordinates of
@@ -2003,6 +2036,36 @@ fn copy_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The band a pane is sent is the rows that differ from the frame it was
+    /// sent before, so a change near one edge does not cost a whole frame.
+    #[test]
+    fn changed_rows_are_the_rows_that_differ() {
+        const STRIDE: usize = 9;
+        let shown = vec![0u8; 4 * STRIDE];
+        let mut buffer = shown.clone();
+        assert_eq!(changed_rows(&shown, &buffer, STRIDE), None, "identical");
+
+        buffer[0..3].copy_from_slice(&[1, 1, 1]);
+        assert_eq!(changed_rows(&shown, &buffer, STRIDE), Some(0..1), "row 0");
+
+        buffer[0..3].copy_from_slice(&[0, 0, 0]);
+        buffer[3 * STRIDE..3 * STRIDE + 3].copy_from_slice(&[1, 1, 1]);
+        assert_eq!(changed_rows(&shown, &buffer, STRIDE), Some(3..4), "row 3");
+
+        buffer[0..3].copy_from_slice(&[1, 1, 1]);
+        assert_eq!(
+            changed_rows(&shown, &buffer, STRIDE),
+            Some(0..4),
+            "rows 0 and 3 span the frame"
+        );
+
+        // A frame of another size cannot be compared row for row.
+        assert_eq!(
+            changed_rows(&shown, &buffer[..2 * STRIDE], STRIDE),
+            Some(0..2)
+        );
+    }
 
     /// `Argb8888` holds `b, g, r, a` in memory and the snapshot holds
     /// `r, g, b, a`; `Xrgb8888` ignores the fourth byte and is always opaque.

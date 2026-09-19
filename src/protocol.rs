@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 /// The length prefix every message carries, in bytes.
@@ -110,9 +110,13 @@ pub enum PaneToServer {
 pub enum ServerToPane {
     HelloOk,
     Reject(String),
+    /// The rows of a `width` by `height` frame from `y` down, `rgb` in
+    /// `r, g, b` order: the pane composes bands into the frame it keeps, so a
+    /// change that moves a cursor costs a row and not a frame.
     Frame {
         width: u32,
         height: u32,
+        y: u32,
         #[serde(with = "serde_bytes")]
         rgb: Vec<u8>,
     },
@@ -272,6 +276,7 @@ mod tests {
         let value = ServerToPane::Frame {
             width: 3,
             height: 2,
+            y: 0,
             rgb: vec![1, 2, 3, 4, 5, 6],
         };
         let mut framed = Vec::new();

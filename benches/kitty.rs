@@ -102,7 +102,7 @@ fn scattered(base: &[u8]) -> Vec<u8> {
             &mut frame,
             WIDTH,
             (index % 8) * 240,
-            (index / 8) * 270,
+            (index / 8) * 260,
             u32::from(CELL.0),
             u32::from(CELL.1),
             CHANGED,
@@ -157,8 +157,8 @@ fn patches(c: &mut Criterion) {
 
     let base = vec![FLAT; BYTES];
 
-    // A glyph being typed: the diff stops at the first differing row, and one
-    // patch, one cursor move and one small payload go out.
+    // A glyph being typed: one patch, one cursor move and one small payload
+    // go out, after a full walk of the frame's rows.
     let cell = one_cell(&base);
     group.bench_function("one_cell_1080p", |b| {
         b.iter_batched(
@@ -187,8 +187,7 @@ fn patches(c: &mut Criterion) {
     });
 
     // The patch budget spent exactly: thirty-two single-cell patches with their
-    // deletes and cursor moves, and the four rows holding them are the only
-    // ones scanned cell by cell.
+    // deletes and cursor moves, in four rows of eight cells each.
     let spread = scattered(&base);
     group.bench_function("scattered_1080p", |b| {
         b.iter_batched(

@@ -4,14 +4,19 @@
 //! to know about raw mode, terminal escape sequences, or crossterm events.
 
 use std::{
-    env, fs,
+    fs,
     io::{self, Write},
     os::unix::net::UnixStream,
-    path::{Path, PathBuf},
+    path::Path,
     process,
-    time::{Duration, Instant, SystemTime},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind},
     execute, terminal,
@@ -22,12 +27,16 @@ use rustix::{
 };
 
 use crate::{
+    diag,
     kitty::{Presenter, SharedMemory},
     protocol::{self, Hello, Input, PaneToServer, ServerToPane, Show},
 };
 
 const CELL_WIDTH: u16 = 10;
 const CELL_HEIGHT: u16 = 20;
+/// The size of a cell a pane assumes when the terminal never reported one, so
+/// that a pane in a quiet terminal still has a size to send.
+const FALLBACK_CELL: (u16, u16) = (CELL_WIDTH, CELL_HEIGHT);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// After the last reply, a terminal gets this long to send stragglers.
 const PROBE_QUIET: Duration = Duration::from_millis(25);
@@ -130,11 +139,26 @@ fn terminal_probe() -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
     Ok((probe, shared))
 }
 
+/// Whether a device-attributes reply is in `bytes`.  That reply is what ends
+/// the probe's quiet window, and the DECRQM reply is a `CSI ?` sequence too,
+/// so the whole `CSI ? <params> c` shape is matched rather than a stray `c`.
 fn device_attributes_seen(bytes: &[u8]) -> bool {
-    let Some(start) = find(bytes, b"\x1b[?") else {
-        return false;
-    };
-    bytes[start + 3..].contains(&b'c')
+    let mut index = 0;
+    while let Some(offset) = find(&bytes[index..], b"\x1b[?") {
+        let start = index + offset;
+        index = start + 3;
+        let Some((body, final_byte, _)) = control_sequence(bytes, start) else {
+            return false;
+        };
+        if final_byte == b'c'
+            && body[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -321,21 +345,8 @@ struct PaneStats {
 
 impl PaneStats {
     fn new(socket: &Path) -> Self {
-        let path = env::var_os("MEOWLAND_LOG").map_or_else(
-            || {
-                socket
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join("meowland.log")
-            },
-            PathBuf::from,
-        );
         Self {
-            log: fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok(),
+            log: diag::open(&diag::path(socket)).ok(),
             pid: process::id(),
             window: Instant::now(),
             frames: 0,
@@ -351,10 +362,7 @@ impl PaneStats {
         let Some(file) = self.log.as_mut() else {
             return;
         };
-        let seconds = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        let _ = writeln!(file, "{seconds} pane {}: {message}", self.pid);
+        let _ = writeln!(file, "{} pane {}: {message}", diag::seconds(), self.pid);
     }
 
     /// What the terminal said about itself, and the size it is drawn at.
@@ -416,8 +424,26 @@ impl PaneStats {
               terminal guard"
 )]
 pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "could not reach the pane socket {} (is the server running?)",
+            socket.display()
+        )
+    })?;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    // A pane killed from outside must still hand the terminal back: raw mode,
+    // the alternate screen and mouse reporting all outlive a default-action
+    // death, and the shell that comes after it cannot undo them.  The handlers
+    // go in before the terminal is taken over, so a signal during the probe is
+    // not a window in which the modes outlive the pane.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
+    }
     let mut mode = TerminalGuard::enter()?;
     let (probe, shared) = terminal_probe()?;
     if !probe.graphics {
@@ -425,28 +451,27 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
     }
     let units = mouse_units(&probe);
     mode.enable_mouse(units)?;
-    let window = terminal::window_size().ok();
-    let window_pixels = window.map(|size| (u32::from(size.width), u32::from(size.height)));
-    let cell_width = u32::from(probe.cell_width.unwrap_or(CELL_WIDTH));
-    let cell_height = u32::from(probe.cell_height.unwrap_or(CELL_HEIGHT));
+    // The size of a cell is what the probe answered, or the fallback the pane
+    // assumes so a terminal that stayed quiet still has a geometry.
+    let mut cell = probe.cell_width.zip(probe.cell_height);
+    let (width, height) = pane_pixels(
+        probe.pixel_width.zip(probe.pixel_height),
+        window_pixels(),
+        (cols, rows),
+        cell.unwrap_or(FALLBACK_CELL),
+    );
     let hello = Hello {
         version: protocol::VERSION,
-        width: probe
-            .pixel_width
-            .or_else(|| window_pixels.map(|(width, _)| width).filter(|w| *w > 0))
-            .unwrap_or_else(|| u32::from(cols) * cell_width),
-        height: probe
-            .pixel_height
-            .or_else(|| window_pixels.map(|(_, height)| height).filter(|h| *h > 0))
-            .unwrap_or_else(|| u32::from(rows) * cell_height),
-        cell_width: probe.cell_width,
-        cell_height: probe.cell_height,
+        width,
+        height,
+        cell_width: cell.map(|cell| cell.0),
+        cell_height: cell.map(|cell| cell.1),
         show,
     };
 
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
-    let mut presenter = Presenter::new(probe.cell_width.zip(probe.cell_height), shared);
+    let mut presenter = Presenter::new(cell, shared);
     let mut stats = PaneStats::new(socket);
     stats.capabilities(&probe, hello.width, hello.height);
 
@@ -455,6 +480,12 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     loop {
+        if interrupted.load(Ordering::Relaxed) {
+            // Something asked the pane to leave; the terminal goes back the
+            // same way it does on any other exit.
+            mode.restore()?;
+            return Ok(());
+        }
         if !handshake_done && Instant::now() >= handshake_deadline {
             return Err(anyhow::anyhow!("pane handshake timed out"));
         }
@@ -475,7 +506,14 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
                 tv_nsec: wait.subsec_nanos().into(),
             }
         });
-        poll(&mut fds, timeout.as_ref())?;
+        // A signal that is not one of the pane's own (a resize, say) lands
+        // here; the flag is read at the top of the loop, so waiting again is
+        // all that is left to do.
+        match poll(&mut fds, timeout.as_ref()) {
+            Err(Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
         if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR)
             || fds[1].revents().intersects(PollFlags::HUP | PollFlags::ERR)
         {
@@ -526,26 +564,29 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if let Some(code) = binding_code(key) {
-                        send_key(&mut tx, code, key.modifiers)?;
+                        send_key_bits(&mut tx, code, modifier_bits(key.modifiers))?;
                         continue;
                     }
-                    if let Some(Input::Key {
-                        code, modifiers, ..
-                    }) = key_input(key)
-                    {
+                    if let Some((code, modifiers)) = key_input(key) {
                         send_key_bits(&mut tx, code, modifiers)?;
                     }
                 }
-                Event::Resize(w, h) => {
-                    let cw = probe.cell_width;
-                    let ch = probe.cell_height;
+                Event::Resize(cols, rows) => {
+                    let pixels = window_pixels();
+                    // A font zoom changes the cell the terminal draws with
+                    // without changing the answer the probe got, so the cell
+                    // is derived again from this reading.
+                    cell = derived_cell(pixels, (cols, rows)).or(cell);
+                    presenter.set_cell_size(cell);
+                    let (width, height) =
+                        pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
                     protocol::send(
                         &mut tx,
                         &PaneToServer::Resize {
-                            width: u32::from(w) * cell_width,
-                            height: u32::from(h) * cell_height,
-                            cell_width: cw,
-                            cell_height: ch,
+                            width,
+                            height,
+                            cell_width: cell.map(|cell| cell.0),
+                            cell_height: cell.map(|cell| cell.1),
                         },
                     )?;
                 }
@@ -561,12 +602,15 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
                         MouseUnits::Pixels => (f64::from(mouse.column), f64::from(mouse.row)),
                         // Without `SGR-Pixels` the cell is the unit; aim at its
                         // middle so a click lands inside the cell.
-                        MouseUnits::Cells => (
-                            f64::from(mouse.column)
-                                .mul_add(f64::from(cell_width), f64::from(cell_width) / 2.0),
-                            f64::from(mouse.row)
-                                .mul_add(f64::from(cell_height), f64::from(cell_height) / 2.0),
-                        ),
+                        MouseUnits::Cells => {
+                            let (cell_width, cell_height) = cell.unwrap_or(FALLBACK_CELL);
+                            let (cell_width, cell_height) =
+                                (f64::from(cell_width), f64::from(cell_height));
+                            (
+                                f64::from(mouse.column).mul_add(cell_width, cell_width / 2.0),
+                                f64::from(mouse.row).mul_add(cell_height, cell_height / 2.0),
+                            )
+                        }
                     };
                     protocol::send(
                         &mut tx,
@@ -580,8 +624,15 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
                     )?;
                 }
                 Event::Paste(text) => {
-                    for character in text.chars() {
+                    // A paste copied from a system that ends lines with CRLF
+                    // is one line break, not two.
+                    let mut characters = text.chars().peekable();
+                    while let Some(character) = characters.next() {
                         let code = match character {
+                            '\r' if characters.peek() == Some(&'\n') => {
+                                characters.next();
+                                Some(28)
+                            }
                             '\n' | '\r' => Some(28),
                             '\t' => Some(15),
                             _ => evdev_char_code(character),
@@ -597,7 +648,9 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
     }
 }
 
-fn key_input(key: KeyEvent) -> Option<Input> {
+/// The Linux input code and modifier bits a key event carries, or `None` for
+/// a key the pane cannot express as one.
+fn key_input(key: KeyEvent) -> Option<(u16, u8)> {
     let mut modifiers = key.modifiers;
     if let KeyCode::Char(character) = key.code
         && needs_shift(character)
@@ -611,7 +664,7 @@ fn key_input(key: KeyEvent) -> Option<Input> {
         KeyCode::Enter => 28,
         KeyCode::Esc => 1,
         KeyCode::Backspace => 14,
-        KeyCode::Tab => 15,
+        KeyCode::Tab | KeyCode::BackTab => 15,
         KeyCode::Up => 103,
         KeyCode::Down => 108,
         KeyCode::Left => 105,
@@ -622,18 +675,19 @@ fn key_input(key: KeyEvent) -> Option<Input> {
         KeyCode::PageDown => 109,
         KeyCode::Delete => 111,
         KeyCode::Insert => 110,
-        KeyCode::F(n) => 58 + u16::from(n),
+        // The function keys are not in one run in evdev: `KEY_F1`..`KEY_F10`
+        // are 59..68, `KEY_F11` and `KEY_F12` are 87 and 88, and `KEY_F13` and
+        // up continue from 183.
+        KeyCode::F(n) => match n {
+            1..=10 => 58 + u16::from(n),
+            11 => 87,
+            12 => 88,
+            13..=24 => 170 + u16::from(n),
+            _ => return None,
+        },
         _ => return None,
     };
-    Some(Input::Key {
-        code,
-        pressed: true,
-        modifiers: modifier_bits(modifiers),
-    })
-}
-
-fn send_key(stream: &mut UnixStream, code: u16, modifiers: KeyModifiers) -> anyhow::Result<()> {
-    send_key_bits(stream, code, modifier_bits(modifiers))
+    Some((code, modifier_bits(modifiers)))
 }
 
 fn send_key_bits(stream: &mut UnixStream, code: u16, modifiers: u8) -> anyhow::Result<()> {
@@ -717,6 +771,49 @@ fn needs_shift(c: char) -> bool {
     c.is_ascii_uppercase() || "!@#$%^&*()_+{}:\"~|<>?".contains(c)
 }
 
+/// The terminal's size in pixels as the kernel last saw it.  Terminals that
+/// do not report pixels at all answer with zeros, which is no answer.
+fn window_pixels() -> Option<(u32, u32)> {
+    terminal::window_size()
+        .ok()
+        .map(|size| (u32::from(size.width), u32::from(size.height)))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+}
+
+/// The pane's size in pixels for a window of `cells` cells.  A pixel size the
+/// terminal reported wins over the cells: `reported` is what the terminal
+/// answered itself, `fresh` what the kernel was told just now, and a window
+/// neither of them describes is its cells times the size of a cell.
+fn pane_pixels(
+    reported: Option<(u32, u32)>,
+    fresh: Option<(u32, u32)>,
+    cells: (u16, u16),
+    cell: (u16, u16),
+) -> (u32, u32) {
+    reported.or(fresh).unwrap_or_else(|| {
+        (
+            u32::from(cells.0) * u32::from(cell.0),
+            u32::from(cells.1) * u32::from(cell.1),
+        )
+    })
+}
+
+/// The size of a cell derived from a window reading.  A font zoom changes the
+/// cell the terminal draws with and leaves no other trace, so this is how a
+/// pane notices one.
+fn derived_cell(pixels: Option<(u32, u32)>, cells: (u16, u16)) -> Option<(u16, u16)> {
+    let (width, height) = pixels?;
+    let (cols, rows) = (u32::from(cells.0), u32::from(cells.1));
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let cell = (
+        u16::try_from(width / cols).ok()?,
+        u16::try_from(height / rows).ok()?,
+    );
+    (cell.0 > 0 && cell.1 > 0).then_some(cell)
+}
+
 /// The terminal's modifier flags as the bits the pane protocol packs.
 fn modifier_bits(modifiers: KeyModifiers) -> u8 {
     use protocol::modifiers::{ALT, CONTROL, SHIFT, SUPER};
@@ -737,11 +834,7 @@ fn modifier_bits(modifiers: KeyModifiers) -> u8 {
 /// `Alt+Q` asks the shown window to close and `Alt+W` detaches, in Linux input
 /// codes.  Only without Ctrl or Super, so everything else reaches the client.
 fn binding_code(key: KeyEvent) -> Option<u16> {
-    let alt_alone = key.modifiers.contains(KeyModifiers::ALT)
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
-    if !alt_alone {
+    if !protocol::modifiers::alt_only(modifier_bits(key.modifiers)) {
         return None;
     }
     match key.code {
@@ -752,11 +845,7 @@ fn binding_code(key: KeyEvent) -> Option<u16> {
 }
 
 fn set_title(title: &str) {
-    let clean: String = title
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(512)
-        .collect();
+    let clean = protocol::sanitize_with_limit(title, 512);
     let _ = write!(io::stdout(), "\x1b]2;{clean}\x07");
     let _ = io::stdout().flush();
 }
@@ -812,37 +901,43 @@ impl TerminalGuard {
     }
 
     fn restore_with_message(&mut self, reason: &str) -> io::Result<()> {
-        let clean: String = reason
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(512)
-            .collect();
+        let clean = protocol::sanitize_with_limit(reason, 512);
         self.restore()?;
         writeln!(io::stdout(), "meowland: {clean}")
     }
 
+    /// Undo every mode the pane turned on.  Each step is attempted even after
+    /// one of them fails: a shell cannot live with any of them left behind,
+    /// and the ones that follow raw mode are exactly the ones a broken write
+    /// would otherwise skip.
     fn restore(&mut self) -> io::Result<()> {
-        if self.active {
-            // Raw mode is the one mode that survives a writer that cannot
-            // reach the terminal, and a shell cannot live with it, so it is
-            // undone before any write that could fail.
-            terminal::disable_raw_mode()?;
-            if let Some(units) = self.mouse.take() {
-                let off: &[u8] = match units {
-                    MouseUnits::Pixels => b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
-                    MouseUnits::Cells => b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
-                };
-                io::stdout().write_all(off)?;
-            }
-            io::stdout().write_all(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\")?;
-            execute!(
-                io::stdout(),
-                crossterm::cursor::Show,
-                terminal::LeaveAlternateScreen
-            )?;
-            self.active = false;
+        if !self.active {
+            return Ok(());
         }
-        Ok(())
+        self.active = false;
+        let mut failure = None;
+        let mut note = |result: io::Result<()>| {
+            if failure.is_none() {
+                failure = result.err();
+            }
+        };
+        // Raw mode is the one mode that survives a writer that cannot reach
+        // the terminal, so it is undone before any write that could fail.
+        note(terminal::disable_raw_mode());
+        if let Some(units) = self.mouse.take() {
+            let off: &[u8] = match units {
+                MouseUnits::Pixels => b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+                MouseUnits::Cells => b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+            };
+            note(io::stdout().write_all(off));
+        }
+        note(io::stdout().write_all(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\"));
+        note(execute!(
+            io::stdout(),
+            crossterm::cursor::Show,
+            terminal::LeaveAlternateScreen
+        ));
+        failure.map_or(Ok(()), Err)
     }
 }
 impl Drop for TerminalGuard {
@@ -937,30 +1032,61 @@ mod tests {
     fn shifted_characters_carry_the_shift_bit() {
         let key =
             |character, modifiers| key_input(KeyEvent::new(KeyCode::Char(character), modifiers));
-        assert!(matches!(
-            key('A', KeyModifiers::NONE),
-            Some(Input::Key {
-                code: 30,
-                modifiers: 1,
-                ..
-            })
-        ));
-        assert!(matches!(
-            key('!', KeyModifiers::NONE),
-            Some(Input::Key {
-                code: 2,
-                modifiers: 1,
-                ..
-            })
-        ));
-        assert!(matches!(
-            key('a', KeyModifiers::NONE),
-            Some(Input::Key {
-                code: 30,
-                modifiers: 0,
-                ..
-            })
-        ));
+        assert_eq!(key('A', KeyModifiers::NONE), Some((30, 1)));
+        assert_eq!(key('!', KeyModifiers::NONE), Some((2, 1)));
+        assert_eq!(key('a', KeyModifiers::NONE), Some((30, 0)));
+    }
+
+    /// Windows-style F1..F24 are not one run of codes in evdev, and F11 and
+    /// F12 in particular sit far away from F10.
+    #[test]
+    fn function_keys_use_their_evdev_codes() {
+        let key = |n| key_input(KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE));
+        assert_eq!(key(1), Some((59, 0)));
+        assert_eq!(key(10), Some((68, 0)));
+        assert_eq!(key(11), Some((87, 0)));
+        assert_eq!(key(12), Some((88, 0)));
+        assert_eq!(key(13), Some((183, 0)));
+        assert_eq!(key(24), Some((194, 0)));
+        assert_eq!(key(25), None);
+    }
+
+    #[test]
+    fn shift_tab_is_a_tab_with_the_shift_bit() {
+        assert_eq!(
+            key_input(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some((15, protocol::modifiers::SHIFT))
+        );
+    }
+
+    /// The probe's quiet window is armed by the device-attributes reply, and
+    /// both the DECRQM reply and the terminal name contain the letters that
+    /// a substring match would trip over.
+    #[test]
+    fn only_a_complete_device_attributes_reply_ends_the_probe() {
+        assert!(!device_attributes_seen(b"\x1b[?1016;2$y"));
+        assert!(!device_attributes_seen(b"\x1bP>|contour\x1b\\"));
+        assert!(!device_attributes_seen(b"\x1b[?62;4;6;22"));
+        assert!(device_attributes_seen(b"\x1b[?1016;2$y\x1b[?62;4;6;22c"));
+    }
+
+    /// A pane reports the pixels the terminal does, and a cell size derived
+    /// from them when the probe's answer is all it has: the two must agree
+    /// about the same window.
+    #[test]
+    fn pane_size_prefers_reported_pixels() {
+        assert_eq!(
+            pane_pixels(Some((800, 600)), Some((1024, 768)), (80, 24), (10, 20)),
+            (800, 600)
+        );
+        assert_eq!(
+            pane_pixels(None, Some((1024, 768)), (80, 24), (10, 20)),
+            (1024, 768)
+        );
+        assert_eq!(pane_pixels(None, None, (80, 24), (10, 20)), (800, 480));
+        assert_eq!(derived_cell(Some((1024, 768)), (80, 24)), Some((12, 32)));
+        assert_eq!(derived_cell(None, (80, 24)), None);
+        assert_eq!(derived_cell(Some((1024, 768)), (0, 24)), None);
     }
 
     #[test]

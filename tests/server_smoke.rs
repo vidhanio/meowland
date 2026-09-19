@@ -94,3 +94,26 @@ fn xwayland_gives_clients_a_working_display() {
         server.log()
     );
 }
+
+/// A server that has just been asked to stop is still on its way out, and its
+/// socket is still open: starting a new one has to wait for that to finish and
+/// then try again rather than give up on the first refusal.
+#[test]
+fn a_server_starts_right_after_one_is_stopped() {
+    let server = Server::start();
+    let stop = server.cli(&["server", "stop"]);
+    assert!(
+        stop.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let start = server.cli(&["server", "start"]);
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    // The restarted server answers control requests; `list` panics if it does
+    // not.
+    let _ = server.list();
+}

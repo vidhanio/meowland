@@ -156,3 +156,47 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
         "the pane did not say why it left: {text:?}"
     );
 }
+
+/// A pane killed from outside hands the terminal back: raw mode, the
+/// alternate screen and mouse reporting all outlive a default-action death,
+/// and the shell that comes after it has no way to undo them.
+#[test]
+fn a_signalled_pane_restores_the_terminal() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let toplevel = client.create_toplevel("signal test", "meowland.test");
+    let rgb = gradient();
+    let (buffer, _file) = client.shm_buffer_with_file(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&toplevel, buffer, SIDE, SIDE);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
+
+    let mut pty = Pty::open(2, 2, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["attach", "1"])
+            .env("XDG_RUNTIME_DIR", &server.runtime),
+    );
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(&mut pty, &mut terminal, &mut child, &rgb, "the first frame");
+
+    child.signal(rustix::process::Signal::TERM);
+    assert!(
+        wait_for(Duration::from_secs(10), || child
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "pane did not exit after SIGTERM"
+    );
+    let text = String::from_utf8_lossy(&pty.read_now()).into_owned();
+    assert!(
+        text.contains("\x1b[?1049l"),
+        "the alternate screen was not left: {text:?}"
+    );
+    assert!(
+        text.contains("\x1b[?1003l"),
+        "mouse reporting was left on: {text:?}"
+    );
+}

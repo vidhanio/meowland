@@ -69,12 +69,17 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// client is told it may draw again instead of waiting on a pane that may be
 /// stuck writing to a terminal that stopped reading.  Long enough that a slow
 /// terminal still gets its frames, short enough that a client never freezes.
+/// The pane then stays behind until it acknowledges one, so a slow terminal
+/// costs itself frames and nothing else.
 const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// A window no pane shows still has to keep drawing, or it could never be
 /// attached to.  It gets frame callbacks at the same rate.
 const IDLE_INTERVAL: Duration = Duration::from_millis(16);
-const MAX_SURFACE_SIDE: u32 = 8192;
-const MAX_SURFACE_PIXELS: usize = 16_000_000;
+/// Largest surface side and pixel count the compositor will copy; the pane
+/// protocol's size gate uses the same limits, so a pane can never be told a
+/// size its clients' buffers would be refused at.
+pub const MAX_SURFACE_SIDE: u32 = 8192;
+pub const MAX_SURFACE_PIXELS: usize = 16_000_000;
 /// Each modifier bit a stroke can carry, with the Linux input code of the key
 /// that holds it down while the stroke is sent.
 const MODIFIER_KEYS: [(u8, u16); 4] = [
@@ -200,14 +205,26 @@ struct Snapshot {
     opaque: bool,
 }
 
+/// Where a pane is with the frame it was last given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameState {
+    /// Nothing in flight: the next frame can go out.
+    Ready,
+    /// A frame is with the pane until it acknowledges it.
+    InFlight,
+    /// The pane never took the frame it was given, so it is behind and nothing
+    /// is rendered for it until it acknowledges one.
+    Behind,
+}
+
 struct PaneState {
     window: u64,
     width: u32,
     height: u32,
-    /// A frame is with the pane until it acknowledges it.
-    in_flight: bool,
-    /// When that frame was handed over, so one that is never acknowledged can
-    /// be given up on instead of freezing the client that is waiting on it.
+    frame: FrameState,
+    /// When the frame in flight was handed over, so one that is never
+    /// acknowledged can be given up on instead of freezing the client that is
+    /// waiting on it.
     sent: Instant,
     /// Acks for frames that were given up on, which say nothing about the
     /// frame that is in flight now.
@@ -230,7 +247,7 @@ impl PaneState {
             window,
             width,
             height,
-            in_flight: false,
+            frame: FrameState::Ready,
             sent: Instant::now(),
             stale_acks: 0,
             dirty: false,
@@ -341,13 +358,15 @@ impl CompositorHandler for State {
                 let bound = self.pane_bound(surface);
                 // The pixels of the snapshot this one replaces are the next
                 // snapshot's storage: a client redrawing at a steady size then
-                // never allocates (or faults in) a frame buffer again.
-                let reuse = self
-                    .snapshots
-                    .remove(surface)
-                    .map_or_else(Vec::new, |old| old.pixels);
+                // never allocates (or faults in) a frame buffer again.  A
+                // buffer that cannot be copied leaves the storage to the
+                // snapshot already on screen, which stays there.
+                let mut previous = self.snapshots.remove(surface);
+                let mut reuse = previous
+                    .as_mut()
+                    .map_or_else(Vec::new, |old| std::mem::take(&mut old.pixels));
                 let snapshot = with_buffer_contents(&buffer, |ptr, len, data| {
-                    copy_buffer(ptr, len, &data, bound, reuse)
+                    copy_buffer(ptr, len, &data, bound, &mut reuse)
                 })
                 .ok()
                 .flatten();
@@ -357,7 +376,10 @@ impl CompositorHandler for State {
                         self.snapshots.insert(surface.clone(), snapshot);
                     }
                     None => {
-                        self.snapshots.remove(surface);
+                        if let Some(mut previous) = previous {
+                            previous.pixels = reuse;
+                            self.snapshots.insert(surface.clone(), previous);
+                        }
                     }
                 }
             }
@@ -383,14 +405,17 @@ impl CompositorHandler for State {
 impl State {
     /// How large a buffer for this surface may be: at most twice the size of
     /// the panes showing its window, so a resize can be in flight, and
-    /// unbounded when no pane shows it yet.
+    /// unbounded when no pane shows it yet.  The two axes are taken
+    /// independently: the tallest pane may not be the widest one.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
         let window = self.window_for_surface(surface)?;
         self.panes
             .values()
             .filter(|pane| pane.window == window)
-            .map(|pane| (pane.width * 2, pane.height * 2))
-            .max_by_key(|(width, _)| *width)
+            .fold(None, |bound: Option<(u32, u32)>, pane| {
+                let pane = (pane.width * 2, pane.height * 2);
+                Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))))
+            })
     }
 
     /// The window a surface belongs to: the toplevel itself, one of its
@@ -477,16 +502,19 @@ impl State {
     }
 
     fn mark_dirty(&mut self, pane: u64) {
-        let in_flight = match self.panes.get_mut(&pane) {
+        let deferred = match self.panes.get_mut(&pane) {
             Some(state) => {
-                if state.in_flight {
+                // A frame is with the pane, or the pane never took the last
+                // one: either way the scene change is remembered rather than
+                // turned into a frame now.
+                if state.frame != FrameState::Ready {
                     state.dirty = true;
                 }
-                state.in_flight
+                state.frame != FrameState::Ready
             }
             None => return,
         };
-        if !in_flight {
+        if !deferred {
             self.pending.insert(pane);
         }
     }
@@ -507,6 +535,47 @@ impl State {
         self.panes.insert(pane, entry);
         if self.panes.keys().min() == Some(&pane) {
             configure_output(self, width, height);
+        }
+    }
+
+    /// Take a pane out of the compositor, wherever it is going: the window it
+    /// showed is returned, and the output goes back to the panes that are
+    /// left.  Everything keyed by a pane lives here so no removal path can
+    /// leave a stale entry behind.
+    fn remove_pane(&mut self, pane: u64) -> Option<u64> {
+        let first = self.panes.keys().min() == Some(&pane);
+        let window = self.panes.remove(&pane).map(|state| state.window);
+        self.pending.remove(&pane);
+        self.following.remove(&pane);
+        self.deciding.retain(|_, deciding| *deciding != pane);
+        if self.cursor_pane == Some(pane) {
+            self.cursor_pane = None;
+        }
+        if self.cursor_shape_pane == Some(pane) {
+            self.cursor_shape_pane = None;
+        }
+        if first && let Some((_, next)) = self.panes.iter().min_by_key(|(pane, _)| **pane) {
+            configure_output(self, next.width, next.height);
+        }
+        window
+    }
+
+    /// What removing a pane means for the window it was showing: it is no
+    /// longer drawn anywhere, and the focus moves to whichever pane is left.
+    fn release_pane_window(&mut self, pane: u64) {
+        let Some(window) = self.remove_pane(pane) else {
+            return;
+        };
+        self.leave_output(window);
+        if self.focused == Some(window)
+            && let Some(next) = self
+                .panes
+                .iter()
+                .min_by_key(|(pane, _)| **pane)
+                .map(|(_, pane)| pane.window)
+                .filter(|window| *window != 0)
+        {
+            self.focus_window(next);
         }
     }
 
@@ -676,8 +745,7 @@ impl XdgShellHandler for State {
                 // The title belonged to the window that just went away.
                 self.send_title(pane, 0);
             } else {
-                self.panes.remove(&pane);
-                self.pending.remove(&pane);
+                self.remove_pane(pane);
                 let _ = self.events.send(Event::Release {
                     pane,
                     reason: "window closed".into(),
@@ -697,6 +765,11 @@ impl XdgShellHandler for State {
                 .filter(|(_, entry)| entry.announced)
                 .map(|(id, _)| *id)
                 .max();
+            // A pane that follows the newest window follows the one that is
+            // left, rather than sitting on an empty pane.
+            if let Some(newest) = self.newest {
+                self.follow_panes(newest);
+            }
         }
         self.popups.cleanup();
         if self.focused == Some(id) {
@@ -1053,29 +1126,7 @@ fn handle_command(state: &mut State, command: Command) {
             width,
             height,
         } => attach(state, pane, show, width, height),
-        Command::Detach { pane } => {
-            let first = state.panes.keys().min() == Some(&pane);
-            let window = state.panes.remove(&pane).map(|state| state.window);
-            state.pending.remove(&pane);
-            state.following.remove(&pane);
-            state.deciding.retain(|_, deciding| *deciding != pane);
-            if first && let Some((_, next)) = state.panes.iter().min_by_key(|(pane, _)| **pane) {
-                configure_output(state, next.width, next.height);
-            }
-            if let Some(window) = window {
-                state.leave_output(window);
-                if state.focused == Some(window)
-                    && let Some(next) = state
-                        .panes
-                        .iter()
-                        .min_by_key(|(pane, _)| **pane)
-                        .map(|(_, pane)| pane.window)
-                        .filter(|window| *window != 0)
-                {
-                    state.focus_window(next);
-                }
-            }
-        }
+        Command::Detach { pane } => state.release_pane_window(pane),
         Command::Resize {
             pane,
             width,
@@ -1100,15 +1151,23 @@ fn handle_command(state: &mut State, command: Command) {
             };
             // An ack for a frame that was given up on says nothing about the
             // one in flight now, so it only takes itself out of the count.
-            if entry.stale_acks > 0 {
+            let given_up = entry.stale_acks > 0;
+            if given_up {
                 entry.stale_acks -= 1;
+            } else if entry.frame != FrameState::InFlight {
+                // An ack that answers nothing is a duplicate or a stray:
+                // acting on it would take a frame that is in flight for
+                // delivered.
                 return;
             }
-            entry.in_flight = false;
+            entry.frame = FrameState::Ready;
+            // Whatever the pane was behind on, it is reading one more frame
+            // now, so the scene it missed is due: everything drawn since then
+            // was held in `dirty` rather than rendered.
             entry.shown_stale = !drawn;
             let dirty = std::mem::take(&mut entry.dirty);
             let window = entry.window;
-            if dirty {
+            if dirty || given_up {
                 state.mark_dirty(pane);
             }
             if window != 0 {
@@ -1195,10 +1254,12 @@ fn dispatch_frames(state: &mut State) {
         .iter()
         .copied()
         .filter(|pane| {
+            // A pane that is behind stays in `pending` until it acknowledges
+            // one: the frame it wanted is not worth rendering yet.
             state
                 .panes
                 .get(pane)
-                .is_some_and(|entry| now >= entry.next_frame)
+                .is_some_and(|entry| entry.frame != FrameState::Behind && now >= entry.next_frame)
         })
         .collect();
     for pane in due {
@@ -1206,7 +1267,7 @@ fn dispatch_frames(state: &mut State) {
         let Some((window, in_flight)) = state
             .panes
             .get(&pane)
-            .map(|entry| (entry.window, entry.in_flight))
+            .map(|entry| (entry.window, entry.frame == FrameState::InFlight))
         else {
             continue;
         };
@@ -1233,7 +1294,7 @@ fn dispatch_frames(state: &mut State) {
         if changed {
             if let Some(entry) = state.panes.get_mut(&pane) {
                 entry.shown.clone_from(&buffer);
-                entry.in_flight = true;
+                entry.frame = FrameState::InFlight;
                 entry.sent = now;
             }
             let _ = state.events.send(Event::Frame {
@@ -1265,16 +1326,23 @@ fn expire_frames(state: &mut State) {
     let expired: Vec<u64> = state
         .panes
         .iter()
-        .filter(|(_, entry)| entry.in_flight && now.duration_since(entry.sent) >= ACK_TIMEOUT)
+        .filter(|(_, entry)| {
+            entry.frame == FrameState::InFlight && now.duration_since(entry.sent) >= ACK_TIMEOUT
+        })
         .map(|(pane, _)| *pane)
         .collect();
     for pane in expired {
         let Some(entry) = state.panes.get_mut(&pane) else {
             continue;
         };
-        entry.in_flight = false;
         entry.stale_acks += 1;
+        // The pane is behind: whatever it is shown next waits for its ack.
+        // Rendering frame after frame for a terminal that cannot take them
+        // only adds work to the slowest part of the pipeline, and the scene
+        // that matters is the one rendered when the pane comes back.
+        entry.frame = FrameState::Behind;
         entry.shown_stale = true;
+        entry.dirty = true;
         let window = entry.window;
         if window != 0 {
             send_frame_callbacks(state, window);
@@ -1298,9 +1366,11 @@ fn idle_callbacks(state: &mut State) {
         .map(|(id, _)| *id)
         .collect();
     for window in due {
-        if send_frame_callbacks(state, window)
-            && let Some(entry) = state.windows.get_mut(&window)
-        {
+        // The check itself is the cost here, so a window that had nothing to
+        // send waits for the idle clock rather than being looked at on every
+        // pass of the loop.
+        send_frame_callbacks(state, window);
+        if let Some(entry) = state.windows.get_mut(&window) {
             entry.callback_due = now + IDLE_INTERVAL;
         }
     }
@@ -1365,24 +1435,41 @@ fn render_frame(state: &mut State, pane: u64) -> Option<Vec<u8>> {
 fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
     let mut stack = Vec::new();
     collect_surface(root, (0, 0).into(), &mut stack);
-    // A popup is positioned relative to the window geometry the client set,
-    // while a pane draws from the surface origin.
-    let geometry = with_states(root, |states| {
+    let geometry = window_geometry(root);
+    let mut popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
+    // The manager lists children before their parents; drawing runs bottom to
+    // top, so parents and older siblings come first.
+    popups.reverse();
+    for (popup, location) in popups {
+        let origin = popup_origin(geometry, location, &popup);
+        collect_surface(popup.wl_surface(), origin, &mut stack);
+    }
+    stack
+}
+
+/// The origin of the window geometry a client set on a surface, which is what
+/// a popup's position is measured against.
+fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
+    with_states(surface, |states| {
         states
             .cached_state
             .get::<SurfaceCachedState>()
             .current()
             .geometry
             .map_or_else(|| (0, 0).into(), |geometry| geometry.loc)
-    });
-    let mut popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
-    // The manager lists children before their parents; drawing runs bottom to
-    // top, so parents and older siblings come first.
-    popups.reverse();
-    for (popup, location) in popups {
-        collect_surface(popup.wl_surface(), geometry + location, &mut stack);
-    }
-    stack
+    })
+}
+
+/// Where a popup's surface starts in pane coordinates.  `location` is where
+/// the popup sits against the parent's window geometry, and the popup's own
+/// window geometry sits inside the surface it draws from, so it comes back
+/// off: a pane draws a surface from its own origin, not from its geometry.
+fn popup_origin(
+    parent_geometry: Point<i32, Logical>,
+    location: Point<i32, Logical>,
+    popup: &PopupKind,
+) -> Point<i32, Logical> {
+    parent_geometry + location - popup.geometry().loc
 }
 
 fn collect_surface(
@@ -1707,22 +1794,16 @@ fn point_in_popups(state: &State, window: u64, x: f64, y: f64) -> bool {
     else {
         return false;
     };
-    let geometry = with_states(&root, |states| {
-        states
-            .cached_state
-            .get::<SurfaceCachedState>()
-            .current()
-            .geometry
-            .map_or_else(|| (0, 0).into(), |geometry| geometry.loc)
-    });
+    let geometry = window_geometry(&root);
     PopupManager::popups_for_surface(&root).any(|(popup, location)| {
         let surface = popup.wl_surface();
         let Some(snapshot) = state.snapshots.get(surface) else {
             return false;
         };
         let (_, dst) = extents(snapshot, viewport_of(surface));
-        let left = f64::from(geometry.x) + f64::from(location.x);
-        let top = f64::from(geometry.y) + f64::from(location.y);
+        let origin = popup_origin(geometry, location, &popup);
+        let left = f64::from(origin.x);
+        let top = f64::from(origin.y);
         x >= left && y >= top && x < left + f64::from(dst.w) && y < top + f64::from(dst.h)
     })
 }
@@ -1833,8 +1914,9 @@ fn configure_output(state: &mut State, width: u32, height: u32) {
 
 /// Copy a committed shm buffer into an owned snapshot, in `r, g, b, a` order.
 ///
-/// `reuse` is the storage of the snapshot this one replaces, or empty; it is
-/// resized and overwritten whole.
+/// `pixels` is the storage of the snapshot this one replaces, or empty; it is
+/// resized and overwritten whole, and left with the caller (emptied) when the
+/// buffer cannot be used.
 #[expect(
     unsafe_code,
     reason = "the shm pool is only reachable as a raw pointer, so reading it takes one \
@@ -1845,7 +1927,7 @@ fn copy_buffer(
     len: usize,
     data: &smithay::wayland::shm::BufferData,
     bound: Option<(u32, u32)>,
-    reuse: Vec<u8>,
+    pixels: &mut Vec<u8>,
 ) -> Option<Snapshot> {
     if !matches!(
         data.format,
@@ -1882,8 +1964,13 @@ fn copy_buffer(
     // the pixels are copied out here and the reference ends with this function.
     let source = unsafe { std::slice::from_raw_parts(ptr, len) };
     let row_bytes = width as usize * 4;
-    let mut pixels = reuse;
-    pixels.resize(row_bytes * height as usize, 0);
+    let needed = row_bytes * height as usize;
+    pixels.resize(needed, 0);
+    // A surface that once drew large must not pin that memory for as long as
+    // it lives: reuse is worth an allocation, not a page's worth of them.
+    if pixels.capacity() >= needed.saturating_mul(4).max(1 << 20) {
+        pixels.shrink_to_fit();
+    }
     let xrgb = data.format == wl_shm::Format::Xrgb8888;
     let mut opaque = true;
     for y in 0..height as usize {
@@ -1908,7 +1995,7 @@ fn copy_buffer(
     Some(Snapshot {
         width,
         height,
-        pixels,
+        pixels: std::mem::take(pixels),
         opaque,
     })
 }
@@ -1935,8 +2022,10 @@ mod tests {
             stride: STRIDE as i32,
             offset: 0,
         };
-        let copy = |format, reuse| {
-            copy_buffer(raw.as_ptr(), raw.len(), &data(format), None, reuse).expect("a 2x2 buffer")
+        let copy = |format, reuse: Vec<u8>| {
+            let mut reuse = reuse;
+            copy_buffer(raw.as_ptr(), raw.len(), &data(format), None, &mut reuse)
+                .expect("a 2x2 buffer")
         };
 
         let argb = copy(wl_shm::Format::Argb8888, Vec::new());

@@ -337,6 +337,12 @@ impl PtyChild {
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.0.try_wait()
     }
+
+    /// Send the pane process a signal, the way a shell or the server would.
+    pub fn signal(&self, signal: rustix::process::Signal) {
+        let pid = rustix::process::Pid::from_raw(i32::try_from(self.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
+    }
 }
 
 impl Drop for PtyChild {

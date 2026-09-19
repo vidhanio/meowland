@@ -7,6 +7,7 @@
 //! `benches/` can measure the encoder and the wire codec.
 
 pub mod compositor;
+pub mod diag;
 pub mod kitty;
 pub mod protocol;
 pub mod server;

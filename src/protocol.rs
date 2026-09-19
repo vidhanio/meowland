@@ -27,6 +27,15 @@ pub mod modifiers {
     pub const CONTROL: u8 = 2;
     pub const ALT: u8 = 4;
     pub const SUPER: u8 = 8;
+
+    /// Whether a key carrying these modifiers is a compositor binding.
+    ///
+    /// Alt alone is one, so a client can still receive the same key from any
+    /// terminal that reports Ctrl or Super with it.
+    #[must_use]
+    pub const fn alt_only(modifiers: u8) -> bool {
+        modifiers & (CONTROL | SUPER) == 0 && modifiers & ALT != 0
+    }
 }
 
 /// The keys a pane treats as compositor bindings, in Linux input codes.
@@ -201,12 +210,23 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
     })
 }
 
+/// Strip the control characters that would let a window title drive the
+/// terminal, keeping at most [`SANITIZE`] characters.
 #[must_use]
 pub fn sanitize(input: &str) -> String {
+    sanitize_with_limit(input, SANITIZE)
+}
+
+/// The length [`sanitize`] keeps.
+const SANITIZE: usize = 256;
+
+/// [`sanitize`] with the caller's own length limit.
+#[must_use]
+pub fn sanitize_with_limit(input: &str, limit: usize) -> String {
     input
         .chars()
         .filter(|c| !c.is_control())
-        .take(256)
+        .take(limit)
         .collect()
 }
 

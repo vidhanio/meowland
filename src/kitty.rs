@@ -18,6 +18,11 @@ use flate2::{Compression, write::ZlibEncoder};
 use rustix::{fs::Mode, shm};
 
 const MAX_PATCHES: usize = 32;
+/// Whole frames a terminal may leave unread before the shared object is
+/// cleared and the frame goes down the pty instead.  A terminal that is a
+/// frame behind catches up well inside this; one that never does must not
+/// freeze the pane.
+const DROP_LIMIT: u32 = 30;
 const CHUNK: usize = 4096;
 /// Payload bytes whose base64 is exactly one chunk: 4 characters per 3 bytes,
 /// and a chunk has to be a whole number of base64 quanta.
@@ -133,6 +138,9 @@ pub struct Presenter {
     /// Whether the last frame handed to [`Presenter::present`] was dropped
     /// rather than drawn.
     dropped: bool,
+    /// Whole frames dropped in a row because the terminal had not read the
+    /// shared object yet.
+    drops: u32,
 }
 
 #[derive(Debug)]
@@ -164,6 +172,17 @@ impl Presenter {
             shared,
             compressed: Vec::new(),
             dropped: false,
+            drops: 0,
+        }
+    }
+
+    /// Replace the grid patches are aligned to.  A grid that changed makes the
+    /// patches on the screen meaningless, so the next frame is sent whole.
+    pub fn set_cell_size(&mut self, cell_size: Option<(u16, u16)>) {
+        if self.cell_size != cell_size {
+            self.cell_size = cell_size;
+            self.base = None;
+            self.patch_count = 0;
         }
     }
 
@@ -180,6 +199,9 @@ impl Presenter {
     /// invalid buffer is ignored and returns an empty update.
     #[must_use]
     pub fn present(&mut self, width: u32, height: u32, rgb: Vec<u8>) -> Vec<u8> {
+        // Every call decides again: a call that returns without writing leaves
+        // the flag saying what *this* call did, not what the last one did.
+        self.dropped = false;
         let pixels = usize::try_from(width)
             .ok()
             .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
@@ -198,7 +220,6 @@ impl Presenter {
             height,
             pixels: Arc::new(rgb),
         };
-        self.dropped = false;
 
         // Superseded patches are always deleted before the next ones are
         // drawn, so the live patch ids are exactly `2 ..= patch_count + 1`.
@@ -221,6 +242,10 @@ impl Presenter {
         // front of it, which is how a terminal that fell behind stays behind.
         // The frame is dropped instead — the next one supersedes it — and the
         // ack says so, so the compositor knows the pane is a frame behind.
+        // A terminal that never reads the object, though, would drop every
+        // whole frame for the rest of the session, so a run of drops clears
+        // the object and takes the pty for this frame: the pane stays on the
+        // session's newest scene either way.
         let slot = self.shared.as_ref();
         let mut file = None;
         if patches.is_none()
@@ -228,8 +253,15 @@ impl Presenter {
         {
             file = slot.create();
             if file.is_none() {
-                self.dropped = true;
-                return Vec::new();
+                self.drops += 1;
+                if self.drops < DROP_LIMIT {
+                    self.dropped = true;
+                    return Vec::new();
+                }
+                self.drops = 0;
+                slot.clear();
+            } else {
+                self.drops = 0;
             }
         }
 
@@ -393,7 +425,11 @@ fn extract(frame: &Frame, rect: Rect) -> Vec<u8> {
 }
 
 fn move_cursor(out: &mut Vec<u8>, x: u32, y: u32, cell_size: Option<(u16, u16)>) {
-    let (cell_w, cell_h) = cell_size.map_or((1, 1), |(w, h)| (u32::from(w), u32::from(h)));
+    // A grid without cells is a grid of one pixel per cell, and a cell of
+    // nothing is not one at all: the two callers that can supply a cell size
+    // both reject zero, and this is where that would divide by it.
+    let (cell_w, cell_h) =
+        cell_size.map_or((1, 1), |(w, h)| (u32::from(w).max(1), u32::from(h).max(1)));
     let col = x / cell_w + 1;
     let row = y / cell_h + 1;
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
@@ -1154,6 +1190,73 @@ mod tests {
         );
         replay.feed(&update);
         assert_eq!(replay.screen(), second);
+    }
+
+    /// A frame that is dropped must not leave the pane reporting `drawn:
+    /// false` for the next frame that needs nothing drawn: the compositor
+    /// would keep re-sending frames nothing changes.
+    #[test]
+    fn an_unchanged_frame_after_a_drop_is_not_reported_dropped() {
+        let Some(shared) = shared_memory() else {
+            return;
+        };
+        let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
+        let first = noise(&mut 3, 4 * 2 * 3);
+        assert!(!presenter.present(4, 2, first.clone()).is_empty());
+        assert!(!presenter.dropped(), "the first frame is drawn");
+
+        // Nothing has read the first frame, so the next whole one is dropped.
+        let second = noise(&mut 5, 4 * 4 * 3);
+        assert!(presenter.present(4, 4, second).is_empty());
+        assert!(presenter.dropped());
+
+        // The frame that is on screen is the one the pane already holds, so
+        // there is nothing to draw, which is not the same as a drop.
+        assert!(presenter.present(4, 2, first).is_empty());
+        assert!(!presenter.dropped());
+    }
+
+    /// A terminal that answers the probe but never reads the object must not
+    /// be able to freeze the pane: after a run of drops the object is cleared
+    /// and the frame goes down the pty.
+    #[test]
+    fn a_slot_that_is_never_read_falls_back_to_the_pty() {
+        let Some(shared) = shared_memory() else {
+            return;
+        };
+        let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
+        let mut replay = Replay::new(4, 4, (2, 2));
+        replay.read_shared = false;
+        let mut frame = vec![0; 4 * 4 * 3];
+        let first = presenter.present(4, 4, frame.clone());
+        replay.feed(&first);
+        assert!(!presenter.dropped());
+
+        for step in 1..DROP_LIMIT {
+            // Differences in every cell cannot be patched, so each of these
+            // needs the shared object.
+            frame.fill(step as u8);
+            let update = presenter.present(4, 4, frame.clone());
+            assert!(update.is_empty(), "step {step} wrote something");
+            assert!(
+                presenter.dropped(),
+                "step {step} did not say it was dropped"
+            );
+        }
+
+        // The run is over: this frame is not dropped but drawn.
+        frame.fill(0xab);
+        let update = presenter.present(4, 4, frame.clone());
+        assert!(!update.is_empty(), "the fallback frame must be drawn");
+        assert!(!presenter.dropped());
+        assert!(
+            whole_frames(&update)
+                .iter()
+                .all(|control| !control.contains("t=s")),
+            "the fallback is a pty frame: {update:?}"
+        );
+        replay.feed(&update);
+        assert_eq!(replay.screen(), frame);
     }
 
     #[test]

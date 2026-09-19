@@ -300,10 +300,11 @@ fn shared_memory(c: &mut Criterion) {
         );
     });
 
-    // A terminal that has not read the object yet: the second frame has to go
-    // over the pty instead, which is what keeps the two transfers in order.
+    // A terminal that has not read the object yet is behind: the second frame
+    // is dropped rather than pushed down the pty, which would be ten times the
+    // bytes in front of it.
     group.throughput(Throughput::Bytes((BYTES * 2) as u64));
-    group.bench_function("unread_falls_back_1080p", |b| {
+    group.bench_function("unread_drops_1080p", |b| {
         b.iter_batched(
             || {
                 (
@@ -314,7 +315,9 @@ fn shared_memory(c: &mut Criterion) {
             },
             |(mut presenter, first, second)| {
                 black_box(presenter.present(WIDTH, HEIGHT, first));
-                black_box(presenter.present(WIDTH, HEIGHT, second))
+                let dropped = presenter.present(WIDTH, HEIGHT, second);
+                assert!(dropped.is_empty() && presenter.dropped(), "not dropped");
+                black_box(dropped)
             },
             BatchSize::LargeInput,
         );

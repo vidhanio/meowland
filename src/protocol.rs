@@ -1,9 +1,22 @@
-use std::io::{self, Read, Write};
+use std::{
+    cell::RefCell,
+    io::{self, Read, Write},
+};
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+
+/// The length prefix every message carries, in bytes.
+const HEADER: usize = 4;
+
+thread_local! {
+    /// Storage for one message, kept for the next one this thread sends or
+    /// receives.  A frame is megabytes: allocating (and so faulting in) a
+    /// buffer of that size per message is a per-frame cost on both sides.
+    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// The modifier bits a pane packs into [`Input::Key`], one per modifier.
 ///
@@ -75,7 +88,13 @@ pub enum PaneToServer {
         cell_width: Option<u16>,
         cell_height: Option<u16>,
     },
-    Ack,
+    /// The pane has taken the frame it was sent.  `drawn` says whether its
+    /// terminal now shows it: a frame the pane dropped (because the terminal
+    /// was still reading the last one) leaves the compositor's idea of the
+    /// pane's screen stale, and it has to keep sending until one lands.
+    Ack {
+        drawn: bool,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -115,19 +134,35 @@ pub enum ControlResponse {
 /// Returns an error when the message does not encode, when it is larger than
 /// [`MAX_MESSAGE`], or when the writer fails.
 pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
-    let encoded = bincode::serde::encode_to_vec(
-        value,
-        bincode::config::standard().with_limit::<MAX_MESSAGE>(),
-    )
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if encoded.len() > MAX_MESSAGE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "message too large",
-        ));
-    }
-    writer.write_all(&(encoded.len() as u32).to_le_bytes())?;
-    writer.write_all(&encoded)
+    SCRATCH.with_borrow_mut(|buffer| {
+        loop {
+            // The buffer's length is the room this thread remembers for a message;
+            // it is never shortened, so a steady stream of frames encodes into the
+            // same allocation.
+            if buffer.len() < HEADER {
+                buffer.resize(HEADER, 0);
+            }
+            let config = bincode::config::standard().with_limit::<MAX_MESSAGE>();
+            match bincode::serde::encode_into_slice(value, &mut buffer[HEADER..], config) {
+                Ok(size) => {
+                    if size > MAX_MESSAGE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "message too large",
+                        ));
+                    }
+                    buffer[..HEADER].copy_from_slice(&(size as u32).to_le_bytes());
+                    return writer.write_all(&buffer[..HEADER + size]);
+                }
+                // The message outgrew the room; the next round has twice as much.
+                Err(bincode::error::EncodeError::UnexpectedEnd) => {
+                    let grown = (buffer.len() * 2).max(1024);
+                    buffer.resize(grown, 0);
+                }
+                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        }
+    })
 }
 
 /// Read one length-prefixed message.
@@ -137,7 +172,7 @@ pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> 
 /// than [`MAX_MESSAGE`] bytes, when the body is truncated, or when it does not
 /// decode as exactly one value of the requested type.
 pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<T> {
-    let mut header = [0; 4];
+    let mut header = [0; HEADER];
     reader.read_exact(&mut header)?;
     let size = u32::from_le_bytes(header) as usize;
     if size > MAX_MESSAGE {
@@ -146,20 +181,24 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
             "message too large",
         ));
     }
-    let mut encoded = vec![0; size];
-    reader.read_exact(&mut encoded)?;
-    let (value, used) = bincode::serde::decode_from_slice(
-        &encoded,
-        bincode::config::standard().with_limit::<MAX_MESSAGE>(),
-    )
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if used != size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trailing message bytes",
-        ));
-    }
-    Ok(value)
+    SCRATCH.with_borrow_mut(|buffer| {
+        if buffer.len() < size {
+            buffer.resize(size, 0);
+        }
+        reader.read_exact(&mut buffer[..size])?;
+        let (value, used) = bincode::serde::decode_from_slice(
+            &buffer[..size],
+            bincode::config::standard().with_limit::<MAX_MESSAGE>(),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if used != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trailing message bytes",
+            ));
+        }
+        Ok(value)
+    })
 }
 
 #[must_use]
@@ -203,5 +242,34 @@ mod tests {
     #[test]
     fn strips_untrusted_terminal_controls() {
         assert_eq!(sanitize("abc\x1b[31m\n"), "abc[31m");
+    }
+
+    /// The framing is a length prefix over a plain bincode encoding: both
+    /// sides of the pane socket have to keep agreeing on it byte for byte, and
+    /// the buffer `send` reuses must not leak one message into the next.
+    #[test]
+    fn framing_is_a_length_prefix_over_bincode() {
+        let value = ServerToPane::Frame {
+            width: 3,
+            height: 2,
+            rgb: vec![1, 2, 3, 4, 5, 6],
+        };
+        let mut framed = Vec::new();
+        send(&mut framed, &value).unwrap();
+        let body = bincode::serde::encode_to_vec(
+            &value,
+            bincode::config::standard().with_limit::<MAX_MESSAGE>(),
+        )
+        .unwrap();
+        let mut expected = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        expected.extend_from_slice(&body);
+        assert_eq!(framed, expected);
+
+        let mut small = Vec::new();
+        send(&mut small, &PaneToServer::Ack { drawn: false }).unwrap();
+        assert!(matches!(
+            recv::<PaneToServer>(&mut small.as_slice()).unwrap(),
+            PaneToServer::Ack { drawn: false }
+        ));
     }
 }

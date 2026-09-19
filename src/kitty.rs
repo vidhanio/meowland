@@ -19,6 +19,9 @@ use rustix::{fs::Mode, shm};
 
 const MAX_PATCHES: usize = 32;
 const CHUNK: usize = 4096;
+/// Payload bytes whose base64 is exactly one chunk: 4 characters per 3 bytes,
+/// and a chunk has to be a whole number of base64 quanta.
+const CHUNK_PAYLOAD: usize = CHUNK / 4 * 3;
 const SCREEN_ID: u32 = 1;
 const FIRST_PATCH_ID: u32 = 2;
 /// The image id of the one-pixel query that discovers shared-memory support.
@@ -79,11 +82,16 @@ impl SharedMemory {
         .map(File::from)
     }
 
-    /// Hand a whole frame over, or report that it has to go the pty's way.
-    fn transfer(&self, out: &mut Vec<u8>, width: u32, height: u32, pixels: &[u8]) -> bool {
-        let Some(mut file) = self.create() else {
-            return false;
-        };
+    /// Hand a whole frame over in an object `file` names, or report that it
+    /// has to go the pty's way.
+    fn transfer(
+        &self,
+        out: &mut Vec<u8>,
+        mut file: File,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> bool {
         if file.write_all(pixels).is_err() {
             self.clear();
             return false;
@@ -119,6 +127,12 @@ pub struct Presenter {
     base: Option<Frame>,
     patch_count: usize,
     shared: Option<SharedMemory>,
+    /// The last compressed payload, kept so a frame does not allocate a fresh
+    /// one (and fault its pages in) every time.
+    compressed: Vec<u8>,
+    /// Whether the last frame handed to [`Presenter::present`] was dropped
+    /// rather than drawn.
+    dropped: bool,
 }
 
 #[derive(Debug)]
@@ -148,7 +162,16 @@ impl Presenter {
             base: None,
             patch_count: 0,
             shared,
+            compressed: Vec::new(),
+            dropped: false,
         }
+    }
+
+    /// Whether the last frame was dropped instead of drawn, which happens
+    /// when the terminal is still reading the previous one.
+    #[must_use]
+    pub const fn dropped(&self) -> bool {
+        self.dropped
     }
 
     /// Encode a complete frame or a bounded set of cell-aligned patches.
@@ -175,8 +198,7 @@ impl Presenter {
             height,
             pixels: Arc::new(rgb),
         };
-        let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(b"\x1b[?2026h");
+        self.dropped = false;
 
         // Superseded patches are always deleted before the next ones are
         // drawn, so the live patch ids are exactly `2 ..= patch_count + 1`.
@@ -193,6 +215,27 @@ impl Presenter {
             _ => None,
         };
 
+        // A whole frame goes through shared memory when the terminal reads it.
+        // An object that is still there is one the terminal has not read: it
+        // is behind, and the pty fallback would put ten times the bytes in
+        // front of it, which is how a terminal that fell behind stays behind.
+        // The frame is dropped instead — the next one supersedes it — and the
+        // ack says so, so the compositor knows the pane is a frame behind.
+        let slot = self.shared.as_ref();
+        let mut file = None;
+        if patches.is_none()
+            && let Some(slot) = slot
+        {
+            file = slot.create();
+            if file.is_none() {
+                self.dropped = true;
+                return Vec::new();
+            }
+        }
+
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(b"\x1b[?2026h");
+
         if let Some(rects) = patches {
             for index in 0..self.patch_count {
                 delete_image(
@@ -204,7 +247,15 @@ impl Presenter {
                 let id = FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX);
                 let payload = extract(&frame, *rect);
                 move_cursor(&mut out, rect.x, rect.y, self.cell_size);
-                image(&mut out, id, rect.width, rect.height, &payload, true);
+                image(
+                    &mut out,
+                    &mut self.compressed,
+                    id,
+                    rect.width,
+                    rect.height,
+                    &payload,
+                    true,
+                );
             }
             self.patch_count = rects.len();
         } else {
@@ -212,12 +263,19 @@ impl Presenter {
             // replacement is transmitted.
             delete_all(&mut out);
             out.extend_from_slice(b"\x1b[2J\x1b[H");
-            let shared = self
-                .shared
-                .as_ref()
-                .is_some_and(|slot| slot.transfer(&mut out, width, height, &frame.pixels));
+            let shared = slot.zip(file).is_some_and(|(slot, file)| {
+                slot.transfer(&mut out, file, width, height, &frame.pixels)
+            });
             if !shared {
-                image(&mut out, SCREEN_ID, width, height, &frame.pixels, false);
+                image(
+                    &mut out,
+                    &mut self.compressed,
+                    SCREEN_ID,
+                    width,
+                    height,
+                    &frame.pixels,
+                    false,
+                );
             }
             self.patch_count = 0;
             self.base = Some(Frame {
@@ -355,29 +413,39 @@ fn transmit(id: u32, width: u32, height: u32, placement: u32) -> String {
     format!("a=T,f=24,s={width},v={height},i={id},p={placement},z=1,C=1,q=2")
 }
 
-fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], patch: bool) {
-    let compressed = compress(pixels);
-    let (payload, zlib) = compressed.as_deref().map_or((pixels, false), |candidate| {
-        if candidate.len() * 4 <= pixels.len() * 3 {
-            (candidate, true)
-        } else {
-            (pixels, false)
-        }
-    });
-    let encoded = STANDARD.encode(payload);
-    // Reserve once: growing to a whole 1080p frame in doublings copies it
-    // about twenty times.
-    out.reserve(encoded.len() + 128);
+fn image(
+    out: &mut Vec<u8>,
+    compressed: &mut Vec<u8>,
+    id: u32,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    patch: bool,
+) {
+    let zlib = compress(compressed, pixels) && compressed.len() * 4 <= pixels.len() * 3;
+    let payload: &[u8] = if zlib { compressed } else { pixels };
     let compression = if zlib { ",o=z" } else { "" };
-    let mut chunks = encoded.as_bytes().chunks(CHUNK).peekable();
+    let control = transmit(id, width, height, u32::from(patch));
+    // Reserve once: growing to a whole 1080p frame in doublings copies it
+    // about twenty times.  Every chunk carries its base64 plus the escape
+    // around it, which is what the framing term is for.
+    let chunks = payload.len().div_ceil(CHUNK_PAYLOAD).max(1);
+    out.reserve(payload.len().div_ceil(3) * 4 + chunks * (control.len() + 16));
+    // Each chunk is encoded where it goes: encoding the payload into one
+    // string and copying it out in chunks would touch every byte of a frame
+    // twice more.
+    let mut encoded = [0u8; CHUNK];
+    let mut chunks = payload.chunks(CHUNK_PAYLOAD).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
+        let bytes = STANDARD
+            .encode_slice(chunk, &mut encoded)
+            .expect("a chunk of payload always fits its base64");
         // Every chunk but the last says `m=1`; a whole image in one chunk
         // carries no `m` key at all.
         let more = chunks.peek().is_some();
         if first {
             let marker = if more { ",m=1" } else { "" };
-            let control = transmit(id, width, height, u32::from(patch));
             out.extend_from_slice(format!("\x1b_G{control}{compression}{marker};").as_bytes());
             first = false;
         } else if more {
@@ -385,17 +453,18 @@ fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], pat
         } else {
             out.extend_from_slice(b"\x1b_Gm=0;");
         }
-        out.extend_from_slice(chunk);
+        out.extend_from_slice(&encoded[..bytes]);
         out.extend_from_slice(b"\x1b\\");
     }
 }
 
-/// Compress `data`, or nothing when a sample says the full pass would not pay.
+/// Compress `data` into `compressed`, or report that the full pass would not
+/// pay.
 ///
 /// Compressing megabytes of already-compressed pixels costs more than a whole
 /// frame's time budget, and the result would be thrown away, so four spread
 /// samples decide first.
-fn compress(data: &[u8]) -> Option<Vec<u8>> {
+fn compress(compressed: &mut Vec<u8>, data: &[u8]) -> bool {
     const SAMPLE_BYTES: usize = 16 * 1024;
     const SAMPLES: usize = 4;
     if data.len() > SAMPLE_BYTES * SAMPLES {
@@ -404,17 +473,19 @@ fn compress(data: &[u8]) -> Option<Vec<u8>> {
             let start = (data.len() - SAMPLE_BYTES) * index / (SAMPLES - 1);
             sample.extend_from_slice(&data[start..start + SAMPLE_BYTES]);
         }
-        if zlib(&sample)?.len() * 4 > sample.len() * 3 {
-            return None;
+        if !zlib(compressed, &sample) || compressed.len() * 4 > sample.len() * 3 {
+            return false;
         }
     }
-    zlib(data)
+    zlib(compressed, data)
 }
 
-fn zlib(data: &[u8]) -> Option<Vec<u8>> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data).ok()?;
-    encoder.finish().ok()
+/// zlib `data` into `out`, which is cleared first.  Reusing the output keeps a
+/// whole frame from allocating, and faulting in, a buffer per pass.
+fn zlib(out: &mut Vec<u8>, data: &[u8]) -> bool {
+    out.clear();
+    let mut encoder = ZlibEncoder::new(&mut *out, Compression::fast());
+    encoder.write_all(data).is_ok() && encoder.finish().is_ok()
 }
 
 #[cfg(test)]
@@ -1050,25 +1121,37 @@ mod tests {
         assert_eq!(replay(&[update], 4, 2, (2, 2)), frame);
     }
 
+    /// A terminal that has not read the object is behind, and a whole frame
+    /// pushed down the pty is ten times the bytes in front of it: the frame is
+    /// dropped, the ack says so, and the next one goes through shared memory
+    /// once the terminal catches up.
     #[test]
-    fn a_slot_the_terminal_has_not_read_goes_over_the_pty_instead() {
+    fn a_slot_the_terminal_has_not_read_drops_the_frame() {
         let Some(shared) = shared_memory() else {
             return;
         };
         let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
         let mut replay = Replay::new(4, 4, (2, 2));
         replay.read_shared = false;
-        replay.feed(&presenter.present(4, 2, noise(&mut 13, 4 * 2 * 3)));
+        let first = presenter.present(4, 2, noise(&mut 13, 4 * 2 * 3));
+        replay.feed(&first);
 
         let second = noise(&mut 17, 4 * 4 * 3);
         let update = presenter.present(4, 4, second.clone());
-        let control = whole_frames(&update);
-        assert_eq!(control.len(), 1);
-        assert!(
-            !control[0].contains("t=s"),
-            "the pty path was needed: {control:?}"
-        );
+        assert!(update.is_empty(), "a dropped frame writes nothing");
+        assert!(presenter.dropped(), "the pane has to say it drew nothing");
+        assert!(whole_frames(&update).is_empty());
+
+        // The terminal catches up, reads what it was sent, and the next frame
+        // goes through shared memory again.
         replay.read_shared = true;
+        replay.feed(&first);
+        let update = presenter.present(4, 4, second.clone());
+        assert!(!presenter.dropped());
+        assert!(
+            whole_frames(&update)[0].contains("t=s"),
+            "not shared memory"
+        );
         replay.feed(&update);
         assert_eq!(replay.screen(), second);
     }

@@ -65,6 +65,11 @@ use crate::protocol::{Input, Show, WindowInfo, modifiers};
 /// Windows are composed at most this often.  A client that draws in a loop
 /// cannot spin the compositor, and a pane that is slow costs its own frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// A frame the pane has not acknowledged for this long is given up on: the
+/// client is told it may draw again instead of waiting on a pane that may be
+/// stuck writing to a terminal that stopped reading.  Long enough that a slow
+/// terminal still gets its frames, short enough that a client never freezes.
+const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// A window no pane shows still has to keep drawing, or it could never be
 /// attached to.  It gets frame callbacks at the same rate.
 const IDLE_INTERVAL: Duration = Duration::from_millis(16);
@@ -101,6 +106,8 @@ pub enum Command {
     },
     Ack {
         pane: u64,
+        /// Whether the pane drew the frame it is acknowledging.
+        drawn: bool,
     },
     /// A frame buffer the pane is done with, given back for the next frame.
     Recycle(Vec<u8>),
@@ -199,11 +206,20 @@ struct PaneState {
     height: u32,
     /// A frame is with the pane until it acknowledges it.
     in_flight: bool,
+    /// When that frame was handed over, so one that is never acknowledged can
+    /// be given up on instead of freezing the client that is waiting on it.
+    sent: Instant,
+    /// Acks for frames that were given up on, which say nothing about the
+    /// frame that is in flight now.
+    stale_acks: u32,
     /// The scene changed while that frame was in flight.
     dirty: bool,
     next_frame: Instant,
     /// The last frame this pane was sent, so an unchanged scene costs nothing.
     shown: Vec<u8>,
+    /// The pane did not draw that frame, so `shown` is not what its terminal
+    /// displays and the next frame has to be sent whatever it contains.
+    shown_stale: bool,
 }
 
 impl PaneState {
@@ -215,9 +231,12 @@ impl PaneState {
             width,
             height,
             in_flight: false,
+            sent: Instant::now(),
+            stale_acks: 0,
             dirty: false,
             next_frame: Instant::now(),
             shown: Vec::new(),
+            shown_stale: false,
         }
     }
 }
@@ -320,8 +339,15 @@ impl CompositorHandler for State {
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = self.pane_bound(surface);
+                // The pixels of the snapshot this one replaces are the next
+                // snapshot's storage: a client redrawing at a steady size then
+                // never allocates (or faults in) a frame buffer again.
+                let reuse = self
+                    .snapshots
+                    .remove(surface)
+                    .map_or_else(Vec::new, |old| old.pixels);
                 let snapshot = with_buffer_contents(&buffer, |ptr, len, data| {
-                    copy_buffer(ptr, len, &data, bound)
+                    copy_buffer(ptr, len, &data, bound, reuse)
                 })
                 .ok()
                 .flatten();
@@ -993,6 +1019,15 @@ fn run(
     };
     let _ = ready.send(Ok(()));
     while !state.shutdown {
+        // Waiting on the channel rather than sleeping means a command is
+        // handled the moment it arrives, while the frame work below still runs
+        // at its own pace.
+        match rx.recv_timeout(Duration::from_millis(2)) {
+            Ok(command) => handle_command(&mut state, command),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Every sender is gone: the server that owns this thread has died.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
         while let Ok(command) = rx.try_recv() {
             handle_command(&mut state, command);
         }
@@ -1007,7 +1042,6 @@ fn run(
         let _ = display.flush_clients();
         dispatch_frames(&mut state);
         idle_callbacks(&mut state);
-        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -1060,18 +1094,25 @@ fn handle_command(state: &mut State, command: Command) {
             apply_window_state(state, window);
         }
         Command::Input { pane, event } => pane_input(state, pane, &event),
-        Command::Ack { pane } => {
+        Command::Ack { pane, drawn } => {
             let Some(entry) = state.panes.get_mut(&pane) else {
                 return;
             };
+            // An ack for a frame that was given up on says nothing about the
+            // one in flight now, so it only takes itself out of the count.
+            if entry.stale_acks > 0 {
+                entry.stale_acks -= 1;
+                return;
+            }
             entry.in_flight = false;
+            entry.shown_stale = !drawn;
             let dirty = std::mem::take(&mut entry.dirty);
             let window = entry.window;
             if dirty {
                 state.mark_dirty(pane);
             }
             if window != 0 {
-                // The pane has shown the frame, so the client may draw again.
+                // The pane has taken the frame, so the client may draw again.
                 send_frame_callbacks(state, window);
             }
         }
@@ -1144,6 +1185,7 @@ fn attach(state: &mut State, pane: u64, show: Show, width: u32, height: u32) {
 
 /// Hand a pane the newest frame, at most once per [`FRAME_INTERVAL`].
 fn dispatch_frames(state: &mut State) {
+    expire_frames(state);
     if state.pending.is_empty() {
         return;
     }
@@ -1180,7 +1222,11 @@ fn dispatch_frames(state: &mut State) {
         let (width, height, changed) = match state.panes.get_mut(&pane) {
             Some(entry) => {
                 entry.next_frame = now + FRAME_INTERVAL;
-                (entry.width, entry.height, entry.shown != buffer)
+                (
+                    entry.width,
+                    entry.height,
+                    entry.shown_stale || entry.shown != buffer,
+                )
             }
             None => continue,
         };
@@ -1188,6 +1234,7 @@ fn dispatch_frames(state: &mut State) {
             if let Some(entry) = state.panes.get_mut(&pane) {
                 entry.shown.clone_from(&buffer);
                 entry.in_flight = true;
+                entry.sent = now;
             }
             let _ = state.events.send(Event::Frame {
                 pane,
@@ -1201,6 +1248,35 @@ fn dispatch_frames(state: &mut State) {
             if state.pool.len() < 4 {
                 state.pool.push(buffer);
             }
+            send_frame_callbacks(state, window);
+        }
+    }
+}
+
+/// Give up on frames no pane has acknowledged in [`ACK_TIMEOUT`].
+///
+/// A pane whose terminal has stopped reading sits in a write that never
+/// finishes, and the client that is waiting for the frame callback behind it
+/// would sit there with it: a frozen terminal would freeze the window too.
+/// The frame is dropped, the client draws again, and the pane takes whichever
+/// frame reaches it first.
+fn expire_frames(state: &mut State) {
+    let now = Instant::now();
+    let expired: Vec<u64> = state
+        .panes
+        .iter()
+        .filter(|(_, entry)| entry.in_flight && now.duration_since(entry.sent) >= ACK_TIMEOUT)
+        .map(|(pane, _)| *pane)
+        .collect();
+    for pane in expired {
+        let Some(entry) = state.panes.get_mut(&pane) else {
+            continue;
+        };
+        entry.in_flight = false;
+        entry.stale_acks += 1;
+        entry.shown_stale = true;
+        let window = entry.window;
+        if window != 0 {
             send_frame_callbacks(state, window);
         }
     }
@@ -1340,7 +1416,9 @@ fn blit(
     let Some(snapshot) = state.snapshots.get(surface) else {
         return;
     };
-    let (src, dst) = extents(snapshot, viewport_of(surface));
+    let viewport = viewport_of(surface);
+    let unscaled = viewport.src.is_none() && viewport.dst.is_none();
+    let (src, dst) = extents(snapshot, viewport);
     if dst.w <= 0 || dst.h <= 0 {
         return;
     }
@@ -1352,6 +1430,16 @@ fn blit(
     let clip_right = left.saturating_add(dst.w).min(width as i32);
     let clip_bottom = top.saturating_add(dst.h).min(height as i32);
     if clip_right <= clip_left || clip_bottom <= clip_top {
+        return;
+    }
+    let clip = Rectangle::new(
+        (clip_left, clip_top).into(),
+        (clip_right - clip_left, clip_bottom - clip_top).into(),
+    );
+    if unscaled {
+        // No viewport: one pane pixel per snapshot pixel, which is what a
+        // client that never uses `wp_viewporter` draws at.
+        blit_unscaled(snapshot, left, top, clip, out, width);
         return;
     }
     let last_x = snapshot.width as usize - 1;
@@ -1381,6 +1469,55 @@ fn blit(
                         out[at + channel] = (u32::from(snapshot.pixels[pixel + channel])
                             + (under * inverse + 127) / 255)
                             as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The unscaled case of [`blit`]: the surface has no viewport, so one pane
+/// pixel is one snapshot pixel and the sample of a pixel is its offset from
+/// the surface origin.  Integer indexing alone, with the alpha blend kept
+/// byte for byte identical to the sampling path's.
+fn blit_unscaled(
+    snapshot: &Snapshot,
+    left: i32,
+    top: i32,
+    clip: Rectangle<i32, Logical>,
+    out: &mut [u8],
+    width: u32,
+) {
+    let columns = clip.size.w as usize;
+    let row_bytes = columns * 4;
+    let stride = snapshot.width as usize * 4;
+    let pane_stride = width as usize * 3;
+    // The clip was taken against the snapshot's own size, so `first` and
+    // `first_row` are inside it and every span below is in bounds.
+    let first = (clip.loc.x - left) as usize;
+    let first_row = (clip.loc.y - top) as usize;
+    for row in 0..clip.size.h as usize {
+        let from = (first_row + row) * stride + first * 4;
+        let source = snapshot.pixels[from..from + row_bytes].as_chunks::<4>().0;
+        let at = (clip.loc.y as usize + row) * pane_stride + clip.loc.x as usize * 3;
+        let dest = out[at..at + columns * 3].as_chunks_mut::<3>().0;
+        if snapshot.opaque {
+            for (pixel, rgb) in source.iter().zip(dest) {
+                rgb.copy_from_slice(&pixel[..3]);
+            }
+            continue;
+        }
+        for (pixel, rgb) in source.iter().zip(dest) {
+            let alpha = u32::from(pixel[3]);
+            match alpha {
+                0 => {}
+                255 => rgb.copy_from_slice(&pixel[..3]),
+                _ => {
+                    let inverse = 255 - alpha;
+                    for channel in 0..3 {
+                        let under = u32::from(rgb[channel]);
+                        rgb[channel] =
+                            (u32::from(pixel[channel]) + (under * inverse + 127) / 255) as u8;
                     }
                 }
             }
@@ -1695,6 +1832,9 @@ fn configure_output(state: &mut State, width: u32, height: u32) {
 }
 
 /// Copy a committed shm buffer into an owned snapshot, in `r, g, b, a` order.
+///
+/// `reuse` is the storage of the snapshot this one replaces, or empty; it is
+/// resized and overwritten whole.
 #[expect(
     unsafe_code,
     reason = "the shm pool is only reachable as a raw pointer, so reading it takes one \
@@ -1705,6 +1845,7 @@ fn copy_buffer(
     len: usize,
     data: &smithay::wayland::shm::BufferData,
     bound: Option<(u32, u32)>,
+    reuse: Vec<u8>,
 ) -> Option<Snapshot> {
     if !matches!(
         data.format,
@@ -1740,20 +1881,27 @@ fn copy_buffer(
     // the client and could be written at any time, so the slice is never held:
     // the pixels are copied out here and the reference ends with this function.
     let source = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let mut pixels = vec![0; width as usize * height as usize * 4];
+    let row_bytes = width as usize * 4;
+    let mut pixels = reuse;
+    pixels.resize(row_bytes * height as usize, 0);
     let xrgb = data.format == wl_shm::Format::Xrgb8888;
     let mut opaque = true;
     for y in 0..height as usize {
         let from = offset + y * stride;
-        let to = y * width as usize * 4;
-        for x in 0..width as usize {
-            let p = from + x * 4;
-            let q = to + x * 4;
-            pixels[q] = source[p + 2];
-            pixels[q + 1] = source[p + 1];
-            pixels[q + 2] = source[p];
-            let alpha = if xrgb { 255 } else { source[p + 3] };
-            pixels[q + 3] = alpha;
+        let source_row = source[from..from + row_bytes].as_chunks::<4>().0;
+        let to = y * row_bytes;
+        let row = pixels[to..to + row_bytes].as_chunks_mut::<4>().0;
+        for (pixel, out_pixel) in source_row.iter().zip(row) {
+            // The pool holds `b, g, r, a` in memory order, which is the word
+            // `a << 24 | r << 16 | g << 8 | b`; the snapshot keeps
+            // `r, g, b, a`, the same word with its outer two bytes swapped.
+            let word = u32::from_le_bytes(*pixel);
+            let alpha = if xrgb { 255 } else { word >> 24 };
+            *out_pixel = ((word & 0xFF00_FF00)
+                | ((word & 0x00FF_0000) >> 16)
+                | ((word & 0x0000_00FF) << 16)
+                | (alpha << 24))
+                .to_le_bytes();
             opaque &= alpha == 255;
         }
     }
@@ -1763,4 +1911,173 @@ fn copy_buffer(
         pixels,
         opaque,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Argb8888` holds `b, g, r, a` in memory and the snapshot holds
+    /// `r, g, b, a`; `Xrgb8888` ignores the fourth byte and is always opaque.
+    /// The stride is wider than the row, so padding must be neither read into
+    /// the snapshot nor written from the previous one.
+    #[test]
+    fn snapshot_swizzles_both_shm_formats() {
+        const STRIDE: usize = 12;
+        let raw: [u8; 24] = [
+            3, 4, 5, 0x40, 6, 7, 8, 0xff, 0xaa, 0xaa, 0xaa, 0xaa, //
+            9, 10, 11, 0xff, 12, 13, 14, 0x7f, 0xbb, 0xbb, 0xbb, 0xbb,
+        ];
+        let data = |format| smithay::wayland::shm::BufferData {
+            format,
+            width: 2,
+            height: 2,
+            stride: STRIDE as i32,
+            offset: 0,
+        };
+        let copy = |format, reuse| {
+            copy_buffer(raw.as_ptr(), raw.len(), &data(format), None, reuse).expect("a 2x2 buffer")
+        };
+
+        let argb = copy(wl_shm::Format::Argb8888, Vec::new());
+        assert_eq!(
+            argb.pixels,
+            [
+                5, 4, 3, 0x40, 8, 7, 6, 0xff, 11, 10, 9, 0xff, 14, 13, 12, 0x7f
+            ]
+        );
+        assert!(!argb.opaque, "an alpha byte below 255 is not opaque");
+
+        let xrgb = copy(wl_shm::Format::Xrgb8888, Vec::new());
+        assert_eq!(
+            xrgb.pixels,
+            [
+                5, 4, 3, 0xff, 8, 7, 6, 0xff, 11, 10, 9, 0xff, 14, 13, 12, 0xff
+            ]
+        );
+        assert!(xrgb.opaque, "Xrgb8888 has no alpha byte");
+
+        // A second copy into the first one's storage must overwrite it whole.
+        let mut reused = argb.pixels.clone();
+        reused.fill(0xcc);
+        let again = copy(wl_shm::Format::Argb8888, reused);
+        assert_eq!(again.pixels, argb.pixels);
+    }
+
+    /// The sampled blit, kept as the reference the unscaled path must agree
+    /// with: the same nearest-neighbour formula, one division per pixel.
+    fn sampled_blit(
+        snapshot: &Snapshot,
+        left: i32,
+        top: i32,
+        out: &mut [u8],
+        width: u32,
+        height: u32,
+    ) {
+        let src = Rectangle::<f64, Logical>::new(
+            (0.0, 0.0).into(),
+            (f64::from(snapshot.width), f64::from(snapshot.height)).into(),
+        );
+        let dst = Size::<i32, Logical>::from((snapshot.width as i32, snapshot.height as i32));
+        let clip_left = left.max(0);
+        let clip_top = top.max(0);
+        let clip_right = left.saturating_add(dst.w).min(width as i32);
+        let clip_bottom = top.saturating_add(dst.h).min(height as i32);
+        if clip_right <= clip_left || clip_bottom <= clip_top {
+            return;
+        }
+        let last_x = snapshot.width as usize - 1;
+        let last_y = snapshot.height as usize - 1;
+        let stride = snapshot.width as usize * 4;
+        for y in clip_top..clip_bottom {
+            let sample = src.loc.y + (f64::from(y - top) + 0.5) * src.size.h / f64::from(dst.h);
+            let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
+            let to = (y as usize * width as usize + clip_left as usize) * 3;
+            for x in clip_left..clip_right {
+                let sample =
+                    src.loc.x + (f64::from(x - left) + 0.5) * src.size.w / f64::from(dst.w);
+                let column = (sample.floor().max(0.0) as usize).min(last_x);
+                let pixel = row + column * 4;
+                let at = to + (x - clip_left) as usize * 3;
+                if snapshot.opaque {
+                    out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]);
+                    continue;
+                }
+                let alpha = u32::from(snapshot.pixels[pixel + 3]);
+                match alpha {
+                    0 => {}
+                    255 => out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]),
+                    _ => {
+                        let inverse = 255 - alpha;
+                        for channel in 0..3 {
+                            let under = u32::from(out[at + channel]);
+                            out[at + channel] = (u32::from(snapshot.pixels[pixel + channel])
+                                + (under * inverse + 127) / 255)
+                                as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The unscaled path is the sampled one with the sampling replaced by
+    /// index arithmetic, so the two must draw the same bytes, clip to the same
+    /// pixels, and leave the same pixels outside the clip alone.
+    #[test]
+    fn unscaled_blit_matches_the_sampled_one() {
+        const WIDTH: u32 = 6;
+        const HEIGHT: u32 = 5;
+        let (snapshot_width, snapshot_height) = (4u32, 3u32);
+        let mut pixels = Vec::new();
+        let mut state = 0x1234_5678u32;
+        for _ in 0..snapshot_width * snapshot_height {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Every alpha case: transparent, opaque, and two blends.
+            let alpha = [0x00, 0xff, 0x40, 0x80][state as usize % 4];
+            pixels.extend_from_slice(&[
+                state as u8,
+                (state >> 8) as u8,
+                (state >> 16) as u8,
+                alpha,
+            ]);
+        }
+        let origin = |left: i32, top: i32| {
+            let clip_left = left.max(0);
+            let clip_top = top.max(0);
+            let clip_right = left.saturating_add(snapshot_width as i32).min(WIDTH as i32);
+            let clip_bottom = top
+                .saturating_add(snapshot_height as i32)
+                .min(HEIGHT as i32);
+            Rectangle::<i32, Logical>::new(
+                (clip_left, clip_top).into(),
+                (clip_right - clip_left, clip_bottom - clip_top).into(),
+            )
+        };
+        // Mostly aligned, plus the clipping corners and a fully off-pane one.
+        let places = [(0, 0), (1, 2), (-2, -1), (3, 3), (5, 4), (-4, 2), (6, 0)];
+        for opaque in [true, false] {
+            let snapshot = Snapshot {
+                width: snapshot_width,
+                height: snapshot_height,
+                pixels: pixels.clone(),
+                opaque,
+            };
+            for (left, top) in places {
+                let backdrop: Vec<u8> = (0..(WIDTH * HEIGHT * 3) as usize)
+                    .map(|index| (index * 7) as u8)
+                    .collect();
+                let mut fast = backdrop.clone();
+                let mut reference = backdrop;
+                blit_unscaled(&snapshot, left, top, origin(left, top), &mut fast, WIDTH);
+                sampled_blit(&snapshot, left, top, &mut reference, WIDTH, HEIGHT);
+                assert_eq!(
+                    fast, reference,
+                    "unscaled and sampled blits differ at ({left}, {top}) with opaque={opaque}"
+                );
+            }
+        }
+    }
 }

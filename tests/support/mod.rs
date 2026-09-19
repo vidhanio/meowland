@@ -1,9 +1,12 @@
 //! Shared fixture for the process-level tests: a detached server plus a raw
 //! Wayland client that speaks the wire protocol directly, without libwayland.
 //!
-//! Each test binary uses a subset of these helpers, so the module allows dead
-//! code rather than forcing every binary to use everything.
-#![allow(dead_code)]
+//! Each test binary uses a different subset of these helpers, so unused ones
+//! are expected rather than a reason to force every binary to use everything.
+#![expect(
+    dead_code,
+    reason = "each test binary uses a different subset of the shared fixture"
+)]
 
 use std::{
     collections::HashMap,
@@ -19,24 +22,31 @@ use std::{
     },
     path::PathBuf,
     process::{Child, Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
-mod fake;
+pub mod fake;
 
-#[allow(unused_imports)]
-pub use fake::FakeTerminal;
 use meowland::protocol::{self, Hello, PaneToServer, ServerToPane, Show};
 
 pub const BINARY: &str = env!("CARGO_BIN_EXE_meowland");
 
 pub fn temp_dir(prefix: &str) -> PathBuf {
+    // The counter keeps two calls in the same process apart even when they
+    // read the clock in the same nanosecond; the clock keeps runs apart when
+    // a previous run died before cleaning up.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{unique}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     path
 }
@@ -122,6 +132,11 @@ impl Server {
         }
     }
 
+    /// Wait until the compositor has announced at least one window.
+    pub fn wait_for_window(&self, timeout: Duration) -> bool {
+        wait_for(timeout, || !self.list().is_empty())
+    }
+
     pub fn log(&self) -> String {
         fs::read_to_string(self.runtime.join("meowland.log")).unwrap_or_default()
     }
@@ -150,26 +165,41 @@ impl Server {
             .map(|entry| entry.path())
     }
 
+    /// Stop the server, failing the test if it does not go away.  The
+    /// log is reported with the failure.
     pub fn stop(&mut self) {
-        if self.stopped {
-            return;
-        }
-        self.stopped = true;
-        self.cli(&["server", "stop"]);
         assert!(
-            wait_for(Duration::from_secs(5), || !self
-                .runtime
-                .join("meowland-control.sock")
-                .exists()),
+            self.shutdown(),
             "server did not exit;\nlog:\n{}",
             self.log()
         );
+    }
+
+    /// Stop the server without asserting, so `Drop` cannot panic while a
+    /// failed test is already unwinding.
+    fn shutdown(&mut self) -> bool {
+        if self.stopped {
+            return true;
+        }
+        self.stopped = true;
+        let stop = self.cli(&["server", "stop"]);
+        let stopped = wait_for(Duration::from_secs(5), || {
+            !self.runtime.join("meowland-control.sock").exists()
+        });
+        if !stopped {
+            eprintln!(
+                "server did not exit: {}\nlog:\n{}",
+                String::from_utf8_lossy(&stop.stderr),
+                self.log()
+            );
+        }
+        stopped
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.shutdown();
         let _ = fs::remove_dir_all(&self.runtime);
     }
 }
@@ -242,8 +272,11 @@ impl Pty {
     /// Run a child with this pty as its terminal.  The child gets its own
     /// session so `/dev/tty` cannot reach the terminal running the tests,
     /// which is what makes crossterm fall back to the pty on stdin/stdout.
-    #[allow(unsafe_code)]
-    pub fn spawn(&self, command: &mut Command) -> Child {
+    #[expect(
+        unsafe_code,
+        reason = "`pre_exec` is unsafe because its closure runs between fork and exec"
+    )]
+    pub fn spawn(&self, command: &mut Command) -> PtyChild {
         let slave = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -253,15 +286,17 @@ impl Pty {
             .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
             .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
             .stderr(std::process::Stdio::from(slave));
-        // SAFETY: setsid has no arguments and its failure is ignored on
-        // purpose; it only detaches the controlling terminal.
+        // SAFETY: `pre_exec` runs the closure between fork and exec, where
+        // only async-signal-safe code may run; `setsid` is a raw syscall that
+        // allocates nothing, and its failure is ignored on purpose because the
+        // child only wants to detach from the controlling terminal.
         unsafe {
             command.pre_exec(|| {
                 let _ = rustix::process::setsid();
                 Ok(())
             });
         }
-        command.spawn().expect("spawn on pty")
+        PtyChild(command.spawn().expect("spawn on pty"))
     }
 
     /// Everything the pane has written so far, without blocking.
@@ -290,6 +325,24 @@ impl Pty {
             }
         }
         bytes
+    }
+}
+
+/// A pane process running on a pty: killed and reaped when it goes out of
+/// scope, so a failed assertion cannot leave it behind.
+#[derive(Debug)]
+pub struct PtyChild(Child);
+
+impl PtyChild {
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -457,7 +510,10 @@ impl Client {
 
     pub fn bind(&mut self, interface: &str, version: u32) -> u32 {
         let id = self.alloc();
-        let name = self.globals[interface];
+        let name = *self
+            .globals
+            .get(interface)
+            .unwrap_or_else(|| panic!("the compositor did not advertise {interface}"));
         let mut args = u32s(&[name]);
         args.extend_from_slice(&string_arg(interface));
         args.extend_from_slice(&u32s(&[version, id]));
@@ -568,7 +624,8 @@ impl Client {
     ) -> (u32, fs::File) {
         let pool_id = self.alloc();
         let buffer_id = self.alloc();
-        let path = temp_dir("meowland-shm").join("buffer");
+        let staging = temp_dir("meowland-shm");
+        let path = staging.join("buffer");
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -579,7 +636,10 @@ impl Client {
         file.set_len(u64::from(stride) * u64::from(height)).unwrap();
         (&file).write_all(pixels).unwrap();
         self.send_fd(self.shm, 0, &u32s(&[pool_id, stride * height]), &file);
+        // The pool fd keeps the inode alive, so neither the file nor the
+        // directory it was staged in is needed once the fd has been sent.
         fs::remove_file(&path).unwrap();
+        fs::remove_dir(&staging).unwrap();
         // Argb8888: premultiplied 4-byte pixels, which the compositor reads as
         // B, G, R and ignores the alpha byte of.
         self.request(pool_id, 0, &u32s(&[buffer_id, 0, width, height, stride, 0]));
@@ -774,8 +834,10 @@ impl Pane {
             .unwrap();
         protocol::send(&mut stream, &PaneToServer::Hello(hello)).unwrap();
         let mut pane = Self { stream };
-        assert!(matches!(pane.recv(), ServerToPane::HelloOk));
-        pane
+        match pane.recv() {
+            ServerToPane::HelloOk => pane,
+            other => panic!("pane handshake failed: {other:?}"),
+        }
     }
 
     pub fn recv(&mut self) -> ServerToPane {

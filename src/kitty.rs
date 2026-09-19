@@ -91,8 +91,7 @@ impl SharedMemory {
         let payload = STANDARD.encode(self.name.as_bytes());
         out.reserve(payload.len() + 96);
         out.extend_from_slice(
-            format!("\x1b_Ga=T,f=24,s={width},v={height},i={SCREEN_ID},p=0,z=1,C=1,q=2,t=s;")
-                .as_bytes(),
+            format!("\x1b_G{},t=s;", transmit(SCREEN_ID, width, height, 0)).as_bytes(),
         );
         out.extend_from_slice(payload.as_bytes());
         out.extend_from_slice(b"\x1b\\");
@@ -122,7 +121,7 @@ pub struct Presenter {
     shared: Option<SharedMemory>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Frame {
     width: u32,
     height: u32,
@@ -350,6 +349,12 @@ fn delete_image(out: &mut Vec<u8>, id: u32) {
     out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\").as_bytes());
 }
 
+/// The keys every transmitted image shares, whichever way its pixels travel;
+/// the caller appends `,t=s;`, the compression, or the chunk continuation.
+fn transmit(id: u32, width: u32, height: u32, placement: u32) -> String {
+    format!("a=T,f=24,s={width},v={height},i={id},p={placement},z=1,C=1,q=2")
+}
+
 fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], patch: bool) {
     let compressed = compress(pixels);
     let (payload, zlib) = compressed.as_deref().map_or((pixels, false), |candidate| {
@@ -363,29 +368,25 @@ fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], pat
     // Reserve once: growing to a whole 1080p frame in doublings copies it
     // about twenty times.
     out.reserve(encoded.len() + 128);
+    let compression = if zlib { ",o=z" } else { "" };
+    let mut chunks = encoded.as_bytes().chunks(CHUNK).peekable();
     let mut first = true;
-    let mut offset = 0;
-    while offset < encoded.len() {
-        let end = (offset + CHUNK).min(encoded.len());
-        let more = end < encoded.len();
+    while let Some(chunk) = chunks.next() {
+        // Every chunk but the last says `m=1`; a whole image in one chunk
+        // carries no `m` key at all.
+        let more = chunks.peek().is_some();
         if first {
-            let placement = if patch { ",p=1" } else { ",p=0" };
-            let compression = if zlib { ",o=z" } else { "" };
             let marker = if more { ",m=1" } else { "" };
-            out.extend_from_slice(format!("\x1b_Ga=T,f=24,s={width},v={height},i={id}{placement},z=1,C=1,q=2{compression}{marker};").as_bytes());
+            let control = transmit(id, width, height, u32::from(patch));
+            out.extend_from_slice(format!("\x1b_G{control}{compression}{marker};").as_bytes());
             first = false;
+        } else if more {
+            out.extend_from_slice(b"\x1b_Gm=1;");
+        } else {
+            out.extend_from_slice(b"\x1b_Gm=0;");
         }
-        out.extend_from_slice(&encoded.as_bytes()[offset..end]);
+        out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
-        offset = end;
-        if more {
-            let next_more = offset + CHUNK < encoded.len();
-            if next_more {
-                out.extend_from_slice(b"\x1b_Gm=1;");
-            } else {
-                out.extend_from_slice(b"\x1b_Gm=0;");
-            }
-        }
     }
 }
 
@@ -395,13 +396,13 @@ fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], pat
 /// frame's time budget, and the result would be thrown away, so four spread
 /// samples decide first.
 fn compress(data: &[u8]) -> Option<Vec<u8>> {
-    const CHUNK: usize = 16 * 1024;
-    const CHUNKS: usize = 4;
-    if data.len() > CHUNK * CHUNKS {
-        let mut sample = Vec::with_capacity(CHUNK * CHUNKS);
-        for index in 0..CHUNKS {
-            let start = (data.len() - CHUNK) * index / (CHUNKS - 1);
-            sample.extend_from_slice(&data[start..start + CHUNK]);
+    const SAMPLE_BYTES: usize = 16 * 1024;
+    const SAMPLES: usize = 4;
+    if data.len() > SAMPLE_BYTES * SAMPLES {
+        let mut sample = Vec::with_capacity(SAMPLE_BYTES * SAMPLES);
+        for index in 0..SAMPLES {
+            let start = (data.len() - SAMPLE_BYTES) * index / (SAMPLES - 1);
+            sample.extend_from_slice(&data[start..start + SAMPLE_BYTES]);
         }
         if zlib(&sample)?.len() * 4 > sample.len() * 3 {
             return None;
@@ -616,8 +617,8 @@ mod tests {
     fn shared_memory() -> Option<SharedMemory> {
         let slot = SharedMemory::new();
         slot.probe()?;
-        // A terminal that answered the probe has read, and so unlinked, the
-        // probe object.
+        // No terminal is here to read and unlink the probe object, so it is
+        // dropped here before the presenter takes the slot.
         slot.clear();
         Some(slot)
     }

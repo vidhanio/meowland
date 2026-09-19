@@ -41,8 +41,10 @@ fn committed_shm_window_reaches_the_pane_byte_for_byte() {
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&toplevel, buffer, WIDTH, HEIGHT);
 
-    let windows = wait_for(Duration::from_secs(5), || !server.list().is_empty());
-    assert!(windows, "window was never announced");
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
     let listed = server.list();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].title, "precise pixels");
@@ -60,9 +62,10 @@ fn frame_callbacks_wait_for_the_pane_ack() {
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&toplevel, buffer, WIDTH, HEIGHT);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
     let _ = pane.frame();
@@ -89,9 +92,10 @@ fn closing_the_toplevel_releases_its_pane() {
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&toplevel, buffer, WIDTH, HEIGHT);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Id(1)));
     let _ = pane.frame();
@@ -138,9 +142,10 @@ fn throughput_of_1080p_frames() {
     let pixels = vec![0x33; (stride * height) as usize];
     let (buffer, file) = client.shm_buffer_with_file(width, height, stride, &pixels);
     client.attach(&toplevel, buffer, width, height);
-    assert!(wait_for(Duration::from_secs(10), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(10)),
+        "window was never announced"
+    );
 
     let mut pane = Pane::attach(&server, hello(width, height, Some((10, 20)), Show::Newest));
     let _ = pane.frame();
@@ -235,9 +240,10 @@ fn subsurface_is_drawn_at_its_position() {
     client.attach_surface(child, child_buffer, 2, 2);
     client.commit(window.surface);
 
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
     let frame = pane.frame();
     assert_eq!(at(&frame, 0, 0), background);
@@ -259,9 +265,10 @@ fn popup_is_drawn_where_the_window_geometry_puts_it() {
     let background = [10, 20, 30];
     let buffer = client.shm_buffer(WIDE, TALL, WIDE * 4, &solid(WIDE, TALL, background));
     client.attach(&window, buffer, WIDE, TALL);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let popup = client.create_popup(window.xdg_surface, (2, 2), (1, 1, 1, 1));
     let position = popup.map(&mut client, 2, 2, &solid(2, 2, [200, 100, 50]));
@@ -309,9 +316,10 @@ fn viewporter_scales_the_source_into_the_pane() {
     client.viewport_source(viewport, 0.0, 0.0, 2.0, 2.0);
     client.viewport_destination(viewport, 4, 4);
     client.attach(&window, buffer, 2, 2);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let mut pane = Pane::attach(&server, hello(4, 4, None, Show::Newest));
     let frame = pane.frame();
@@ -335,9 +343,10 @@ fn title_changes_reach_the_pane_and_the_list() {
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&window, buffer, WIDTH, HEIGHT);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
     let _ = pane.frame();
@@ -363,9 +372,10 @@ fn keyboard_input_reaches_the_client() {
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&window, buffer, WIDTH, HEIGHT);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let seat = client.seat();
     let keyboard = client.get_keyboard(seat);
@@ -406,9 +416,10 @@ fn pointer_input_reaches_the_client() {
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&window, buffer, WIDTH, HEIGHT);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let seat = client.seat();
     let pointer = client.get_pointer(seat);
@@ -459,7 +470,7 @@ fn pointer_input_reaches_the_client() {
         scroll: 0,
     }));
     let leave = client.read_until(|message| message.object == pointer && message.opcode == 1);
-    assert_eq!(leave.opcode, 1);
+    assert_eq!(leave.u32_at(1), window.surface, "pointer left the window");
 }
 
 #[test]
@@ -470,9 +481,10 @@ fn alt_q_asks_the_window_to_close_and_alt_w_detaches() {
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&window, buffer, WIDTH, HEIGHT);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Id(1)));
     let _ = pane.frame();

@@ -46,10 +46,16 @@ usage = { package = "usage-rs", version = "6.9.1", default-features = false, fea
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 # missing_docs = "warn"
-# The shm snapshot is the single local exception to this lint.
+# `unsafe` is read out of the shm pool in src/compositor.rs and used for the
+# two `pre_exec` blocks in src/main.rs and tests/support/mod.rs; each site
+# carries a SAFETY comment and a local expectation.
 unsafe_code = "deny"
 
 [lints.clippy]
+# Every `unsafe` block states the invariant that makes it sound; the crate has
+# three of them, all documented.
+undocumented_unsafe_blocks = "warn"
+
 # Pointer positions, frame rectangles and channel arithmetic convert between
 # number types in bulk. The range is known from the invariants around the code,
 # not from the type.
@@ -58,8 +64,8 @@ cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 
-missing_errors_doc = "allow"
-module_name_repetitions = "allow"
-
+# `missing_errors_doc`, `module_name_repetitions` and the casts below are
+# satisfied by the code as it stands, and the defaults are what the crate
+# wants: they are left to warn rather than being allowed away.
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

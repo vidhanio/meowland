@@ -34,7 +34,7 @@ const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
 const GRAPHICS_ID: u32 = 31;
 
-/// Everything a pane asks the terminal before it takes it over.  Device
+/// Everything a pane asks the terminal after it takes it over.  Device
 /// attributes are asked for last: they are the one reply every terminal gives,
 /// so the reply is the end of the handshake.
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;AAAA\x1b\\";
@@ -304,7 +304,17 @@ fn mouse_units(probe: &ProbeInfo) -> MouseUnits {
 }
 
 /// Attach this process's terminal to a pane socket and run until released.
-#[allow(clippy::too_many_lines)]
+///
+/// # Errors
+/// Returns an error when the pane socket cannot be reached, when the terminal
+/// cannot be taken over or does not answer the handshake, and when the pane
+/// connection fails.  Being released by the server is not an error: the pane
+/// prints the reason and returns `Ok`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the pane's single event loop; every arm shares the same socket, probe and \
+              terminal guard"
+)]
 pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket)?;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -402,12 +412,7 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if is_binding(key, KeyCode::Char('q')) || is_binding(key, KeyCode::Char('w')) {
-                        let code = if matches!(key.code, KeyCode::Char('q')) {
-                            16
-                        } else {
-                            17
-                        };
+                    if let Some(code) = binding_code(key) {
                         send_key(&mut tx, code, key.modifiers)?;
                         continue;
                     }
@@ -593,22 +598,44 @@ const fn evdev_char_code(c: char) -> Option<u16> {
     })
 }
 
+/// Whether typing this character needs Shift held on the `us` layout, which is
+/// the layout [`evdev_char_code`] is a table of.
 fn needs_shift(c: char) -> bool {
     c.is_ascii_uppercase() || "!@#$%^&*()_+{}:\"~|<>?".contains(c)
 }
 
-fn modifier_bits(m: KeyModifiers) -> u8 {
-    u8::from(m.contains(KeyModifiers::SHIFT))
-        | (u8::from(m.contains(KeyModifiers::CONTROL)) << 1)
-        | (u8::from(m.contains(KeyModifiers::ALT)) << 2)
-        | (u8::from(m.contains(KeyModifiers::SUPER)) << 3)
+/// The terminal's modifier flags as the bits the pane protocol packs.
+fn modifier_bits(modifiers: KeyModifiers) -> u8 {
+    use protocol::modifiers::{ALT, CONTROL, SHIFT, SUPER};
+    let mut bits = 0;
+    for (flag, bit) in [
+        (KeyModifiers::SHIFT, SHIFT),
+        (KeyModifiers::CONTROL, CONTROL),
+        (KeyModifiers::ALT, ALT),
+        (KeyModifiers::SUPER, SUPER),
+    ] {
+        if modifiers.contains(flag) {
+            bits |= bit;
+        }
+    }
+    bits
 }
-fn is_binding(k: KeyEvent, c: KeyCode) -> bool {
-    k.code == c
-        && k.modifiers.contains(KeyModifiers::ALT)
-        && !k
+
+/// `Alt+Q` asks the shown window to close and `Alt+W` detaches, in Linux input
+/// codes.  Only without Ctrl or Super, so everything else reaches the client.
+fn binding_code(key: KeyEvent) -> Option<u16> {
+    let alt_alone = key.modifiers.contains(KeyModifiers::ALT)
+        && !key
             .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+    if !alt_alone {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('q') => Some(protocol::KEY_Q),
+        KeyCode::Char('w') => Some(protocol::KEY_W),
+        _ => None,
+    }
 }
 
 fn set_title(title: &str) {
@@ -617,7 +644,7 @@ fn set_title(title: &str) {
         .filter(|c| !c.is_control())
         .take(512)
         .collect();
-    print!("\x1b]2;{clean}\x07");
+    let _ = write!(io::stdout(), "\x1b]2;{clean}\x07");
     let _ = io::stdout().flush();
 }
 
@@ -630,7 +657,7 @@ fn set_cursor(shape: Option<&str>) {
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(64)
         .collect();
-    print!("\x1b]22;{name}\x1b\\");
+    let _ = write!(io::stdout(), "\x1b]22;{name}\x1b\\");
     let _ = io::stdout().flush();
 }
 
@@ -642,6 +669,12 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
+        // The guard exists before the modes are turned on, so any failure
+        // below still undoes what has already been applied.
+        let guard = Self {
+            active: true,
+            mouse: None,
+        };
         execute!(
             io::stdout(),
             terminal::EnterAlternateScreen,
@@ -649,10 +682,7 @@ impl TerminalGuard {
         )?;
         io::stdout().write_all(b"\x1b[?7l\x1b[?25l\x1b[?2004h")?;
         io::stdout().flush()?;
-        Ok(Self {
-            active: true,
-            mouse: None,
-        })
+        Ok(guard)
     }
 
     /// Reporting is chosen after the probe, so the mouse is not enabled
@@ -680,6 +710,10 @@ impl TerminalGuard {
 
     fn restore(&mut self) -> io::Result<()> {
         if self.active {
+            // Raw mode is the one mode that survives a writer that cannot
+            // reach the terminal, and a shell cannot live with it, so it is
+            // undone before any write that could fail.
+            terminal::disable_raw_mode()?;
             if let Some(units) = self.mouse.take() {
                 let off: &[u8] = match units {
                     MouseUnits::Pixels => b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
@@ -693,7 +727,6 @@ impl TerminalGuard {
                 crossterm::cursor::Show,
                 terminal::LeaveAlternateScreen
             )?;
-            terminal::disable_raw_mode()?;
             self.active = false;
         }
         Ok(())

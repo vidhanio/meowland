@@ -102,10 +102,7 @@ fn start() -> Result<()> {
         }
         Commands::List => {
             let paths = server::Paths::discover()?;
-            let ControlResponse::Windows(windows) = request(&paths, &ControlRequest::List)? else {
-                bail!("server did not return windows");
-            };
-            for window in windows {
+            for window in list(&paths)? {
                 println!(
                     "{}\t{}\t{}\t{}",
                     window.id,
@@ -145,12 +142,13 @@ fn start() -> Result<()> {
     }
 }
 
+/// The window list, as the server last reported it.  `request` has already
+/// turned an error reply into an `Err`.
 fn list(paths: &server::Paths) -> Result<Vec<WindowInfo>> {
-    match request(paths, &ControlRequest::List)? {
-        ControlResponse::Windows(windows) => Ok(windows),
-        ControlResponse::Error(error) => bail!("{error}"),
-        ControlResponse::Ok => bail!("unexpected server response"),
-    }
+    let ControlResponse::Windows(windows) = request(paths, &ControlRequest::List)? else {
+        bail!("server did not return windows");
+    };
+    Ok(windows)
 }
 
 fn wait_for_new_window(
@@ -204,7 +202,14 @@ fn ensure_server(paths: &server::Paths) -> Result<()> {
     // Its own session, so the server outlives this terminal and has no
     // controlling terminal to be hung up on.  `setsid` is done here rather
     // than by spawning an external program that may not be installed.
-    #[allow(unsafe_code)]
+    #[expect(
+        unsafe_code,
+        reason = "`CommandExt::pre_exec` is unsafe by signature; the closure only calls setsid"
+    )]
+    // SAFETY: `pre_exec` is unsafe because the closure runs in the child
+    // between fork and exec, where only async-signal-safe work is allowed.
+    // `setsid` is a bare syscall that allocates nothing, and the closure
+    // captures nothing.
     unsafe {
         command.pre_exec(|| {
             rustix::process::setsid().map_err(std::io::Error::from)?;

@@ -4,15 +4,113 @@
 //! hand it a frame and immediately reuse their frame storage after this
 //! method returns.  The output is one synchronized terminal update.
 
-use std::io::Write;
+use std::{
+    fs::File,
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, write::ZlibEncoder};
+use rustix::{fs::Mode, shm};
 
 const MAX_PATCHES: usize = 32;
 const CHUNK: usize = 4096;
 const SCREEN_ID: u32 = 1;
 const FIRST_PATCH_ID: u32 = 2;
+/// The image id of the one-pixel query that discovers shared-memory support.
+pub const PROBE_ID: u32 = 32;
+
+/// A POSIX shared memory slot a whole frame can be handed over in.
+///
+/// A terminal that reads one unlinks it, so a name that still resolves means
+/// the previous frame has not been read: that frame goes over the pty instead,
+/// which keeps the two transfers in the order they were made.
+#[derive(Debug)]
+pub struct SharedMemory {
+    name: String,
+}
+
+impl SharedMemory {
+    #[must_use]
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "/meowland-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let slot = Self { name };
+        slot.clear();
+        slot
+    }
+
+    /// Ask the terminal to read a one-pixel object, which is how the shared
+    /// memory path is discovered.  Absent when the object cannot be made.
+    #[must_use]
+    pub fn probe(&self) -> Option<Vec<u8>> {
+        let mut file = self.create()?;
+        file.write_all(&[0; 3]).ok()?;
+        Some(
+            format!(
+                "\x1b_Ga=q,f=24,s=1,v=1,i={PROBE_ID},t=s;{}\x1b\\",
+                STANDARD.encode(self.name.as_bytes())
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// Forget an object the terminal left behind.
+    pub fn clear(&self) {
+        let _ = shm::unlink(self.name.as_str());
+    }
+
+    /// A fresh object, or `None` while the previous frame is still unread.
+    fn create(&self) -> Option<File> {
+        shm::open(
+            self.name.as_str(),
+            shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .ok()
+        .map(File::from)
+    }
+
+    /// Hand a whole frame over, or report that it has to go the pty's way.
+    fn transfer(&self, out: &mut Vec<u8>, width: u32, height: u32, pixels: &[u8]) -> bool {
+        let Some(mut file) = self.create() else {
+            return false;
+        };
+        if file.write_all(pixels).is_err() {
+            self.clear();
+            return false;
+        }
+        let payload = STANDARD.encode(self.name.as_bytes());
+        out.reserve(payload.len() + 96);
+        out.extend_from_slice(
+            format!("\x1b_Ga=T,f=24,s={width},v={height},i={SCREEN_ID},p=0,z=1,C=1,q=2,t=s;")
+                .as_bytes(),
+        );
+        out.extend_from_slice(payload.as_bytes());
+        out.extend_from_slice(b"\x1b\\");
+        true
+    }
+}
+
+impl Default for SharedMemory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
 
 /// Stateful kitty image presenter.
 #[derive(Debug, Default)]
@@ -21,13 +119,14 @@ pub struct Presenter {
     previous: Option<Frame>,
     base: Option<Frame>,
     patch_count: usize,
+    shared: Option<SharedMemory>,
 }
 
 #[derive(Debug, Clone)]
 struct Frame {
     width: u32,
     height: u32,
-    pixels: Vec<u8>,
+    pixels: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,14 +139,16 @@ struct Rect {
 
 impl Presenter {
     /// Construct a presenter.  Patches are enabled only when the terminal's
-    /// reported cell dimensions are supplied.
+    /// reported cell dimensions are supplied, and whole frames go through
+    /// `shared` when the terminal proved it reads shared memory.
     #[must_use]
-    pub const fn new(cell_size: Option<(u16, u16)>) -> Self {
+    pub const fn new(cell_size: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
         Self {
             cell_size,
             previous: None,
             base: None,
             patch_count: 0,
+            shared,
         }
     }
 
@@ -64,40 +165,36 @@ impl Presenter {
         if pixels != Some(rgb.len()) || width == 0 || height == 0 {
             return Vec::new();
         }
-        if self
-            .previous
-            .as_ref()
-            .is_some_and(|old| old.width == width && old.height == height && old.pixels == rgb)
-        {
+        if self.previous.as_ref().is_some_and(|old| {
+            old.width == width && old.height == height && old.pixels.as_slice() == rgb
+        }) {
             return Vec::new();
         }
 
         let frame = Frame {
             width,
             height,
-            pixels: rgb,
+            pixels: Arc::new(rgb),
         };
-        let mut out = Vec::with_capacity(frame.pixels.len().min(128 * 1024));
+        let mut out = Vec::with_capacity(64);
         out.extend_from_slice(b"\x1b[?2026h");
 
-        let patches = self
+        // Superseded patches are always deleted before the next ones are
+        // drawn, so the live patch ids are exactly `2 ..= patch_count + 1`.
+        let rects = self
             .base
             .as_ref()
             .filter(|old| old.width == width && old.height == height)
             .and_then(|old| self.changed_rects(old, &frame));
-        let use_patches = patches.as_ref().is_some_and(|rects| {
-            !rects.is_empty()
-                && rects.len() <= MAX_PATCHES
-                && self.patch_count + rects.len() <= 64
-                && rects
-                    .iter()
-                    .map(|rect| u64::from(rect.width) * u64::from(rect.height))
-                    .sum::<u64>()
-                    < u64::from(width) * u64::from(height)
-        });
+        let patches = match rects {
+            // The frame returned to the base image: only the patches that
+            // covered the difference have to go.
+            Some(rects) if rects.is_empty() => (self.patch_count > 0).then(Vec::new),
+            Some(rects) if within_patch_budget(&rects, width, height) => Some(rects),
+            _ => None,
+        };
 
-        if use_patches {
-            let rects = patches.expect("checked above");
+        if let Some(rects) = patches {
             for index in 0..self.patch_count {
                 delete_image(
                     &mut out,
@@ -112,16 +209,26 @@ impl Presenter {
             }
             self.patch_count = rects.len();
         } else {
+            // `2J` also destroys images, so the layer is wiped before the
+            // replacement is transmitted.
             delete_all(&mut out);
-            out.extend_from_slice(b"\x1b[H");
-            image(&mut out, SCREEN_ID, width, height, &frame.pixels, false);
+            out.extend_from_slice(b"\x1b[2J\x1b[H");
+            let shared = self
+                .shared
+                .as_ref()
+                .is_some_and(|slot| slot.transfer(&mut out, width, height, &frame.pixels));
+            if !shared {
+                image(&mut out, SCREEN_ID, width, height, &frame.pixels, false);
+            }
             self.patch_count = 0;
+            self.base = Some(Frame {
+                width,
+                height,
+                pixels: Arc::clone(&frame.pixels),
+            });
         }
 
         out.extend_from_slice(b"\x1b[?2026l");
-        if self.patch_count == 0 {
-            self.base = Some(frame.clone());
-        }
         self.previous = Some(frame);
         out
     }
@@ -138,6 +245,11 @@ impl Presenter {
         for row in 0..rows {
             let y = row * cell_h;
             let h = cell_h.min(new.height - y);
+            let row_start = y as usize * new.width as usize * 3;
+            let row_end = (y + h) as usize * new.width as usize * 3;
+            if old.pixels[row_start..row_end] == new.pixels[row_start..row_end] {
+                continue;
+            }
             let mut col = 0;
             while col < cols {
                 let x = col * cell_w;
@@ -200,6 +312,18 @@ fn different(old: &Frame, new: &Frame, x: u32, y: u32, width: u32, height: u32) 
     false
 }
 
+/// A patch set is worth sending only while it stays small, stays under the
+/// patch id budget and moves less pixel data than a whole frame would.
+fn within_patch_budget(rects: &[Rect], width: u32, height: u32) -> bool {
+    !rects.is_empty()
+        && rects.len() <= MAX_PATCHES
+        && rects
+            .iter()
+            .map(|rect| u64::from(rect.width) * u64::from(rect.height))
+            .sum::<u64>()
+            < u64::from(width) * u64::from(height)
+}
+
 fn extract(frame: &Frame, rect: Rect) -> Vec<u8> {
     let stride = frame.width as usize * 3;
     let row_len = rect.width as usize * 3;
@@ -236,6 +360,9 @@ fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], pat
         }
     });
     let encoded = STANDARD.encode(payload);
+    // Reserve once: growing to a whole 1080p frame in doublings copies it
+    // about twenty times.
+    out.reserve(encoded.len() + 128);
     let mut first = true;
     let mut offset = 0;
     while offset < encoded.len() {
@@ -262,7 +389,28 @@ fn image(out: &mut Vec<u8>, id: u32, width: u32, height: u32, pixels: &[u8], pat
     }
 }
 
+/// Compress `data`, or nothing when a sample says the full pass would not pay.
+///
+/// Compressing megabytes of already-compressed pixels costs more than a whole
+/// frame's time budget, and the result would be thrown away, so four spread
+/// samples decide first.
 fn compress(data: &[u8]) -> Option<Vec<u8>> {
+    const CHUNK: usize = 16 * 1024;
+    const CHUNKS: usize = 4;
+    if data.len() > CHUNK * CHUNKS {
+        let mut sample = Vec::with_capacity(CHUNK * CHUNKS);
+        for index in 0..CHUNKS {
+            let start = (data.len() - CHUNK) * index / (CHUNKS - 1);
+            sample.extend_from_slice(&data[start..start + CHUNK]);
+        }
+        if zlib(&sample)?.len() * 4 > sample.len() * 3 {
+            return None;
+        }
+    }
+    zlib(data)
+}
+
+fn zlib(data: &[u8]) -> Option<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data).ok()?;
     encoder.finish().ok()
@@ -270,16 +418,239 @@ fn compress(data: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{collections::HashMap, io::Read};
 
+    use super::*;
+
+    /// One placement of transmitted image data, keyed the way kitty keys it.
     #[derive(Debug)]
-    struct DecodedImage {
+    struct Placement {
+        z: i32,
+        image: u32,
+        reference: u32,
         x: usize,
         y: usize,
         width: usize,
         height: usize,
-        pixels: Vec<u8>,
+    }
+
+    /// Independent decoder for the emitted stream.  It models the image layer
+    /// the terminal keeps: transmitted data, placements anchored to cell
+    /// positions, z-ordering by `(z, image id, placement id)`, `a=d,d=A`
+    /// freeing every image, `a=d,d=I` freeing one, and `2J` destroying the
+    /// placements on screen.
+    struct Replay {
+        width: usize,
+        height: usize,
+        cell: (usize, usize),
+        cursor: (usize, usize),
+        images: HashMap<u32, Vec<u8>>,
+        placements: HashMap<(u32, u32), Placement>,
+        /// A terminal that has not looked at its input yet ignores a shared
+        /// object transfer until it does.
+        read_shared: bool,
+    }
+
+    impl Replay {
+        fn new(width: usize, height: usize, cell: (usize, usize)) -> Self {
+            Self {
+                width,
+                height,
+                cell,
+                cursor: (0, 0),
+                images: HashMap::new(),
+                placements: HashMap::new(),
+                read_shared: true,
+            }
+        }
+
+        fn feed(&mut self, stream: &[u8]) {
+            let mut pos = 0;
+            while pos < stream.len() {
+                if let Some((final_byte, parameters, next)) = csi(stream, pos) {
+                    match final_byte {
+                        b'H' => self.cursor = cursor_from(parameters),
+                        b'J' => self.placements.clear(),
+                        _ => {}
+                    }
+                    pos = next;
+                } else if stream[pos..].starts_with(b"\x1b_G") {
+                    pos = self.command(stream, pos);
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+
+        /// Consumes one graphics command, chunk continuations included, and
+        /// returns the offset just past it.
+        fn command(&mut self, stream: &[u8], pos: usize) -> usize {
+            const ALLOWED: [&str; 12] =
+                ["a", "f", "s", "v", "i", "p", "z", "C", "q", "o", "m", "t"];
+            let end = escape_end(stream, pos + 3);
+            let (parameters, first_chunk) = split_data(&stream[pos + 3..end]);
+            let parameters = std::str::from_utf8(parameters).unwrap();
+            let fields: HashMap<&str, &str> = parameters
+                .split(',')
+                .filter_map(|field| field.split_once('='))
+                .collect();
+
+            let mut encoded = first_chunk.to_vec();
+            let mut more = fields.get("m") == Some(&"1");
+            let mut next = end + 2;
+            while more {
+                assert!(
+                    stream[next..].starts_with(b"\x1b_G"),
+                    "a continuation chunk must be a graphics command"
+                );
+                let chunk_end = escape_end(stream, next + 3);
+                let (chunk_parameters, data) = split_data(&stream[next + 3..chunk_end]);
+                assert!(
+                    chunk_parameters == b"m=1" || chunk_parameters == b"m=0",
+                    "continuation chunks carry only the m key, got {:?}",
+                    String::from_utf8_lossy(chunk_parameters)
+                );
+                encoded.extend_from_slice(data);
+                more = chunk_parameters == b"m=1";
+                next = chunk_end + 2;
+            }
+
+            match fields.get("a").copied() {
+                Some("T") => {
+                    if fields.get("t") == Some(&"s") && !self.read_shared {
+                        return next;
+                    }
+                    for key in fields.keys() {
+                        assert!(
+                            ALLOWED.contains(key),
+                            "unexpected key {key} in {parameters:?}"
+                        );
+                    }
+                    for key in ["a", "f", "s", "v", "i", "p", "z", "C", "q"] {
+                        assert!(
+                            fields.contains_key(key),
+                            "missing key {key} in {parameters:?}"
+                        );
+                    }
+                    assert_eq!(fields["f"], "24", "RGB only");
+                    assert_eq!(fields["C"], "1", "a placement must never move the cursor");
+                    assert_eq!(fields["q"], "2", "replies must be suppressed");
+                    assert_eq!(fields["z"], "1", "images draw above the text");
+                    let id: u32 = fields["i"].parse().unwrap();
+                    let reference: u32 = fields["p"].parse().unwrap();
+                    let width: usize = fields["s"].parse().unwrap();
+                    let height: usize = fields["v"].parse().unwrap();
+                    assert!(
+                        !self.images.contains_key(&id),
+                        "image {id} was re-transmitted before being deleted"
+                    );
+                    let pixels = if fields.get("t") == Some(&"s") {
+                        read_shared_object(&encoded)
+                    } else {
+                        inflate(&encoded, fields.get("o") == Some(&"z"))
+                    };
+                    assert_eq!(
+                        pixels.len(),
+                        width * height * 3,
+                        "payload does not match s and v"
+                    );
+                    self.images.insert(id, pixels);
+                    let (row, column) = self.cursor;
+                    self.placements.insert(
+                        (id, reference),
+                        Placement {
+                            z: fields["z"].parse().unwrap(),
+                            image: id,
+                            reference,
+                            x: column * self.cell.0,
+                            y: row * self.cell.1,
+                            width,
+                            height,
+                        },
+                    );
+                }
+                Some("d") => {
+                    let what = fields.get("d").copied().unwrap_or("A");
+                    if what == "A" {
+                        self.placements.clear();
+                        self.images.clear();
+                    } else {
+                        assert_eq!(what, "I", "only d=A and d=I are emitted");
+                        let id: u32 = fields["i"].parse().unwrap();
+                        self.placements.retain(|(image, _), _| *image != id);
+                        self.images.remove(&id);
+                    }
+                }
+                other => panic!("unexpected graphics action {other:?}"),
+            }
+            next
+        }
+
+        fn screen(&self) -> Vec<u8> {
+            let mut screen = vec![0; self.width * self.height * 3];
+            let mut order: Vec<&Placement> = self.placements.values().collect();
+            order.sort_by_key(|placement| (placement.z, placement.image, placement.reference));
+            for placement in order {
+                let pixels = &self.images[&placement.image];
+                for row in 0..placement.height {
+                    let destination = ((placement.y + row) * self.width + placement.x) * 3;
+                    let source = row * placement.width * 3;
+                    screen[destination..destination + placement.width * 3]
+                        .copy_from_slice(&pixels[source..source + placement.width * 3]);
+                }
+            }
+            screen
+        }
+    }
+
+    /// The terminal side of `t=s`: the object holds the pixels, and reading it
+    /// is what unlinking it means.
+    fn read_shared_object(encoded: &[u8]) -> Vec<u8> {
+        let name = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        let path = std::path::Path::new("/dev/shm").join(name.trim_start_matches('/'));
+        let pixels = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        pixels
+    }
+
+    fn shared_memory() -> Option<SharedMemory> {
+        let slot = SharedMemory::new();
+        slot.probe()?;
+        // A terminal that answered the probe has read, and so unlinked, the
+        // probe object.
+        slot.clear();
+        Some(slot)
+    }
+
+    fn csi(stream: &[u8], pos: usize) -> Option<(u8, &str, usize)> {
+        if !stream[pos..].starts_with(b"\x1b[") {
+            return None;
+        }
+        let end = stream[pos + 2..]
+            .iter()
+            .position(|byte| (0x40..=0x7e).contains(byte))?
+            + pos
+            + 2;
+        let parameters = std::str::from_utf8(&stream[pos + 2..end]).ok()?;
+        Some((stream[end], parameters, end + 1))
+    }
+
+    fn cursor_from(parameters: &str) -> (usize, usize) {
+        if parameters.is_empty() {
+            return (0, 0);
+        }
+        let mut parts = parameters
+            .split(';')
+            .map(|part| part.parse::<usize>().unwrap());
+        (parts.next().unwrap() - 1, parts.next().unwrap() - 1)
+    }
+
+    fn escape_end(stream: &[u8], start: usize) -> usize {
+        start
+            + stream[start..]
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .expect("every graphics command ends with ST")
     }
 
     fn split_data(body: &[u8]) -> (&[u8], &[u8]) {
@@ -288,210 +659,483 @@ mod tests {
             .map_or((body, &[]), |index| (&body[..index], &body[index + 1..]))
     }
 
-    /// Small protocol replay used by the tests. It parses APCs independently
-    /// of the encoder and models kitty's persistent image layer semantics.
-    #[allow(clippy::too_many_lines)]
-    fn replay(stream: &[u8], width: usize, height: usize, cell: (usize, usize)) -> Vec<u8> {
-        let mut base = vec![0; width * height * 3];
-        let mut screen = base.clone();
-        let mut images: HashMap<u32, DecodedImage> = HashMap::new();
-        let mut cursor = (0usize, 0usize);
+    fn inflate(encoded: &[u8], zlib: bool) -> Vec<u8> {
+        let mut decoded = STANDARD.decode(encoded).unwrap();
+        if zlib {
+            let mut out = Vec::new();
+            flate2::read::ZlibDecoder::new(decoded.as_slice())
+                .read_to_end(&mut out)
+                .unwrap();
+            decoded = out;
+        }
+        decoded
+    }
+
+    /// Control strings of every graphics command in `stream`.
+    fn commands(stream: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
         let mut pos = 0;
         while pos < stream.len() {
-            if stream[pos..].starts_with(b"\x1b[")
-                && let Some(end) = stream[pos + 2..]
-                    .iter()
-                    .position(|byte| (0x40..=0x7e).contains(byte))
-            {
-                let end = pos + 2 + end;
-                if stream[end] != b'H' {
-                    pos = end + 1;
-                    continue;
-                }
-                let numbers = std::str::from_utf8(&stream[pos + 2..end]).unwrap();
-                if numbers.is_empty() {
-                    cursor = (0, 0);
-                } else {
-                    let mut it = numbers
-                        .split(';')
-                        .map(|part| part.parse::<usize>().unwrap());
-                    cursor = (it.next().unwrap() - 1, it.next().unwrap() - 1);
-                }
-                pos = end + 1;
-                continue;
-            }
             if !stream[pos..].starts_with(b"\x1b_G") {
                 pos += 1;
                 continue;
             }
-            let start = pos + 3;
-            let end = stream[start..]
-                .windows(2)
-                .position(|window| window == b"\x1b\\")
-                .map(|offset| start + offset)
-                .unwrap();
-            let body = &stream[start..end];
-            let (params, data) = split_data(body);
-            let params = String::from_utf8_lossy(params);
-            let fields: HashMap<_, _> = params
-                .split(',')
-                .filter_map(|field| field.split_once('='))
-                .collect();
-            if fields.get("a") == Some(&"d") {
-                if fields.get("d") == Some(&"A") {
-                    images.clear();
-                } else if let Some(id) = fields.get("i").and_then(|id| id.parse().ok()) {
-                    images.remove(&id);
-                }
-                screen = base.clone();
-                for image in images.values() {
-                    blit(&mut screen, width, image);
-                }
-                pos = end + 2;
-                continue;
-            }
-            if fields.get("a") != Some(&"T") {
-                pos = end + 2;
-                continue;
-            }
-            let id: u32 = fields["i"].parse().unwrap();
-            let image_width: usize = fields["s"].parse().unwrap();
-            let image_height: usize = fields["v"].parse().unwrap();
-            let patch = fields.get("p") == Some(&"1");
-            let compressed = fields.get("o") == Some(&"z");
-            let mut encoded = data.to_vec();
-            let mut next = end + 2;
-            let mut more = fields.get("m") == Some(&"1");
-            while more {
-                assert!(stream[next..].starts_with(b"\x1b_G"));
-                let continuation_start = next + 3;
-                let continuation_end = stream[continuation_start..]
-                    .windows(2)
-                    .position(|window| window == b"\x1b\\")
-                    .map(|offset| continuation_start + offset)
-                    .unwrap();
-                let continuation = &stream[continuation_start..continuation_end];
-                let (continuation_params, continuation_data) = split_data(continuation);
-                encoded.extend_from_slice(continuation_data);
-                more = continuation_params == b"m=1";
-                next = continuation_end + 2;
-            }
-            let mut decoded = STANDARD.decode(encoded).unwrap();
-            if compressed {
-                let compressed = decoded;
-                let mut zlib = flate2::read::ZlibDecoder::new(compressed.as_slice());
-                decoded = Vec::new();
-                zlib.read_to_end(&mut decoded).unwrap();
-            }
-            if patch {
-                let image = DecodedImage {
-                    x: cursor.0 * cell.0,
-                    y: cursor.1 * cell.1,
-                    width: image_width,
-                    height: image_height,
-                    pixels: decoded,
-                };
-                images.insert(id, image);
-            } else {
-                base = decoded;
-                screen = base.clone();
-                images.clear();
-            }
-            for image in images.values() {
-                blit(&mut screen, width, image);
-            }
-            pos = next;
+            let end = escape_end(stream, pos + 3);
+            let (parameters, _) = split_data(&stream[pos + 3..end]);
+            out.push(String::from_utf8_lossy(parameters).into_owned());
+            pos = end + 2;
         }
-        screen
+        out
     }
 
-    fn blit(screen: &mut [u8], screen_width: usize, image: &DecodedImage) {
-        for row in 0..image.height {
-            let destination = ((image.y + row) * screen_width + image.x) * 3;
-            let source = row * image.width * 3;
-            screen[destination..destination + image.width * 3]
-                .copy_from_slice(&image.pixels[source..source + image.width * 3]);
+    fn field<'a>(control: &'a str, key: &str) -> Option<&'a str> {
+        control
+            .split(',')
+            .filter_map(|field| field.split_once('='))
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value)
+    }
+
+    fn transmits(stream: &[u8]) -> Vec<String> {
+        commands(stream)
+            .into_iter()
+            .filter(|control| field(control, "a") == Some("T"))
+            .collect()
+    }
+
+    fn whole_frames(stream: &[u8]) -> Vec<String> {
+        transmits(stream)
+            .into_iter()
+            .filter(|control| field(control, "p") == Some("0"))
+            .collect()
+    }
+
+    fn patches(stream: &[u8]) -> Vec<String> {
+        transmits(stream)
+            .into_iter()
+            .filter(|control| field(control, "p") == Some("1"))
+            .collect()
+    }
+
+    fn replay(streams: &[Vec<u8>], width: usize, height: usize, cell: (usize, usize)) -> Vec<u8> {
+        let mut replay = Replay::new(width, height, cell);
+        for stream in streams {
+            replay.feed(stream);
+        }
+        replay.screen()
+    }
+
+    fn next(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    fn noise(state: &mut u32, len: usize) -> Vec<u8> {
+        (0..len).map(|_| next(state) as u8).collect()
+    }
+
+    /// Fills the `w` by `h` pixel block at `(x, y)` with one value.
+    fn put_block(frame: &mut [u8], width: u32, x: u32, y: u32, w: u32, h: u32, value: u8) {
+        for row in 0..h {
+            let start = ((y + row) * width + x) as usize * 3;
+            frame[start..start + (w * 3) as usize].fill(value);
         }
     }
 
     #[test]
-    fn first_frame_is_whole_and_subsequent_cell_change_is_patch() {
-        let mut presenter = Presenter::new(Some((2, 2)));
-        let first = presenter.present(4, 2, vec![0; 24]);
-        assert!(String::from_utf8_lossy(&first).contains("i=1"));
-        let mut next = vec![0; 24];
-        next[0..3].copy_from_slice(&[255, 0, 0]);
-        let second = presenter.present(4, 2, next);
-        let text = String::from_utf8_lossy(&second);
-        assert!(text.contains("i=2"));
-        assert!(text.contains("p=1"));
-        assert!(!text.contains("i=1"));
+    fn first_frame_is_whole_and_a_cell_change_is_a_patch() {
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let base = noise(&mut 1, 4 * 2 * 3);
+        let first = presenter.present(4, 2, base.clone());
+        assert_eq!(whole_frames(&first).len(), 1);
+        assert_eq!(patches(&first), Vec::<String>::new());
+
+        let mut changed = base;
+        put_block(&mut changed, 4, 0, 0, 2, 2, 0xab);
+        let second = presenter.present(4, 2, changed.clone());
+        assert_eq!(patches(&second).len(), 1);
+        assert_eq!(whole_frames(&second).len(), 0);
+        assert_eq!(replay(&[first, second], 4, 2, (2, 2)), changed);
     }
 
     #[test]
     fn unchanged_frame_is_empty() {
-        let mut presenter = Presenter::new(None);
+        let mut presenter = Presenter::new(None, None);
         let rgb = vec![1; 12];
-        assert!(!presenter.present(2, 2, rgb.clone()).is_empty());
-        assert!(presenter.present(2, 2, rgb).is_empty());
+        assert_ne!(presenter.present(2, 2, rgb.clone()), Vec::<u8>::new());
+        assert_eq!(presenter.present(2, 2, rgb), Vec::<u8>::new());
     }
 
     #[test]
-    fn large_payload_is_chunked_at_four_thousand_ninety_six() {
-        let mut presenter = Presenter::new(None);
-        let mut state = 0x9e37_79b9_u32;
-        let rgb: Vec<u8> = (0..30_000)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
+    fn whole_frame_transmit_has_exact_parameters() {
+        let mut presenter = Presenter::new(None, None);
+        let update = presenter.present(2, 2, noise(&mut 7, 2 * 2 * 3));
+        assert!(
+            update.starts_with(b"\x1b[?2026h\x1b_Ga=d,d=A,q=2;\x1b\\\x1b[2J\x1b[H"),
+            "whole frames wipe the layer, clear the screen and home the cursor"
+        );
+        assert!(update.ends_with(b"\x1b[?2026l"));
+        assert_eq!(
+            whole_frames(&update)[0],
+            "a=T,f=24,s=2,v=2,i=1,p=0,z=1,C=1,q=2"
+        );
+
+        let mut sequences = Vec::new();
+        let mut pos = 0;
+        while pos < update.len() {
+            if let Some((final_byte, parameters, next)) = csi(&update, pos) {
+                sequences.push(format!("{parameters}{}", char::from(final_byte)));
+                pos = next;
+            } else {
+                pos += 1;
+            }
+        }
+        assert_eq!(
+            sequences,
+            ["?2026h", "2J", "H", "?2026l"],
+            "nothing else may move the cursor or scroll the terminal"
+        );
+    }
+
+    #[test]
+    fn patch_is_placed_by_the_cursor_alone() {
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let base = vec![0; 4 * 4 * 3];
+        let first = presenter.present(4, 4, base.clone());
+        let mut changed = base;
+        let cell = noise(&mut 3, 2 * 2 * 3);
+        for row in 0..2 {
+            let start = ((2 + row) * 4 + 2) * 3;
+            changed[start..start + 6].copy_from_slice(&cell[row * 6..row * 6 + 6]);
+        }
+        let second = presenter.present(4, 4, changed.clone());
+
+        assert!(String::from_utf8_lossy(&second).contains("\x1b[2;2H"));
+        let patch = &patches(&second)[0];
+        let mut keys: Vec<&str> = patch
+            .split(',')
+            .filter_map(|field| field.split_once('=').map(|(key, _)| key))
             .collect();
-        let output = presenter.present(100, 100, rgb);
-        assert!(String::from_utf8_lossy(&output).contains("\x1b\\\x1b_Gm=1;"));
+        keys.retain(|key| *key != "o");
+        assert_eq!(keys, ["a", "f", "s", "v", "i", "p", "z", "C", "q"]);
+        assert_eq!(field(patch, "s"), Some("2"));
+        assert_eq!(field(patch, "v"), Some("2"));
+        assert_eq!(field(patch, "i"), Some("2"));
+        let text = String::from_utf8_lossy(&second);
+        assert!(
+            !text.contains(",c=") && !text.contains(",r="),
+            "patches are never scaled"
+        );
+        assert_eq!(replay(&[first, second], 4, 4, (2, 2)), changed);
     }
 
     #[test]
-    fn replayed_whole_and_persistent_patches_match_every_frame() {
-        let mut presenter = Presenter::new(Some((2, 2)));
-        let frame0 = vec![0; 4 * 4 * 3];
-        let mut frame1 = frame0.clone();
-        frame1[0..12].fill(200);
-        let mut frame2 = frame1.clone();
-        frame2[(2 * 4 + 2) * 3..(2 * 4 + 2) * 3 + 12].fill(80);
-        let first = presenter.present(4, 4, frame0.clone());
-        assert_eq!(replay(&first, 4, 4, (2, 2)), frame0);
-        let second = presenter.present(4, 4, frame1.clone());
-        assert_eq!(
-            replay(&[first.clone(), second.clone()].concat(), 4, 4, (2, 2)),
-            frame1
+    fn patches_need_a_whole_base_of_the_same_size() {
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let base = vec![0; 4 * 4 * 3];
+        let first = presenter.present(4, 4, base.clone());
+        let mut changed = base;
+        put_block(&mut changed, 4, 0, 0, 2, 2, 200);
+        let second = presenter.present(4, 4, changed.clone());
+        assert_eq!(patches(&second).len(), 1);
+
+        let mut larger = vec![0; 6 * 4 * 3];
+        put_block(&mut larger, 6, 4, 0, 2, 2, 90);
+        let third = presenter.present(6, 4, larger.clone());
+        assert!(
+            patches(&third).is_empty(),
+            "a new size cannot patch the old base"
         );
-        let third = presenter.present(4, 4, frame2.clone());
-        assert_eq!(
-            replay(&[first, second, third].concat(), 4, 4, (2, 2)),
-            frame2
+        assert!(String::from_utf8_lossy(&third).contains("a=d,d=A"));
+        let transmit = &whole_frames(&third)[0];
+        assert_eq!(field(transmit, "s"), Some("6"));
+        assert_eq!(field(transmit, "v"), Some("4"));
+        assert_eq!(replay(&[first, second, third], 6, 4, (2, 2)), larger);
+    }
+
+    #[test]
+    fn returning_to_the_base_deletes_patches_without_resending_it() {
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let base = noise(&mut 11, 4 * 4 * 3);
+        let first = presenter.present(4, 4, base.clone());
+        let mut changed = base.clone();
+        put_block(&mut changed, 4, 2, 2, 2, 2, 255);
+        let second = presenter.present(4, 4, changed);
+        assert_eq!(patches(&second).len(), 1);
+
+        let third = presenter.present(4, 4, base.clone());
+        assert!(
+            transmits(&third).is_empty(),
+            "the base image still is on screen"
         );
+        assert!(
+            commands(&third).iter().any(|c| c == "a=d,d=I,i=2,q=2"),
+            "the superseded patch is deleted"
+        );
+        assert_eq!(replay(&[first, second, third], 4, 4, (2, 2)), base);
+    }
+
+    #[test]
+    fn a_smaller_patch_set_deletes_the_superseded_ids() {
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let base = vec![0; 4 * 4 * 3];
+        let first = presenter.present(4, 4, base.clone());
+        let mut two = base.clone();
+        put_block(&mut two, 4, 0, 0, 2, 2, 30);
+        put_block(&mut two, 4, 2, 2, 2, 2, 60);
+        let second = presenter.present(4, 4, two.clone());
+        assert_eq!(patches(&second).len(), 2);
+
+        let mut one = base;
+        put_block(&mut one, 4, 0, 0, 2, 2, 30);
+        let third = presenter.present(4, 4, one.clone());
+        assert_eq!(patches(&third).len(), 1);
+        assert!(
+            commands(&third).iter().any(|c| c == "a=d,d=I,i=3,q=2"),
+            "unused patch ids are freed before redrawing"
+        );
+        assert_eq!(replay(&[first, second, third], 4, 4, (2, 2)), one);
+    }
+
+    #[test]
+    fn changes_beyond_the_patch_budget_go_whole() {
+        let runs = MAX_PATCHES as u32 + 1;
+        // One changed cell, then one untouched cell, per run.
+        let width = runs * 4 + 2;
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let base = vec![0; width as usize * 2 * 3];
+        let first = presenter.present(width, 2, base.clone());
+        let mut scattered = base;
+        for run in 0..runs {
+            put_block(&mut scattered, width, run * 4, 0, 2, 2, 100);
+        }
+        let second = presenter.present(width, 2, scattered.clone());
+        assert!(patches(&second).is_empty(), "{runs} runs exceed the limit");
+        assert_eq!(
+            replay(&[first, second], width as usize, 2, (2, 2)),
+            scattered
+        );
+
+        let mut coverage = Presenter::new(Some((2, 2)), None);
+        let base = vec![0; 4 * 4 * 3];
+        let first = coverage.present(4, 4, base);
+        let full = vec![200; 4 * 4 * 3];
+        let second = coverage.present(4, 4, full.clone());
+        assert!(patches(&second).is_empty(), "a full frame is not a patch");
+        assert_eq!(replay(&[first, second], 4, 4, (2, 2)), full);
+
+        let mut unaligned = Presenter::new(Some((2, 2)), None);
+        let base = vec![0; 5 * 2 * 3];
+        let first = unaligned.present(5, 2, base.clone());
+        let mut ragged = base;
+        put_block(&mut ragged, 5, 4, 0, 1, 2, 77);
+        let second = unaligned.present(5, 2, ragged.clone());
+        assert!(
+            patches(&second).is_empty(),
+            "a partial cell cannot be patched"
+        );
+        assert_eq!(replay(&[first, second], 5, 2, (2, 2)), ragged);
+    }
+
+    #[test]
+    fn payload_chunks_respect_the_protocol_framing() {
+        let mut presenter = Presenter::new(None, None);
+        let update = presenter.present(100, 100, noise(&mut 5, 30_000));
+
+        let mut chunks: Vec<(String, usize)> = Vec::new();
+        let mut pos = 0;
+        while pos < update.len() {
+            if !update[pos..].starts_with(b"\x1b_G") {
+                pos += 1;
+                continue;
+            }
+            let end = escape_end(&update, pos + 3);
+            let (parameters, data) = split_data(&update[pos + 3..end]);
+            chunks.push((String::from_utf8_lossy(parameters).into_owned(), data.len()));
+            pos = end + 2;
+        }
+        assert!(chunks.len() > 5, "30k of noise cannot fit in one chunk");
+        let first = chunks
+            .iter()
+            .position(|(parameters, _)| parameters.starts_with("a=T"))
+            .expect("a transmit command");
+        assert!(chunks[first].0.ends_with(",m=1"), "{:?}", chunks[first].0);
+        for (index, (parameters, length)) in chunks.iter().enumerate().skip(first + 1) {
+            let last = index + 1 == chunks.len();
+            assert_eq!(parameters, if last { "m=0" } else { "m=1" });
+            assert!(*length <= CHUNK, "chunks are bounded by CHUNK");
+            if !last {
+                assert_eq!(length % 4, 0, "chunks are whole base64 quanta");
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_frame_sequences_replay_exactly() {
+        const WIDTH: usize = 4;
+        const HEIGHT: usize = 4;
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let mut decoder = Replay::new(WIDTH, HEIGHT, (2, 2));
+        let mut state = 0x1234_5678_u32;
+        let mut frame = vec![0; WIDTH * HEIGHT * 3];
+        let mut base = frame.clone();
+        let (mut saw_whole, mut saw_patch, mut saw_deletes) = (false, false, false);
+        for step in 0..400 {
+            match step % 11 {
+                0 => {}
+                1 => frame.clone_from(&base),
+                5 => {
+                    for cell in 0..4 {
+                        put_block(
+                            &mut frame,
+                            WIDTH as u32,
+                            (cell % 2) * 2,
+                            (cell / 2) * 2,
+                            2,
+                            2,
+                            next(&mut state) as u8,
+                        );
+                    }
+                }
+                _ => {
+                    for _ in 0..=next(&mut state) % 2 {
+                        let cell = next(&mut state) % 4;
+                        let (x, y) = ((cell % 2) * 2, (cell / 2) * 2);
+                        for row in 0..2 {
+                            let start = ((y + row) * WIDTH as u32 + x) as usize * 3;
+                            frame[start..start + 6].copy_from_slice(&noise(&mut state, 6));
+                        }
+                    }
+                }
+            }
+            let update = presenter.present(WIDTH as u32, HEIGHT as u32, frame.clone());
+            let controls = commands(&update);
+            let transmit = |kind: &str| {
+                controls.iter().any(|control| {
+                    field(control, "a") == Some("T") && field(control, "p") == Some(kind)
+                })
+            };
+            saw_whole |= transmit("0");
+            saw_patch |= transmit("1");
+            saw_deletes |= !update.is_empty() && !transmit("0") && !transmit("1");
+            if transmit("0") {
+                base.clone_from(&frame);
+            }
+            decoder.feed(&update);
+            assert_eq!(decoder.screen(), frame, "screen diverged at step {step}");
+        }
+        assert!(
+            saw_whole && saw_patch && saw_deletes,
+            "the sequence must exercise whole frames, patches and deletes"
+        );
+    }
+
+    #[test]
+    fn a_whole_frame_goes_through_shared_memory_when_the_terminal_reads_it() {
+        let Some(shared) = shared_memory() else {
+            return;
+        };
+        let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
+        let frame = noise(&mut 11, 4 * 2 * 3);
+        let update = presenter.present(4, 2, frame.clone());
+        let control = whole_frames(&update);
+        assert_eq!(control.len(), 1);
+        assert!(
+            control[0].contains("t=s"),
+            "not a shared transfer: {control:?}"
+        );
+        assert_eq!(replay(&[update], 4, 2, (2, 2)), frame);
+    }
+
+    #[test]
+    fn a_slot_the_terminal_has_not_read_goes_over_the_pty_instead() {
+        let Some(shared) = shared_memory() else {
+            return;
+        };
+        let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
+        let mut replay = Replay::new(4, 4, (2, 2));
+        replay.read_shared = false;
+        replay.feed(&presenter.present(4, 2, noise(&mut 13, 4 * 2 * 3)));
+
+        let second = noise(&mut 17, 4 * 4 * 3);
+        let update = presenter.present(4, 4, second.clone());
+        let control = whole_frames(&update);
+        assert_eq!(control.len(), 1);
+        assert!(
+            !control[0].contains("t=s"),
+            "the pty path was needed: {control:?}"
+        );
+        replay.read_shared = true;
+        replay.feed(&update);
+        assert_eq!(replay.screen(), second);
+    }
+
+    #[test]
+    fn the_shared_memory_probe_asks_for_one_pixel_through_an_object() {
+        let slot = SharedMemory::new();
+        let Some(probe) = slot.probe() else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&probe);
+        assert!(text.starts_with("\x1b_Ga=q,f=24,s=1,v=1,"), "{text:?}");
+        assert!(text.contains(&format!("i={PROBE_ID}")), "{text:?}");
+        assert!(text.contains("t=s;"), "{text:?}");
+        let path = format!("/dev/shm/{}", slot.name.trim_start_matches('/'));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 3);
+        slot.clear();
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[test]
     #[ignore = "manual performance check"]
     fn benchmark_present_1080p_and_small_patch() {
-        let mut presenter = Presenter::new(Some((10, 20)));
-        let frame = vec![17; 1920 * 1080 * 3];
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+        const PIXELS: usize = WIDTH as usize * HEIGHT as usize * 3;
+        let mut presenter = Presenter::new(Some((10, 20)), None);
+        let frame = vec![17; PIXELS];
+
+        let whole_frame = frame.clone();
         let start = std::time::Instant::now();
-        let whole = presenter.present(1920, 1080, frame.clone());
+        let whole = presenter.present(WIDTH, HEIGHT, whole_frame);
         let whole_time = start.elapsed();
-        let mut changed = frame;
-        changed[0..300].fill(42);
+
+        let mut one_cell = frame.clone();
+        put_block(&mut one_cell, WIDTH, 0, 0, 10, 10, 42);
         let start = std::time::Instant::now();
-        let patch = presenter.present(1920, 1080, changed);
+        let small = presenter.present(WIDTH, HEIGHT, one_cell);
+        let small_time = start.elapsed();
+
+        let mut block = frame;
+        put_block(&mut block, WIDTH, 100, 100, 100, 400, 42);
+        let start = std::time::Instant::now();
+        let realistic = presenter.present(WIDTH, HEIGHT, block);
+        let realistic_time = start.elapsed();
+
+        let mut noisy = Presenter::new(None, None);
+        let noise_frame = noise(&mut 9, PIXELS);
+        let start = std::time::Instant::now();
+        let noise_update = noisy.present(WIDTH, HEIGHT, noise_frame);
+        let noise_time = start.elapsed();
+
+        let mut shared = Presenter::new(None, shared_memory());
+        let shared_noise = noise(&mut 21, PIXELS);
+        let start = std::time::Instant::now();
+        let shared_frame = shared.present(WIDTH, HEIGHT, shared_noise);
+        let shared_time = start.elapsed();
+
         eprintln!(
-            "kitty benchmark: whole={} bytes in {:?}; patch={} bytes in {:?}",
+            "kitty benchmark: whole 1080p={} bytes in {whole_time:?}; one cell={} bytes in \
+             {small_time:?}; 10x20 cells={} bytes in {realistic_time:?}; whole 1080p \
+             uncompressible={} bytes in {noise_time:?}; whole 1080p through shared memory={} \
+             bytes in {shared_time:?}",
             whole.len(),
-            whole_time,
-            patch.len(),
-            start.elapsed()
+            small.len(),
+            realistic.len(),
+            noise_update.len(),
+            shared_frame.len()
         );
     }
 }

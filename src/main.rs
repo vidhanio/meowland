@@ -1,19 +1,17 @@
-mod compositor;
-mod kitty;
-mod protocol;
-mod server;
-mod terminal;
-
 use std::{
     env,
     io::IsTerminal,
+    os::unix::process::CommandExt as _,
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use protocol::{ControlRequest, ControlResponse, Show, WindowInfo};
+use meowland::{
+    protocol::{self, ControlRequest, ControlResponse, Show, WindowInfo},
+    server, terminal,
+};
 use usage::{Args, Cli, Subcommands};
 
 #[derive(Cli)]
@@ -94,13 +92,16 @@ fn start() -> Result<()> {
         return server::serve(&server::Paths::discover()?);
     }
     let cli = Meowland::parse();
-    let paths = server::Paths::discover()?;
     match cli.command {
-        Commands::Server(ServerArgs { command }) => match command {
-            ServerCommands::Start => ensure_server(&paths),
-            ServerCommands::Stop => request(&paths, &ControlRequest::Stop).map(|_| ()),
-        },
+        Commands::Server(ServerArgs { command }) => {
+            let paths = server::Paths::discover()?;
+            match command {
+                ServerCommands::Start => ensure_server(&paths),
+                ServerCommands::Stop => request(&paths, &ControlRequest::Stop).map(|_| ()),
+            }
+        }
         Commands::List => {
+            let paths = server::Paths::discover()?;
             let ControlResponse::Windows(windows) = request(&paths, &ControlRequest::List)? else {
                 bail!("server did not return windows");
             };
@@ -116,6 +117,7 @@ fn start() -> Result<()> {
             Ok(())
         }
         Commands::Run(RunArgs { command: client }) => {
+            let paths = server::Paths::discover()?;
             ensure_server(&paths)?;
             let before = list(&paths).unwrap_or_default();
             let has_client = !client.is_empty();
@@ -135,6 +137,7 @@ fn start() -> Result<()> {
             }
         }
         Commands::Attach(AttachArgs { id }) => {
+            let paths = server::Paths::discover()?;
             let show = id.map_or(Show::Focused, Show::Id);
             terminal::attach(&paths.pane, show)
         }
@@ -192,14 +195,23 @@ fn ensure_server(paths: &server::Paths) -> Result<()> {
         .create(true)
         .append(true)
         .open(&paths.log)?;
-    let child = Command::new("setsid")
-        .arg(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--internal-server")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()
-        .context("starting detached server (setsid)")?;
+        .stderr(log);
+    // Its own session, so the server outlives this terminal and has no
+    // controlling terminal to be hung up on.  `setsid` is done here rather
+    // than by spawning an external program that may not be installed.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    let child = command.spawn().context("starting detached server")?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if request(paths, &ControlRequest::Ping).is_ok() {

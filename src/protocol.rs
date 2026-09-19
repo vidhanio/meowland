@@ -20,7 +20,7 @@ pub struct WindowInfo {
     pub active: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Hello {
     pub version: u32,
     pub width: u32,
@@ -72,6 +72,8 @@ pub enum ServerToPane {
     },
     Release(String),
     Title(String),
+    /// The pointer shape the terminal should show, or `None` for its own.
+    Cursor(Option<String>),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -90,8 +92,11 @@ pub enum ControlResponse {
 }
 
 pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
-    let encoded = bincode::serde::encode_to_vec(value, bincode::config::standard().with_limit::<MAX_MESSAGE>())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let encoded = bincode::serde::encode_to_vec(
+        value,
+        bincode::config::standard().with_limit::<MAX_MESSAGE>(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if encoded.len() > MAX_MESSAGE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -114,8 +119,11 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
     }
     let mut encoded = vec![0; size];
     reader.read_exact(&mut encoded)?;
-    let (value, used) = bincode::serde::decode_from_slice(&encoded, bincode::config::standard().with_limit::<MAX_MESSAGE>())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let (value, used) = bincode::serde::decode_from_slice(
+        &encoded,
+        bincode::config::standard().with_limit::<MAX_MESSAGE>(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if used != size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -125,6 +133,7 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
     Ok(value)
 }
 
+#[must_use]
 pub fn sanitize(input: &str) -> String {
     input
         .chars()

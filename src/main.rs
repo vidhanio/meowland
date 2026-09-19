@@ -1,8 +1,8 @@
 use std::{
     env,
     io::IsTerminal,
-    os::unix::process::CommandExt as _,
-    process::Command,
+    os::unix::{net::UnixStream, process::CommandExt as _},
+    process::{Child, Command},
     thread,
     time::{Duration, Instant},
 };
@@ -116,7 +116,7 @@ fn start() -> Result<()> {
         Commands::Run(RunArgs { command: client }) => {
             let paths = server::Paths::discover()?;
             ensure_server(&paths)?;
-            let before = list(&paths).unwrap_or_default();
+            let before = list(&paths)?;
             let has_client = !client.is_empty();
             if !client.is_empty() {
                 request(&paths, &ControlRequest::Run(client))?;
@@ -184,15 +184,43 @@ fn request(paths: &server::Paths, value: &ControlRequest) -> Result<ControlRespo
     Ok(reply)
 }
 
+/// Launchers one `ensure_server` may start before it gives up and reports the
+/// log: enough to step over a server that is on its way out, not enough to
+/// hammer a binary that cannot start at all.
+const LAUNCH_LIMIT: u32 = 4;
+
 fn ensure_server(paths: &server::Paths) -> Result<()> {
-    if request(paths, &ControlRequest::Ping).is_ok() {
-        return Ok(());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut launcher: Option<Child> = None;
+    let mut started = 0;
+    loop {
+        if request(paths, &ControlRequest::Ping).is_ok() {
+            return Ok(());
+        }
+        // Another server still holding the socket makes a launcher fail to
+        // bind, so a new one is started only while nothing is listening and
+        // the last launcher has exited: a server on its way out is one that
+        // this has to wait for and then replace.  A launcher that dies for
+        // any other reason must not be started over and over either.
+        let listening = UnixStream::connect(&paths.control).is_ok();
+        let exited = launcher
+            .as_mut()
+            .is_none_or(|child| matches!(child.try_wait(), Ok(Some(_))));
+        if !listening && exited && started < LAUNCH_LIMIT {
+            launcher = Some(spawn_server(paths)?);
+            started += 1;
+        }
+        if Instant::now() >= deadline {
+            bail!("server did not become ready; see {}", paths.log.display());
+        }
+        thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Start a detached server, with its output going to the log.
+fn spawn_server(paths: &server::Paths) -> Result<Child> {
     let executable = env::current_exe()?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log)?;
+    let log = meowland::diag::open(&paths.log)?;
     let mut command = Command::new(executable);
     command
         .arg("--internal-server")
@@ -216,19 +244,7 @@ fn ensure_server(paths: &server::Paths) -> Result<()> {
             Ok(())
         });
     }
-    let child = command.spawn().context("starting detached server")?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if request(paths, &ControlRequest::Ping).is_ok() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    bail!(
-        "server did not become ready (launcher PID {}); see {}",
-        child.id(),
-        paths.log.display()
-    )
+    command.spawn().context("starting detached server")
 }
 
 fn completions(shell: &str) -> Result<()> {

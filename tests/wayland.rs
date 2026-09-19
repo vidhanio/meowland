@@ -510,3 +510,194 @@ fn alt_q_asks_the_window_to_close_and_alt_w_detaches() {
     }
     assert_eq!(server.list().len(), 1, "the window outlives the pane");
 }
+
+/// A popup's own window geometry sits inside its surface, and a pane draws a
+/// surface from its own origin: a popup anchored at (1,1) of a window geometry
+/// that starts at (2,1) has its *geometry* at (3,2) but its pixels start two
+/// up and to the left of that.
+#[test]
+fn popup_is_drawn_from_the_window_geometry_the_client_set() {
+    const WIDE: u32 = 6;
+    const TALL: u32 = 4;
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("popup geometry", "meowland.test");
+    client.set_window_geometry(window.xdg_surface, 2, 1, 4, 2);
+    let background = [10, 20, 30];
+    let buffer = client.shm_buffer(WIDE, TALL, WIDE * 4, &solid(WIDE, TALL, background));
+    client.attach(&window, buffer, WIDE, TALL);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
+
+    let popup = client.create_popup(window.xdg_surface, (4, 4), (1, 1, 1, 1));
+    client.set_window_geometry(popup.xdg_surface, 2, 2, 2, 2);
+    let position = popup.map(&mut client, 4, 4, &solid(4, 4, [200, 100, 50]));
+    assert_eq!(
+        position,
+        (1, 1),
+        "the configure is in window geometry space"
+    );
+
+    let mut pane = Pane::attach(&server, hello(WIDE, TALL, None, Show::Newest));
+    let frame = pane.frame();
+    assert_eq!(
+        at(&frame, 1, 0),
+        [200, 100, 50],
+        "the popup's surface origin is (2,1) + (1,1) - (2,2)"
+    );
+    assert_eq!(
+        at(&frame, 5, 3),
+        background,
+        "nothing is drawn two pixels past the popup's surface"
+    );
+}
+
+/// Two panes with crossed aspect ratios: the buffer bound has to cover both
+/// axes independently, or a buffer the client is configured for is refused and
+/// the pane goes blank.
+#[test]
+fn a_pane_bound_covers_both_axes() {
+    const WIDE_PANE: (u32, u32) = (200, 50);
+    const TALL_PANE: (u32, u32) = (40, 400);
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("bounds", "meowland.test");
+    let buffer = client.shm_buffer(
+        WIDE_PANE.0,
+        WIDE_PANE.1,
+        WIDE_PANE.0 * 4,
+        &solid(WIDE_PANE.0, WIDE_PANE.1, [1, 2, 3]),
+    );
+    client.attach(&window, buffer, WIDE_PANE.0, WIDE_PANE.1);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
+
+    let mut wide = Pane::attach(&server, hello(WIDE_PANE.0, WIDE_PANE.1, None, Show::Id(1)));
+    let _ = wide.frame();
+    wide.send(&protocol::PaneToServer::Ack { drawn: true });
+    let mut tall = Pane::attach(&server, hello(TALL_PANE.0, TALL_PANE.1, None, Show::Id(1)));
+    let _ = tall.frame();
+    tall.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    // The client redraws at the second pane's size: 40 wide, 400 tall fits
+    // the bound only when the height does not come from the widest pane.
+    let painted = [9, 8, 7];
+    let buffer = client.shm_buffer(
+        TALL_PANE.0,
+        TALL_PANE.1,
+        TALL_PANE.0 * 4,
+        &solid(TALL_PANE.0, TALL_PANE.1, painted),
+    );
+    client.attach(&window, buffer, TALL_PANE.0, TALL_PANE.1);
+
+    let frame = tall.frame();
+    assert_eq!((frame.0, frame.1), TALL_PANE);
+    assert_eq!(at(&frame, 0, 0), painted, "the tall pane shows the redraw");
+}
+
+/// The compositor counts a frame it has handed over as displayed, and a pane
+/// that has not acknowledged one is a frame behind: the newest frame has to be
+/// kept for it rather than dropped, or the pane never shows it.
+#[test]
+fn a_frame_held_for_a_busy_pane_is_delivered_after_its_ack() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("busy pane", "meowland.test");
+    let first = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [1, 2, 3]));
+    client.attach(&window, first, WIDTH, HEIGHT);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
+
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let frame = pane.frame();
+    assert_eq!(at(&frame, 0, 0), [1, 2, 3]);
+
+    // The client redraws while the pane holds the first frame unacknowledged.
+    let second = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [9, 8, 7]));
+    client.attach(&window, second, WIDTH, HEIGHT);
+
+    // After the half second the compositor gives the unacknowledged frame up,
+    // the redraw is rendered and sent; the pane is still busy, so the server
+    // holds it.  The acknowledgement then releases it.
+    thread::sleep(Duration::from_millis(700));
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    let frame = pane.frame();
+    assert_eq!(
+        at(&frame, 0, 0),
+        [9, 8, 7],
+        "the frame held for the busy pane was never delivered"
+    );
+}
+
+/// A pane that stops reading and comes back later must still be connected: a
+/// loaded machine can leave a pane unrun for seconds, and the frame only has
+/// to wait for it.  A write that gives up on the pane ends a session that
+/// needed nothing but time.
+#[test]
+fn a_pane_that_stalls_mid_frame_is_not_disconnected() {
+    // The frame has to be far larger than the socket buffers, so the write
+    // cannot finish while the pane is not reading.
+    const SIDE: u32 = 2048;
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("slow reader", "meowland.test");
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &solid(SIDE, SIDE, [4, 5, 6]));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
+
+    let mut pane = Pane::attach(&server, hello(SIDE, SIDE, None, Show::Newest));
+    // Long enough that a write which gives up on the pane has given up: the
+    // socket fills, the writer waits, and the pane comes back to the frame
+    // that was waiting for it.
+    thread::sleep(Duration::from_millis(5000));
+    let frame = pane.frame();
+    assert_eq!((frame.0, frame.1), (SIDE, SIDE));
+    assert_eq!(at(&frame, 0, 0), [4, 5, 6], "the stalled frame was lost");
+}
+
+/// A pane that follows the newest window has to follow the one that is left
+/// when that window closes, rather than sitting on an empty, black pane.
+#[test]
+fn a_following_pane_moves_to_the_next_window_when_the_newest_closes() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let first = client.create_toplevel("first", "meowland.test");
+    let (raw, painted) = pixels();
+    let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
+    client.attach(&first, buffer, WIDTH, HEIGHT);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "the first window was never announced"
+    );
+
+    let second = client.create_toplevel("second", "meowland.test");
+    let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [7, 7, 7]));
+    client.attach(&second, buffer, WIDTH, HEIGHT);
+    assert!(
+        wait_for(Duration::from_secs(5), || server.list().len() == 2),
+        "the second window was never announced"
+    );
+
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let frame = pane.frame();
+    assert_eq!(at(&frame, 0, 0), [7, 7, 7], "the pane follows the newest");
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    client.destroy_toplevel(&second);
+    let frame = pane.frame();
+    assert_eq!(
+        at(&frame, 0, 0),
+        [painted[0], painted[1], painted[2]],
+        "the pane should be showing the window that is left"
+    );
+}

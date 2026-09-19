@@ -128,7 +128,7 @@ fn whole_frames(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("flat", name), |b| {
             b.iter_batched(
                 || (Presenter::new(Some(CELL), None), flat.clone()),
-                |(mut presenter, frame)| black_box(presenter.present(width, height, frame)),
+                |(mut presenter, frame)| black_box(presenter.present(width, height, 0, frame)),
                 BatchSize::LargeInput,
             );
         });
@@ -139,7 +139,7 @@ fn whole_frames(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("incompressible", name), |b| {
             b.iter_batched(
                 || (Presenter::new(None, None), noisy.clone()),
-                |(mut presenter, frame)| black_box(presenter.present(width, height, frame)),
+                |(mut presenter, frame)| black_box(presenter.present(width, height, 0, frame)),
                 BatchSize::LargeInput,
             );
         });
@@ -164,10 +164,10 @@ fn patches(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
                 (presenter, cell.clone())
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -178,10 +178,10 @@ fn patches(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
                 (presenter, repainted.clone())
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -193,10 +193,10 @@ fn patches(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
                 (presenter, spread.clone())
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -207,11 +207,11 @@ fn patches(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, base.clone()));
-                black_box(presenter.present(WIDTH, HEIGHT, cell.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, cell.clone()));
                 (presenter, base.clone())
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -222,10 +222,10 @@ fn patches(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut presenter = Presenter::new(None, None);
-                black_box(presenter.present(WIDTH, HEIGHT, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
                 (presenter, base.clone())
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -251,10 +251,10 @@ fn damage(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
                 (presenter, noisy.clone())
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -294,7 +294,7 @@ fn shared_memory(c: &mut Criterion) {
                     noisy.clone(),
                 )
             },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, frame)),
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
             BatchSize::LargeInput,
         );
     });
@@ -313,8 +313,8 @@ fn shared_memory(c: &mut Criterion) {
                 )
             },
             |(mut presenter, first, second)| {
-                black_box(presenter.present(WIDTH, HEIGHT, first));
-                let dropped = presenter.present(WIDTH, HEIGHT, second);
+                black_box(presenter.present(WIDTH, HEIGHT, 0, first));
+                let dropped = presenter.present(WIDTH, HEIGHT, 0, second);
                 assert!(dropped.is_empty() && presenter.dropped(), "not dropped");
                 black_box(dropped)
             },

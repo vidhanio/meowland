@@ -260,13 +260,11 @@ impl Server<'_> {
                     pane,
                     width,
                     height,
+                    y,
                     rgb,
-                } => self.hand_over_frame(pane, width, height, rgb),
+                } => self.hand_over_frame(pane, width, height, y, rgb),
                 CompositorEvent::Release { pane, reason } => {
                     if let Some(target) = self.panes.remove(&pane) {
-                        if let Some(held) = target.held {
-                            recycle(&self.commands, held);
-                        }
                         release(&target.writer, reason);
                     }
                 }
@@ -279,21 +277,24 @@ impl Server<'_> {
     /// compositor treats a frame it handed over as displayed, so a frame that
     /// is dropped here would leave the pane on a scene the compositor thinks
     /// it has replaced.
-    fn hand_over_frame(&mut self, pane: u64, width: u32, height: u32, rgb: Vec<u8>) {
-        let frame = ServerToPane::Frame { width, height, rgb };
+    fn hand_over_frame(&mut self, pane: u64, width: u32, height: u32, y: u32, rgb: Vec<u8>) {
+        let frame = ServerToPane::Frame {
+            width,
+            height,
+            y,
+            rgb,
+        };
         let Some(target) = self.panes.get_mut(&pane) else {
-            recycle(&self.commands, frame);
             return;
         };
         if target.busy {
-            if let Some(superseded) = target.held.replace(frame) {
-                recycle(&self.commands, superseded);
-            }
+            // Only the newest band is worth holding: the next one is the whole
+            // of what a pane that comes back needs to be current.
+            target.held = Some(frame);
             return;
         }
-        match target.writer.send(frame) {
-            Ok(()) => target.busy = true,
-            Err(error) => recycle(&self.commands, error.0),
+        if target.writer.send(frame).is_ok() {
+            target.busy = true;
         }
     }
 
@@ -367,9 +368,8 @@ impl Server<'_> {
         self.next_pane += 1;
         let (send_tx, send_rx) = mpsc::channel();
         let _ = protocol::send(&mut writer, &ServerToPane::HelloOk);
-        let recycler = self.commands.clone();
         let log = self.paths.log.clone();
-        thread::spawn(move || pane_writer(writer, send_rx, &recycler, &log));
+        thread::spawn(move || pane_writer(writer, send_rx, &log));
         read_pane(id, socket, self.incoming.clone());
         self.panes.insert(
             id,
@@ -435,11 +435,10 @@ impl Server<'_> {
                     pane.busy = false;
                     // The frame held back while this one was in flight is the
                     // one the compositor last rendered; it goes out now.
-                    if let Some(held) = pane.held.take() {
-                        match pane.writer.send(held) {
-                            Ok(()) => pane.busy = true,
-                            Err(error) => recycle(&self.commands, error.0),
-                        }
+                    if let Some(held) = pane.held.take()
+                        && pane.writer.send(held).is_ok()
+                    {
+                        pane.busy = true;
                     }
                     let _ = self
                         .commands
@@ -674,32 +673,17 @@ fn accept_panes(listener: UnixListener, incoming: Sender<Incoming>, log: PathBuf
 
 /// Frames are the compositor's, so `commands` is only borrowed: the thread
 /// that spawned this one owns the sender for its whole life.
-fn pane_writer(
-    mut socket: UnixStream,
-    rx: Receiver<ServerToPane>,
-    commands: &Sender<CompositorCommand>,
-    log: &Path,
-) {
+fn pane_writer(mut socket: UnixStream, rx: Receiver<ServerToPane>, log: &Path) {
     let _ = socket.set_write_timeout(Some(FRAME_WRITE_TIMEOUT));
     for message in rx {
         if let Err(error) = protocol::send(&mut socket, &message) {
             // A write that did not finish leaves the stream half a message
             // long, so there is no way back except closing it; the pane's
-            // reader sees the end too and the pane is reaped.  The frame goes
-            // back to the compositor first.
-            recycle(commands, message);
+            // reader sees the end too and the pane is reaped.
             let _ = socket.shutdown(std::net::Shutdown::Both);
             diag::line(log, &format!("pane: write failed ({error}); closed"));
             break;
         }
-        recycle(commands, message);
-    }
-}
-
-/// Give a frame buffer back to the compositor for its next frame.
-fn recycle(commands: &Sender<CompositorCommand>, message: ServerToPane) {
-    if let ServerToPane::Frame { rgb, .. } = message {
-        let _ = commands.send(CompositorCommand::Recycle(rgb));
     }
 }
 

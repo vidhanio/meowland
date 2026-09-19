@@ -35,6 +35,7 @@ fn frame(width: u32, height: u32) -> ServerToPane {
     ServerToPane::Frame {
         width,
         height,
+        y: 0,
         rgb: vec![17; pixels(width, height)],
     }
 }

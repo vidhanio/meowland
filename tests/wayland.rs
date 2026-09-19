@@ -636,6 +636,43 @@ fn a_frame_held_for_a_busy_pane_is_delivered_after_its_ack() {
     );
 }
 
+/// A change of one row must cost one row on the wire: the pane is sent the
+/// band that changed, not the frame it is part of.
+#[test]
+fn a_small_change_reaches_the_pane_as_a_band() {
+    const SIDE: u32 = 64;
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("bands", "meowland.test");
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &solid(SIDE, SIDE, [1, 2, 3]));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
+
+    let mut pane = Pane::attach(&server, hello(SIDE, SIDE, None, Show::Newest));
+    let frame = pane.frame();
+    assert_eq!((frame.0, frame.1), (SIDE, SIDE));
+    assert_eq!(pane.band(), (0, SIDE), "the first frame is the whole of it");
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    // One row of pixels changes.
+    let mut raw = solid(SIDE, SIDE, [1, 2, 3]);
+    for pixel in raw[..(SIDE * 4) as usize].as_chunks_mut::<4>().0 {
+        pixel.copy_from_slice(&[9, 9, 9, 0xff]);
+    }
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw);
+    client.attach(&window, buffer, SIDE, SIDE);
+
+    let frame = pane.frame();
+    let (y, rows) = pane.band();
+    assert!(rows < SIDE, "a one row change sent {rows} rows");
+    assert!(y + rows >= 1, "the changed row was not in the band");
+    assert_eq!(at(&frame, 0, 0), [9, 9, 9], "the change is in the picture");
+    assert_eq!(at(&frame, 0, SIDE - 1), [1, 2, 3], "the rest is untouched");
+}
+
 /// A pane that stops reading and comes back later must still be connected: a
 /// loaded machine can leave a pane unrun for seconds, and the frame only has
 /// to wait for it.  A write that gives up on the pane ends a session that

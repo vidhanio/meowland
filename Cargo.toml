@@ -21,8 +21,20 @@ flate2 = "1.1.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"
 signal-hook = "0.3"
-rustix = { version = "1.1.4", features = ["net", "process", "runtime", "shm"] }
-smithay = { version = "0.7", default-features = false, features = ["wayland_frontend"] }
+rustix = { version = "1.1.4", features = [
+  "event",
+  "net",
+  "pipe",
+  "process",
+  "pty",
+  "runtime",
+  "shm",
+  "termios",
+] }
+smithay = { version = "0.7", default-features = false, features = [
+  "wayland_frontend",
+  "desktop",
+] }
 usage = { package = "usage-rs", version = "6.9.1", default-features = false, features = [
   "completions",
   "diagnostics",

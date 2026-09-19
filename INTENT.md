@@ -504,6 +504,17 @@ What "it works" meant here, and should mean again:
 - A compositor like this cannot be proven by tests alone. The real check is
   running it in a pane: run clients, resize the terminal, detach and reattach,
   stop the server, and watch targets/frames in the log.
+- The frame path's costs are measured, not asserted: `cargo bench` runs the
+  criterion suites in `benches/`. `kitty.rs` covers the encoder's branches (a
+  whole frame of flat and of incompressible pixels at 1080p and 4K, one-cell
+  and block patches, the patch budget spent exactly, a revert to the base
+  image, an unchanged frame, and the shared-memory handover including the
+  fallback when the object has not been read), and `protocol.rs` covers the
+  wire codec (frames both ways, the per-event input messages, the window
+  list). Criterion is a dev-dependency with plotting off: the numbers are
+  text. The end-to-end rate check — client commit, compositor copy, pane
+  socket, ack — stays with the harness it needs, as the ignored test in
+  `tests/wayland.rs`.
 - The three-part split must be observable in practice: killing a pane must not
   disturb other panes or the compositor; a stalled terminal must only cost its
   own pane frames.

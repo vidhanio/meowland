@@ -41,6 +41,23 @@ usage = { package = "usage-rs", version = "6.9.1", default-features = false, fea
   "help",
 ] }
 
+[dev-dependencies]
+# `cargo bench` only: the encoder and the wire codec are where the frame path
+# spends its time, and the two benchmark targets below are built on these.  The
+# plotting stack (`plotters`, `rayon`) stays off, since text output is what the
+# numbers are read from.
+criterion = { version = "0.8.2", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[[bench]]
+name = "kitty"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
+
 [lints]
 [lints.rust]
 missing_copy_implementations = "warn"

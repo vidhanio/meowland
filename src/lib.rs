@@ -2,8 +2,9 @@
 //! pane using the kitty graphics protocol.
 //!
 //! The binary in `main.rs` is a thin shell around these modules.  They are
-//! public so process-level integration tests can speak the real protocols and
-//! so the pane-side encoder can be exercised directly.
+//! public so process-level integration tests can speak the real protocols, so
+//! the pane-side encoder can be exercised directly, and so the benchmarks in
+//! `benches/` can measure the encoder and the wire codec.
 
 pub mod compositor;
 pub mod kitty;

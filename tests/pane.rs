@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use support::{BINARY, Client, FakeTerminal, Pty, Server, wait_for};
+use support::{BINARY, Client, Pty, PtyChild, Server, fake::FakeTerminal, wait_for};
 
 const SIDE: u32 = 4;
 
@@ -37,7 +37,7 @@ fn raw_from_rgb(rgb: &[u8]) -> Vec<u8> {
 fn pump_until_drawn(
     pty: &mut Pty,
     terminal: &mut FakeTerminal,
-    child: &mut std::process::Child,
+    child: &mut PtyChild,
     expected: &[u8],
     what: &str,
 ) {
@@ -70,9 +70,10 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
     let rgb = gradient();
     let (buffer, file) = client.shm_buffer_with_file(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
     client.attach(&toplevel, buffer, SIDE, SIDE);
-    assert!(wait_for(Duration::from_secs(5), || !server
-        .list()
-        .is_empty()));
+    assert!(
+        server.wait_for_window(Duration::from_secs(5)),
+        "window was never announced"
+    );
 
     let mut pty = Pty::open(2, 2, (2, 2));
     let mut child = pty.spawn(

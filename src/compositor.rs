@@ -60,7 +60,7 @@ use smithay::{
     },
 };
 
-use crate::protocol::{Input, Show, WindowInfo};
+use crate::protocol::{Input, Show, WindowInfo, modifiers};
 
 /// Windows are composed at most this often.  A client that draws in a loop
 /// cannot spin the compositor, and a pane that is slow costs its own frames.
@@ -70,8 +70,16 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const IDLE_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_SURFACE_SIDE: u32 = 8192;
 const MAX_SURFACE_PIXELS: usize = 16_000_000;
+/// Each modifier bit a stroke can carry, with the Linux input code of the key
+/// that holds it down while the stroke is sent.
+const MODIFIER_KEYS: [(u8, u16); 4] = [
+    (modifiers::SHIFT, 42),
+    (modifiers::CONTROL, 29),
+    (modifiers::ALT, 56),
+    (modifiers::SUPER, 125),
+];
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Command {
     Attach {
         pane: u64,
@@ -103,7 +111,7 @@ pub enum Command {
     Shutdown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Event {
     /// A window appeared, or its title or app id changed.
     WindowUp(WindowInfo),
@@ -139,6 +147,12 @@ pub type Handle = (
     thread::JoinHandle<()>,
 );
 
+/// Start the compositor thread and wait until it is listening.
+///
+/// # Errors
+/// Returns an error when the thread cannot be spawned, when the compositor
+/// fails to build its display, keymap or Wayland socket, or when it does not
+/// report readiness within two seconds.
 pub fn spawn() -> std::io::Result<Handle> {
     let (commands, rx) = mpsc::channel();
     let (tx, events) = mpsc::channel();
@@ -170,7 +184,7 @@ impl ClientData for ClientState {
 }
 
 /// A committed buffer, copied out of the client's memory at commit time.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Snapshot {
     width: u32,
     height: u32,
@@ -190,6 +204,22 @@ struct PaneState {
     next_frame: Instant,
     /// The last frame this pane was sent, so an unchanged scene costs nothing.
     shown: Vec<u8>,
+}
+
+impl PaneState {
+    /// A pane showing `window`, or 0 for one still waiting for a window with
+    /// pixels.
+    fn new(window: u64, width: u32, height: u32) -> Self {
+        Self {
+            window,
+            width,
+            height,
+            in_flight: false,
+            dirty: false,
+            next_frame: Instant::now(),
+            shown: Vec::new(),
+        }
+    }
 }
 
 struct Window {
@@ -272,12 +302,13 @@ impl CompositorHandler for State {
             .compositor_state
     }
 
-    #[allow(unsafe_code)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "`cached` borrows from the guard and must outlive `current`, so the two \
+                  statements cannot be merged"
+    )]
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
-        // The state guard must outlive `current`, so it cannot be tightened
-        // into the same expression.
-        #[allow(clippy::significant_drop_tightening)]
         let assignment = with_states(surface, |states| {
             let mut cached = states.cached_state.get::<SurfaceAttributes>();
             let current = cached.current();
@@ -313,6 +344,13 @@ impl CompositorHandler for State {
         if let Some(window) = self.window_for_surface(surface) {
             self.touch(window);
         }
+    }
+
+    /// A destroyed surface takes its snapshot with it: `toplevel_destroyed`
+    /// only sweeps surfaces its tree still leads back to, which never covers a
+    /// surface that had no window role at all.
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.snapshots.remove(surface);
     }
 }
 
@@ -368,14 +406,7 @@ impl State {
             return;
         }
         self.newest = Some(id);
-        let following: Vec<u64> = self.following.iter().copied().collect();
-        for pane in following {
-            if let Some(state) = self.panes.get_mut(&pane) {
-                state.window = id;
-            }
-            self.mark_dirty(pane);
-            self.send_title(pane, id);
-        }
+        self.follow_panes(id);
         let info = self.window_info(id);
         let _ = self.events.send(Event::WindowUp(info));
         apply_window_state(self, id);
@@ -406,11 +437,10 @@ impl State {
             .and_then(|pane| self.panes.get(pane))
             .filter(|pane| pane.window == window);
         let first = self
-            .panes
-            .iter()
-            .filter(|(_, pane)| pane.window == window)
-            .min_by_key(|(pane, _)| **pane)
-            .map(|(_, pane)| pane);
+            .panes_showing(window)
+            .into_iter()
+            .min()
+            .and_then(|pane| self.panes.get(&pane));
         deciding.or(first).map_or(self.mode, |pane| {
             Size::from((pane.width as i32, pane.height as i32))
         })
@@ -435,15 +465,40 @@ impl State {
         }
     }
 
-    /// Something the panes showing this window draw has changed.
-    fn touch(&mut self, window: u64) {
-        let panes: Vec<u64> = self
-            .panes
+    /// The panes showing this window.
+    fn panes_showing(&self, window: u64) -> Vec<u64> {
+        self.panes
             .iter()
             .filter(|(_, pane)| pane.window == window)
             .map(|(pane, _)| *pane)
-            .collect();
-        for pane in panes {
+            .collect()
+    }
+
+    /// Register a pane; while it is the lowest-numbered one, its size is the
+    /// output mode every client sees.
+    fn insert_pane(&mut self, pane: u64, entry: PaneState) {
+        let (width, height) = (entry.width, entry.height);
+        self.panes.insert(pane, entry);
+        if self.panes.keys().min() == Some(&pane) {
+            configure_output(self, width, height);
+        }
+    }
+
+    /// Point every follow-the-newest pane at `window`, with its title.
+    fn follow_panes(&mut self, window: u64) {
+        let following: Vec<u64> = self.following.iter().copied().collect();
+        for pane in following {
+            if let Some(state) = self.panes.get_mut(&pane) {
+                state.window = window;
+            }
+            self.mark_dirty(pane);
+            self.send_title(pane, window);
+        }
+    }
+
+    /// Something the panes showing this window draw has changed.
+    fn touch(&mut self, window: u64) {
+        for pane in self.panes_showing(window) {
             self.mark_dirty(pane);
         }
     }
@@ -457,13 +512,7 @@ impl State {
     }
 
     fn send_titles(&self, window: u64) {
-        let panes: Vec<u64> = self
-            .panes
-            .iter()
-            .filter(|(_, pane)| pane.window == window)
-            .map(|(pane, _)| *pane)
-            .collect();
-        for pane in panes {
+        for pane in self.panes_showing(window) {
             self.send_title(pane, window);
         }
     }
@@ -553,11 +602,7 @@ impl XdgShellHandler for State {
         {
             return;
         }
-        let target = popup_target(self, &surface);
-        surface.with_pending_state(|state| {
-            state.geometry = positioner.get_unconstrained_geometry(target);
-            state.positioner = positioner;
-        });
+        place_popup(self, &surface, positioner);
         let _ = surface.send_configure();
     }
 
@@ -567,11 +612,7 @@ impl XdgShellHandler for State {
         positioner: PositionerState,
         token: u32,
     ) {
-        let target = popup_target(self, &surface);
-        surface.with_pending_state(|state| {
-            state.geometry = positioner.get_unconstrained_geometry(target);
-            state.positioner = positioner;
-        });
+        place_popup(self, &surface, positioner);
         surface.send_repositioned(token);
     }
 
@@ -600,6 +641,26 @@ impl XdgShellHandler for State {
             self.snapshots.remove(&surface);
         }
         self.ids.remove(surface.wl_surface());
+        for pane in self.panes_showing(id) {
+            if self.following.contains(&pane) {
+                if let Some(state) = self.panes.get_mut(&pane) {
+                    state.window = 0;
+                }
+                self.mark_dirty(pane);
+                // The title belonged to the window that just went away.
+                self.send_title(pane, 0);
+            } else {
+                self.panes.remove(&pane);
+                self.pending.remove(&pane);
+                let _ = self.events.send(Event::Release {
+                    pane,
+                    reason: "window closed".into(),
+                });
+            }
+        }
+        // With no pane showing the window any more, the surfaces that were
+        // told they entered the output are told they left it.  The window
+        // entry is what finds those surfaces, so this runs before it goes.
         self.leave_output(id);
         self.windows.remove(&id);
         self.deciding.remove(&id);
@@ -610,27 +671,6 @@ impl XdgShellHandler for State {
                 .filter(|(_, entry)| entry.announced)
                 .map(|(id, _)| *id)
                 .max();
-        }
-        let panes: Vec<u64> = self
-            .panes
-            .iter()
-            .filter(|(_, pane)| pane.window == id)
-            .map(|(pane, _)| *pane)
-            .collect();
-        for pane in panes {
-            if self.following.contains(&pane) {
-                if let Some(state) = self.panes.get_mut(&pane) {
-                    state.window = 0;
-                }
-                self.mark_dirty(pane);
-            } else {
-                self.panes.remove(&pane);
-                self.pending.remove(&pane);
-                let _ = self.events.send(Event::Release {
-                    pane,
-                    reason: "window closed".into(),
-                });
-            }
         }
         self.popups.cleanup();
         if self.focused == Some(id) {
@@ -652,18 +692,18 @@ impl XdgShellHandler for State {
         let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
             return;
         };
-        if let Some(window) = self.windows.get_mut(&id) {
-            window.fullscreen = true;
-        }
-        // Fullscreen means "be the window on this screen": a pane that follows
-        // the newest window switches to it.
-        let following: Vec<u64> = self.following.iter().copied().collect();
-        for pane in following {
-            if let Some(state) = self.panes.get_mut(&pane) {
-                state.window = id;
+        let announced = match self.windows.get_mut(&id) {
+            Some(window) => {
+                window.fullscreen = true;
+                window.announced
             }
-            self.mark_dirty(pane);
-            self.send_title(pane, id);
+            None => return,
+        };
+        // Fullscreen means "be the window on this screen": a pane that follows
+        // the newest window switches to it, but only once the window has
+        // pixels, or it would capture a pane it can only draw black into.
+        if announced {
+            self.follow_panes(id);
         }
         self.enter_output(id);
         self.focus_window(id);
@@ -738,7 +778,25 @@ fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> 
     let size = state
         .window_for_surface(popup.wl_surface())
         .map_or(state.mode, |window| state.pane_size(window));
-    Rectangle::new((-geometry.loc.x, -geometry.loc.y).into(), size)
+    Rectangle::new(
+        (
+            geometry.loc.x.saturating_neg(),
+            geometry.loc.y.saturating_neg(),
+        )
+            .into(),
+        size,
+    )
+}
+
+/// Give a popup the geometry its positioner asks for, against the pane showing
+/// its window.  Creating and re-positioning a popup both go through here, so
+/// the two paths cannot place the same popup differently.
+fn place_popup(state: &State, surface: &PopupSurface, positioner: PositionerState) {
+    let target = popup_target(state, surface);
+    surface.with_pending_state(|pending| {
+        pending.geometry = positioner.get_unconstrained_geometry(target);
+        pending.positioner = positioner;
+    });
 }
 
 impl SeatHandler for State {
@@ -846,7 +904,10 @@ delegate_output!(State);
 delegate_data_device!(State);
 delegate_cursor_shape!(State);
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the compositor thread's channels are handed over once, when the thread starts"
+)]
 fn run(
     name: String,
     rx: mpsc::Receiver<Command>,
@@ -919,25 +980,28 @@ fn run(
         started: Instant::now(),
         shutdown: false,
     };
-    state.keyboard = state.seat.add_keyboard(XkbConfig::default(), 25, 600).ok();
+    let Ok(keyboard) = state.seat.add_keyboard(XkbConfig::default(), 25, 600) else {
+        let _ = ready.send(Err(std::io::Error::other(
+            "could not compile the keyboard keymap",
+        )));
+        return;
+    };
+    state.keyboard = Some(keyboard);
     let Ok(listener) = ListeningSocket::bind(name) else {
         let _ = ready.send(Err(std::io::Error::other("could not bind Wayland socket")));
         return;
     };
     let _ = ready.send(Ok(()));
-    // Held, not read: dropping a client handle disconnects that client.
-    #[allow(clippy::collection_is_never_read)]
-    let mut clients = Vec::new();
     while !state.shutdown {
         while let Ok(command) = rx.try_recv() {
             handle_command(&mut state, command);
         }
-        if let Ok(Some(stream)) = listener.accept()
-            && let Ok(client) = state
+        // The backend owns accepted connections; the returned handle carries
+        // nothing the compositor needs, so it is not kept.
+        if let Ok(Some(stream)) = listener.accept() {
+            let _ = state
                 .display
-                .insert_client(stream, Arc::new(ClientState::default()))
-        {
-            clients.push(client);
+                .insert_client(stream, Arc::new(ClientState::default()));
         }
         let _ = display.dispatch_clients(&mut state);
         let _ = display.flush_clients();
@@ -947,7 +1011,6 @@ fn run(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn handle_command(state: &mut State, command: Command) {
     match command {
         Command::Attach {
@@ -955,65 +1018,7 @@ fn handle_command(state: &mut State, command: Command) {
             show,
             width,
             height,
-        } => {
-            if matches!(show, Show::Newest) {
-                state.following.insert(pane);
-            }
-            let id = match show {
-                Show::Id(id) => id,
-                Show::Newest => state.newest.unwrap_or(0),
-                Show::Focused => state.focused.unwrap_or(0),
-            };
-            let announced = state
-                .windows
-                .get(&id)
-                .is_some_and(|window| window.announced);
-            if announced {
-                state.panes.insert(
-                    pane,
-                    PaneState {
-                        window: id,
-                        width,
-                        height,
-                        in_flight: false,
-                        dirty: false,
-                        next_frame: Instant::now(),
-                        shown: Vec::new(),
-                    },
-                );
-                if state.panes.keys().min() == Some(&pane) {
-                    configure_output(state, width, height);
-                }
-                state.enter_output(id);
-                state.send_title(pane, id);
-                state.mark_dirty(pane);
-                apply_window_state(state, id);
-                state.focus_window(id);
-            } else if matches!(show, Show::Newest | Show::Focused) {
-                // Nothing to show yet: wait for the next window with pixels.
-                state.panes.insert(
-                    pane,
-                    PaneState {
-                        window: 0,
-                        width,
-                        height,
-                        in_flight: false,
-                        dirty: false,
-                        next_frame: Instant::now(),
-                        shown: Vec::new(),
-                    },
-                );
-                state.following.insert(pane);
-                if state.panes.keys().min() == Some(&pane) {
-                    configure_output(state, width, height);
-                }
-            } else {
-                let _ = state.events.send(Event::Release {
-                    pane,
-                    reason: "no such window".into(),
-                });
-            }
-        }
+        } => attach(state, pane, show, width, height),
         Command::Detach { pane } => {
             let first = state.panes.keys().min() == Some(&pane);
             let window = state.panes.remove(&pane).map(|state| state.window);
@@ -1099,6 +1104,41 @@ fn handle_command(state: &mut State, command: Command) {
             }
             state.shutdown = true;
         }
+    }
+}
+
+/// Attach a pane to the window its selection resolves to.  A selection that
+/// names a window which is not there is released with a reason, and one that
+/// follows the newest window waits for the next window with pixels instead.
+fn attach(state: &mut State, pane: u64, show: Show, width: u32, height: u32) {
+    if matches!(show, Show::Newest) {
+        state.following.insert(pane);
+    }
+    let id = match show {
+        Show::Id(id) => id,
+        Show::Newest => state.newest.unwrap_or(0),
+        Show::Focused => state.focused.unwrap_or(0),
+    };
+    let announced = state
+        .windows
+        .get(&id)
+        .is_some_and(|window| window.announced);
+    if announced {
+        state.insert_pane(pane, PaneState::new(id, width, height));
+        state.enter_output(id);
+        state.send_title(pane, id);
+        state.mark_dirty(pane);
+        apply_window_state(state, id);
+        state.focus_window(id);
+    } else if matches!(show, Show::Newest | Show::Focused) {
+        // Nothing to show yet: wait for the next window with pixels.
+        state.insert_pane(pane, PaneState::new(0, width, height));
+        state.following.insert(pane);
+    } else {
+        let _ = state.events.send(Event::Release {
+            pane,
+            reason: "no such window".into(),
+        });
     }
 }
 
@@ -1226,20 +1266,19 @@ fn render_frame(state: &mut State, pane: u64) -> Option<Vec<u8>> {
         let entry = state.panes.get(&pane)?;
         (entry.window, entry.width, entry.height)
     };
+    // Drawing and the backdrop decision share one stack, so they cannot
+    // disagree about what is on the pane.
+    let stack = state
+        .windows
+        .get(&window)
+        .map_or_default(|entry| surface_stack(&entry.surface.wl_surface().clone()));
     let mut out = state.pool.pop().unwrap_or_default();
     out.resize(width as usize * height as usize * 3, 0);
-    if window == 0 || !opaque_cover(state, window, width, height) {
+    if !opaque_cover(state, &stack, width, height) {
         out.fill(0);
     }
-    if window != 0
-        && let Some(root) = state
-            .windows
-            .get(&window)
-            .map(|entry| entry.surface.wl_surface().clone())
-    {
-        for (surface, origin) in surface_stack(&root) {
-            blit(state, &surface, origin, &mut out, width, height);
-        }
+    for (surface, origin) in &stack {
+        blit(state, surface, *origin, &mut out, width, height);
     }
     Some(out)
 }
@@ -1309,27 +1348,24 @@ fn blit(
     let top = origin.y;
     let clip_left = left.max(0);
     let clip_top = top.max(0);
-    let clip_right = (left + dst.w).min(width as i32);
-    let clip_bottom = (top + dst.h).min(height as i32);
+    // Both extents are client-chosen, so the box is clamped, not added.
+    let clip_right = left.saturating_add(dst.w).min(width as i32);
+    let clip_bottom = top.saturating_add(dst.h).min(height as i32);
     if clip_right <= clip_left || clip_bottom <= clip_top {
         return;
     }
     let last_x = snapshot.width as usize - 1;
     let last_y = snapshot.height as usize - 1;
-    let columns: Vec<usize> = (clip_left..clip_right)
-        .map(|x| {
-            let sample = src.loc.x + (f64::from(x - left) + 0.5) * src.size.w / f64::from(dst.w);
-            (sample.floor().max(0.0) as usize).min(last_x)
-        })
-        .collect();
     let stride = snapshot.width as usize * 4;
     for y in clip_top..clip_bottom {
         let sample = src.loc.y + (f64::from(y - top) + 0.5) * src.size.h / f64::from(dst.h);
         let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
         let to = (y as usize * width as usize + clip_left as usize) * 3;
-        for (index, &column) in columns.iter().enumerate() {
+        for x in clip_left..clip_right {
+            let sample = src.loc.x + (f64::from(x - left) + 0.5) * src.size.w / f64::from(dst.w);
+            let column = (sample.floor().max(0.0) as usize).min(last_x);
             let pixel = row + column * 4;
-            let at = to + index * 3;
+            let at = to + (x - clip_left) as usize * 3;
             if snapshot.opaque {
                 out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]);
                 continue;
@@ -1354,15 +1390,12 @@ fn blit(
 
 /// Whether the topmost thing a window draws is opaque and covers the whole
 /// pane, in which case the backdrop under it need not be laid down.
-fn opaque_cover(state: &State, window: u64, width: u32, height: u32) -> bool {
-    let Some(root) = state
-        .windows
-        .get(&window)
-        .map(|entry| entry.surface.wl_surface().clone())
-    else {
-        return false;
-    };
-    let stack = surface_stack(&root);
+fn opaque_cover(
+    state: &State,
+    stack: &[(WlSurface, Point<i32, Logical>)],
+    width: u32,
+    height: u32,
+) -> bool {
     let Some((surface, origin)) = stack.last() else {
         return false;
     };
@@ -1375,8 +1408,8 @@ fn opaque_cover(state: &State, window: u64, width: u32, height: u32) -> bool {
         && viewport.dst.is_none()
         && origin.x <= 0
         && origin.y <= 0
-        && origin.x + snapshot.width as i32 >= width as i32
-        && origin.y + snapshot.height as i32 >= height as i32
+        && origin.x.saturating_add(snapshot.width as i32) >= width as i32
+        && origin.y.saturating_add(snapshot.height as i32) >= height as i32
 }
 
 /// The source rectangle and on-screen size of a surface after its viewport.
@@ -1551,8 +1584,8 @@ fn point_in_popups(state: &State, window: u64, x: f64, y: f64) -> bool {
             return false;
         };
         let (_, dst) = extents(snapshot, viewport_of(surface));
-        let left = f64::from(geometry.x + location.x);
-        let top = f64::from(geometry.y + location.y);
+        let left = f64::from(geometry.x) + f64::from(location.x);
+        let top = f64::from(geometry.y) + f64::from(location.y);
         x >= left && y >= top && x < left + f64::from(dst.w) && y < top + f64::from(dst.h)
     })
 }
@@ -1587,7 +1620,9 @@ fn inject_key(
     pressed: bool,
     modifiers: u8,
 ) {
-    const MODIFIER_KEYS: [(u8, u16); 4] = [(1, 42), (2, 29), (4, 56), (8, 125)];
+    // The modifier keys are pressed before the stroke and released after it,
+    // in the reverse order, so the shift a symbol needs is held while it is
+    // sent.
     let emit = |code: u16, pressed: bool, state: &mut State| {
         keyboard.input(
             state,
@@ -1660,7 +1695,11 @@ fn configure_output(state: &mut State, width: u32, height: u32) {
 }
 
 /// Copy a committed shm buffer into an owned snapshot, in `r, g, b, a` order.
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "the shm pool is only reachable as a raw pointer, so reading it takes one \
+              bounded, documented slice"
+)]
 fn copy_buffer(
     ptr: *const u8,
     len: usize,
@@ -1695,6 +1734,11 @@ fn copy_buffer(
     if offset.checked_add(stride.checked_mul(height as usize)?)? > len {
         return None;
     }
+    // SAFETY: `with_buffer_contents` passes the pool's mapping base and its
+    // length, and the checks above establish `offset + stride * height <= len`,
+    // so every index read below is inside the mapping.  The pool is shared with
+    // the client and could be written at any time, so the slice is never held:
+    // the pixels are copied out here and the reference ends with this function.
     let source = unsafe { std::slice::from_raw_parts(ptr, len) };
     let mut pixels = vec![0; width as usize * height as usize * 4];
     let xrgb = data.format == wl_shm::Format::Xrgb8888;

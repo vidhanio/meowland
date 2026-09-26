@@ -50,7 +50,7 @@ fn committed_shm_window_reaches_the_pane_byte_for_byte() {
     assert_eq!(listed[0].title, "precise pixels");
     assert_eq!(listed[0].app_id, "meowland.test");
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     assert_eq!(pane.frame(), (WIDTH, HEIGHT, rgb));
 }
 
@@ -67,7 +67,7 @@ fn frame_callbacks_wait_for_the_pane_ack() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let _ = pane.frame();
     // The pane holds the frame now.  While it does, the window is shown, so
     // the compositor may not hand its client another frame; a round trip
@@ -97,7 +97,7 @@ fn closing_the_toplevel_releases_its_pane() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Id(1)));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Id(1)));
     let _ = pane.frame();
     client.destroy_toplevel(&toplevel);
     match pane.recv() {
@@ -117,7 +117,7 @@ fn unsupported_pane_protocol_version_is_rejected() {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut handshake = hello(640, 480, None, Show::Newest);
+    let mut handshake = hello(640, 480, Show::Newest);
     handshake.version = protocol::VERSION + 1;
     protocol::send(&mut stream, &protocol::PaneToServer::Hello(handshake)).unwrap();
     match protocol::recv::<ServerToPane>(&mut stream).unwrap() {
@@ -147,7 +147,7 @@ fn throughput_of_1080p_frames() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(width, height, Some((10, 20)), Show::Newest));
+    let mut pane = Pane::attach(&server, hello(width, height, Show::Newest));
     let _ = pane.frame();
     pane.send(&protocol::PaneToServer::Ack { drawn: true });
 
@@ -196,8 +196,6 @@ fn oversized_pane_hello_is_rejected() {
         version: protocol::VERSION,
         width: u32::MAX,
         height: 2,
-        cell_width: None,
-        cell_height: None,
         show: Show::Newest,
     };
     protocol::send(&mut stream, &protocol::PaneToServer::Hello(bad)).unwrap();
@@ -244,7 +242,7 @@ fn subsurface_is_drawn_at_its_position() {
         server.wait_for_window(Duration::from_secs(5)),
         "window was never announced"
     );
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let frame = pane.frame();
     assert_eq!(at(&frame, 0, 0), background);
     assert_eq!(at(&frame, 1, 1), [200, 100, 50]);
@@ -278,7 +276,7 @@ fn popup_is_drawn_where_the_window_geometry_puts_it() {
         "the configure is in window geometry space"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDE, TALL, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDE, TALL, Show::Newest));
     let frame = pane.frame();
     assert_eq!(at(&frame, 2, 1), background);
     assert_eq!(at(&frame, 3, 2), [200, 100, 50]);
@@ -321,7 +319,7 @@ fn viewporter_scales_the_source_into_the_pane() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(4, 4, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(4, 4, Show::Newest));
     let frame = pane.frame();
     for (x, y, corner) in [
         (0, 0, corners[0]),
@@ -348,7 +346,7 @@ fn title_changes_reach_the_pane_and_the_list() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let _ = pane.frame();
     client.set_title(window.xdg_toplevel, "second");
     loop {
@@ -379,7 +377,7 @@ fn keyboard_input_reaches_the_client() {
 
     let seat = client.seat();
     let keyboard = client.get_keyboard(seat);
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let _ = pane.frame();
 
     let enter = client.read_until(|message| message.object == keyboard && message.opcode == 1);
@@ -423,7 +421,7 @@ fn pointer_input_reaches_the_client() {
 
     let seat = client.seat();
     let pointer = client.get_pointer(seat);
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let _ = pane.frame();
 
     pane.send(&protocol::PaneToServer::Input(protocol::Input::Pointer {
@@ -486,7 +484,7 @@ fn alt_q_asks_the_window_to_close_and_alt_w_detaches() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Id(1)));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Id(1)));
     let _ = pane.frame();
 
     // Alt+Q asks the shown window to close; the client decides what to do.
@@ -540,7 +538,7 @@ fn popup_is_drawn_from_the_window_geometry_the_client_set() {
         "the configure is in window geometry space"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDE, TALL, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDE, TALL, Show::Newest));
     let frame = pane.frame();
     assert_eq!(
         at(&frame, 1, 0),
@@ -576,10 +574,10 @@ fn a_pane_bound_covers_both_axes() {
         "window was never announced"
     );
 
-    let mut wide = Pane::attach(&server, hello(WIDE_PANE.0, WIDE_PANE.1, None, Show::Id(1)));
+    let mut wide = Pane::attach(&server, hello(WIDE_PANE.0, WIDE_PANE.1, Show::Id(1)));
     let _ = wide.frame();
     wide.send(&protocol::PaneToServer::Ack { drawn: true });
-    let mut tall = Pane::attach(&server, hello(TALL_PANE.0, TALL_PANE.1, None, Show::Id(1)));
+    let mut tall = Pane::attach(&server, hello(TALL_PANE.0, TALL_PANE.1, Show::Id(1)));
     let _ = tall.frame();
     tall.send(&protocol::PaneToServer::Ack { drawn: true });
 
@@ -614,7 +612,7 @@ fn a_frame_held_for_a_busy_pane_is_delivered_after_its_ack() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let frame = pane.frame();
     assert_eq!(at(&frame, 0, 0), [1, 2, 3]);
 
@@ -651,7 +649,7 @@ fn a_small_change_reaches_the_pane_as_a_band() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(SIDE, SIDE, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(SIDE, SIDE, Show::Newest));
     let frame = pane.frame();
     assert_eq!((frame.0, frame.1), (SIDE, SIDE));
     assert_eq!(pane.band(), (0, SIDE), "the first frame is the whole of it");
@@ -692,7 +690,7 @@ fn a_pane_that_stalls_mid_frame_is_not_disconnected() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(SIDE, SIDE, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(SIDE, SIDE, Show::Newest));
     // Long enough that a write which gives up on the pane has given up: the
     // socket fills, the writer waits, and the pane comes back to the frame
     // that was waiting for it.
@@ -725,7 +723,7 @@ fn a_following_pane_moves_to_the_next_window_when_the_newest_closes() {
         "the second window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, None, Show::Newest));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let frame = pane.frame();
     assert_eq!(at(&frame, 0, 0), [7, 7, 7], "the pane follows the newest");
     pane.send(&protocol::PaneToServer::Ack { drawn: true });

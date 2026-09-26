@@ -4,23 +4,24 @@ use std::{
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
-        process::CommandExt,
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Child,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
-use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+mod process;
+
+use process::{Xwayland, launch_client, start_xwayland, terminate_tree, xwayland_program};
 
 use crate::{
+    Error, Result,
     compositor::{
         self, Command as CompositorCommand, Event as CompositorEvent, MAX_SURFACE_PIXELS,
         MAX_SURFACE_SIDE,
@@ -47,9 +48,9 @@ impl Paths {
     pub fn discover() -> Result<Self> {
         let runtime = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .context("XDG_RUNTIME_DIR is not set")?;
+            .ok_or(Error::RuntimeDirectoryUnset)?;
         if !runtime.is_dir() {
-            bail!("XDG_RUNTIME_DIR is not a directory");
+            return Err(Error::RuntimeDirectoryInvalid(runtime));
         }
         Ok(Self {
             control: runtime.join("meowland-control.sock"),
@@ -95,15 +96,26 @@ struct Pane {
     held: Option<ServerToPane>,
 }
 
-/// Rootless X11 clients, through `xwayland-satellite`.
-///
-/// Xwayland owns its display number for as long as it runs: it takes the
-/// standard lock file and creates `/tmp/.X11-unix/X<n>`, and removes both on
-/// exit.  The satellite is told which number to use and the socket is watched
-/// to prove the server came up.
-struct Xwayland {
-    child: Child,
-    display: String,
+impl Pane {
+    /// Send a frame now when the pane is ready, otherwise retain only the
+    /// newest frame. Frames supersede each other, so a longer queue is stale
+    /// by construction.
+    fn hand_over(&mut self, frame: ServerToPane) {
+        if self.busy {
+            self.held = Some(frame);
+        } else {
+            self.busy = self.writer.send(frame).is_ok();
+        }
+    }
+
+    /// Mark the in-flight frame consumed and send the newest replacement, if
+    /// one arrived in the meantime.
+    fn acknowledge(&mut self) {
+        self.busy = false;
+        if let Some(frame) = self.held.take() {
+            self.busy = self.writer.send(frame).is_ok();
+        }
+    }
 }
 
 /// Everything the server keeps between events: the panes, the window list the
@@ -129,14 +141,7 @@ struct Server<'a> {
 /// started, or the signal handlers cannot be installed.  Everything the server
 /// started itself is a warning, never a failure.
 pub fn serve(paths: &Paths) -> Result<()> {
-    let interrupted = Arc::new(AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
-    }
+    let interrupted = diag::termination_flag()?;
     let (commands, events, display, compositor_thread) = compositor::spawn()?;
     // Xwayland is started before either socket exists, because choosing a
     // display can take seconds and a client that can connect is one the loop
@@ -287,15 +292,7 @@ impl Server<'_> {
         let Some(target) = self.panes.get_mut(&pane) else {
             return;
         };
-        if target.busy {
-            // Only the newest band is worth holding: the next one is the whole
-            // of what a pane that comes back needs to be current.
-            target.held = Some(frame);
-            return;
-        }
-        if target.writer.send(frame).is_ok() {
-            target.busy = true;
-        }
+        target.hand_over(frame);
     }
 
     fn to_pane(&self, pane: u64, message: ServerToPane) {
@@ -318,8 +315,8 @@ impl Server<'_> {
                 let x11 = self
                     .xwayland
                     .as_ref()
-                    .map(|xwayland| xwayland.display.clone());
-                match launch_client(&args, &self.display, x11.as_deref(), &self.paths.log) {
+                    .map(|xwayland| xwayland.display.as_str());
+                match launch_client(&args, &self.display, x11, &self.paths.log) {
                     Ok(child) => {
                         self.child_groups.insert(child.id());
                         self.children.push(child);
@@ -421,7 +418,7 @@ impl Server<'_> {
                         .send(CompositorCommand::Input { pane: id, event });
                 }
             },
-            PaneToServer::Resize { width, height, .. } => {
+            PaneToServer::Resize { width, height } => {
                 if valid_size(width, height) {
                     let _ = self.commands.send(CompositorCommand::Resize {
                         pane: id,
@@ -432,14 +429,9 @@ impl Server<'_> {
             }
             PaneToServer::Ack { drawn } => {
                 if let Some(pane) = self.panes.get_mut(&id) {
-                    pane.busy = false;
                     // The frame held back while this one was in flight is the
                     // one the compositor last rendered; it goes out now.
-                    if let Some(held) = pane.held.take()
-                        && pane.writer.send(held).is_ok()
-                    {
-                        pane.busy = true;
-                    }
+                    pane.acknowledge();
                     let _ = self
                         .commands
                         .send(CompositorCommand::Ack { pane: id, drawn });
@@ -524,10 +516,11 @@ fn bind(path: &Path) -> Result<UnixListener> {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             if UnixStream::connect(path).is_ok() {
-                bail!("server already listening at {}", path.display());
+                return Err(Error::ServerAlreadyListening(path.to_path_buf()));
             }
-            fs::remove_file(path)
-                .with_context(|| format!("removing stale socket {}", path.display()))?;
+            fs::remove_file(path).map_err(|error| {
+                Error::io(format!("removing stale socket {}", path.display()), error)
+            })?;
             UnixListener::bind(path)?
         }
         Err(error) => return Err(error.into()),
@@ -569,101 +562,102 @@ fn transient_accept(error: &io::Error) -> bool {
 }
 
 fn accept_control(listener: UnixListener, incoming: Sender<Incoming>, log: PathBuf) {
-    thread::spawn(move || {
-        loop {
-            match listener.accept() {
-                Ok((mut socket, _)) => {
-                    let incoming = incoming.clone();
-                    thread::spawn(move || {
-                        let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
-                        let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
-                        if let Ok(request) = protocol::recv::<ControlRequest>(&mut socket) {
-                            let (reply_tx, reply_rx) = mpsc::channel();
-                            let waiting = Arc::new(AtomicBool::new(true));
-                            let reply = Reply {
-                                sender: reply_tx,
-                                waiting: Arc::clone(&waiting),
-                            };
-                            if incoming.send(Incoming::Control(request, reply)).is_ok()
-                                && let Ok(answer) = reply_rx.recv_timeout(Duration::from_secs(2))
-                            {
-                                let _ = protocol::send(&mut socket, &answer);
-                            }
-                            // The client gives up when this returns without an
-                            // answer, so the request may no longer be acted on.
-                            waiting.store(false, Ordering::Relaxed);
-                        }
-                    });
+    accept_connections(
+        listener,
+        incoming,
+        log,
+        "control",
+        |mut socket, incoming, _| {
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+            let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+            if let Ok(request) = protocol::recv::<ControlRequest>(&mut socket) {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                let waiting = Arc::new(AtomicBool::new(true));
+                let reply = Reply {
+                    sender: reply_tx,
+                    waiting: Arc::clone(&waiting),
+                };
+                if incoming.send(Incoming::Control(request, reply)).is_ok()
+                    && let Ok(answer) = reply_rx.recv_timeout(Duration::from_secs(2))
+                {
+                    let _ = protocol::send(&mut socket, &answer);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) if transient_accept(&error) => {
-                    diag::line(&log, &format!("control: accept failed: {error}; retrying"));
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    diag::line(&log, &format!("control: accept stopped: {error}"));
-                    break;
-                }
+                // The client gives up when this returns without an answer, so
+                // the request may no longer be acted on.
+                waiting.store(false, Ordering::Relaxed);
             }
-        }
-    });
+        },
+    );
 }
 
 fn accept_panes(listener: UnixListener, incoming: Sender<Incoming>, log: PathBuf) {
+    accept_connections(
+        listener,
+        incoming,
+        log,
+        "pane",
+        |mut socket, incoming, log| {
+            let _ = socket.set_read_timeout(Some(HELLO_TIMEOUT));
+            // The hello and any rejection are written from the event loop,
+            // which must not be held up by a peer that stopped
+            // reading.
+            let _ = socket.set_write_timeout(Some(HANDSHAKE_WRITE_TIMEOUT));
+            match protocol::recv::<PaneToServer>(&mut socket) {
+                Ok(PaneToServer::Hello(hello)) => {
+                    let _ = socket.set_read_timeout(None);
+                    let _ = incoming.send(Incoming::Pane(hello, socket));
+                }
+                Ok(other) => {
+                    diag::line(
+                        &log,
+                        &format!("pane: first message was not a hello: {other:?}"),
+                    );
+                    let _ = protocol::send(
+                        &mut socket,
+                        &ServerToPane::Reject("the pane did not start with a hello".into()),
+                    );
+                }
+                Err(error) => {
+                    diag::line(&log, &format!("pane: no hello: {error}"));
+                    let _ = protocol::send(
+                        &mut socket,
+                        &ServerToPane::Reject(format!("the pane hello failed: {error}")),
+                    );
+                }
+            }
+        },
+    );
+}
+
+/// Run one nonblocking listener and give each accepted socket to a short-lived
+/// handler thread. The two socket protocols differ, but their retry and fatal
+/// error policy must stay identical.
+fn accept_connections<F>(
+    listener: UnixListener,
+    incoming: Sender<Incoming>,
+    log: PathBuf,
+    label: &'static str,
+    handle: F,
+) where
+    F: Fn(UnixStream, Sender<Incoming>, PathBuf) + Copy + Send + 'static,
+{
     thread::spawn(move || {
         loop {
             match listener.accept() {
-                Ok((mut socket, _)) => {
+                Ok((socket, _)) => {
                     let incoming = incoming.clone();
                     let log = log.clone();
-                    thread::spawn(move || {
-                        let _ = socket.set_read_timeout(Some(HELLO_TIMEOUT));
-                        // The hello and any rejection are written from the event
-                        // loop, which must not be held up by a peer that stopped
-                        // reading.
-                        let _ = socket.set_write_timeout(Some(HANDSHAKE_WRITE_TIMEOUT));
-                        match protocol::recv::<PaneToServer>(&mut socket) {
-                            Ok(PaneToServer::Hello(hello)) => {
-                                let _ = socket.set_read_timeout(None);
-                                let _ = incoming.send(Incoming::Pane(hello, socket));
-                            }
-                            // A pane the server cannot use is told why rather than
-                            // left to time out.
-                            Ok(other) => {
-                                diag::line(
-                                    &log,
-                                    &format!("pane: first message was not a hello: {other:?}"),
-                                );
-                                let _ = protocol::send(
-                                    &mut socket,
-                                    &ServerToPane::Reject(
-                                        "the pane did not start with a hello".into(),
-                                    ),
-                                );
-                            }
-                            Err(error) => {
-                                diag::line(&log, &format!("pane: no hello: {error}"));
-                                let _ = protocol::send(
-                                    &mut socket,
-                                    &ServerToPane::Reject(format!(
-                                        "the pane hello failed: {error}"
-                                    )),
-                                );
-                            }
-                        }
-                    });
+                    thread::spawn(move || handle(socket, incoming, log));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) if transient_accept(&error) => {
-                    diag::line(&log, &format!("pane: accept failed: {error}; retrying"));
+                    diag::line(&log, &format!("{label}: accept failed: {error}; retrying"));
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(error) => {
-                    diag::line(&log, &format!("pane: accept stopped: {error}"));
+                    diag::line(&log, &format!("{label}: accept stopped: {error}"));
                     break;
                 }
             }
@@ -696,217 +690,4 @@ fn read_pane(id: u64, mut socket: UnixStream, incoming: Sender<Incoming>) {
         }
         let _ = incoming.send(Incoming::PaneGone(id));
     });
-}
-
-fn launch_client(
-    args: &[String],
-    wayland: &str,
-    x11: Option<&str>,
-    log_path: &Path,
-) -> Result<Child> {
-    let Some(executable) = args.first() else {
-        bail!("run requires a command");
-    };
-    let log = diag::open(log_path)?;
-    let mut command = Command::new(executable);
-    command.args(&args[1..]).env("WAYLAND_DISPLAY", wayland);
-    match x11 {
-        Some(display) => {
-            command.env("DISPLAY", display);
-        }
-        None => {
-            command.env_remove("DISPLAY");
-        }
-    }
-    command
-        .env("GDK_BACKEND", "wayland")
-        .env("QT_QPA_PLATFORM", "wayland")
-        .env("SDL_VIDEODRIVER", "wayland")
-        .env("MOZ_ENABLE_WAYLAND", "1")
-        .env("ELECTRON_OZONE_PLATFORM_HINT", "auto")
-        .env("XDG_SESSION_TYPE", "wayland")
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    command.process_group(0);
-    command
-        .spawn()
-        .with_context(|| format!("starting {executable}"))
-}
-
-/// Signal every process in the trees rooted at `roots`, and the process group
-/// of each root.
-///
-/// The tree is rescanned before each signal, because Unix does not take
-/// children down with their parent: a helper that forked on the way out would
-/// otherwise be missed by every signal.  Escalation is `SIGHUP`, `SIGTERM`,
-/// `SIGKILL`, with a moment between them for a process to leave on its own
-/// terms.
-fn terminate_tree(roots: &HashSet<u32>) {
-    for signal in [Signal::HUP, Signal::TERM, Signal::KILL] {
-        for raw in descendants(roots).into_iter().chain(roots.iter().copied()) {
-            if let Some(pid) = process_id(raw) {
-                let _ = kill_process(pid, signal);
-            }
-        }
-        // Every child was started in its own process group, so the group goes
-        // too: a daemonised grandchild that left the tree is still in it.
-        for raw in roots {
-            if let Some(group) = process_id(*raw) {
-                let _ = kill_process_group(group, signal);
-            }
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// `Pid::from_raw` refuses 0 and negatives, so nothing here can signal a group
-/// by mistake.
-fn process_id(raw: u32) -> Option<Pid> {
-    i32::try_from(raw).ok().and_then(Pid::from_raw)
-}
-
-fn descendants(roots: &HashSet<u32>) -> HashSet<u32> {
-    let mut parents = HashMap::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|s| s.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-                continue;
-            };
-            let Some(rest) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
-                continue;
-            };
-            if let Some(parent) = rest
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                parents.insert(pid, parent);
-            }
-        }
-    }
-    let mut result = HashSet::new();
-    let mut frontier: Vec<u32> = roots.iter().copied().collect();
-    while let Some(parent) = frontier.pop() {
-        for (&pid, &ppid) in &parents {
-            if ppid == parent && result.insert(pid) {
-                frontier.push(pid);
-            }
-        }
-    }
-    result
-}
-
-/// Where `xwayland-satellite` comes from.
-///
-/// `MEOWLAND_XWAYLAND` may disable it (`off`), force the normal lookup
-/// (`auto`, the default) or name a binary to use.
-fn xwayland_program() -> Option<PathBuf> {
-    match env::var("MEOWLAND_XWAYLAND").ok().as_deref().map(str::trim) {
-        Some("off" | "0" | "false" | "no") => None,
-        Some(path) if !matches!(path, "" | "auto" | "on" | "1" | "true" | "yes") => {
-            Some(PathBuf::from(path))
-        }
-        _ => env::var_os("PATH").and_then(|path| {
-            env::split_paths(&path)
-                .map(|directory| directory.join("xwayland-satellite"))
-                .find(|candidate| candidate.is_file())
-        }),
-    }
-}
-
-fn start_xwayland(program: &Path, wayland: &str, log_path: &Path) -> Result<Xwayland> {
-    let log = diag::open(log_path)?;
-    // `xwayland-satellite` forwards only a subset of Xwayland's options and
-    // does not accept `-displayfd`, so the display number is chosen here and
-    // verified by waiting for the socket.  A number that loses a race makes
-    // Xwayland exit at once; the next candidate is then tried.
-    let mut last = String::new();
-    for number in FIRST_X_DISPLAY..=LAST_X_DISPLAY {
-        if x_display_in_use(number) {
-            continue;
-        }
-        let mut child = Command::new(program)
-            .arg(format!(":{number}"))
-            .env("WAYLAND_DISPLAY", wayland)
-            .env_remove("DISPLAY")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log.try_clone()?)
-            .process_group(0)
-            .spawn()
-            .with_context(|| format!("starting {}", program.display()))?;
-        match wait_for_x_socket(number, &mut child, Duration::from_secs(5)) {
-            Ok(true) => {
-                return Ok(Xwayland {
-                    child,
-                    display: format!(":{number}"),
-                });
-            }
-            Ok(false) => {
-                last = format!(":{number}");
-                let _ = child.wait();
-            }
-            Err(error) => {
-                // Nothing is listening but the process is alive: this is a
-                // broken satellite, not a lost race, so stop trying numbers
-                // and take its tree down with it.
-                terminate_tree(&HashSet::from([child.id()]));
-                let _ = child.wait();
-                return Err(error);
-            }
-        }
-    }
-    bail!("no X display could be started (last tried {last})")
-}
-
-const FIRST_X_DISPLAY: u32 = 8;
-const LAST_X_DISPLAY: u32 = 63;
-
-fn x_display_socket(number: u32) -> PathBuf {
-    PathBuf::from(format!("/tmp/.X11-unix/X{number}"))
-}
-
-/// Another X server owns the display if its lock is held by a live process or
-/// its socket exists.
-fn x_display_in_use(number: u32) -> bool {
-    if x_display_socket(number).exists() {
-        return true;
-    }
-    let Ok(lock) = fs::read_to_string(format!("/tmp/.X{number}-lock")) else {
-        return false;
-    };
-    let pid = lock.trim().parse::<i32>().ok();
-    let Some(pid) = pid.and_then(rustix::process::Pid::from_raw) else {
-        return true;
-    };
-    !matches!(
-        rustix::process::test_kill_process(pid),
-        Err(rustix::io::Errno::SRCH)
-    )
-}
-
-fn wait_for_x_socket(number: u32, child: &mut Child, timeout: Duration) -> Result<bool> {
-    let socket = x_display_socket(number);
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            return Ok(false);
-        }
-        if socket.exists() && UnixStream::connect(&socket).is_ok() {
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    bail!(
-        "X server did not listen on {} within {timeout:?}",
-        socket.display()
-    )
 }

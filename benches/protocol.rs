@@ -99,7 +99,6 @@ fn input(c: &mut Criterion) {
         pressed: true,
         modifiers: modifiers::ALT,
     });
-    let text = PaneToServer::Input(Input::Text("hello, world".to_owned()));
     let pointer = PaneToServer::Input(Input::Pointer {
         x: 640.0,
         y: 360.0,
@@ -108,7 +107,7 @@ fn input(c: &mut Criterion) {
         scroll: 0,
     });
 
-    for (name, message) in [("key", &key), ("text", &text), ("pointer", &pointer)] {
+    for (name, message) in [("key", &key), ("pointer", &pointer)] {
         // A pane writes input into a buffer it keeps, so the buffer lives
         // outside the measured loop: this is the per-event cost alone.
         let mut out = Vec::with_capacity(64);

@@ -63,6 +63,12 @@ use smithay::{
 
 use crate::protocol::{Input, Show, WindowInfo, modifiers};
 
+mod render;
+
+use render::{
+    extents, hit_test, popup_origin, render_frame, surface_stack, viewport_of, window_geometry,
+};
+
 /// Windows are composed at most this often.  A client that draws in a loop
 /// cannot spin the compositor, and a pane that is slow costs its own frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -90,7 +96,7 @@ const MODIFIER_KEYS: [(u8, u16); 4] = [
     (modifiers::SUPER, 125),
 ];
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Command {
     Attach {
         pane: u64,
@@ -166,7 +172,7 @@ pub type Handle = (
 /// Returns an error when the thread cannot be spawned, when the compositor
 /// fails to build its display, keymap or Wayland socket, or when it does not
 /// report readiness within two seconds.
-pub fn spawn() -> std::io::Result<Handle> {
+pub fn spawn() -> crate::Result<Handle> {
     let (commands, rx) = mpsc::channel();
     let (tx, events) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -490,10 +496,11 @@ impl State {
             .and_then(|pane| self.panes.get(pane))
             .filter(|pane| pane.window == window);
         let first = self
-            .panes_showing(window)
-            .into_iter()
-            .min()
-            .and_then(|pane| self.panes.get(&pane));
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.window == window)
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, pane)| pane);
         deciding.or(first).map_or(self.mode, |pane| {
             Size::from((pane.width as i32, pane.height as i32))
         })
@@ -1433,307 +1440,6 @@ fn send_frame_callbacks(state: &State, window: u64) -> bool {
     sent
 }
 
-/// Compose one pane's frame into [`State::scratch`], reporting whether there
-/// was anything to compose: the window it shows, its subsurfaces and its
-/// popups, over an opaque backdrop.
-fn render_frame(state: &mut State, pane: u64) -> bool {
-    let Some((window, width, height)) = state
-        .panes
-        .get(&pane)
-        .map(|entry| (entry.window, entry.width, entry.height))
-    else {
-        return false;
-    };
-    // Drawing and the backdrop decision share one stack, so they cannot
-    // disagree about what is on the pane.
-    let stack = state
-        .windows
-        .get(&window)
-        .map_or_default(|entry| surface_stack(&entry.surface.wl_surface().clone()));
-    let mut out = std::mem::take(&mut state.scratch);
-    out.resize(width as usize * height as usize * 3, 0);
-    if !opaque_cover(state, &stack, width, height) {
-        out.fill(0);
-    }
-    for (surface, origin) in &stack {
-        blit(state, surface, *origin, &mut out, width, height);
-    }
-    state.scratch = out;
-    true
-}
-
-/// Every surface a window draws, bottom to top, with the pane coordinates of
-/// its top-left corner.  Drawing and hit-testing share this list, so they
-/// cannot disagree about where a surface is.
-fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
-    let mut stack = Vec::new();
-    collect_surface(root, (0, 0).into(), &mut stack);
-    let geometry = window_geometry(root);
-    let mut popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
-    // The manager lists children before their parents; drawing runs bottom to
-    // top, so parents and older siblings come first.
-    popups.reverse();
-    for (popup, location) in popups {
-        let origin = popup_origin(geometry, location, &popup);
-        collect_surface(popup.wl_surface(), origin, &mut stack);
-    }
-    stack
-}
-
-/// The origin of the window geometry a client set on a surface, which is what
-/// a popup's position is measured against.
-fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
-    with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<SurfaceCachedState>()
-            .current()
-            .geometry
-            .map_or_else(|| (0, 0).into(), |geometry| geometry.loc)
-    })
-}
-
-/// Where a popup's surface starts in pane coordinates.  `location` is where
-/// the popup sits against the parent's window geometry, and the popup's own
-/// window geometry sits inside the surface it draws from, so it comes back
-/// off: a pane draws a surface from its own origin, not from its geometry.
-fn popup_origin(
-    parent_geometry: Point<i32, Logical>,
-    location: Point<i32, Logical>,
-    popup: &PopupKind,
-) -> Point<i32, Logical> {
-    parent_geometry + location - popup.geometry().loc
-}
-
-fn collect_surface(
-    surface: &WlSurface,
-    origin: Point<i32, Logical>,
-    stack: &mut Vec<(WlSurface, Point<i32, Logical>)>,
-) {
-    stack.push((surface.clone(), origin));
-    for child in get_children(surface) {
-        let offset = with_states(&child, |states| {
-            states
-                .cached_state
-                .get::<SubsurfaceCachedState>()
-                .current()
-                .location
-        });
-        collect_surface(&child, origin + offset, stack);
-    }
-}
-
-/// Copy one surface's snapshot into a pane, applying its viewport and
-/// blending premultiplied alpha over what is already there.
-fn blit(
-    state: &State,
-    surface: &WlSurface,
-    origin: Point<i32, Logical>,
-    out: &mut [u8],
-    width: u32,
-    height: u32,
-) {
-    let Some(snapshot) = state.snapshots.get(surface) else {
-        return;
-    };
-    let viewport = viewport_of(surface);
-    let unscaled = viewport.src.is_none() && viewport.dst.is_none();
-    let (src, dst) = extents(snapshot, viewport);
-    if dst.w <= 0 || dst.h <= 0 {
-        return;
-    }
-    let left = origin.x;
-    let top = origin.y;
-    let clip_left = left.max(0);
-    let clip_top = top.max(0);
-    // Both extents are client-chosen, so the box is clamped, not added.
-    let clip_right = left.saturating_add(dst.w).min(width as i32);
-    let clip_bottom = top.saturating_add(dst.h).min(height as i32);
-    if clip_right <= clip_left || clip_bottom <= clip_top {
-        return;
-    }
-    let clip = Rectangle::new(
-        (clip_left, clip_top).into(),
-        (clip_right - clip_left, clip_bottom - clip_top).into(),
-    );
-    if unscaled {
-        // No viewport: one pane pixel per snapshot pixel, which is what a
-        // client that never uses `wp_viewporter` draws at.
-        blit_unscaled(snapshot, left, top, clip, out, width);
-        return;
-    }
-    let last_x = snapshot.width as usize - 1;
-    let last_y = snapshot.height as usize - 1;
-    let stride = snapshot.width as usize * 4;
-    for y in clip_top..clip_bottom {
-        let sample = src.loc.y + (f64::from(y - top) + 0.5) * src.size.h / f64::from(dst.h);
-        let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
-        let to = (y as usize * width as usize + clip_left as usize) * 3;
-        for x in clip_left..clip_right {
-            let sample = src.loc.x + (f64::from(x - left) + 0.5) * src.size.w / f64::from(dst.w);
-            let column = (sample.floor().max(0.0) as usize).min(last_x);
-            let pixel = row + column * 4;
-            let at = to + (x - clip_left) as usize * 3;
-            if snapshot.opaque {
-                out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]);
-                continue;
-            }
-            let alpha = u32::from(snapshot.pixels[pixel + 3]);
-            match alpha {
-                0 => {}
-                255 => out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]),
-                _ => {
-                    let inverse = 255 - alpha;
-                    for channel in 0..3 {
-                        let under = u32::from(out[at + channel]);
-                        out[at + channel] = (u32::from(snapshot.pixels[pixel + channel])
-                            + (under * inverse + 127) / 255)
-                            as u8;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// The unscaled case of [`blit`]: the surface has no viewport, so one pane
-/// pixel is one snapshot pixel and the sample of a pixel is its offset from
-/// the surface origin.  Integer indexing alone, with the alpha blend kept
-/// byte for byte identical to the sampling path's.
-fn blit_unscaled(
-    snapshot: &Snapshot,
-    left: i32,
-    top: i32,
-    clip: Rectangle<i32, Logical>,
-    out: &mut [u8],
-    width: u32,
-) {
-    let columns = clip.size.w as usize;
-    let row_bytes = columns * 4;
-    let stride = snapshot.width as usize * 4;
-    let pane_stride = width as usize * 3;
-    // The clip was taken against the snapshot's own size, so `first` and
-    // `first_row` are inside it and every span below is in bounds.
-    let first = (clip.loc.x - left) as usize;
-    let first_row = (clip.loc.y - top) as usize;
-    for row in 0..clip.size.h as usize {
-        let from = (first_row + row) * stride + first * 4;
-        let source = snapshot.pixels[from..from + row_bytes].as_chunks::<4>().0;
-        let at = (clip.loc.y as usize + row) * pane_stride + clip.loc.x as usize * 3;
-        let dest = out[at..at + columns * 3].as_chunks_mut::<3>().0;
-        if snapshot.opaque {
-            for (pixel, rgb) in source.iter().zip(dest) {
-                rgb.copy_from_slice(&pixel[..3]);
-            }
-            continue;
-        }
-        for (pixel, rgb) in source.iter().zip(dest) {
-            let alpha = u32::from(pixel[3]);
-            match alpha {
-                0 => {}
-                255 => rgb.copy_from_slice(&pixel[..3]),
-                _ => {
-                    let inverse = 255 - alpha;
-                    for channel in 0..3 {
-                        let under = u32::from(rgb[channel]);
-                        rgb[channel] =
-                            (u32::from(pixel[channel]) + (under * inverse + 127) / 255) as u8;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Whether the topmost thing a window draws is opaque and covers the whole
-/// pane, in which case the backdrop under it need not be laid down.
-fn opaque_cover(
-    state: &State,
-    stack: &[(WlSurface, Point<i32, Logical>)],
-    width: u32,
-    height: u32,
-) -> bool {
-    let Some((surface, origin)) = stack.last() else {
-        return false;
-    };
-    let Some(snapshot) = state.snapshots.get(surface) else {
-        return false;
-    };
-    let viewport = viewport_of(surface);
-    snapshot.opaque
-        && viewport.src.is_none()
-        && viewport.dst.is_none()
-        && origin.x <= 0
-        && origin.y <= 0
-        && origin.x.saturating_add(snapshot.width as i32) >= width as i32
-        && origin.y.saturating_add(snapshot.height as i32) >= height as i32
-}
-
-/// The source rectangle and on-screen size of a surface after its viewport.
-fn extents(
-    snapshot: &Snapshot,
-    viewport: ViewportCachedState,
-) -> (Rectangle<f64, Logical>, Size<i32, Logical>) {
-    let full = Rectangle::new(
-        (0.0, 0.0).into(),
-        (f64::from(snapshot.width), f64::from(snapshot.height)).into(),
-    );
-    let src = viewport.src.unwrap_or(full);
-    let dst = viewport
-        .dst
-        .unwrap_or_else(|| Size::from((src.size.w.round() as i32, src.size.h.round() as i32)));
-    (src, dst)
-}
-
-fn viewport_of(surface: &WlSurface) -> ViewportCachedState {
-    with_states(surface, |states| {
-        *states.cached_state.get::<ViewportCachedState>().current()
-    })
-}
-
-/// The surface under a point, topmost first, with the pane coordinates of its
-/// top-left corner.  Smithay wants the surface origin, not the local point:
-/// it subtracts the origin itself before telling the client where it is.
-fn hit_test(
-    state: &State,
-    window: u64,
-    x: f64,
-    y: f64,
-) -> Option<(WlSurface, Point<f64, Logical>)> {
-    let root = state.windows.get(&window)?.surface.wl_surface().clone();
-    for (surface, origin) in surface_stack(&root).into_iter().rev() {
-        let Some(snapshot) = state.snapshots.get(&surface) else {
-            continue;
-        };
-        let (_, dst) = extents(snapshot, viewport_of(&surface));
-        let local = Point::<f64, Logical>::from((x - f64::from(origin.x), y - f64::from(origin.y)));
-        if local.x < 0.0
-            || local.y < 0.0
-            || local.x >= f64::from(dst.w)
-            || local.y >= f64::from(dst.h)
-        {
-            continue;
-        }
-        let region = with_states(&surface, |states| {
-            states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .input_region
-                .clone()
-        });
-        let inside = region
-            .is_none_or(|region| region.contains((local.x.floor() as i32, local.y.floor() as i32)));
-        if inside {
-            return Some((
-                surface,
-                Point::from((f64::from(origin.x), f64::from(origin.y))),
-            ));
-        }
-    }
-    None
-}
-
 fn pane_input(state: &mut State, pane: u64, event: &Input) {
     let Some(window) = state.panes.get(&pane).map(|pane| pane.window) else {
         return;
@@ -1813,7 +1519,6 @@ fn pane_input(state: &mut State, pane: u64, event: &Input) {
                 state.pointer = Some(pointer);
             }
         }
-        Input::Text(_) => {}
     }
 }
 
@@ -2114,122 +1819,5 @@ mod tests {
         reused.fill(0xcc);
         let again = copy(wl_shm::Format::Argb8888, reused);
         assert_eq!(again.pixels, argb.pixels);
-    }
-
-    /// The sampled blit, kept as the reference the unscaled path must agree
-    /// with: the same nearest-neighbour formula, one division per pixel.
-    fn sampled_blit(
-        snapshot: &Snapshot,
-        left: i32,
-        top: i32,
-        out: &mut [u8],
-        width: u32,
-        height: u32,
-    ) {
-        let src = Rectangle::<f64, Logical>::new(
-            (0.0, 0.0).into(),
-            (f64::from(snapshot.width), f64::from(snapshot.height)).into(),
-        );
-        let dst = Size::<i32, Logical>::from((snapshot.width as i32, snapshot.height as i32));
-        let clip_left = left.max(0);
-        let clip_top = top.max(0);
-        let clip_right = left.saturating_add(dst.w).min(width as i32);
-        let clip_bottom = top.saturating_add(dst.h).min(height as i32);
-        if clip_right <= clip_left || clip_bottom <= clip_top {
-            return;
-        }
-        let last_x = snapshot.width as usize - 1;
-        let last_y = snapshot.height as usize - 1;
-        let stride = snapshot.width as usize * 4;
-        for y in clip_top..clip_bottom {
-            let sample = src.loc.y + (f64::from(y - top) + 0.5) * src.size.h / f64::from(dst.h);
-            let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
-            let to = (y as usize * width as usize + clip_left as usize) * 3;
-            for x in clip_left..clip_right {
-                let sample =
-                    src.loc.x + (f64::from(x - left) + 0.5) * src.size.w / f64::from(dst.w);
-                let column = (sample.floor().max(0.0) as usize).min(last_x);
-                let pixel = row + column * 4;
-                let at = to + (x - clip_left) as usize * 3;
-                if snapshot.opaque {
-                    out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]);
-                    continue;
-                }
-                let alpha = u32::from(snapshot.pixels[pixel + 3]);
-                match alpha {
-                    0 => {}
-                    255 => out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]),
-                    _ => {
-                        let inverse = 255 - alpha;
-                        for channel in 0..3 {
-                            let under = u32::from(out[at + channel]);
-                            out[at + channel] = (u32::from(snapshot.pixels[pixel + channel])
-                                + (under * inverse + 127) / 255)
-                                as u8;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The unscaled path is the sampled one with the sampling replaced by
-    /// index arithmetic, so the two must draw the same bytes, clip to the same
-    /// pixels, and leave the same pixels outside the clip alone.
-    #[test]
-    fn unscaled_blit_matches_the_sampled_one() {
-        const WIDTH: u32 = 6;
-        const HEIGHT: u32 = 5;
-        let (snapshot_width, snapshot_height) = (4u32, 3u32);
-        let mut pixels = Vec::new();
-        let mut state = 0x1234_5678u32;
-        for _ in 0..snapshot_width * snapshot_height {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            // Every alpha case: transparent, opaque, and two blends.
-            let alpha = [0x00, 0xff, 0x40, 0x80][state as usize % 4];
-            pixels.extend_from_slice(&[
-                state as u8,
-                (state >> 8) as u8,
-                (state >> 16) as u8,
-                alpha,
-            ]);
-        }
-        let origin = |left: i32, top: i32| {
-            let clip_left = left.max(0);
-            let clip_top = top.max(0);
-            let clip_right = left.saturating_add(snapshot_width as i32).min(WIDTH as i32);
-            let clip_bottom = top
-                .saturating_add(snapshot_height as i32)
-                .min(HEIGHT as i32);
-            Rectangle::<i32, Logical>::new(
-                (clip_left, clip_top).into(),
-                (clip_right - clip_left, clip_bottom - clip_top).into(),
-            )
-        };
-        // Mostly aligned, plus the clipping corners and a fully off-pane one.
-        let places = [(0, 0), (1, 2), (-2, -1), (3, 3), (5, 4), (-4, 2), (6, 0)];
-        for opaque in [true, false] {
-            let snapshot = Snapshot {
-                width: snapshot_width,
-                height: snapshot_height,
-                pixels: pixels.clone(),
-                opaque,
-            };
-            for (left, top) in places {
-                let backdrop: Vec<u8> = (0..(WIDTH * HEIGHT * 3) as usize)
-                    .map(|index| (index * 7) as u8)
-                    .collect();
-                let mut fast = backdrop.clone();
-                let mut reference = backdrop;
-                blit_unscaled(&snapshot, left, top, origin(left, top), &mut fast, WIDTH);
-                sampled_blit(&snapshot, left, top, &mut reference, WIDTH, HEIGHT);
-                assert_eq!(
-                    fast, reference,
-                    "unscaled and sampled blits differ at ({left}, {top}) with opaque={opaque}"
-                );
-            }
-        }
     }
 }

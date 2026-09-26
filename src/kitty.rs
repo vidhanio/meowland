@@ -142,9 +142,7 @@ pub struct Presenter {
     base: Option<Frame>,
     patch_count: usize,
     shared: Option<SharedMemory>,
-    /// The last compressed payload, kept so a frame does not allocate a fresh
-    /// one (and fault its pages in) every time.
-    compressed: Vec<u8>,
+    encoder: EncodingBuffers,
     /// Whether the last frame handed to [`Presenter::present`] was dropped
     /// rather than drawn.
     dropped: bool,
@@ -168,6 +166,14 @@ struct Rect {
     height: u32,
 }
 
+/// Scratch space retained across images so compression does not allocate in
+/// the frame path.
+#[derive(Debug, Default)]
+struct EncodingBuffers {
+    compressed: Vec<u8>,
+    sample: Vec<u8>,
+}
+
 impl Presenter {
     /// Construct a presenter.  Patches are enabled only when the terminal's
     /// reported cell dimensions are supplied, and whole frames go through
@@ -182,7 +188,7 @@ impl Presenter {
             base: None,
             patch_count: 0,
             shared,
-            compressed: Vec::new(),
+            encoder: EncodingBuffers::default(),
             dropped: false,
             drops: 0,
         }
@@ -294,7 +300,7 @@ impl Presenter {
                 move_cursor(&mut out, rect.x, rect.y, self.cell_size);
                 image(
                     &mut out,
-                    &mut self.compressed,
+                    &mut self.encoder,
                     id,
                     rect.width,
                     rect.height,
@@ -314,7 +320,7 @@ impl Presenter {
             if !shared {
                 image(
                     &mut out,
-                    &mut self.compressed,
+                    &mut self.encoder,
                     SCREEN_ID,
                     width,
                     height,
@@ -513,15 +519,16 @@ fn transmit(id: u32, width: u32, height: u32, placement: u32) -> String {
 
 fn image(
     out: &mut Vec<u8>,
-    compressed: &mut Vec<u8>,
+    encoder: &mut EncodingBuffers,
     id: u32,
     width: u32,
     height: u32,
     pixels: &[u8],
     patch: bool,
 ) {
-    let zlib = compress(compressed, pixels) && compressed.len() * 4 <= pixels.len() * 3;
-    let payload: &[u8] = if zlib { compressed } else { pixels };
+    let zlib = compress(&mut encoder.compressed, &mut encoder.sample, pixels)
+        && encoder.compressed.len() * 4 <= pixels.len() * 3;
+    let payload: &[u8] = if zlib { &encoder.compressed } else { pixels };
     let compression = if zlib { ",o=z" } else { "" };
     let control = transmit(id, width, height, u32::from(patch));
     // Reserve once: growing to a whole 1080p frame in doublings copies it
@@ -532,12 +539,12 @@ fn image(
     // Each chunk is encoded where it goes: encoding the payload into one
     // string and copying it out in chunks would touch every byte of a frame
     // twice more.
-    let mut encoded = [0u8; CHUNK];
+    let mut encoded_chunk = [0u8; CHUNK];
     let mut chunks = payload.chunks(CHUNK_PAYLOAD).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         let bytes = STANDARD
-            .encode_slice(chunk, &mut encoded)
+            .encode_slice(chunk, &mut encoded_chunk)
             .expect("a chunk of payload always fits its base64");
         // Every chunk but the last says `m=1`; a whole image in one chunk
         // carries no `m` key at all.
@@ -551,7 +558,7 @@ fn image(
         } else {
             out.extend_from_slice(b"\x1b_Gm=0;");
         }
-        out.extend_from_slice(&encoded[..bytes]);
+        out.extend_from_slice(&encoded_chunk[..bytes]);
         out.extend_from_slice(b"\x1b\\");
     }
 }
@@ -562,16 +569,17 @@ fn image(
 /// Compressing megabytes of already-compressed pixels costs more than a whole
 /// frame's time budget, and the result would be thrown away, so four spread
 /// samples decide first.
-fn compress(compressed: &mut Vec<u8>, data: &[u8]) -> bool {
+fn compress(compressed: &mut Vec<u8>, sample: &mut Vec<u8>, data: &[u8]) -> bool {
     const SAMPLE_BYTES: usize = 16 * 1024;
     const SAMPLES: usize = 4;
     if data.len() > SAMPLE_BYTES * SAMPLES {
-        let mut sample = Vec::with_capacity(SAMPLE_BYTES * SAMPLES);
+        sample.clear();
+        sample.reserve(SAMPLE_BYTES * SAMPLES);
         for index in 0..SAMPLES {
             let start = (data.len() - SAMPLE_BYTES) * index / (SAMPLES - 1);
             sample.extend_from_slice(&data[start..start + SAMPLE_BYTES]);
         }
-        if !zlib(compressed, &sample) || compressed.len() * 4 > sample.len() * 3 {
+        if !zlib(compressed, sample) || compressed.len() * 4 > sample.len() * 3 {
             return false;
         }
     }
@@ -1243,7 +1251,7 @@ mod tests {
         let update = whole(&mut presenter, 4, 4, &second);
         assert!(update.is_empty(), "a dropped frame writes nothing");
         assert!(presenter.dropped(), "the pane has to say it drew nothing");
-        assert!(whole_frames(&update).is_empty());
+        assert_eq!(whole_frames(&update), Vec::<String>::new());
 
         // The terminal catches up, reads what it was sent, and the next frame
         // goes through shared memory again.
@@ -1306,17 +1314,17 @@ mod tests {
         };
         let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
         let first = noise(&mut 3, 4 * 2 * 3);
-        assert!(!whole(&mut presenter, 4, 2, &first).is_empty());
+        assert_ne!(whole(&mut presenter, 4, 2, &first), Vec::<u8>::new());
         assert!(!presenter.dropped(), "the first frame is drawn");
 
         // Nothing has read the first frame, so the next whole one is dropped.
         let second = noise(&mut 5, 4 * 4 * 3);
-        assert!(whole(&mut presenter, 4, 4, &second).is_empty());
+        assert_eq!(whole(&mut presenter, 4, 4, &second), Vec::<u8>::new());
         assert!(presenter.dropped());
 
         // The frame that is on screen is the one the pane already holds, so
         // there is nothing to draw, which is not the same as a drop.
-        assert!(whole(&mut presenter, 4, 2, &first).is_empty());
+        assert_eq!(whole(&mut presenter, 4, 2, &first), Vec::<u8>::new());
         assert!(!presenter.dropped());
     }
 

@@ -9,6 +9,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,4 +49,22 @@ pub fn line(path: &Path, message: &str) {
     if let Ok(mut file) = open(path) {
         let _ = writeln!(file, "{} {message}", seconds());
     }
+}
+
+/// A flag set by the signals that ask either the server or a pane to leave.
+/// Keeping the signal set here prevents the two long-running processes from
+/// quietly acquiring different shutdown behavior.
+///
+/// # Errors
+/// Returns an error when a signal handler cannot be registered.
+pub fn termination_flag() -> std::io::Result<Arc<AtomicBool>> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    for signal in [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ] {
+        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
+    }
+    Ok(interrupted)
 }

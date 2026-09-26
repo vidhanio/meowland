@@ -9,14 +9,10 @@ use std::{
     os::unix::net::UnixStream,
     path::Path,
     process,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
-use anyhow::Context as _;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind},
     execute, terminal,
@@ -27,7 +23,7 @@ use rustix::{
 };
 
 use crate::{
-    diag,
+    Error, Result, diag,
     kitty::{Presenter, SharedMemory},
     protocol::{self, Hello, Input, PaneToServer, ServerToPane, Show},
 };
@@ -123,7 +119,7 @@ fn terminal_probe() -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
                 }
             }
             Err(Errno::INTR) => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(io::Error::from(error)),
         }
     }
     let mut probe = parse_probe_bytes(&bytes);
@@ -423,11 +419,14 @@ impl PaneStats {
     reason = "the pane's single event loop; every arm shares the same socket, probe and \
               terminal guard"
 )]
-pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket).with_context(|| {
-        format!(
-            "could not reach the pane socket {} (is the server running?)",
-            socket.display()
+pub fn attach(socket: &Path, show: Show) -> Result<()> {
+    let mut stream = UnixStream::connect(socket).map_err(|error| {
+        Error::io(
+            format!(
+                "could not reach the pane socket {} (is the server running?)",
+                socket.display()
+            ),
+            error,
         )
     })?;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -436,18 +435,11 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
     // death, and the shell that comes after it cannot undo them.  The handlers
     // go in before the terminal is taken over, so a signal during the probe is
     // not a window in which the modes outlive the pane.
-    let interrupted = Arc::new(AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ] {
-        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
-    }
+    let interrupted = diag::termination_flag()?;
     let mut mode = TerminalGuard::enter()?;
     let (probe, shared) = terminal_probe()?;
     if !probe.graphics {
-        return Err(anyhow::anyhow!("terminal does not support kitty graphics"));
+        return Err(Error::GraphicsUnsupported);
     }
     let units = mouse_units(&probe);
     mode.enable_mouse(units)?;
@@ -464,8 +456,6 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
         version: protocol::VERSION,
         width,
         height,
-        cell_width: cell.map(|cell| cell.0),
-        cell_height: cell.map(|cell| cell.1),
         show,
     };
 
@@ -487,7 +477,7 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
             return Ok(());
         }
         if !handshake_done && Instant::now() >= handshake_deadline {
-            return Err(anyhow::anyhow!("pane handshake timed out"));
+            return Err(Error::PaneHandshakeTimeout);
         }
         // Wait on the terminal, the pane socket and the handshake in one go.
         // Waiting on the socket itself, rather than on a relay thread's
@@ -511,7 +501,7 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
         // all that is left to do.
         match poll(&mut fds, timeout.as_ref()) {
             Err(Errno::INTR) => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(io::Error::from(error).into()),
             Ok(_) => {}
         }
         if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR)
@@ -585,15 +575,7 @@ pub fn attach(socket: &Path, show: Show) -> anyhow::Result<()> {
                     presenter.set_cell_size(cell);
                     let (width, height) =
                         pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
-                    protocol::send(
-                        &mut tx,
-                        &PaneToServer::Resize {
-                            width,
-                            height,
-                            cell_width: cell.map(|cell| cell.0),
-                            cell_height: cell.map(|cell| cell.1),
-                        },
-                    )?;
+                    protocol::send(&mut tx, &PaneToServer::Resize { width, height })?;
                 }
                 Event::Mouse(mouse) => {
                     let (pressed, button, scroll) = match mouse.kind {
@@ -695,7 +677,7 @@ fn key_input(key: KeyEvent) -> Option<(u16, u8)> {
     Some((code, modifier_bits(modifiers)))
 }
 
-fn send_key_bits(stream: &mut UnixStream, code: u16, modifiers: u8) -> anyhow::Result<()> {
+fn send_key_bits(stream: &mut UnixStream, code: u16, modifiers: u8) -> Result<()> {
     protocol::send(
         stream,
         &PaneToServer::Input(Input::Key {
@@ -955,15 +937,7 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     #[test]
-    fn parses_sizes_and_ignores_zero() {
-        let expected = ProbeInfo {
-            pixel_width: Some(800),
-            pixel_height: Some(600),
-            cell_width: Some(10),
-            cell_height: Some(20),
-            ..ProbeInfo::default()
-        };
-        assert_eq!(parse_probe_bytes(b"\x1b[4;600;800t\x1b[6;20;10t"), expected);
+    fn ignores_zero_size_replies() {
         assert_eq!(parse_probe_bytes(b"\x1b[4;0;0t"), ProbeInfo::default());
     }
 

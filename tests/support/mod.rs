@@ -907,13 +907,11 @@ impl Pane {
     }
 }
 
-pub fn hello(width: u32, height: u32, cell: Option<(u16, u16)>, show: Show) -> Hello {
+pub const fn hello(width: u32, height: u32, show: Show) -> Hello {
     Hello {
         version: protocol::VERSION,
         width,
         height,
-        cell_width: cell.map(|(width, _)| width),
-        cell_height: cell.map(|(_, height)| height),
         show,
     }
 }

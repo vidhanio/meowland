@@ -1,11 +1,12 @@
 use std::{
     cell::RefCell,
+    ffi::OsString,
     io::{self, Read, Write},
 };
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 /// The length prefix every message carries, in bytes.
@@ -62,12 +63,10 @@ pub struct Hello {
     pub version: u32,
     pub width: u32,
     pub height: u32,
-    pub cell_width: Option<u16>,
-    pub cell_height: Option<u16>,
     pub show: Show,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum Input {
     Key {
         /// Linux input code (`KEY_*`), which is 8 below what XKB uses for an
@@ -77,7 +76,6 @@ pub enum Input {
         /// [`modifiers`] bits.
         modifiers: u8,
     },
-    Text(String),
     Pointer {
         x: f64,
         y: f64,
@@ -87,15 +85,13 @@ pub enum Input {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum PaneToServer {
     Hello(Hello),
     Input(Input),
     Resize {
         width: u32,
         height: u32,
-        cell_width: Option<u16>,
-        cell_height: Option<u16>,
     },
     /// The pane has taken the frame it was sent.  `drawn` says whether its
     /// terminal now shows it: a frame the pane dropped (because the terminal
@@ -129,7 +125,7 @@ pub enum ServerToPane {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ControlRequest {
     Ping,
-    Run(Vec<String>),
+    Run(Vec<OsString>),
     List,
     Stop,
 }
@@ -149,9 +145,9 @@ pub enum ControlResponse {
 pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
     SCRATCH.with_borrow_mut(|buffer| {
         loop {
-            // The buffer's length is the room this thread remembers for a message;
-            // it is never shortened, so a steady stream of frames encodes into the
-            // same allocation.
+            // The buffer's length is the room this thread remembers for a
+            // message; it is never shortened, so a steady stream of
+            // frames encodes into the same allocation.
             if buffer.len() < HEADER {
                 buffer.resize(HEADER, 0);
             }
@@ -239,33 +235,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_and_reject_bad_frames() {
-        let value = PaneToServer::Hello(Hello {
-            version: VERSION,
-            width: 800,
-            height: 600,
-            cell_width: Some(10),
-            cell_height: Some(20),
-            show: Show::Id(42),
-        });
+    fn rejects_truncated_oversized_and_trailing_frames() {
+        let value = PaneToServer::Ack { drawn: true };
         let mut data = Vec::new();
         send(&mut data, &value).unwrap();
-        assert!(matches!(
-            recv::<PaneToServer>(&mut data.as_slice()).unwrap(),
-            PaneToServer::Hello(Hello {
-                show: Show::Id(42),
-                ..
-            })
-        ));
         assert!(recv::<PaneToServer>(&mut data[..data.len() - 1].as_ref()).is_err());
-        let mut oversized = ((MAX_MESSAGE + 1) as u32).to_le_bytes().to_vec();
+
+        let oversized = ((MAX_MESSAGE + 1) as u32).to_le_bytes().to_vec();
         assert!(recv::<PaneToServer>(&mut oversized.as_slice()).is_err());
-        oversized.clear();
+
+        let mut trailing = data;
+        let body_len = u32::from_le_bytes(trailing[..HEADER].try_into().unwrap());
+        trailing[..HEADER].copy_from_slice(&(body_len + 1).to_le_bytes());
+        trailing.push(0);
+        assert!(recv::<PaneToServer>(&mut trailing.as_slice()).is_err());
     }
 
     #[test]
-    fn strips_untrusted_terminal_controls() {
-        assert_eq!(sanitize("abc\x1b[31m\n"), "abc[31m");
+    fn sanitizes_controls_and_limits_characters() {
+        assert_eq!(sanitize_with_limit("a\x1b猫b\n", 3), "a猫b");
     }
 
     /// The framing is a length prefix over a plain bincode encoding: both

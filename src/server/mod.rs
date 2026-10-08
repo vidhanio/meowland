@@ -1,24 +1,23 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs, io,
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-    },
-    path::{Path, PathBuf},
+    env, io,
+    os::unix::net::UnixStream,
+    path::PathBuf,
     process::Child,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Sender},
     },
     thread,
     time::Duration,
 };
 
 mod process;
+mod transport;
 
 use process::{Xwayland, launch_client, start_xwayland, terminate_tree, xwayland_program};
+use transport::{Pane, accept_control, accept_panes, bind};
 
 use crate::{
     Error, Result,
@@ -26,22 +25,21 @@ use crate::{
         self, Command as CompositorCommand, Event as CompositorEvent, MAX_SURFACE_PIXELS,
         MAX_SURFACE_SIDE,
     },
-    diag,
     protocol::{
         self, ControlRequest, ControlResponse, Hello, KEY_Q, KEY_W, PaneToServer, ServerToPane,
         WindowInfo,
     },
+    signals,
 };
 
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub control: PathBuf,
     pub pane: PathBuf,
-    pub log: PathBuf,
 }
 
 impl Paths {
-    /// The socket and log paths inside `XDG_RUNTIME_DIR`.
+    /// The sockets inside `XDG_RUNTIME_DIR`.
     ///
     /// # Errors
     /// Returns an error when `XDG_RUNTIME_DIR` is unset or is not a directory.
@@ -55,7 +53,6 @@ impl Paths {
         Ok(Self {
             control: runtime.join("meowland-control.sock"),
             pane: runtime.join("meowland-pane.sock"),
-            log: diag::path(&runtime.join("meowland-pane.sock")),
         })
     }
 }
@@ -65,11 +62,11 @@ enum Incoming {
     Pane(Hello, UnixStream),
     PaneMessage(u64, PaneToServer),
     PaneGone(u64),
+    Compositor(CompositorEvent),
+    CompositorGone,
 }
 
-/// The way back to the client that asked, and whether it is still waiting.
-/// The handler thread stops waiting after its own timeout, and a request
-/// nobody is waiting for must not be carried out.
+/// Timed-out clients must not have their queued requests executed.
 struct Reply {
     sender: Sender<ControlResponse>,
     waiting: Arc<AtomicBool>,
@@ -85,103 +82,75 @@ impl Reply {
     }
 }
 
-struct Pane {
-    writer: Sender<ServerToPane>,
-    /// A frame is with the pane until it acknowledges one.
-    busy: bool,
-    /// The newest frame that arrived while the pane was busy.  The compositor
-    /// treats a frame it hands over as displayed, so one that is not sent now
-    /// would be lost; holding the newest keeps the pane on the last scene it
-    /// was shown without queueing frames the next one supersedes.
-    held: Option<ServerToPane>,
-}
-
-impl Pane {
-    /// Send a frame now when the pane is ready, otherwise retain only the
-    /// newest frame. Frames supersede each other, so a longer queue is stale
-    /// by construction.
-    fn hand_over(&mut self, frame: ServerToPane) {
-        if self.busy {
-            self.held = Some(frame);
-        } else {
-            self.busy = self.writer.send(frame).is_ok();
-        }
-    }
-
-    /// Mark the in-flight frame consumed and send the newest replacement, if
-    /// one arrived in the meantime.
-    fn acknowledge(&mut self) {
-        self.busy = false;
-        if let Some(frame) = self.held.take() {
-            self.busy = self.writer.send(frame).is_ok();
-        }
-    }
-}
-
-/// Everything the server keeps between events: the panes, the window list the
-/// control socket reports, and the clients it started.
-struct Server<'a> {
-    paths: &'a Paths,
+struct Server {
     incoming: Sender<Incoming>,
     commands: Sender<CompositorCommand>,
     display: String,
     xwayland: Option<Xwayland>,
     panes: HashMap<u64, Pane>,
+    releasing_panes: Vec<Pane>,
     windows: HashMap<u64, WindowInfo>,
     children: Vec<Child>,
     child_groups: HashSet<u32>,
     next_pane: u64,
-    stopping: bool,
 }
 
-/// Run the server until it is asked to stop or a watched signal arrives.
+/// Run until a stop request or termination signal.
 ///
 /// # Errors
-/// Returns an error when a socket cannot be bound, the compositor cannot be
-/// started, or the signal handlers cannot be installed.  Everything the server
-/// started itself is a warning, never a failure.
+/// Fails if startup cannot bind sockets, launch the compositor, or install
+/// signal handlers.
 pub fn serve(paths: &Paths) -> Result<()> {
-    let interrupted = diag::termination_flag()?;
+    let interrupted = signals::termination_flag()?;
+    // Binding below still decides; the probe keeps a second server from
+    // starting Xwayland only to be turned away.
+    if UnixStream::connect(&paths.control).is_ok() {
+        return Err(Error::ServerAlreadyListening(paths.control.clone()));
+    }
     let (commands, events, display, compositor_thread) = compositor::spawn()?;
-    // Xwayland is started before either socket exists, because choosing a
-    // display can take seconds and a client that can connect is one the loop
-    // below can answer: a bound socket that nothing reads yet is a client
-    // that times out by construction.
-    let xwayland = start_xwayland_if_configured(paths, &display);
-    let sockets = || -> Result<(UnixListener, UnixListener)> {
-        Ok((bind(&paths.control)?, bind(&paths.pane)?))
-    };
-    let (control, pane) = match sockets() {
+    // Bind sockets only after Xwayland startup, so connecting clients can be
+    // served immediately.
+    let xwayland = start_xwayland_if_configured(&display);
+    let (control, pane) = match bind(&paths.control)
+        .and_then(|control| bind(&paths.pane).map(|pane| (control, pane)))
+    {
         Ok(sockets) => sockets,
         Err(error) => {
-            let _ = fs::remove_file(&paths.control);
             abandon(xwayland, commands, compositor_thread);
             return Err(error);
         }
     };
     let (incoming, incoming_rx) = mpsc::channel();
-    accept_control(control, incoming.clone(), paths.log.clone());
-    accept_panes(pane, incoming.clone(), paths.log.clone());
+    let control = accept_control(control, incoming.clone());
+    let pane = accept_panes(pane, incoming.clone());
+    let compositor_events = thread::spawn({
+        let incoming = incoming.clone();
+        move || {
+            for event in events {
+                if incoming.send(Incoming::Compositor(event)).is_err() {
+                    return;
+                }
+            }
+            let _ = incoming.send(Incoming::CompositorGone);
+        }
+    });
     let mut server = Server {
         xwayland,
-        paths,
         incoming,
         commands,
         display,
         panes: HashMap::new(),
+        releasing_panes: Vec::new(),
         windows: HashMap::new(),
         children: Vec::new(),
         child_groups: HashSet::new(),
         next_pane: 1,
-        stopping: false,
     };
 
-    while !server.stopping && !interrupted.load(Ordering::Relaxed) {
-        server.drain_compositor_events(&events);
-        match incoming_rx.recv_timeout(Duration::from_millis(10)) {
-            // A client that has given up is not there to wait for the reply,
-            // and a request must not still be carried out (starting a client,
-            // say) long after it was asked for.
+    let mut compositor_failed = false;
+    while !interrupted.interrupted() {
+        match incoming_rx.recv_timeout(Duration::from_millis(100)) {
+            // A client that has given up must not have its request acted on.
             Ok(Incoming::Control(request, reply)) => {
                 if reply.waiting() {
                     let response = server.control(request);
@@ -191,18 +160,40 @@ pub fn serve(paths: &Paths) -> Result<()> {
             Ok(Incoming::Pane(hello, socket)) => server.attach_pane(hello, socket),
             Ok(Incoming::PaneMessage(id, message)) => server.pane_message(id, message),
             Ok(Incoming::PaneGone(id)) => server.pane_gone(id),
+            Ok(Incoming::Compositor(event)) => server.compositor_event(event),
+            Ok(Incoming::CompositorGone) => {
+                compositor_failed = true;
+                break;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        // Do not keep accepting clients into a display whose thread panicked.
+        if compositor_thread.is_finished() {
+            compositor_failed = true;
+            break;
+        }
         server.reap_children();
+        server.releasing_panes.retain(|pane| !pane.finished());
     }
 
+    // Pending requests and handshakes must not become new clients during
+    // shutdown. Dropping replies also wakes waiting control workers.
+    drop(incoming_rx);
+    drop(control);
+    drop(pane);
     server.shutdown(compositor_thread);
+    let _ = compositor_events.join();
+    if compositor_failed {
+        return Err(Error::io(
+            "compositor thread stopped unexpectedly",
+            io::Error::other("display unavailable"),
+        ));
+    }
     Ok(())
 }
 
-/// Give back everything a half-started server owns: the Xwayland it started,
-/// the compositor thread, and the caller's error.
+/// Release resources from a server that failed to start.
 fn abandon(
     xwayland: Option<Xwayland>,
     commands: Sender<CompositorCommand>,
@@ -217,87 +208,72 @@ fn abandon(
     let _ = compositor_thread.join();
 }
 
-/// X11 support is a convenience, never a reason to fail: a satellite that
-/// cannot start is logged and forgotten.
-fn start_xwayland_if_configured(paths: &Paths, wayland: &str) -> Option<Xwayland> {
+/// X11 startup is optional; report failure without stopping the server.
+fn start_xwayland_if_configured(wayland: &str) -> Option<Xwayland> {
     let program = xwayland_program()?;
-    match start_xwayland(&program, wayland, &paths.log) {
+    match start_xwayland(&program, wayland) {
         Ok(xwayland) => {
-            diag::line(
-                &paths.log,
-                &format!(
-                    "xwayland: DISPLAY={} via {}",
-                    xwayland.display,
-                    program.display()
-                ),
-            );
+            tracing::info!(display = %xwayland.display, program = %program.display(), "xwayland started");
             Some(xwayland)
         }
         Err(error) => {
-            diag::line(&paths.log, &format!("xwayland: not started: {error:#}"));
+            tracing::warn!(%error, "xwayland could not start");
             None
         }
     }
 }
 
-impl Server<'_> {
-    fn drain_compositor_events(&mut self, events: &Receiver<CompositorEvent>) {
-        while let Ok(event) = events.try_recv() {
-            match event {
-                CompositorEvent::WindowUp(info) => {
-                    self.windows.insert(info.id, info);
-                }
-                CompositorEvent::WindowDown(id) => {
-                    self.windows.remove(&id);
-                }
-                CompositorEvent::Title { pane, title } => {
-                    self.to_pane(pane, ServerToPane::Title(title));
-                }
-                CompositorEvent::Cursor { pane, shape } => {
-                    self.to_pane(pane, ServerToPane::Cursor(shape));
-                }
-                CompositorEvent::Focus(id) => {
-                    for window in self.windows.values_mut() {
-                        window.active = window.id == id;
-                    }
-                }
-                CompositorEvent::Frame {
-                    pane,
-                    width,
-                    height,
-                    y,
-                    rgb,
-                } => self.hand_over_frame(pane, width, height, y, rgb),
-                CompositorEvent::Release { pane, reason } => {
-                    if let Some(target) = self.panes.remove(&pane) {
-                        release(&target.writer, reason);
-                    }
+impl Server {
+    fn compositor_event(&mut self, event: CompositorEvent) {
+        match event {
+            CompositorEvent::WindowUp(info) => {
+                self.windows.insert(info.id, info);
+            }
+            CompositorEvent::WindowDown(id) => {
+                self.windows.remove(&id);
+            }
+            CompositorEvent::Title { pane, title } => {
+                self.to_pane(pane, ServerToPane::Title(title));
+            }
+            CompositorEvent::Cursor { pane, shape } => {
+                self.to_pane(pane, ServerToPane::Cursor(shape));
+            }
+            CompositorEvent::Focus(id) => {
+                for window in self.windows.values_mut() {
+                    window.active = window.id == id;
                 }
             }
+            CompositorEvent::Frame {
+                pane,
+                width,
+                height,
+                y,
+                rgb,
+            } => {
+                self.hand_over_frame(pane, width, height, y, rgb);
+            }
+            CompositorEvent::Release { pane, reason } => self.release_pane(pane, reason),
         }
     }
 
-    /// A frame goes to a pane that has acknowledged the last one.  One that is
-    /// still busy keeps only the newest frame until its ack arrives: the
-    /// compositor treats a frame it handed over as displayed, so a frame that
-    /// is dropped here would leave the pane on a scene the compositor thinks
-    /// it has replaced.
-    fn hand_over_frame(&mut self, pane: u64, width: u32, height: u32, y: u32, rgb: Vec<u8>) {
-        let frame = ServerToPane::Frame {
-            width,
-            height,
-            y,
-            rgb,
-        };
-        let Some(target) = self.panes.get_mut(&pane) else {
-            return;
-        };
-        target.hand_over(frame);
+    /// The compositor owns presentation backpressure: it sends no new frame
+    /// until the pane has acknowledged its previous one. The server only
+    /// forwards frames; a second independent queue would retain stale pixels.
+    fn hand_over_frame(&self, pane: u64, width: u32, height: u32, y: u32, rgb: Vec<u8>) {
+        self.to_pane(
+            pane,
+            ServerToPane::Frame {
+                width,
+                height,
+                y,
+                rgb,
+            },
+        );
     }
 
     fn to_pane(&self, pane: u64, message: ServerToPane) {
         if let Some(target) = self.panes.get(&pane) {
-            let _ = target.writer.send(message);
+            target.send(message);
         }
     }
 
@@ -316,7 +292,7 @@ impl Server<'_> {
                     .xwayland
                     .as_ref()
                     .map(|xwayland| xwayland.display.as_str());
-                match launch_client(&args, &self.display, x11, &self.paths.log) {
+                match launch_client(&args, &self.display, x11) {
                     Ok(child) => {
                         self.child_groups.insert(child.id());
                         self.children.push(child);
@@ -325,22 +301,14 @@ impl Server<'_> {
                     Err(error) => ControlResponse::Error(format!("{error:#}")),
                 }
             }
-            ControlRequest::Stop => {
-                self.stopping = true;
-                ControlResponse::Ok
-            }
         }
     }
 
-    /// A pane that has just said hello.  One the server cannot use is told why
-    /// rather than left to time out.
+    /// Reject unusable panes instead of leaving them to time out.
     fn attach_pane(&mut self, hello: Hello, socket: UnixStream) {
         // Descriptor exhaustion must reject this pane, not end the server.
         let Ok(mut writer) = socket.try_clone() else {
-            diag::line(
-                &self.paths.log,
-                "pane: cannot clone the socket; dropping it",
-            );
+            tracing::warn!("pane: cannot clone socket; dropping connection");
             return;
         };
         if hello.version != protocol::VERSION {
@@ -363,19 +331,17 @@ impl Server<'_> {
         }
         let id = self.next_pane;
         self.next_pane += 1;
-        let (send_tx, send_rx) = mpsc::channel();
-        let _ = protocol::send(&mut writer, &ServerToPane::HelloOk);
-        let log = self.paths.log.clone();
-        thread::spawn(move || pane_writer(writer, send_rx, &log));
-        read_pane(id, socket, self.incoming.clone());
-        self.panes.insert(
-            id,
-            Pane {
-                writer: send_tx,
-                busy: false,
-                held: None,
-            },
-        );
+        if protocol::send(&mut writer, &ServerToPane::HelloOk).is_err() {
+            return;
+        }
+        let pane = match Pane::start(id, socket, writer, self.incoming.clone()) {
+            Ok(pane) => pane,
+            Err(error) => {
+                tracing::warn!(%error, "pane: cannot own connection; dropping pane");
+                return;
+            }
+        };
+        self.panes.insert(id, pane);
         let _ = self.commands.send(CompositorCommand::Attach {
             pane: id,
             show: hello.show,
@@ -393,9 +359,7 @@ impl Server<'_> {
                     pressed: true,
                     modifiers,
                 } if protocol::modifiers::alt_only(*modifiers) => {
-                    if let Some(target) = self.panes.remove(&id) {
-                        release(&target.writer, "detached".into());
-                    }
+                    self.release_pane(id, "detached".into());
                     let _ = self.commands.send(CompositorCommand::Detach { pane: id });
                 }
                 protocol::Input::Key {
@@ -428,15 +392,20 @@ impl Server<'_> {
                 }
             }
             PaneToServer::Ack { drawn } => {
-                if let Some(pane) = self.panes.get_mut(&id) {
-                    // The frame held back while this one was in flight is the
-                    // one the compositor last rendered; it goes out now.
-                    pane.acknowledge();
+                if self.panes.contains_key(&id) {
                     let _ = self
                         .commands
                         .send(CompositorCommand::Ack { pane: id, drawn });
                 }
             }
+        }
+    }
+
+    /// Keep the connection owned while its writer drains the ordered Release.
+    fn release_pane(&mut self, id: u64, reason: String) {
+        if let Some(mut pane) = self.panes.remove(&id) {
+            pane.release(reason);
+            self.releasing_panes.push(pane);
         }
     }
 
@@ -449,42 +418,37 @@ impl Server<'_> {
         // A child that is gone takes its pid with it: the raw number is only
         // safe to signal while the process is known to be alive, since a
         // reused pid would put SIGKILL on an unrelated process at shutdown.
-        let mut gone = Vec::new();
+        let child_groups = &mut self.child_groups;
         self.children.retain_mut(|child| {
-            // A child that is gone, or one that cannot be waited for at all,
-            // is not one that will be reaped later.
+            // A child that cannot be waited for must not remain in the process
+            // group set.
             let running = matches!(child.try_wait(), Ok(None));
             if !running {
-                gone.push(child.id());
+                child_groups.remove(&child.id());
             }
             running
         });
-        for pid in gone {
-            self.child_groups.remove(&pid);
-        }
         if self
             .xwayland
             .as_mut()
             .is_some_and(|running| matches!(running.child.try_wait(), Ok(Some(_))))
         {
-            diag::line(&self.paths.log, "xwayland: server exited");
+            tracing::warn!("xwayland server exited");
             self.xwayland = None;
         }
     }
 
-    /// Let go in the order a pane and a client have to see: ask the windows to
-    /// close, release the panes (the terminal is given back on EOF), then
-    /// signal whatever is left.
-    ///
-    /// The socket files go first: they are what says a server is there, and
-    /// `server stop` returning while they still resolve is a `run` right after
-    /// it that connects to a server already on its way out.
+    /// Listener owners have already stopped accepting before this grace period.
     fn shutdown(&mut self, compositor_thread: thread::JoinHandle<()>) {
-        let _ = fs::remove_file(&self.paths.control);
-        let _ = fs::remove_file(&self.paths.pane);
         let _ = self.commands.send(CompositorCommand::CloseAll);
+        for pane in self.panes.values_mut() {
+            pane.release("server stopped".into());
+        }
         thread::sleep(Duration::from_millis(250));
+        // Unlike normal detach, final shutdown cannot wait for a stalled pane
+        // forever. Close both halves and join every established transport.
         self.panes.clear();
+        self.releasing_panes.clear();
         if let Some(mut xwayland) = self.xwayland.take() {
             terminate_tree(&HashSet::from([xwayland.child.id()]));
             let _ = xwayland.child.wait();
@@ -495,199 +459,10 @@ impl Server<'_> {
     }
 }
 
-/// Tell a pane why it is being let go.  The pane may still have a frame in
-/// flight, so this is queued behind it rather than dropped when the queue
-/// happens to be busy.  Frames are paced by the pane's acks, so the queue
-/// holds at most one frame plus a few short messages.
-fn release(writer: &Sender<ServerToPane>, reason: String) {
-    let _ = writer.send(ServerToPane::Release(reason));
-}
-
 fn valid_size(width: u32, height: u32) -> bool {
     width > 0
         && height > 0
         && width <= MAX_SURFACE_SIDE
         && height <= MAX_SURFACE_SIDE
         && u64::from(width) * u64::from(height) <= MAX_SURFACE_PIXELS as u64
-}
-
-fn bind(path: &Path) -> Result<UnixListener> {
-    let listener = match UnixListener::bind(path) {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            if UnixStream::connect(path).is_ok() {
-                return Err(Error::ServerAlreadyListening(path.to_path_buf()));
-            }
-            fs::remove_file(path).map_err(|error| {
-                Error::io(format!("removing stale socket {}", path.display()), error)
-            })?;
-            UnixListener::bind(path)?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
-}
-
-/// How long the pane has to say hello.  A pane connects as soon as it starts,
-/// but it only sends its hello after it has probed the terminal it is in,
-/// which it gives up to a second to answer.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long the pane handshake writes from the event loop may take.  They are
-/// a few bytes on a fresh socket, so this is only a guard against a peer that
-/// never reads at all: the loop must not be held up for long.
-const HANDSHAKE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How long one frame may take to reach the pane.  A frame is megabytes and
-/// the pane is a process on the same machine: it is read as fast as the
-/// terminal takes it, and a busy machine can leave the pane unrun for seconds
-/// at a time.  Killing the pane over that would end a session that only had to
-/// wait, so the writer is patient; a pane that is really gone closes its
-/// socket, which fails the write immediately.
-const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Whether a listener error is one the accept loop can wait out.  Running out
-/// of descriptors is the one that happens on a long-lived server with many
-/// panes; the rest are transient at the socket layer.  The listener is the
-/// only way into a running server, so its thread must not leave it behind.
-fn transient_accept(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
-    ) || [rustix::io::Errno::MFILE, rustix::io::Errno::NFILE]
-        .iter()
-        .any(|candidate| Some(candidate.raw_os_error()) == error.raw_os_error())
-}
-
-fn accept_control(listener: UnixListener, incoming: Sender<Incoming>, log: PathBuf) {
-    accept_connections(
-        listener,
-        incoming,
-        log,
-        "control",
-        |mut socket, incoming, _| {
-            let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
-            let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
-            if let Ok(request) = protocol::recv::<ControlRequest>(&mut socket) {
-                let (reply_tx, reply_rx) = mpsc::channel();
-                let waiting = Arc::new(AtomicBool::new(true));
-                let reply = Reply {
-                    sender: reply_tx,
-                    waiting: Arc::clone(&waiting),
-                };
-                if incoming.send(Incoming::Control(request, reply)).is_ok()
-                    && let Ok(answer) = reply_rx.recv_timeout(Duration::from_secs(2))
-                {
-                    let _ = protocol::send(&mut socket, &answer);
-                }
-                // The client gives up when this returns without an answer, so
-                // the request may no longer be acted on.
-                waiting.store(false, Ordering::Relaxed);
-            }
-        },
-    );
-}
-
-fn accept_panes(listener: UnixListener, incoming: Sender<Incoming>, log: PathBuf) {
-    accept_connections(
-        listener,
-        incoming,
-        log,
-        "pane",
-        |mut socket, incoming, log| {
-            let _ = socket.set_read_timeout(Some(HELLO_TIMEOUT));
-            // The hello and any rejection are written from the event loop,
-            // which must not be held up by a peer that stopped
-            // reading.
-            let _ = socket.set_write_timeout(Some(HANDSHAKE_WRITE_TIMEOUT));
-            match protocol::recv::<PaneToServer>(&mut socket) {
-                Ok(PaneToServer::Hello(hello)) => {
-                    let _ = socket.set_read_timeout(None);
-                    let _ = incoming.send(Incoming::Pane(hello, socket));
-                }
-                Ok(other) => {
-                    diag::line(
-                        &log,
-                        &format!("pane: first message was not a hello: {other:?}"),
-                    );
-                    let _ = protocol::send(
-                        &mut socket,
-                        &ServerToPane::Reject("the pane did not start with a hello".into()),
-                    );
-                }
-                Err(error) => {
-                    diag::line(&log, &format!("pane: no hello: {error}"));
-                    let _ = protocol::send(
-                        &mut socket,
-                        &ServerToPane::Reject(format!("the pane hello failed: {error}")),
-                    );
-                }
-            }
-        },
-    );
-}
-
-/// Run one nonblocking listener and give each accepted socket to a short-lived
-/// handler thread. The two socket protocols differ, but their retry and fatal
-/// error policy must stay identical.
-fn accept_connections<F>(
-    listener: UnixListener,
-    incoming: Sender<Incoming>,
-    log: PathBuf,
-    label: &'static str,
-    handle: F,
-) where
-    F: Fn(UnixStream, Sender<Incoming>, PathBuf) + Copy + Send + 'static,
-{
-    thread::spawn(move || {
-        loop {
-            match listener.accept() {
-                Ok((socket, _)) => {
-                    let incoming = incoming.clone();
-                    let log = log.clone();
-                    thread::spawn(move || handle(socket, incoming, log));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) if transient_accept(&error) => {
-                    diag::line(&log, &format!("{label}: accept failed: {error}; retrying"));
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    diag::line(&log, &format!("{label}: accept stopped: {error}"));
-                    break;
-                }
-            }
-        }
-    });
-}
-
-/// Frames are the compositor's, so `commands` is only borrowed: the thread
-/// that spawned this one owns the sender for its whole life.
-fn pane_writer(mut socket: UnixStream, rx: Receiver<ServerToPane>, log: &Path) {
-    let _ = socket.set_write_timeout(Some(FRAME_WRITE_TIMEOUT));
-    for message in rx {
-        if let Err(error) = protocol::send(&mut socket, &message) {
-            // A write that did not finish leaves the stream half a message
-            // long, so there is no way back except closing it; the pane's
-            // reader sees the end too and the pane is reaped.
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-            diag::line(log, &format!("pane: write failed ({error}); closed"));
-            break;
-        }
-    }
-}
-
-fn read_pane(id: u64, mut socket: UnixStream, incoming: Sender<Incoming>) {
-    thread::spawn(move || {
-        while let Ok(message) = protocol::recv::<PaneToServer>(&mut socket) {
-            if incoming.send(Incoming::PaneMessage(id, message)).is_err() {
-                return;
-            }
-        }
-        let _ = incoming.send(Incoming::PaneGone(id));
-    });
 }

@@ -2,27 +2,23 @@ use std::{
     cell::RefCell,
     ffi::OsString,
     io::{self, Read, Write},
+    os::unix::net::UnixStream,
 };
 
+use rustix::{io::Errno, net::RecvFlags};
 use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 4;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
-/// The length prefix every message carries, in bytes.
 const HEADER: usize = 4;
 
 thread_local! {
-    /// Storage for one message, kept for the next one this thread sends or
-    /// receives.  A frame is megabytes: allocating (and so faulting in) a
-    /// buffer of that size per message is a per-frame cost on both sides.
+    /// Reuse a message buffer across frames to avoid megabyte-scale allocations.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The modifier bits a pane packs into [`Input::Key`], one per modifier.
-///
-/// Both sides of the pane socket read these, so the layout lives here rather
-/// than in either of them.
+/// Shared modifier bits for [`Input::Key`].
 pub mod modifiers {
     pub const SHIFT: u8 = 1;
     pub const CONTROL: u8 = 2;
@@ -93,10 +89,8 @@ pub enum PaneToServer {
         width: u32,
         height: u32,
     },
-    /// The pane has taken the frame it was sent.  `drawn` says whether its
-    /// terminal now shows it: a frame the pane dropped (because the terminal
-    /// was still reading the last one) leaves the compositor's idea of the
-    /// pane's screen stale, and it has to keep sending until one lands.
+    /// `drawn` is false if the pane dropped the frame; the compositor must
+    /// resend.
     Ack {
         drawn: bool,
     },
@@ -106,9 +100,7 @@ pub enum PaneToServer {
 pub enum ServerToPane {
     HelloOk,
     Reject(String),
-    /// The rows of a `width` by `height` frame from `y` down, `rgb` in
-    /// `r, g, b` order: the pane composes bands into the frame it keeps, so a
-    /// change that moves a cursor costs a row and not a frame.
+    /// RGB rows of a frame, starting at `y`.
     Frame {
         width: u32,
         height: u32,
@@ -127,7 +119,6 @@ pub enum ControlRequest {
     Ping,
     Run(Vec<OsString>),
     List,
-    Stop,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -163,9 +154,16 @@ pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> 
                     buffer[..HEADER].copy_from_slice(&(size as u32).to_le_bytes());
                     return writer.write_all(&buffer[..HEADER + size]);
                 }
-                // The message outgrew the room; the next round has twice as much.
                 Err(bincode::error::EncodeError::UnexpectedEnd) => {
-                    let grown = (buffer.len() * 2).max(1024);
+                    let maximum = HEADER + MAX_MESSAGE;
+                    if buffer.len() == maximum {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "message too large",
+                        ));
+                    }
+                    let grown = (buffer.len() * 2).clamp(1024, maximum);
+                    buffer.reserve_exact(grown - buffer.len());
                     buffer.resize(grown, 0);
                 }
                 Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
@@ -183,6 +181,17 @@ pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> 
 pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<T> {
     let mut header = [0; HEADER];
     reader.read_exact(&mut header)?;
+    let size = message_size(header)?;
+    SCRATCH.with_borrow_mut(|buffer| {
+        if buffer.len() < size {
+            buffer.resize(size, 0);
+        }
+        reader.read_exact(&mut buffer[..size])?;
+        decode(&buffer[..size])
+    })
+}
+
+fn message_size(header: [u8; HEADER]) -> io::Result<usize> {
     let size = u32::from_le_bytes(header) as usize;
     if size > MAX_MESSAGE {
         return Err(io::Error::new(
@@ -190,24 +199,84 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
             "message too large",
         ));
     }
-    SCRATCH.with_borrow_mut(|buffer| {
-        if buffer.len() < size {
-            buffer.resize(size, 0);
+    Ok(size)
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
+    let (value, used) = bincode::serde::decode_from_slice(
+        bytes,
+        bincode::config::standard().with_limit::<MAX_MESSAGE>(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if used != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing message bytes",
+        ));
+    }
+    Ok(value)
+}
+
+/// One bounded, incremental message buffer for a readiness-driven socket.
+///
+/// The socket remains blocking for writes, including through cloned handles.
+#[derive(Debug, Default)]
+pub(crate) struct MessageReader {
+    header: [u8; HEADER],
+    header_read: usize,
+    body: Vec<u8>,
+    body_size: usize,
+    body_read: usize,
+}
+
+impl MessageReader {
+    /// Receive at most one message without waiting for missing bytes.
+    ///
+    /// `None` retains a partial packet for the next readable wakeup. Each call
+    /// reads at most a header and 64 KiB of body, so larger packets yield to
+    /// the event loop. EOF, oversized packets and decode errors match
+    /// [`recv`].
+    pub(crate) fn try_recv<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        socket: &UnixStream,
+    ) -> io::Result<Option<T>> {
+        if self.header_read < HEADER {
+            self.header_read += receive_available(socket, &mut self.header[self.header_read..])?;
+            if self.header_read < HEADER {
+                return Ok(None);
+            }
+            self.body_size = message_size(self.header)?;
+            // Remember initialized room just as the blocking receiver does.
+            if self.body.len() < self.body_size {
+                self.body.resize(self.body_size, 0);
+            }
         }
-        reader.read_exact(&mut buffer[..size])?;
-        let (value, used) = bincode::serde::decode_from_slice(
-            &buffer[..size],
-            bincode::config::standard().with_limit::<MAX_MESSAGE>(),
-        )
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if used != size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trailing message bytes",
-            ));
+        if self.body_read < self.body_size {
+            let end = (self.body_read + 64 * 1024).min(self.body_size);
+            self.body_read += receive_available(socket, &mut self.body[self.body_read..end])?;
+            if self.body_read < self.body_size {
+                return Ok(None);
+            }
         }
-        Ok(value)
-    })
+        self.header_read = 0;
+        self.body_read = 0;
+        decode(&self.body[..self.body_size]).map(Some)
+    }
+}
+
+/// Return currently available bytes, or zero on would-block/interruption.
+fn receive_available(socket: &UnixStream, bytes: &mut [u8]) -> io::Result<usize> {
+    // O_NONBLOCK would also change cloned writers. DONTWAIT affects only this
+    // receive call, leaving Hello, input and acknowledgements blocking.
+    match rustix::net::recv(socket, bytes, RecvFlags::DONTWAIT) {
+        Ok((0, _)) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )),
+        Ok((read, _)) => Ok(read),
+        Err(Errno::AGAIN | Errno::INTR) => Ok(0),
+        Err(error) => Err(io::Error::from(error)),
+    }
 }
 
 /// Strip the control characters that would let a window title drive the

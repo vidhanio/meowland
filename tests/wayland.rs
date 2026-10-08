@@ -55,33 +55,35 @@ fn committed_shm_window_reaches_the_pane_byte_for_byte() {
 }
 
 #[test]
-fn frame_callbacks_wait_for_the_pane_ack() {
+fn frame_callbacks_continue_at_display_rate_without_pane_acks() {
     let server = Server::start();
     let mut client = Client::connect(&server);
     let toplevel = client.create_toplevel("frame clock", "meowland.test");
     let (raw, _) = pixels();
     let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &raw);
     client.attach(&toplevel, buffer, WIDTH, HEIGHT);
-    assert!(
-        server.wait_for_window(Duration::from_secs(5)),
-        "window was never announced"
-    );
+    assert!(server.wait_for_window(Duration::from_secs(5)));
 
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
     let _ = pane.frame();
-    // The pane holds the frame now.  While it does, the window is shown, so
-    // the compositor may not hand its client another frame; a round trip
-    // proves the callback was not ordered before the pane's acknowledgement.
-    let callback = client.frame_callback(toplevel.surface);
-    let seen = client.sync();
+    // Never acknowledge the pane frame. Each callback commits a new request;
+    // even a terminal that remains stalled must not freeze the Wayland client.
+    let start = Instant::now();
+    let mut times = Vec::new();
+    for _ in 0..4 {
+        let callback = client.frame_callback(toplevel.surface);
+        let done = client.read_until(|message| message.object == callback);
+        assert_eq!(done.opcode, 0);
+        times.push(done.u32_at(0));
+    }
     assert!(
-        seen.iter().all(|message| message.object != callback),
-        "frame callback fired before the pane acknowledged"
+        times.windows(2).all(|pair| pair[1] > pair[0]),
+        "the callback clock did not advance: {times:?}"
     );
-
-    pane.send(&protocol::PaneToServer::Ack { drawn: true });
-    let done = client.read_until(|message| message.object == callback);
-    assert_eq!(done.opcode, 0);
+    assert!(
+        start.elapsed() < Duration::from_millis(450),
+        "callbacks were held behind the unacknowledged frame"
+    );
 }
 
 #[test]
@@ -97,7 +99,7 @@ fn closing_the_toplevel_releases_its_pane() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Id(1)));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Id(server.list()[0].id)));
     let _ = pane.frame();
     client.destroy_toplevel(&toplevel);
     match pane.recv() {
@@ -170,14 +172,14 @@ fn throughput_of_1080p_frames() {
         let offset = (frames * 4096) % u64::from(stride * height);
         file.write_at(&[0xa5], offset).unwrap();
         client.attach(&toplevel, buffer, width, height);
-        let (frame_width, frame_height, _) = pane.frame();
-        bytes += u64::from(frame_width) * u64::from(frame_height) * 3;
+        let (frame_width, _, _) = pane.frame();
+        bytes += u64::from(frame_width) * u64::from(pane.band().1) * 3;
         pane.send(&protocol::PaneToServer::Ack { drawn: true });
         frames += 1;
     }
     let elapsed = start.elapsed();
     eprintln!(
-        "1080p pane throughput: {frames} frames in {elapsed:?} ({:.1} fps, {:.0} MiB/s of RGB)",
+        "1080p pane throughput: {frames} frames in {elapsed:?} ({:.1} fps, {:.2} MiB/s of frame bands)",
         f64::from(frames as u32) / elapsed.as_secs_f64(),
         bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
     );
@@ -484,7 +486,7 @@ fn alt_q_asks_the_window_to_close_and_alt_w_detaches() {
         "window was never announced"
     );
 
-    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Id(1)));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Id(server.list()[0].id)));
     let _ = pane.frame();
 
     // Alt+Q asks the shown window to close; the client decides what to do.
@@ -573,11 +575,12 @@ fn a_pane_bound_covers_both_axes() {
         server.wait_for_window(Duration::from_secs(5)),
         "window was never announced"
     );
+    let id = server.list()[0].id;
 
-    let mut wide = Pane::attach(&server, hello(WIDE_PANE.0, WIDE_PANE.1, Show::Id(1)));
+    let mut wide = Pane::attach(&server, hello(WIDE_PANE.0, WIDE_PANE.1, Show::Id(id)));
     let _ = wide.frame();
     wide.send(&protocol::PaneToServer::Ack { drawn: true });
-    let mut tall = Pane::attach(&server, hello(TALL_PANE.0, TALL_PANE.1, Show::Id(1)));
+    let mut tall = Pane::attach(&server, hello(TALL_PANE.0, TALL_PANE.1, Show::Id(id)));
     let _ = tall.frame();
     tall.send(&protocol::PaneToServer::Ack { drawn: true });
 
@@ -597,40 +600,30 @@ fn a_pane_bound_covers_both_axes() {
     assert_eq!(at(&frame, 0, 0), painted, "the tall pane shows the redraw");
 }
 
-/// The compositor counts a frame it has handed over as displayed, and a pane
-/// that has not acknowledged one is a frame behind: the newest frame has to be
-/// kept for it rather than dropped, or the pane never shows it.
+/// The pane has only one presentation slot: two client commits while it is
+/// blocked coalesce into the most recent image when it acknowledges the first.
 #[test]
-fn a_frame_held_for_a_busy_pane_is_delivered_after_its_ack() {
+fn an_unacked_pane_receives_only_the_latest_frame_after_its_ack() {
     let server = Server::start();
     let mut client = Client::connect(&server);
     let window = client.create_toplevel("busy pane", "meowland.test");
     let first = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [1, 2, 3]));
     client.attach(&window, first, WIDTH, HEIGHT);
-    assert!(
-        server.wait_for_window(Duration::from_secs(5)),
-        "window was never announced"
-    );
+    assert!(server.wait_for_window(Duration::from_secs(5)));
 
     let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
-    let frame = pane.frame();
-    assert_eq!(at(&frame, 0, 0), [1, 2, 3]);
-
-    // The client redraws while the pane holds the first frame unacknowledged.
-    let second = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [9, 8, 7]));
+    assert_eq!(at(&pane.frame(), 0, 0), [1, 2, 3]);
+    let second = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [4, 5, 6]));
     client.attach(&window, second, WIDTH, HEIGHT);
-
-    // After the half second the compositor gives the unacknowledged frame up,
-    // the redraw is rendered and sent; the pane is still busy, so the server
-    // holds it.  The acknowledgement then releases it.
-    thread::sleep(Duration::from_millis(700));
+    let third = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, [9, 8, 7]));
+    client.attach(&window, third, WIDTH, HEIGHT);
+    let _ = client.sync();
     pane.send(&protocol::PaneToServer::Ack { drawn: true });
 
-    let frame = pane.frame();
     assert_eq!(
-        at(&frame, 0, 0),
+        at(&pane.frame(), 0, 0),
         [9, 8, 7],
-        "the frame held for the busy pane was never delivered"
+        "the busy pane was sent an obsolete image"
     );
 }
 

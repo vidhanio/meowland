@@ -1,13 +1,5 @@
-//! Benchmarks for the wire codec the sockets speak.
-//!
-//! A frame crosses the pane socket as one `bincode` message, so encoding and
-//! decoding a whole screen are both per-frame costs.  Input messages go the
-//! other way and are the per-event cost of a keystroke, a paste or a mouse
-//! move.  `send` grows the buffer it writes into and `recv` allocates the
-//! message it returns, which is what their callers do too, so both are paid
-//! for here.
-//!
-//! `cargo test --all-targets` runs each case once, in criterion's test mode.
+//! Wire-codec benchmarks for full frames, input events, and window lists.
+//! Encoding uses reusable output buffers; decoding includes message allocation.
 
 use std::{hint::black_box, time::Duration};
 
@@ -16,13 +8,9 @@ use meowland::protocol::{
     ControlResponse, Input, PaneToServer, ServerToPane, WindowInfo, modifiers, recv, send,
 };
 
-/// A laptop screen and a 4K one: the message is pixels, so it scales with them.
+/// Pixel payloads at 1080p and 4K.
 const SIZES: [(u32, u32, &str); 2] = [(1920, 1080, "1080p"), (3840, 2160, "2160p")];
-/// A busy desktop's worth of windows for `meowland list` to answer with.
 const WINDOWS: u64 = 64;
-/// A codec is a memcpy with a format around it, so a few thousand iterations
-/// per case say more than a longer wall clock does; the measurement still runs
-/// for seconds so a 4K frame gets its samples.
 const SAMPLES: usize = 30;
 const MEASUREMENT: Duration = Duration::from_secs(3);
 const WARM_UP: Duration = Duration::from_secs(1);
@@ -51,8 +39,7 @@ fn frames(c: &mut Criterion) {
         let bytes = pixels(width, height);
         group.throughput(Throughput::Bytes(bytes as u64));
 
-        // Server to pane: the pixels are copied into the message, and the
-        // message into the socket.
+        // Server-to-pane frame encoding.
         group.bench_function(BenchmarkId::new("encode", name), |b| {
             b.iter_batched(
                 || (frame(width, height), Vec::with_capacity(bytes + 64)),
@@ -64,8 +51,7 @@ fn frames(c: &mut Criterion) {
             );
         });
 
-        // Pane to server: the frame arrives as bytes and lands in one
-        // allocation.
+        // Server-to-pane frame decoding.
         group.bench_function(BenchmarkId::new("decode", name), |b| {
             b.iter_batched(
                 || {
@@ -108,8 +94,7 @@ fn input(c: &mut Criterion) {
     });
 
     for (name, message) in [("key", &key), ("pointer", &pointer)] {
-        // A pane writes input into a buffer it keeps, so the buffer lives
-        // outside the measured loop: this is the per-event cost alone.
+        // Reuse the pane's output buffer to measure per-event encoding.
         let mut out = Vec::with_capacity(64);
         group.bench_with_input(BenchmarkId::new("encode", name), message, |b, message| {
             b.iter(|| {
@@ -141,7 +126,6 @@ fn control(c: &mut Criterion) {
         .measurement_time(MEASUREMENT)
         .warm_up_time(WARM_UP);
 
-    // `meowland list` answers with every window the server has.
     let windows = ControlResponse::Windows(
         (0..WINDOWS)
             .map(|id| WindowInfo {

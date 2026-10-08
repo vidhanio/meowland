@@ -1,54 +1,54 @@
-//! The Wayland side of the server.
+//! Wayland compositor and its command/event channels.
 //!
-//! One Smithay display runs on its own thread and talks to the rest of the
-//! server over two channels: [`Command`] in, [`Event`] out.  Client buffers
-//! are copied into owned snapshots the moment they are committed, so a client
-//! that redraws into a buffer it still owns cannot tear a frame that is on its
-//! way to a terminal.
+//! Client buffers are copied on commit so later client writes cannot tear a
+//! frame in transit to a terminal.
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::Range,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use smithay::{
-    backend::input::{Axis, AxisSource, ButtonState, KeyState, Keycode},
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_output,
-    delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
+    backend::allocator::dmabuf::Dmabuf,
+    delegate_dispatch2,
     desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, KeyboardHandle, XkbConfig},
-        pointer::{
-            AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, MotionEvent, PointerHandle,
-        },
+        dnd::DndGrabHandler,
+        keyboard::{KeyboardHandle, XkbConfig},
+        pointer::{CursorIcon, CursorImageStatus, PointerHandle},
+        tablet::TabletSeatHandler,
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Client, Display, DisplayHandle, ListeningSocket, Resource,
+            Client, Display, DisplayHandle, ListeningSocket, Resource, Weak,
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::{wl_buffer, wl_shm, wl_surface::WlSurface},
+            protocol::{wl_buffer, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Size},
+    utils::{Logical, Rectangle, SERIAL_COUNTER, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SubsurfaceCachedState, SurfaceAttributes, get_children, get_parent, with_states,
+            Barrier, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SubsurfaceCachedState, SurfaceAttributes, add_blocker, add_pre_commit_hook,
+            get_children, get_parent, with_states,
         },
         cursor_shape::CursorShapeManagerState,
+        dmabuf::{
+            DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+            get_dmabuf,
+        },
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::PointerConstraintsHandler,
         selection::{
             SelectionHandler, SelectionSource, SelectionTarget,
             data_device::{
-                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-                set_data_device_focus,
+                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
             },
         },
         shell::xdg::{
@@ -56,45 +56,31 @@ use smithay::{
             XdgShellState, XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
-        tablet_manager::TabletSeatHandler,
         viewporter::{ViewportCachedState, ViewporterState},
     },
 };
 
-use crate::protocol::{Input, Show, WindowInfo, modifiers};
+use crate::protocol::{Input, Show, WindowInfo};
 
+mod dmabuf;
+mod frame;
+mod input;
 mod render;
+mod snapshot;
 
-use render::{
-    extents, hit_test, popup_origin, render_frame, surface_stack, viewport_of, window_geometry,
-};
+use dmabuf::DmabufBackend;
+use frame::{PaneState, dispatch_frames, frame_callbacks, next_wakeup, pane_ack};
+use input::pane_input;
+use render::{render_frame, surface_stack};
+use snapshot::{Snapshot, copy_buffer};
 
-/// Windows are composed at most this often.  A client that draws in a loop
-/// cannot spin the compositor, and a pane that is slow costs its own frames.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-/// A frame the pane has not acknowledged for this long is given up on: the
-/// client is told it may draw again instead of waiting on a pane that may be
-/// stuck writing to a terminal that stopped reading.  Long enough that a slow
-/// terminal still gets its frames, short enough that a client never freezes.
-/// The pane then stays behind until it acknowledges one, so a slow terminal
-/// costs itself frames and nothing else.
-const ACK_TIMEOUT: Duration = Duration::from_millis(500);
-/// A window no pane shows still has to keep drawing, or it could never be
-/// attached to.  It gets frame callbacks at the same rate.
-const IDLE_INTERVAL: Duration = Duration::from_millis(16);
-/// Largest surface side and pixel count the compositor will copy; the pane
-/// protocol's size gate uses the same limits, so a pane can never be told a
-/// size its clients' buffers would be refused at.
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+/// Check display connections and newly accepted clients at least this often;
+/// the command channel has no pollable descriptor.
+const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// Shared pane and surface size limits.
 pub const MAX_SURFACE_SIDE: u32 = 8192;
 pub const MAX_SURFACE_PIXELS: usize = 16_000_000;
-/// Each modifier bit a stroke can carry, with the Linux input code of the key
-/// that holds it down while the stroke is sent.
-const MODIFIER_KEYS: [(u8, u16); 4] = [
-    (modifiers::SHIFT, 42),
-    (modifiers::CONTROL, 29),
-    (modifiers::ALT, 56),
-    (modifiers::SUPER, 125),
-];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
@@ -118,7 +104,6 @@ pub enum Command {
     },
     Ack {
         pane: u64,
-        /// Whether the pane drew the frame it is acknowledging.
         drawn: bool,
     },
     CloseAll,
@@ -133,7 +118,6 @@ pub enum Event {
     /// A window appeared, or its title or app id changed.
     WindowUp(WindowInfo),
     WindowDown(u64),
-    /// The title a pane should show for the window it is displaying.
     Title {
         pane: u64,
         title: String,
@@ -158,7 +142,6 @@ pub enum Event {
     },
 }
 
-/// The channels and thread a running compositor is reached through.
 pub type Handle = (
     mpsc::Sender<Command>,
     mpsc::Receiver<Event>,
@@ -166,12 +149,11 @@ pub type Handle = (
     thread::JoinHandle<()>,
 );
 
-/// Start the compositor thread and wait until it is listening.
+/// Start the compositor thread and wait for its Wayland socket to be ready.
 ///
 /// # Errors
-/// Returns an error when the thread cannot be spawned, when the compositor
-/// fails to build its display, keymap or Wayland socket, or when it does not
-/// report readiness within two seconds.
+/// Returns an error if the thread, display, keymap or socket cannot start, or
+/// if readiness is not reported within two seconds.
 pub fn spawn() -> crate::Result<Handle> {
     let (commands, rx) = mpsc::channel();
     let (tx, events) = mpsc::channel();
@@ -202,85 +184,31 @@ impl ClientData for ClientState {
     fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
 }
 
-/// A committed buffer, copied out of the client's memory at commit time.
-#[derive(Debug)]
-struct Snapshot {
-    width: u32,
-    height: u32,
-    /// `r, g, b, a` per pixel, premultiplied as Wayland defines it.
-    pixels: Vec<u8>,
-    opaque: bool,
-}
-
-/// Where a pane is with the frame it was last given.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FrameState {
-    /// Nothing in flight: the next frame can go out.
-    Ready,
-    /// A frame is with the pane until it acknowledges it.
-    InFlight,
-    /// The pane never took the frame it was given, so it is behind and nothing
-    /// is rendered for it until it acknowledges one.
-    Behind,
-}
-
-struct PaneState {
-    window: u64,
-    width: u32,
-    height: u32,
-    frame: FrameState,
-    /// When the frame in flight was handed over, so one that is never
-    /// acknowledged can be given up on instead of freezing the client that is
-    /// waiting on it.
-    sent: Instant,
-    /// Acks for frames that were given up on, which say nothing about the
-    /// frame that is in flight now.
-    stale_acks: u32,
-    /// The scene changed while that frame was in flight.
-    dirty: bool,
-    next_frame: Instant,
-    /// The last frame this pane was sent, so an unchanged scene costs nothing.
-    shown: Vec<u8>,
-    /// The pane did not draw that frame, so `shown` is not what its terminal
-    /// displays and the next frame has to be sent whatever it contains.
-    shown_stale: bool,
-}
-
-impl PaneState {
-    /// A pane showing `window`, or 0 for one still waiting for a window with
-    /// pixels.
-    fn new(window: u64, width: u32, height: u32) -> Self {
-        Self {
-            window,
-            width,
-            height,
-            frame: FrameState::Ready,
-            sent: Instant::now(),
-            stale_acks: 0,
-            dirty: false,
-            next_frame: Instant::now(),
-            shown: Vec::new(),
-            shown_stale: false,
-        }
-    }
-}
-
 struct Window {
     surface: ToplevelSurface,
     title: String,
     app_id: String,
-    /// Set by the first commit that carries pixels.  A window that never drew
-    /// must not capture a following pane.
+    /// A window without pixels must not capture a follow-the-newest pane.
     announced: bool,
     fullscreen: bool,
-    /// Earliest time the window's next idle frame callback may be sent.
     callback_due: Instant,
+}
+
+type ViewportGeometry = (Option<Rectangle<f64, Logical>>, Option<Size<i32, Logical>>);
+
+struct PendingImport {
+    surface: Weak<WlSurface>,
+    buffer: Dmabuf,
+    barrier: Barrier,
 }
 
 struct State {
     display: DisplayHandle,
     compositor: CompositorState,
     shm: ShmState,
+    dmabuf: DmabufState,
+    gpu: Option<DmabufBackend>,
+    pending_imports: Vec<PendingImport>,
     xdg: XdgShellState,
     _viewporter: ViewporterState,
     _output_manager: OutputManagerState,
@@ -293,33 +221,31 @@ struct State {
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<u64, Window>,
-    /// Toplevel surfaces only: subsurfaces and popups are found through the
-    /// surface tree.
     ids: HashMap<WlSurface, u64>,
     snapshots: HashMap<WlSurface, Snapshot>,
+    /// Cached to distinguish viewport changes from frame-only commits.
+    viewport_geometry: HashMap<WlSurface, ViewportGeometry>,
     next_id: u64,
-    /// The size the output is currently described as.
-    mode: Size<i32, Logical>,
-    /// The window the newest pane selection resolves to.
     newest: Option<u64>,
     panes: HashMap<u64, PaneState>,
     following: HashSet<u64>,
-    /// Panes that have something new to draw.
+    /// Panes with changes waiting for their next frame tick.
     pending: HashSet<u64>,
     /// For each window, the pane that last interacted with it.  That pane
     /// decides the window's configured size while it is attached.
     deciding: HashMap<u64, u64>,
     focused: Option<u64>,
-    /// The pane the pointer is over, which is the one that gets cursor shapes.
+    /// Most recent input pane, used for cursor shape events.
     cursor_pane: Option<u64>,
     cursor: Option<String>,
     /// The pane `cursor` was last sent to, so a shape that is unchanged but
     /// belongs to another pane is still sent.
     cursor_shape_pane: Option<u64>,
-    /// The buffer a frame is composed into, kept so a pane that redraws does
-    /// not allocate (and fault in) a frame's worth of memory every time.
+    /// Reused frame buffer, avoiding a frame-sized allocation per redraw.
     scratch: Vec<u8>,
     events: mpsc::Sender<Event>,
+    /// Output mode, rewritten as panes attach and leave.
+    mode: Size<i32, Logical>,
     started: Instant,
     shutdown: bool,
 }
@@ -331,6 +257,25 @@ impl BufferHandler for State {
 impl ShmHandler for State {
     fn shm_state(&self) -> &ShmState {
         &self.shm
+    }
+}
+
+impl DmabufHandler for State {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        if self.gpu.as_mut().is_some_and(|gpu| gpu.validate(&dmabuf)) {
+            let _ = notifier.successful::<Self>();
+        } else {
+            notifier.failed();
+        }
     }
 }
 
@@ -346,6 +291,29 @@ impl CompositorHandler for State {
             .compositor_state
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        add_pre_commit_hook::<Self, _>(surface, |state, _, surface| {
+            let buffer = with_states(surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                match &attributes.pending().buffer {
+                    Some(BufferAssignment::NewBuffer(buffer)) => get_dmabuf(buffer).ok().cloned(),
+                    _ => None,
+                }
+            });
+            if let Some(buffer) = buffer
+                && !dmabuf_ready(&buffer)
+            {
+                let barrier = Barrier::new(false);
+                add_blocker(surface, barrier.clone());
+                state.pending_imports.push(PendingImport {
+                    surface: surface.downgrade(),
+                    buffer,
+                    barrier,
+                });
+            }
+        });
+    }
+
     #[expect(
         clippy::significant_drop_tightening,
         reason = "`cached` borrows from the guard and must outlive `current`, so the two \
@@ -353,32 +321,63 @@ impl CompositorHandler for State {
     )]
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
-        let assignment = with_states(surface, |states| {
-            let mut cached = states.cached_state.get::<SurfaceAttributes>();
-            let current = cached.current();
-            // Damage is consumed here; leaving it would make it accumulate
-            // across commits.
-            current.damage.clear();
-            current.buffer.take()
+        let (assignment, damaged, viewport) = with_states(surface, |states| {
+            let (assignment, damaged) = {
+                let mut cached = states.cached_state.get::<SurfaceAttributes>();
+                let current = cached.current();
+                let damaged = !current.damage.is_empty();
+                current.damage.clear();
+                (current.buffer.take(), damaged)
+            };
+            let mut viewport = states.cached_state.get::<ViewportCachedState>();
+            let current = viewport.current();
+            (assignment, damaged, (current.src, current.dst))
         });
+        let viewport_changed = if viewport.0.is_some() || viewport.1.is_some() {
+            self.viewport_geometry.insert(surface.clone(), viewport) != Some(viewport)
+        } else {
+            self.viewport_geometry.remove(surface).is_some()
+        };
+        // Frame-only commits on plain toplevels do not change pixels; tree
+        // metadata can still move a child or popup without buffer damage.
+        let visual_change = assignment.is_some()
+            || damaged
+            || viewport_changed
+            || get_parent(surface).is_some()
+            || !get_children(surface).is_empty()
+            || self.popups.find_popup(surface).is_some()
+            || PopupManager::popups_for_surface(surface).next().is_some();
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = self.pane_bound(surface);
-                // The pixels of the snapshot this one replaces are the next
-                // snapshot's storage: a client redrawing at a steady size then
-                // never allocates (or faults in) a frame buffer again.  A
-                // buffer that cannot be copied leaves the storage to the
-                // snapshot already on screen, which stays there.
+                // Reuse the previous snapshot's storage; preserve its pixels
+                // on screen if the new buffer cannot be copied.
                 let mut previous = self.snapshots.remove(surface);
                 let mut reuse = previous
                     .as_mut()
                     .map_or_else(Vec::new, |old| std::mem::take(&mut old.pixels));
-                let snapshot = with_buffer_contents(&buffer, |ptr, len, data| {
-                    copy_buffer(ptr, len, &data, bound, &mut reuse)
-                })
-                .ok()
-                .flatten();
-                buffer.release();
+                let mut release_safe = true;
+                let snapshot = if let Ok(dmabuf) = get_dmabuf(&buffer) {
+                    self.gpu.as_mut().and_then(|gpu| {
+                        match gpu.snapshot(dmabuf, bound, &mut reuse) {
+                            Ok(snapshot) => Some(snapshot),
+                            Err(error) => {
+                                release_safe = error.release_safe();
+                                tracing::warn!(%error, release_safe, "DMA-BUF readback failed");
+                                None
+                            }
+                        }
+                    })
+                } else {
+                    with_buffer_contents(&buffer, |ptr, len, data| {
+                        copy_buffer(ptr, len, &data, bound, &mut reuse)
+                    })
+                    .ok()
+                    .flatten()
+                };
+                if release_safe {
+                    buffer.release();
+                }
                 match snapshot {
                     Some(snapshot) => {
                         self.snapshots.insert(surface.clone(), snapshot);
@@ -397,24 +396,102 @@ impl CompositorHandler for State {
             None => {}
         }
         self.announce(surface);
-        if let Some(window) = self.window_for_surface(surface) {
+        if visual_change && let Some(window) = self.window_for_surface(surface) {
             self.touch(window);
         }
     }
 
-    /// A destroyed surface takes its snapshot with it: `toplevel_destroyed`
-    /// only sweeps surfaces its tree still leads back to, which never covers a
-    /// surface that had no window role at all.
+    /// A destroyed surface may not belong to any toplevel, so remove its
+    /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.snapshots.remove(surface);
+        self.viewport_geometry.remove(surface);
+        self.pending_imports
+            .retain(|pending| pending.surface != surface.downgrade());
     }
 }
 
 impl State {
-    /// How large a buffer for this surface may be: at most twice the size of
-    /// the panes showing its window, so a resize can be in flight, and
-    /// unbounded when no pane shows it yet.  The two axes are taken
-    /// independently: the tallest pane may not be the widest one.
+    fn new(display_handle: DisplayHandle, events: mpsc::Sender<Event>) -> Self {
+        let mut seat_state = SeatState::new();
+        let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
+        let pointer = Some(seat.add_pointer());
+        let mode = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000,
+        };
+        let output_manager = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let output = Output::new(
+            "meowland".into(),
+            PhysicalProperties {
+                size: (300, 200).into(),
+                subpixel: Subpixel::Unknown,
+                make: "meowland".into(),
+                model: "terminal".into(),
+                serial_number: String::new(),
+            },
+        );
+        output.create_global::<Self>(&display_handle);
+        output.change_current_state(
+            Some(mode),
+            None,
+            Some(Scale::Integer(1)),
+            Some((0, 0).into()),
+        );
+        output.set_preferred(mode);
+        let gpu = DmabufBackend::discover();
+        let mut dmabuf = DmabufState::new();
+        if let Some(gpu) = &gpu {
+            match DmabufFeedbackBuilder::new(gpu.device(), gpu.formats().iter().copied()).build() {
+                Ok(feedback) => {
+                    dmabuf.create_global_with_default_feedback::<Self>(&display_handle, &feedback);
+                }
+                Err(error) => tracing::warn!(%error, "DMA-BUF feedback initialization failed"),
+            }
+        }
+        Self {
+            compositor: CompositorState::new::<Self>(&display_handle),
+            shm: ShmState::new::<Self>(&display_handle, vec![]),
+            dmabuf,
+            gpu,
+            pending_imports: Vec::new(),
+            xdg: XdgShellState::new::<Self>(&display_handle),
+            _viewporter: ViewporterState::new::<Self>(&display_handle),
+            _output_manager: output_manager,
+            data_device: DataDeviceState::new::<Self>(&display_handle),
+            _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
+            popups: PopupManager::default(),
+            seats: seat_state,
+            seat,
+            keyboard: None,
+            pointer,
+            output,
+            windows: HashMap::new(),
+            ids: HashMap::new(),
+            snapshots: HashMap::new(),
+            viewport_geometry: HashMap::new(),
+            next_id: 1,
+            newest: None,
+            panes: HashMap::new(),
+            following: HashSet::new(),
+            pending: HashSet::new(),
+            deciding: HashMap::new(),
+            focused: None,
+            cursor_pane: None,
+            cursor: None,
+            cursor_shape_pane: None,
+            scratch: Vec::new(),
+            events,
+            mode: Size::from((mode.size.w, mode.size.h)),
+            started: Instant::now(),
+            shutdown: false,
+            display: display_handle,
+        }
+    }
+
+    /// Pane-relative buffer limit: twice the widest and tallest attached
+    /// panes, independently, to allow an in-flight resize. Without an attached
+    /// pane only the global surface limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
         let window = self.window_for_surface(surface)?;
         self.panes
@@ -426,8 +503,6 @@ impl State {
             })
     }
 
-    /// The window a surface belongs to: the toplevel itself, one of its
-    /// subsurfaces, or one of its popups.
     fn window_for_surface(&self, surface: &WlSurface) -> Option<u64> {
         let mut surface = surface.clone();
         for _ in 0..64 {
@@ -447,8 +522,6 @@ impl State {
         None
     }
 
-    /// A window exists for panes once it has pixels; before that it is a
-    /// client that has not drawn and must not capture a following pane.
     fn announce(&mut self, surface: &WlSurface) {
         let Some(id) = self.ids.get(surface).copied() else {
             return;
@@ -486,49 +559,37 @@ impl State {
         }
     }
 
-    /// The size a window is configured at: the pane the user last interacted
-    /// with, the first pane showing it as a fallback, or the output's own size
-    /// while no pane shows it.
+    /// The last-used pane decides the window's size; otherwise use the first
+    /// attached pane, then the output mode.
     fn pane_size(&self, window: u64) -> Size<i32, Logical> {
-        let deciding = self
+        let selected = self
             .deciding
             .get(&window)
             .and_then(|pane| self.panes.get(pane))
-            .filter(|pane| pane.window == window);
-        let first = self
-            .panes
-            .iter()
-            .filter(|(_, pane)| pane.window == window)
-            .min_by_key(|(id, _)| *id)
-            .map(|(_, pane)| pane);
-        deciding.or(first).map_or(self.mode, |pane| {
+            .filter(|pane| pane.window == window)
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .filter(|(_, pane)| pane.window == window)
+                    .min_by_key(|(id, _)| *id)
+                    .map(|(_, pane)| pane)
+            });
+        selected.map_or(self.mode, |pane| {
             Size::from((pane.width as i32, pane.height as i32))
         })
     }
 
-    fn shown(&self, window: u64) -> bool {
-        self.panes.values().any(|pane| pane.window == window)
-    }
-
     fn mark_dirty(&mut self, pane: u64) {
-        let deferred = match self.panes.get_mut(&pane) {
-            Some(state) => {
-                // A frame is with the pane, or the pane never took the last
-                // one: either way the scene change is remembered rather than
-                // turned into a frame now.
-                if state.frame != FrameState::Ready {
-                    state.dirty = true;
-                }
-                state.frame != FrameState::Ready
-            }
-            None => return,
+        let Some(entry) = self.panes.get_mut(&pane) else {
+            return;
         };
-        if !deferred {
+        if entry.in_flight {
+            entry.dirty = true;
+        } else {
             self.pending.insert(pane);
         }
     }
 
-    /// The panes showing this window.
     fn panes_showing(&self, window: u64) -> Vec<u64> {
         self.panes
             .iter()
@@ -537,8 +598,7 @@ impl State {
             .collect()
     }
 
-    /// Register a pane; while it is the lowest-numbered one, its size is the
-    /// output mode every client sees.
+    /// The lowest-numbered pane sets the output mode seen by clients.
     fn insert_pane(&mut self, pane: u64, entry: PaneState) {
         let (width, height) = (entry.width, entry.height);
         self.panes.insert(pane, entry);
@@ -547,10 +607,7 @@ impl State {
         }
     }
 
-    /// Take a pane out of the compositor, wherever it is going: the window it
-    /// showed is returned, and the output goes back to the panes that are
-    /// left.  Everything keyed by a pane lives here so no removal path can
-    /// leave a stale entry behind.
+    /// Remove every pane-keyed entry, restoring the remaining output mode.
     fn remove_pane(&mut self, pane: u64) -> Option<u64> {
         let first = self.panes.keys().min() == Some(&pane);
         let window = self.panes.remove(&pane).map(|state| state.window);
@@ -569,8 +626,7 @@ impl State {
         window
     }
 
-    /// What removing a pane means for the window it was showing: it is no
-    /// longer drawn anywhere, and the focus moves to whichever pane is left.
+    /// Move focus to another attached pane's window when this pane is released.
     fn release_pane_window(&mut self, pane: u64) {
         let Some(window) = self.remove_pane(pane) else {
             return;
@@ -588,7 +644,6 @@ impl State {
         }
     }
 
-    /// Point every follow-the-newest pane at `window`, with its title.
     fn follow_panes(&mut self, window: u64) {
         let following: Vec<u64> = self.following.iter().copied().collect();
         for pane in following {
@@ -600,10 +655,16 @@ impl State {
         }
     }
 
-    /// Something the panes showing this window draw has changed.
     fn touch(&mut self, window: u64) {
-        for pane in self.panes_showing(window) {
-            self.mark_dirty(pane);
+        for (&pane, entry) in &mut self.panes {
+            if entry.window != window {
+                continue;
+            }
+            if entry.in_flight {
+                entry.dirty = true;
+            } else {
+                self.pending.insert(pane);
+            }
         }
     }
 
@@ -636,7 +697,7 @@ impl State {
     }
 
     fn leave_output(&self, window: u64) {
-        if self.shown(window) {
+        if self.panes.values().any(|pane| pane.window == window) {
             return;
         }
         let Some(root) = self
@@ -651,8 +712,6 @@ impl State {
         }
     }
 
-    /// Focus is the compositor's; the active window's surface gets the
-    /// keyboard and the window is told it is activated.
     fn focus_window(&mut self, window: u64) {
         if self.focused == Some(window) {
             return;
@@ -726,15 +785,14 @@ impl XdgShellHandler for State {
         _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
         _serial: smithay::utils::Serial,
     ) {
-        // A click outside a popup dismisses it; nothing else is grabbed.
+        // Popup grabs are handled by dismissing outside clicks in pane_input.
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
             return;
         };
-        // Snapshots are keyed by surface, so they have to go while the tree
-        // still leads back to this window.
+        // Find descendants before removing the toplevel that identifies them.
         let stale: Vec<WlSurface> = self
             .snapshots
             .keys()
@@ -751,7 +809,6 @@ impl XdgShellHandler for State {
                     state.window = 0;
                 }
                 self.mark_dirty(pane);
-                // The title belonged to the window that just went away.
                 self.send_title(pane, 0);
             } else {
                 self.remove_pane(pane);
@@ -761,9 +818,8 @@ impl XdgShellHandler for State {
                 });
             }
         }
-        // With no pane showing the window any more, the surfaces that were
-        // told they entered the output are told they left it.  The window
-        // entry is what finds those surfaces, so this runs before it goes.
+        // Leave the output before removing the window used to find its
+        // surfaces.
         self.leave_output(id);
         self.windows.remove(&id);
         self.deciding.remove(&id);
@@ -774,8 +830,6 @@ impl XdgShellHandler for State {
                 .filter(|(_, entry)| entry.announced)
                 .map(|(id, _)| *id)
                 .max();
-            // A pane that follows the newest window follows the one that is
-            // left, rather than sitting on an empty pane.
             if let Some(newest) = self.newest {
                 self.follow_panes(newest);
             }
@@ -807,9 +861,8 @@ impl XdgShellHandler for State {
             }
             None => return,
         };
-        // Fullscreen means "be the window on this screen": a pane that follows
-        // the newest window switches to it, but only once the window has
-        // pixels, or it would capture a pane it can only draw black into.
+        // A fullscreen request switches following panes only once this window
+        // has pixels to show.
         if announced {
             self.follow_panes(id);
         }
@@ -896,9 +949,6 @@ fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> 
     )
 }
 
-/// Give a popup the geometry its positioner asks for, against the pane showing
-/// its window.  Creating and re-positioning a popup both go through here, so
-/// the two paths cannot place the same popup differently.
 fn place_popup(state: &State, surface: &PopupSurface, positioner: PositionerState) {
     let target = popup_target(state, surface);
     surface.with_pending_state(|pending| {
@@ -992,25 +1042,21 @@ impl SelectionHandler for State {
     }
 }
 
+impl PointerConstraintsHandler for State {}
+impl DndGrabHandler for State {}
+impl WaylandDndGrabHandler for State {}
+impl TabletSeatHandler for State {
+    type ToolFocus = WlSurface;
+}
 impl DataDeviceHandler for State {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device
     }
 }
 
-impl ClientDndGrabHandler for State {}
-impl ServerDndGrabHandler for State {}
-impl TabletSeatHandler for State {}
 impl OutputHandler for State {}
 
-delegate_compositor!(State);
-delegate_shm!(State);
-delegate_xdg_shell!(State);
-delegate_viewporter!(State);
-delegate_seat!(State);
-delegate_output!(State);
-delegate_data_device!(State);
-delegate_cursor_shape!(State);
+delegate_dispatch2!(State);
 
 #[expect(
     clippy::needless_pass_by_value,
@@ -1028,66 +1074,7 @@ fn run(
         )));
         return;
     };
-    let display_handle = display.handle();
-    let mut seat_state = SeatState::new();
-    let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
-    let pointer = Some(seat.add_pointer());
-    let mode = Mode {
-        size: (1920, 1080).into(),
-        refresh: 60_000,
-    };
-    let output_manager = OutputManagerState::new_with_xdg_output::<State>(&display_handle);
-    let output = Output::new(
-        "meowland".into(),
-        PhysicalProperties {
-            size: (300, 200).into(),
-            subpixel: Subpixel::Unknown,
-            make: "meowland".into(),
-            model: "terminal".into(),
-        },
-    );
-    output.create_global::<State>(&display_handle);
-    output.change_current_state(
-        Some(mode),
-        None,
-        Some(Scale::Integer(1)),
-        Some((0, 0).into()),
-    );
-    output.set_preferred(mode);
-    let mut state = State {
-        display: display_handle.clone(),
-        compositor: CompositorState::new::<State>(&display_handle),
-        shm: ShmState::new::<State>(&display_handle, vec![]),
-        xdg: XdgShellState::new::<State>(&display_handle),
-        _viewporter: ViewporterState::new::<State>(&display_handle),
-        _output_manager: output_manager,
-        data_device: DataDeviceState::new::<State>(&display_handle),
-        _cursor_shape: CursorShapeManagerState::new::<State>(&display_handle),
-        popups: PopupManager::default(),
-        seats: seat_state,
-        seat,
-        keyboard: None,
-        pointer,
-        output,
-        windows: HashMap::new(),
-        ids: HashMap::new(),
-        snapshots: HashMap::new(),
-        next_id: 1,
-        newest: None,
-        panes: HashMap::new(),
-        following: HashSet::new(),
-        pending: HashSet::new(),
-        deciding: HashMap::new(),
-        focused: None,
-        cursor_pane: None,
-        cursor: None,
-        cursor_shape_pane: None,
-        scratch: Vec::new(),
-        events,
-        mode: Size::from((mode.size.w, mode.size.h)),
-        started: Instant::now(),
-        shutdown: false,
-    };
+    let mut state = State::new(display.handle(), events);
     let Ok(keyboard) = state.seat.add_keyboard(XkbConfig::default(), 25, 600) else {
         let _ = ready.send(Err(std::io::Error::other(
             "could not compile the keyboard keymap",
@@ -1101,29 +1088,73 @@ fn run(
     };
     let _ = ready.send(Ok(()));
     while !state.shutdown {
-        // Waiting on the channel rather than sleeping means a command is
-        // handled the moment it arrives, while the frame work below still runs
-        // at its own pace.
-        match rx.recv_timeout(Duration::from_millis(2)) {
+        // Bound the unpollable command channel wait by frame and I/O deadlines.
+        match rx.recv_timeout(next_wakeup(&state, Instant::now())) {
             Ok(command) => handle_command(&mut state, command),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            // Every sender is gone: the server that owns this thread has died.
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         while let Ok(command) = rx.try_recv() {
             handle_command(&mut state, command);
         }
-        // The backend owns accepted connections; the returned handle carries
-        // nothing the compositor needs, so it is not kept.
         if let Ok(Some(stream)) = listener.accept() {
             let _ = state
                 .display
                 .insert_client(stream, Arc::new(ClientState::default()));
         }
         let _ = display.dispatch_clients(&mut state);
-        let _ = display.flush_clients();
+        poll_imports(&mut state);
+        frame_callbacks(&mut state);
         dispatch_frames(&mut state);
-        idle_callbacks(&mut state);
+        let _ = display.flush_clients();
+    }
+}
+
+fn dmabuf_ready(buffer: &Dmabuf) -> bool {
+    buffer.handles().all(|fd| {
+        let mut descriptors = [rustix::event::PollFd::new(
+            &fd,
+            rustix::event::PollFlags::IN,
+        )];
+        rustix::event::poll(
+            &mut descriptors,
+            Some(&rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        )
+        .is_ok_and(|count| {
+            count != 0
+                && descriptors[0].revents().intersects(
+                    rustix::event::PollFlags::IN
+                        | rustix::event::PollFlags::ERR
+                        | rustix::event::PollFlags::HUP,
+                )
+        })
+    })
+}
+
+fn poll_imports(state: &mut State) {
+    let mut index = 0;
+    while index < state.pending_imports.len() {
+        let pending = &state.pending_imports[index];
+        let Ok(surface) = pending.surface.upgrade() else {
+            state.pending_imports.swap_remove(index);
+            continue;
+        };
+        if !dmabuf_ready(&pending.buffer) {
+            index += 1;
+            continue;
+        }
+        state.pending_imports.swap_remove(index).barrier.signal();
+        if let Some(client) = surface.client()
+            && let Some(client_state) = client.get_data::<ClientState>()
+        {
+            let display = state.display.clone();
+            client_state
+                .compositor_state
+                .blocker_cleared(state, &display);
+        }
     }
 }
 
@@ -1154,36 +1185,7 @@ fn handle_command(state: &mut State, command: Command) {
             apply_window_state(state, window);
         }
         Command::Input { pane, event } => pane_input(state, pane, &event),
-        Command::Ack { pane, drawn } => {
-            let Some(entry) = state.panes.get_mut(&pane) else {
-                return;
-            };
-            // An ack for a frame that was given up on says nothing about the
-            // one in flight now, so it only takes itself out of the count.
-            let given_up = entry.stale_acks > 0;
-            if given_up {
-                entry.stale_acks -= 1;
-            } else if entry.frame != FrameState::InFlight {
-                // An ack that answers nothing is a duplicate or a stray:
-                // acting on it would take a frame that is in flight for
-                // delivered.
-                return;
-            }
-            entry.frame = FrameState::Ready;
-            // Whatever the pane was behind on, it is reading one more frame
-            // now, so the scene it missed is due: everything drawn since then
-            // was held in `dirty` rather than rendered.
-            entry.shown_stale = !drawn;
-            let dirty = std::mem::take(&mut entry.dirty);
-            let window = entry.window;
-            if dirty || given_up {
-                state.mark_dirty(pane);
-            }
-            if window != 0 {
-                // The pane has taken the frame, so the client may draw again.
-                send_frame_callbacks(state, window);
-            }
-        }
+        Command::Ack { pane, drawn } => pane_ack(state, pane, drawn),
         Command::CloseAll => {
             for window in state.windows.values() {
                 window.surface.send_close();
@@ -1211,9 +1213,8 @@ fn handle_command(state: &mut State, command: Command) {
     }
 }
 
-/// Attach a pane to the window its selection resolves to.  A selection that
-/// names a window which is not there is released with a reason, and one that
-/// follows the newest window waits for the next window with pixels instead.
+/// Attach a pane to its selected window. A missing explicit ID is released;
+/// a dynamic selection waits for the next window with pixels.
 fn attach(state: &mut State, pane: u64, show: Show, width: u32, height: u32) {
     if matches!(show, Show::Newest) {
         state.following.insert(pane);
@@ -1235,7 +1236,6 @@ fn attach(state: &mut State, pane: u64, show: Show, width: u32, height: u32) {
         apply_window_state(state, id);
         state.focus_window(id);
     } else if matches!(show, Show::Newest | Show::Focused) {
-        // Nothing to show yet: wait for the next window with pixels.
         state.insert_pane(pane, PaneState::new(0, width, height));
         state.following.insert(pane);
     } else {
@@ -1246,372 +1246,6 @@ fn attach(state: &mut State, pane: u64, show: Show, width: u32, height: u32) {
     }
 }
 
-/// Hand a pane the newest frame, at most once per [`FRAME_INTERVAL`].
-fn dispatch_frames(state: &mut State) {
-    expire_frames(state);
-    if state.pending.is_empty() {
-        return;
-    }
-    let now = Instant::now();
-    let due: Vec<u64> = state
-        .pending
-        .iter()
-        .copied()
-        .filter(|pane| {
-            // A pane that is behind stays in `pending` until it acknowledges
-            // one: the frame it wanted is not worth rendering yet.
-            state
-                .panes
-                .get(pane)
-                .is_some_and(|entry| entry.frame != FrameState::Behind && now >= entry.next_frame)
-        })
-        .collect();
-    for pane in due {
-        state.pending.remove(&pane);
-        let Some((window, in_flight)) = state
-            .panes
-            .get(&pane)
-            .map(|entry| (entry.window, entry.frame == FrameState::InFlight))
-        else {
-            continue;
-        };
-        if in_flight {
-            if let Some(entry) = state.panes.get_mut(&pane) {
-                entry.dirty = true;
-            }
-            continue;
-        }
-        if !render_frame(state, pane) {
-            continue;
-        }
-        let (width, height, rows) = match state.panes.get_mut(&pane) {
-            Some(entry) => {
-                entry.next_frame = now + FRAME_INTERVAL;
-                let stride = entry.width as usize * 3;
-                // The pane is only sent the rows that changed; one that was
-                // given a frame it did not draw is sent the whole of it again,
-                // since what its terminal shows is not what `shown` holds.
-                let rows = if entry.shown_stale {
-                    Some(0..entry.height as usize)
-                } else {
-                    changed_rows(&entry.shown, &state.scratch, stride)
-                };
-                (entry.width, entry.height, rows)
-            }
-            None => continue,
-        };
-        match rows {
-            Some(rows) => {
-                let stride = width as usize * 3;
-                let band = state.scratch[rows.start * stride..rows.end * stride].to_vec();
-                if let Some(entry) = state.panes.get_mut(&pane) {
-                    // Only the rows that go out have to be remembered.
-                    entry.shown.resize(state.scratch.len(), 0);
-                    entry.shown[rows.start * stride..rows.end * stride].copy_from_slice(&band);
-                    entry.frame = FrameState::InFlight;
-                    entry.sent = now;
-                }
-                let _ = state.events.send(Event::Frame {
-                    pane,
-                    width,
-                    height,
-                    y: u32::try_from(rows.start).unwrap_or(0),
-                    rgb: band,
-                });
-            }
-            None => {
-                // The pane already holds these pixels; the client is free to
-                // draw again without paying for a frame nobody would see.
-                send_frame_callbacks(state, window);
-            }
-        }
-    }
-}
-
-/// The rows of `buffer` that differ from `shown`, or `None` when the two are
-/// the same picture.  `shown` of another size is a frame that has to be sent
-/// whole.
-fn changed_rows(shown: &[u8], buffer: &[u8], stride: usize) -> Option<Range<usize>> {
-    let rows = buffer.len() / stride;
-    if shown.len() != buffer.len() {
-        return Some(0..rows);
-    }
-    let differs = |row: usize| {
-        shown[row * stride..(row + 1) * stride] != buffer[row * stride..(row + 1) * stride]
-    };
-    let first = (0..rows).find(|row| differs(*row))?;
-    // Searching from the end keeps a change near the top from scanning the
-    // whole frame twice.
-    let last = (first..rows)
-        .rev()
-        .find(|row| differs(*row))
-        .unwrap_or(first);
-    Some(first..last + 1)
-}
-
-/// Give up on frames no pane has acknowledged in [`ACK_TIMEOUT`].
-///
-/// A pane whose terminal has stopped reading sits in a write that never
-/// finishes, and the client that is waiting for the frame callback behind it
-/// would sit there with it: a frozen terminal would freeze the window too.
-/// The frame is dropped, the client draws again, and the pane takes whichever
-/// frame reaches it first.
-fn expire_frames(state: &mut State) {
-    let now = Instant::now();
-    let expired: Vec<u64> = state
-        .panes
-        .iter()
-        .filter(|(_, entry)| {
-            entry.frame == FrameState::InFlight && now.duration_since(entry.sent) >= ACK_TIMEOUT
-        })
-        .map(|(pane, _)| *pane)
-        .collect();
-    for pane in expired {
-        let Some(entry) = state.panes.get_mut(&pane) else {
-            continue;
-        };
-        entry.stale_acks += 1;
-        // The pane is behind: whatever it is shown next waits for its ack.
-        // Rendering frame after frame for a terminal that cannot take them
-        // only adds work to the slowest part of the pipeline, and the scene
-        // that matters is the one rendered when the pane comes back.
-        entry.frame = FrameState::Behind;
-        entry.shown_stale = true;
-        entry.dirty = true;
-        let window = entry.window;
-        if window != 0 {
-            send_frame_callbacks(state, window);
-        }
-    }
-}
-
-/// Frame callbacks for windows no pane is showing: they still have to draw,
-/// or there would be nothing to attach to.
-fn idle_callbacks(state: &mut State) {
-    let now = Instant::now();
-    let due: Vec<u64> = state
-        .windows
-        .iter()
-        .filter(|(id, entry)| {
-            // A window a pane shows is paced by that pane's acknowledgements
-            // once it has pixels; everything else draws on this clock.
-            let paced = entry.announced && state.shown(**id);
-            !paced && now >= entry.callback_due
-        })
-        .map(|(id, _)| *id)
-        .collect();
-    for window in due {
-        // The check itself is the cost here, so a window that had nothing to
-        // send waits for the idle clock rather than being looked at on every
-        // pass of the loop.
-        send_frame_callbacks(state, window);
-        if let Some(entry) = state.windows.get_mut(&window) {
-            entry.callback_due = now + IDLE_INTERVAL;
-        }
-    }
-}
-
-/// Send the frame callbacks the surfaces of a window are waiting for.  Returns
-/// whether any client was told it may draw.
-fn send_frame_callbacks(state: &State, window: u64) -> bool {
-    let Some(root) = state
-        .windows
-        .get(&window)
-        .map(|entry| entry.surface.wl_surface().clone())
-    else {
-        return false;
-    };
-    let time = state.started.elapsed().as_millis() as u32;
-    let mut sent = false;
-    for (surface, _) in surface_stack(&root) {
-        with_states(&surface, |states| {
-            for callback in states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .frame_callbacks
-                .drain(..)
-            {
-                callback.done(time);
-                sent = true;
-            }
-        });
-    }
-    sent
-}
-
-fn pane_input(state: &mut State, pane: u64, event: &Input) {
-    let Some(window) = state.panes.get(&pane).map(|pane| pane.window) else {
-        return;
-    };
-    if window == 0 {
-        return;
-    }
-    state.cursor_pane = Some(pane);
-    if state.deciding.insert(window, pane) != Some(pane) {
-        // The window's size follows the pane the user is actually using.
-        apply_window_state(state, window);
-    }
-    match *event {
-        Input::Key {
-            code,
-            pressed,
-            modifiers,
-        } => {
-            state.focus_window(window);
-            if let Some(keyboard) = state.keyboard.take() {
-                inject_key(&keyboard, state, code, pressed, modifiers);
-                state.keyboard = Some(keyboard);
-            }
-        }
-        Input::Pointer {
-            x,
-            y,
-            button,
-            pressed,
-            scroll,
-        } => {
-            if pressed && button.is_some() && !point_in_popups(state, window, x, y) {
-                dismiss_popups(state, window);
-            }
-            let hit = hit_test(state, window, x, y);
-            let location = Point::from((x, y));
-            if let Some(pointer) = state.pointer.take() {
-                pointer.motion(
-                    state,
-                    hit,
-                    &MotionEvent {
-                        location,
-                        serial: SERIAL_COUNTER.next_serial(),
-                        time: 0,
-                    },
-                );
-                if let Some(button) = button {
-                    pointer.button(
-                        state,
-                        &ButtonEvent {
-                            button: match button {
-                                0 => 0x110,
-                                1 => 0x111,
-                                2 => 0x112,
-                                _ => 0x113,
-                            },
-                            state: if pressed {
-                                ButtonState::Pressed
-                            } else {
-                                ButtonState::Released
-                            },
-                            serial: SERIAL_COUNTER.next_serial(),
-                            time: 0,
-                        },
-                    );
-                }
-                if scroll != 0 {
-                    pointer.axis(
-                        state,
-                        AxisFrame::new(0)
-                            .source(AxisSource::Wheel)
-                            .value(Axis::Vertical, -f64::from(scroll))
-                            .v120(Axis::Vertical, -i32::from(scroll.signum()) * 120),
-                    );
-                }
-                pointer.frame(state);
-                state.pointer = Some(pointer);
-            }
-        }
-    }
-}
-
-/// A press outside every open popup dismisses them, which is what a popup
-/// grab asks for.
-fn point_in_popups(state: &State, window: u64, x: f64, y: f64) -> bool {
-    let Some(root) = state
-        .windows
-        .get(&window)
-        .map(|entry| entry.surface.wl_surface().clone())
-    else {
-        return false;
-    };
-    let geometry = window_geometry(&root);
-    PopupManager::popups_for_surface(&root).any(|(popup, location)| {
-        let surface = popup.wl_surface();
-        let Some(snapshot) = state.snapshots.get(surface) else {
-            return false;
-        };
-        let (_, dst) = extents(snapshot, viewport_of(surface));
-        let origin = popup_origin(geometry, location, &popup);
-        let left = f64::from(origin.x);
-        let top = f64::from(origin.y);
-        x >= left && y >= top && x < left + f64::from(dst.w) && y < top + f64::from(dst.h)
-    })
-}
-
-fn dismiss_popups(state: &mut State, window: u64) {
-    let Some(root) = state
-        .windows
-        .get(&window)
-        .map(|entry| entry.surface.wl_surface().clone())
-    else {
-        return;
-    };
-    let popups: Vec<PopupKind> = PopupManager::popups_for_surface(&root)
-        .map(|(popup, _)| popup)
-        .collect();
-    if popups.is_empty() {
-        return;
-    }
-    for popup in popups.into_iter().rev() {
-        if let PopupKind::Xdg(popup) = &popup {
-            popup.send_popup_done();
-        }
-        let _ = PopupManager::dismiss_popup(&root, &popup);
-    }
-    state.touch(window);
-}
-
-fn inject_key(
-    keyboard: &KeyboardHandle<State>,
-    state: &mut State,
-    code: u16,
-    pressed: bool,
-    modifiers: u8,
-) {
-    // The modifier keys are pressed before the stroke and released after it,
-    // in the reverse order, so the shift a symbol needs is held while it is
-    // sent.
-    let emit = |code: u16, pressed: bool, state: &mut State| {
-        keyboard.input(
-            state,
-            Keycode::from(u32::from(code) + 8),
-            if pressed {
-                KeyState::Pressed
-            } else {
-                KeyState::Released
-            },
-            SERIAL_COUNTER.next_serial(),
-            0,
-            |_, _, _| FilterResult::<()>::Forward,
-        );
-    };
-    if pressed {
-        for (bit, key) in MODIFIER_KEYS {
-            if modifiers & bit != 0 {
-                emit(key, true, state);
-            }
-        }
-    }
-    emit(code, pressed, state);
-    if !pressed {
-        for (bit, key) in MODIFIER_KEYS.into_iter().rev() {
-            if modifiers & bit != 0 {
-                emit(key, false, state);
-            }
-        }
-    }
-}
-
-/// Configure a window at the size of the pane that decides it, maximized, and
-/// activated or fullscreen when it is.
 fn apply_window_state(state: &State, window: u64) {
     let Some(entry) = state.windows.get(&window) else {
         return;
@@ -1637,7 +1271,6 @@ fn apply_window_state(state: &State, window: u64) {
     surface.send_configure();
 }
 
-/// The output is the first pane: its size is the mode every client sees.
 fn configure_output(state: &mut State, width: u32, height: u32) {
     let mode = Mode {
         size: (width as i32, height as i32).into(),
@@ -1648,176 +1281,4 @@ fn configure_output(state: &mut State, width: u32, height: u32) {
         .output
         .change_current_state(Some(mode), None, None, None);
     state.output.set_preferred(mode);
-}
-
-/// Copy a committed shm buffer into an owned snapshot, in `r, g, b, a` order.
-///
-/// `pixels` is the storage of the snapshot this one replaces, or empty; it is
-/// resized and overwritten whole, and left with the caller (emptied) when the
-/// buffer cannot be used.
-#[expect(
-    unsafe_code,
-    reason = "the shm pool is only reachable as a raw pointer, so reading it takes one \
-              bounded, documented slice"
-)]
-fn copy_buffer(
-    ptr: *const u8,
-    len: usize,
-    data: &smithay::wayland::shm::BufferData,
-    bound: Option<(u32, u32)>,
-    pixels: &mut Vec<u8>,
-) -> Option<Snapshot> {
-    if !matches!(
-        data.format,
-        wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
-    ) || data.width <= 0
-        || data.height <= 0
-        || data.stride <= 0
-    {
-        return None;
-    }
-    let width = data.width as u32;
-    let height = data.height as u32;
-    let stride = data.stride as usize;
-    let offset = data.offset as usize;
-    if width > MAX_SURFACE_SIDE
-        || height > MAX_SURFACE_SIDE
-        || width as usize * height as usize > MAX_SURFACE_PIXELS
-        || stride < width as usize * 4
-    {
-        return None;
-    }
-    if let Some((max_width, max_height)) = bound
-        && (width > max_width || height > max_height)
-    {
-        return None;
-    }
-    if offset.checked_add(stride.checked_mul(height as usize)?)? > len {
-        return None;
-    }
-    // SAFETY: `with_buffer_contents` passes the pool's mapping base and its
-    // length, and the checks above establish `offset + stride * height <= len`,
-    // so every index read below is inside the mapping.  The pool is shared with
-    // the client and could be written at any time, so the slice is never held:
-    // the pixels are copied out here and the reference ends with this function.
-    let source = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let row_bytes = width as usize * 4;
-    let needed = row_bytes * height as usize;
-    pixels.resize(needed, 0);
-    // A surface that once drew large must not pin that memory for as long as
-    // it lives: reuse is worth an allocation, not a page's worth of them.
-    if pixels.capacity() >= needed.saturating_mul(4).max(1 << 20) {
-        pixels.shrink_to_fit();
-    }
-    let xrgb = data.format == wl_shm::Format::Xrgb8888;
-    let mut opaque = true;
-    for y in 0..height as usize {
-        let from = offset + y * stride;
-        let source_row = source[from..from + row_bytes].as_chunks::<4>().0;
-        let to = y * row_bytes;
-        let row = pixels[to..to + row_bytes].as_chunks_mut::<4>().0;
-        for (pixel, out_pixel) in source_row.iter().zip(row) {
-            // The pool holds `b, g, r, a` in memory order, which is the word
-            // `a << 24 | r << 16 | g << 8 | b`; the snapshot keeps
-            // `r, g, b, a`, the same word with its outer two bytes swapped.
-            let word = u32::from_le_bytes(*pixel);
-            let alpha = if xrgb { 255 } else { word >> 24 };
-            *out_pixel = ((word & 0xFF00_FF00)
-                | ((word & 0x00FF_0000) >> 16)
-                | ((word & 0x0000_00FF) << 16)
-                | (alpha << 24))
-                .to_le_bytes();
-            opaque &= alpha == 255;
-        }
-    }
-    Some(Snapshot {
-        width,
-        height,
-        pixels: std::mem::take(pixels),
-        opaque,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The band a pane is sent is the rows that differ from the frame it was
-    /// sent before, so a change near one edge does not cost a whole frame.
-    #[test]
-    fn changed_rows_are_the_rows_that_differ() {
-        const STRIDE: usize = 9;
-        let shown = vec![0u8; 4 * STRIDE];
-        let mut buffer = shown.clone();
-        assert_eq!(changed_rows(&shown, &buffer, STRIDE), None, "identical");
-
-        buffer[0..3].copy_from_slice(&[1, 1, 1]);
-        assert_eq!(changed_rows(&shown, &buffer, STRIDE), Some(0..1), "row 0");
-
-        buffer[0..3].copy_from_slice(&[0, 0, 0]);
-        buffer[3 * STRIDE..3 * STRIDE + 3].copy_from_slice(&[1, 1, 1]);
-        assert_eq!(changed_rows(&shown, &buffer, STRIDE), Some(3..4), "row 3");
-
-        buffer[0..3].copy_from_slice(&[1, 1, 1]);
-        assert_eq!(
-            changed_rows(&shown, &buffer, STRIDE),
-            Some(0..4),
-            "rows 0 and 3 span the frame"
-        );
-
-        // A frame of another size cannot be compared row for row.
-        assert_eq!(
-            changed_rows(&shown, &buffer[..2 * STRIDE], STRIDE),
-            Some(0..2)
-        );
-    }
-
-    /// `Argb8888` holds `b, g, r, a` in memory and the snapshot holds
-    /// `r, g, b, a`; `Xrgb8888` ignores the fourth byte and is always opaque.
-    /// The stride is wider than the row, so padding must be neither read into
-    /// the snapshot nor written from the previous one.
-    #[test]
-    fn snapshot_swizzles_both_shm_formats() {
-        const STRIDE: usize = 12;
-        let raw: [u8; 24] = [
-            3, 4, 5, 0x40, 6, 7, 8, 0xff, 0xaa, 0xaa, 0xaa, 0xaa, //
-            9, 10, 11, 0xff, 12, 13, 14, 0x7f, 0xbb, 0xbb, 0xbb, 0xbb,
-        ];
-        let data = |format| smithay::wayland::shm::BufferData {
-            format,
-            width: 2,
-            height: 2,
-            stride: STRIDE as i32,
-            offset: 0,
-        };
-        let copy = |format, reuse: Vec<u8>| {
-            let mut reuse = reuse;
-            copy_buffer(raw.as_ptr(), raw.len(), &data(format), None, &mut reuse)
-                .expect("a 2x2 buffer")
-        };
-
-        let argb = copy(wl_shm::Format::Argb8888, Vec::new());
-        assert_eq!(
-            argb.pixels,
-            [
-                5, 4, 3, 0x40, 8, 7, 6, 0xff, 11, 10, 9, 0xff, 14, 13, 12, 0x7f
-            ]
-        );
-        assert!(!argb.opaque, "an alpha byte below 255 is not opaque");
-
-        let xrgb = copy(wl_shm::Format::Xrgb8888, Vec::new());
-        assert_eq!(
-            xrgb.pixels,
-            [
-                5, 4, 3, 0xff, 8, 7, 6, 0xff, 11, 10, 9, 0xff, 14, 13, 12, 0xff
-            ]
-        );
-        assert!(xrgb.opaque, "Xrgb8888 has no alpha byte");
-
-        // A second copy into the first one's storage must overwrite it whole.
-        let mut reused = argb.pixels.clone();
-        reused.fill(0xcc);
-        let again = copy(wl_shm::Format::Argb8888, reused);
-        assert_eq!(again.pixels, argb.pixels);
-    }
 }

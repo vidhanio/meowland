@@ -1,14 +1,14 @@
 //! Surface traversal, hit testing, and frame composition.
 
+use smithay::utils::Point;
+
 use super::{
-    Logical, Point, PopupKind, PopupManager, Rectangle, Size, Snapshot, State,
-    SubsurfaceCachedState, SurfaceAttributes, SurfaceCachedState, ViewportCachedState, WlSurface,
-    get_children, with_states,
+    Logical, PopupKind, PopupManager, Rectangle, Size, Snapshot, State, SubsurfaceCachedState,
+    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, WlSurface, get_children,
+    with_states,
 };
 
-/// Compose one pane's frame into [`State::scratch`], reporting whether there
-/// was anything to compose: the window it shows, its subsurfaces and its
-/// popups, over an opaque backdrop.
+/// Compose the selected window and its surfaces into the reusable pane buffer.
 pub(super) fn render_frame(state: &mut State, pane: u64) -> bool {
     let Some((window, width, height)) = state
         .panes
@@ -17,34 +17,43 @@ pub(super) fn render_frame(state: &mut State, pane: u64) -> bool {
     else {
         return false;
     };
-    // Drawing and the backdrop decision share one stack, so they cannot
-    // disagree about what is on the pane.
+    // Commands come from validated panes, but reject invalid dimensions here
+    // before allocating or computing a row stride.
+    if width == 0
+        || height == 0
+        || width > super::MAX_SURFACE_SIDE
+        || height > super::MAX_SURFACE_SIDE
+        || width as usize * height as usize > super::MAX_SURFACE_PIXELS
+    {
+        return false;
+    }
     let stack = state
         .windows
         .get(&window)
         .map_or_default(|entry| surface_stack(&entry.surface.wl_surface().clone()));
     let mut out = std::mem::take(&mut state.scratch);
     out.resize(width as usize * height as usize * 3, 0);
-    if !opaque_cover(state, &stack, width, height) {
+    let first = if opaque_cover(state, &stack, width, height) {
+        // The topmost opaque surface hides the backdrop and everything below.
+        stack.len() - 1
+    } else {
         out.fill(0);
-    }
-    for (surface, origin) in &stack {
+        0
+    };
+    for (surface, origin) in &stack[first..] {
         blit(state, surface, *origin, &mut out, width, height);
     }
     state.scratch = out;
     true
 }
 
-/// Every surface a window draws, bottom to top, with the pane coordinates of
-/// its top-left corner.  Drawing and hit-testing share this list, so they
-/// cannot disagree about where a surface is.
+/// Window surfaces in bottom-to-top order, with origins in pane coordinates.
 pub(super) fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
     let mut stack = Vec::new();
     collect_surface(root, (0, 0).into(), &mut stack);
     let geometry = window_geometry(root);
     let mut popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
-    // The manager lists children before their parents; drawing runs bottom to
-    // top, so parents and older siblings come first.
+    // Smithay lists popup children before parents; drawing needs the reverse.
     popups.reverse();
     for (popup, location) in popups {
         let origin = popup_origin(geometry, location, &popup);
@@ -53,8 +62,7 @@ pub(super) fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logi
     stack
 }
 
-/// The origin of the window geometry a client set on a surface, which is what
-/// a popup's position is measured against.
+/// Popup positions are measured against the parent's window geometry origin.
 pub(super) fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
     with_states(surface, |states| {
         states
@@ -66,10 +74,8 @@ pub(super) fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
     })
 }
 
-/// Where a popup's surface starts in pane coordinates.  `location` is where
-/// the popup sits against the parent's window geometry, and the popup's own
-/// window geometry sits inside the surface it draws from, so it comes back
-/// off: a pane draws a surface from its own origin, not from its geometry.
+/// Convert a popup's window-geometry position to its surface origin in the
+/// pane.
 pub(super) fn popup_origin(
     parent_geometry: Point<i32, Logical>,
     location: Point<i32, Logical>,
@@ -96,8 +102,7 @@ pub(super) fn collect_surface(
     }
 }
 
-/// Copy one surface's snapshot into a pane, applying its viewport and
-/// blending premultiplied alpha over what is already there.
+/// Blend premultiplied surface pixels into the pane, applying its viewport.
 pub(super) fn blit(
     state: &State,
     surface: &WlSurface,
@@ -119,7 +124,7 @@ pub(super) fn blit(
     let top = origin.y;
     let clip_left = left.max(0);
     let clip_top = top.max(0);
-    // Both extents are client-chosen, so the box is clamped, not added.
+    // Client-chosen extents can overflow if added without saturation.
     let clip_right = left.saturating_add(dst.w).min(width as i32);
     let clip_bottom = top.saturating_add(dst.h).min(height as i32);
     if clip_right <= clip_left || clip_bottom <= clip_top {
@@ -130,50 +135,76 @@ pub(super) fn blit(
         (clip_right - clip_left, clip_bottom - clip_top).into(),
     );
     if unscaled {
-        // No viewport: one pane pixel per snapshot pixel, which is what a
-        // client that never uses `wp_viewporter` draws at.
         blit_unscaled(snapshot, left, top, clip, out, width);
         return;
     }
+    if snapshot.opaque {
+        blit_scaled::<true>(snapshot, origin, src, dst, clip, out, width);
+    } else {
+        blit_scaled::<false>(snapshot, origin, src, dst, clip, out, width);
+    }
+}
+
+fn blit_scaled<const OPAQUE: bool>(
+    snapshot: &Snapshot,
+    origin: Point<i32, Logical>,
+    src: Rectangle<f64, Logical>,
+    dst: Size<i32, Logical>,
+    clip: Rectangle<i32, Logical>,
+    out: &mut [u8],
+    width: u32,
+) {
     let last_x = snapshot.width as usize - 1;
     let last_y = snapshot.height as usize - 1;
-    let stride = snapshot.width as usize * 4;
-    for y in clip_top..clip_bottom {
-        let sample = src.loc.y + (f64::from(y - top) + 0.5) * src.size.h / f64::from(dst.h);
-        let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
-        let to = (y as usize * width as usize + clip_left as usize) * 3;
-        for x in clip_left..clip_right {
-            let sample = src.loc.x + (f64::from(x - left) + 0.5) * src.size.w / f64::from(dst.w);
-            let column = (sample.floor().max(0.0) as usize).min(last_x);
-            let pixel = row + column * 4;
-            let at = to + (x - clip_left) as usize * 3;
-            if snapshot.opaque {
-                out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]);
-                continue;
-            }
-            let alpha = u32::from(snapshot.pixels[pixel + 3]);
-            match alpha {
-                0 => {}
-                255 => out[at..at + 3].copy_from_slice(&snapshot.pixels[pixel..pixel + 3]),
-                _ => {
-                    let inverse = 255 - alpha;
-                    for channel in 0..3 {
-                        let under = u32::from(out[at + channel]);
-                        out[at + channel] = (u32::from(snapshot.pixels[pixel + channel])
-                            + (under * inverse + 127) / 255)
-                            as u8;
-                    }
+    let stride = snapshot.width as usize;
+    let pixels = snapshot.pixels.as_chunks::<4>().0;
+    let columns = clip.size.w as usize;
+    // Reuse each column map across rows without allocating a frame-width map.
+    let mut source_columns = [0; 256];
+    for start in (0..columns).step_by(source_columns.len()) {
+        let count = (columns - start).min(source_columns.len());
+        let source_columns = &mut source_columns[..count];
+        for (column, source_column) in source_columns.iter_mut().enumerate() {
+            let x = clip.loc.x + (start + column) as i32;
+            let sample =
+                src.loc.x + (f64::from(x - origin.x) + 0.5) * src.size.w / f64::from(dst.w);
+            *source_column = (sample.floor().max(0.0) as usize).min(last_x);
+        }
+        for y in clip.loc.y..clip.loc.y + clip.size.h {
+            let sample =
+                src.loc.y + (f64::from(y - origin.y) + 0.5) * src.size.h / f64::from(dst.h);
+            let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
+            let to = (y as usize * width as usize + clip.loc.x as usize + start) * 3;
+            let rgb_row = out[to..to + count * 3].as_chunks_mut::<3>().0;
+            for (&column, rgb) in source_columns.iter().zip(rgb_row) {
+                let pixel = pixels[row + column];
+                if OPAQUE {
+                    rgb.copy_from_slice(&pixel[..3]);
+                } else {
+                    blend_pixel(pixel, rgb);
                 }
             }
         }
     }
 }
 
-/// The unscaled case of [`blit`]: the surface has no viewport, so one pane
-/// pixel is one snapshot pixel and the sample of a pixel is its offset from
-/// the surface origin.  Integer indexing alone, with the alpha blend kept
-/// byte for byte identical to the sampling path's.
+/// Unscaled pixels map directly to snapshot offsets from the surface origin.
 pub(super) fn blit_unscaled(
+    snapshot: &Snapshot,
+    left: i32,
+    top: i32,
+    clip: Rectangle<i32, Logical>,
+    out: &mut [u8],
+    width: u32,
+) {
+    if snapshot.opaque {
+        blit_unscaled_inner::<true>(snapshot, left, top, clip, out, width);
+    } else {
+        blit_unscaled_inner::<false>(snapshot, left, top, clip, out, width);
+    }
+}
+
+fn blit_unscaled_inner<const OPAQUE: bool>(
     snapshot: &Snapshot,
     left: i32,
     top: i32,
@@ -185,8 +216,7 @@ pub(super) fn blit_unscaled(
     let row_bytes = columns * 4;
     let stride = snapshot.width as usize * 4;
     let pane_stride = width as usize * 3;
-    // The clip was taken against the snapshot's own size, so `first` and
-    // `first_row` are inside it and every span below is in bounds.
+    // Clipping to snapshot bounds keeps the indexed spans below in bounds.
     let first = (clip.loc.x - left) as usize;
     let first_row = (clip.loc.y - top) as usize;
     for row in 0..clip.size.h as usize {
@@ -194,32 +224,34 @@ pub(super) fn blit_unscaled(
         let source = snapshot.pixels[from..from + row_bytes].as_chunks::<4>().0;
         let at = (clip.loc.y as usize + row) * pane_stride + clip.loc.x as usize * 3;
         let dest = out[at..at + columns * 3].as_chunks_mut::<3>().0;
-        if snapshot.opaque {
-            for (pixel, rgb) in source.iter().zip(dest) {
-                rgb.copy_from_slice(&pixel[..3]);
-            }
-            continue;
-        }
         for (pixel, rgb) in source.iter().zip(dest) {
-            let alpha = u32::from(pixel[3]);
-            match alpha {
-                0 => {}
-                255 => rgb.copy_from_slice(&pixel[..3]),
-                _ => {
-                    let inverse = 255 - alpha;
-                    for channel in 0..3 {
-                        let under = u32::from(rgb[channel]);
-                        rgb[channel] =
-                            (u32::from(pixel[channel]) + (under * inverse + 127) / 255) as u8;
-                    }
-                }
+            if OPAQUE {
+                rgb.copy_from_slice(&pixel[..3]);
+            } else {
+                blend_pixel(*pixel, rgb);
             }
         }
     }
 }
 
-/// Whether the topmost thing a window draws is opaque and covers the whole
-/// pane, in which case the backdrop under it need not be laid down.
+/// The snapshot is premultiplied; preserve the same rounding in both the
+/// direct-copy and viewport-sampling paths.
+#[inline]
+fn blend_pixel(pixel: [u8; 4], rgb: &mut [u8; 3]) {
+    let alpha = u32::from(pixel[3]);
+    match alpha {
+        0 => {}
+        255 => rgb.copy_from_slice(&pixel[..3]),
+        _ => {
+            let inverse = 255 - alpha;
+            for channel in 0..3 {
+                let under = u32::from(rgb[channel]);
+                rgb[channel] = (u32::from(pixel[channel]) + (under * inverse + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
 pub(super) fn opaque_cover(
     state: &State,
     stack: &[(WlSurface, Point<i32, Logical>)],
@@ -242,7 +274,6 @@ pub(super) fn opaque_cover(
         && origin.y.saturating_add(snapshot.height as i32) >= height as i32
 }
 
-/// The source rectangle and on-screen size of a surface after its viewport.
 pub(super) fn extents(
     snapshot: &Snapshot,
     viewport: ViewportCachedState,
@@ -264,9 +295,7 @@ pub(super) fn viewport_of(surface: &WlSurface) -> ViewportCachedState {
     })
 }
 
-/// The surface under a point, topmost first, with the pane coordinates of its
-/// top-left corner.  Smithay wants the surface origin, not the local point:
-/// it subtracts the origin itself before telling the client where it is.
+/// Smithay expects the surface origin, not the local point, for pointer focus.
 pub(super) fn hit_test(
     state: &State,
     window: u64,
@@ -287,16 +316,17 @@ pub(super) fn hit_test(
         {
             continue;
         }
-        let region = with_states(&surface, |states| {
+        let inside = with_states(&surface, |states| {
             states
                 .cached_state
                 .get::<SurfaceAttributes>()
                 .current()
                 .input_region
-                .clone()
+                .as_ref()
+                .is_none_or(|region| {
+                    region.contains((local.x.floor() as i32, local.y.floor() as i32))
+                })
         });
-        let inside = region
-            .is_none_or(|region| region.contains((local.x.floor() as i32, local.y.floor() as i32)));
         if inside {
             return Some((
                 surface,

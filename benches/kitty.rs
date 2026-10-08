@@ -1,45 +1,20 @@
-//! Benchmarks for the pane-side frame encoder.
-//!
-//! `Presenter::present` is the whole of the CPU cost between a composed frame
-//! and bytes on a pty, and the branch it takes is decided by what changed on
-//! screen.  Each one is measured here: the first frame after an attach or a
-//! resize, with flat and with incompressible content; a frame whose damage is
-//! too large to patch; the cell-aligned patches a text pane mostly sends; a
-//! frame that did not change at all; and the shared-memory handover a terminal
-//! earns by proving that it reads one.
-//!
-//! The presenter and the frame handed to it are built in criterion's batched
-//! setup, so a number is the encoder alone.  `cargo test --all-targets` runs
-//! each case once, in criterion's test mode.
-//!
-//! A whole-frame case moves megabytes per iteration, so its absolute number
-//! reflects the memory system (page faults, huge pages, allocator reuse) as
-//! much as the encoder: the same case has been measured 2x apart in two
-//! processes while producing identical bytes.  Compare whole-frame cases only
-//! against runs of this same suite; the patch and codec cases are stable.
-//! `cargo bench -- present/patches` narrows a run to one group.
+//! Pane frame-encoder benchmarks: whole frames, patches, partial bands, and
+//! shared-memory handoff. Inputs and presenters are prepared outside timed
+//! work. Whole-frame measurements are sensitive to memory-system variation.
 
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use meowland::kitty::{Presenter, SharedMemory};
 
-/// One cell of a terminal showing a 1080p screen, as `CSI 14 t` reports it.
+/// Cell dimensions reported by `CSI 14 t`.
 const CELL: (u16, u16) = (10, 20);
-/// The flat colour the clients in these benchmarks draw.
 const FLAT: u8 = 17;
-/// A pixel value the base frames never contain.
 const CHANGED: u8 = 0xab;
-/// A laptop screen and a 4K one: on the second, compression and base64 cost
-/// something a frame budget notices.
 const SIZES: [(u32, u32, &str); 2] = [(1920, 1080, "1080p"), (3840, 2160, "2160p")];
-/// The screen the patch benchmarks run at.  Patch size is a per-cell decision,
-/// so one size shows what it costs.
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 const BYTES: usize = pixels(WIDTH, HEIGHT);
-/// Fewer samples than criterion's default, and a shorter measurement: a 2160p
-/// case already holds tens of milliseconds per iteration.
 const SAMPLES: usize = 20;
 const MEASUREMENT: Duration = Duration::from_secs(3);
 const WARM_UP: Duration = Duration::from_secs(1);
@@ -48,8 +23,7 @@ const fn pixels(width: u32, height: u32) -> usize {
     width as usize * height as usize * 3
 }
 
-/// xorshift, the generator the encoder tests use: deterministic, and byte for
-/// byte incompressible, which is what video looks like to the compressor.
+/// Deterministic xorshift noise for incompressible frames.
 fn noise(state: &mut u32, len: usize) -> Vec<u8> {
     let mut frame = Vec::with_capacity(len);
     for _ in 0..len {
@@ -61,8 +35,6 @@ fn noise(state: &mut u32, len: usize) -> Vec<u8> {
     frame
 }
 
-/// Fills the `w` by `h` pixel block at `(x, y)` with one value: a client
-/// typing a glyph, or repainting a widget.
 fn put_block(frame: &mut [u8], width: u32, x: u32, y: u32, w: u32, h: u32, value: u8) {
     for row in 0..h {
         let start = ((y + row) * width + x) as usize * 3;
@@ -70,7 +42,6 @@ fn put_block(frame: &mut [u8], width: u32, x: u32, y: u32, w: u32, h: u32, value
     }
 }
 
-/// One cell at the top-left corner changed.
 fn one_cell(base: &[u8]) -> Vec<u8> {
     let mut frame = base.to_vec();
     put_block(
@@ -85,16 +56,14 @@ fn one_cell(base: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Ten by twenty cells at `(100, 100)` changed: one patch of a hundred by four
-/// hundred pixels, because the rows merge.
+/// A 100x400-pixel block that merges into one patch.
 fn block(base: &[u8]) -> Vec<u8> {
     let mut frame = base.to_vec();
     put_block(&mut frame, WIDTH, 100, 100, 100, 400, CHANGED);
     frame
 }
 
-/// Thirty-two single cells spread over the screen: the most the encoder will
-/// patch, and the diff has to walk every row to find them.
+/// Thirty-two scattered cells, the encoder's patch limit.
 fn scattered(base: &[u8]) -> Vec<u8> {
     let mut frame = base.to_vec();
     for index in 0..32 {
@@ -122,8 +91,6 @@ fn whole_frames(c: &mut Criterion) {
         let bytes = pixels(width, height);
         group.throughput(Throughput::Bytes(bytes as u64));
 
-        // A client drawing a solid screen: the sampling pass says compression
-        // pays, so this is zlib plus base64 of what it produced.
         let flat = vec![FLAT; bytes];
         group.bench_function(BenchmarkId::new("flat", name), |b| {
             b.iter_batched(
@@ -133,8 +100,6 @@ fn whole_frames(c: &mut Criterion) {
             );
         });
 
-        // Incompressible pixels: the sampling pass has to refuse the full
-        // compression pass, so this is base64 of the raw frame alone.
         let noisy = noise(&mut 9, bytes);
         group.bench_function(BenchmarkId::new("incompressible", name), |b| {
             b.iter_batched(
@@ -157,8 +122,7 @@ fn patches(c: &mut Criterion) {
 
     let base = vec![FLAT; BYTES];
 
-    // A glyph being typed: one patch, one cursor move and one small payload
-    // go out, after a full walk of the frame's rows.
+    // A single-cell patch after a full-row diff.
     let cell = one_cell(&base);
     group.bench_function("one_cell_1080p", |b| {
         b.iter_batched(
@@ -172,7 +136,6 @@ fn patches(c: &mut Criterion) {
         );
     });
 
-    // A widget repainting, or a menu opening.
     let repainted = block(&base);
     group.bench_function("block_1080p", |b| {
         b.iter_batched(
@@ -186,8 +149,7 @@ fn patches(c: &mut Criterion) {
         );
     });
 
-    // The patch budget spent exactly: thirty-two single-cell patches with their
-    // deletes and cursor moves, in four rows of eight cells each.
+    // Exhaust the 32-patch budget.
     let spread = scattered(&base);
     group.bench_function("scattered_1080p", |b| {
         b.iter_batched(
@@ -201,8 +163,6 @@ fn patches(c: &mut Criterion) {
         );
     });
 
-    // A client redrawing what the terminal already shows: the patches that
-    // covered the difference are deleted and no pixels move.
     group.bench_function("revert_1080p", |b| {
         b.iter_batched(
             || {
@@ -216,8 +176,6 @@ fn patches(c: &mut Criterion) {
         );
     });
 
-    // Nothing changed: the frame is compared against the previous one and no
-    // bytes are written at all.
     group.bench_function("unchanged_1080p", |b| {
         b.iter_batched(
             || {
@@ -233,11 +191,60 @@ fn patches(c: &mut Criterion) {
     group.finish();
 }
 
+fn bands(c: &mut Criterion) {
+    let mut group = c.benchmark_group("present/bands");
+    group
+        .sample_size(SAMPLES)
+        .measurement_time(MEASUREMENT)
+        .warm_up_time(WARM_UP);
+    let base = vec![FLAT; BYTES];
+    let cell = one_cell(&base);
+
+    // An unchanged band should not detach or resend the retained frame.
+    let unchanged_band = base[..pixels(WIDTH, u32::from(CELL.1))].to_vec();
+    group.bench_function("unchanged_band_1080p", |b| {
+        b.iter_batched(
+            || {
+                let mut presenter = Presenter::new(Some(CELL), None);
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
+                (presenter, unchanged_band.clone())
+            },
+            |(mut presenter, band)| black_box(presenter.present(WIDTH, HEIGHT, 0, band)),
+            BatchSize::LargeInput,
+        );
+    });
+    let cell_band = cell[..unchanged_band.len()].to_vec();
+    group.bench_function("changed_band_1080p", |b| {
+        b.iter_batched(
+            || {
+                let mut presenter = Presenter::new(Some(CELL), None);
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
+                (presenter, cell_band.clone())
+            },
+            |(mut presenter, band)| black_box(presenter.present(WIDTH, HEIGHT, 0, band)),
+            BatchSize::LargeInput,
+        );
+    });
+
+    // Without a patch grid, update the retained frame in place.
+    let changed_band = vec![CHANGED; unchanged_band.len()];
+    group.bench_function("changed_band_no_grid_1080p", |b| {
+        b.iter_batched(
+            || {
+                let mut presenter = Presenter::new(None, None);
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
+                (presenter, changed_band.clone())
+            },
+            |(mut presenter, band)| black_box(presenter.present(WIDTH, HEIGHT, 0, band)),
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
 fn damage(c: &mut Criterion) {
-    // The worst case the encoder can be asked for: the diff walks every row,
-    // the changed area turns out to be the whole screen, and the frame goes
-    // whole.  Anything that moves most of the screen — a scroll, a video
-    // frame — is this case.
+    // Full-screen damage after a row-by-row diff.
     let mut group = c.benchmark_group("present/damage");
     group
         .sample_size(SAMPLES)
@@ -263,8 +270,7 @@ fn damage(c: &mut Criterion) {
 }
 
 fn shared_memory(c: &mut Criterion) {
-    // The whole-frame path a terminal earns by proving it reads a shared
-    // object: the pixels go into `/dev/shm` and the escape carries the name.
+    // The shared-memory path writes pixels to an object and sends its name.
     let slot = SharedMemory::new();
     let usable = slot.probe().is_some();
     slot.clear();
@@ -282,9 +288,7 @@ fn shared_memory(c: &mut Criterion) {
     let noisy = noise(&mut 21, BYTES);
     let other = noise(&mut 22, BYTES);
 
-    // A terminal that reads each frame and unlinks the object: every frame can
-    // be handed over.  A fresh presenter per iteration is the only way to model
-    // the read from outside, because the object name belongs to the presenter.
+    // A fresh presenter models each frame having an available shared object.
     group.throughput(Throughput::Bytes(BYTES as u64));
     group.bench_function("transferred_1080p", |b| {
         b.iter_batched(
@@ -299,9 +303,7 @@ fn shared_memory(c: &mut Criterion) {
         );
     });
 
-    // A terminal that has not read the object yet is behind: the second frame
-    // is dropped rather than pushed down the pty, which would be ten times the
-    // bytes in front of it.
+    // An unread object causes the second frame to be dropped.
     group.throughput(Throughput::Bytes((BYTES * 2) as u64));
     group.bench_function("unread_drops_1080p", |b| {
         b.iter_batched(
@@ -325,5 +327,5 @@ fn shared_memory(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, whole_frames, patches, damage, shared_memory);
+criterion_group!(benches, whole_frames, patches, bands, damage, shared_memory);
 criterion_main!(benches);

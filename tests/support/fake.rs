@@ -1,9 +1,5 @@
-//! A simulated kitty-compatible terminal for the pane tests.
-//!
-//! It answers the pane's queries, decodes the kitty graphics escapes the pane
-//! produces and keeps the resulting screen, so a test can compare pixels after
-//! any sequence of whole frames and patches.  The decoder is written directly
-//! from the protocol description and never shares code with the encoder.
+//! Kitty-compatible terminal fixture that decodes graphics escapes without
+//! sharing the pane's encoder and retains pixels for comparison.
 
 use std::collections::HashSet;
 
@@ -25,12 +21,10 @@ pub struct FakeTerminal {
     pub cell: (u16, u16),
     pub modes: HashSet<String>,
     pub synchronized_updates: u32,
-    /// How many whole frames and how many patches the pane sent, and how many
-    /// of the whole frames arrived through a shared memory object.
+    /// Whole frames, patches, and shared-memory frames received.
     pub whole_frames: u32,
     pub patches: u32,
     pub shared_frames: u32,
-    /// Plain (non-escape) output, which is where error messages land.
     pub text: Vec<u8>,
     pending: Vec<u8>,
     base: Vec<u8>,
@@ -66,8 +60,6 @@ impl FakeTerminal {
         &self.screen
     }
 
-    /// Consume whatever the pane wrote and return the replies a real terminal
-    /// would send back.
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(input);
         let mut replies = Vec::new();
@@ -169,8 +161,8 @@ impl FakeTerminal {
             },
             b'u' => {
                 if params.starts_with('?') {
-                    // No keyboard enhancement: the plain key path is easier to
-                    // drive deterministically from a test.
+                    // Disable keyboard enhancement for deterministic plain-key
+                    // tests.
                     replies.extend_from_slice(b"\x1b[?0u");
                 }
             }
@@ -208,8 +200,8 @@ impl FakeTerminal {
             Some("q") => {
                 if let Some(id) = id {
                     let answer = if fields.get("t").copied() == Some("s") {
-                        // A terminal that cannot read the object answers with
-                        // an error, and the pane then keeps to the pty.
+                        // Unreadable shared memory rejects the probe and
+                        // retains pty transport.
                         if self.shared(&fields, payload) {
                             "OK"
                         } else {
@@ -249,9 +241,8 @@ impl FakeTerminal {
         }
     }
 
-    /// The `t=s` form: the pixels sit in a POSIX shared memory object whose
-    /// name is the payload.  A terminal reads and unlinks it, and a missing
-    /// object is how it says it cannot read one.
+    /// Read and unlink the POSIX shared-memory object named by `t=s`; report
+    /// failure if it cannot be read.
     fn shared(&mut self, fields: &std::collections::HashMap<&str, &str>, payload: &[u8]) -> bool {
         let Ok(name) = STANDARD.decode(payload) else {
             return false;

@@ -41,6 +41,7 @@ smithay = { git = "https://github.com/Smithay/smithay.git", default-features = f
   "backend_drm",
   "renderer_gl",
 ] }
+wl-clipboard-rs = "0.9.4"
 usage = { package = "usage-rs", version = "6.9.1", default-features = false, features = [
   "completions",
   "diagnostics",

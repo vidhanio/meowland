@@ -185,6 +185,98 @@ fn detach(pty: &mut Pty, child: &mut PtyChild) {
 }
 
 #[test]
+fn native_host_clipboard_and_bracketed_paste_preserve_unicode() {
+    use support::clipboard::Clipboard;
+
+    let host = Server::start();
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("clipboard", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let clipboard = Clipboard::bind(&mut client, false);
+    let mut host_client = Client::connect(&host);
+    let host_clipboard = Clipboard::bind(&mut host_client, true);
+    let mut pty = Pty::open(4, 4, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["attach", "1"])
+            .env("XDG_RUNTIME_DIR", &server.runtime)
+            .env("WAYLAND_DISPLAY", host.wayland_socket())
+            .env_remove("MEOWLAND_CLIPBOARD")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_TTY"),
+    );
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(
+        &mut pty,
+        &mut terminal,
+        &mut child,
+        &rgb,
+        "clipboard window",
+    );
+
+    let copied = "Copied: 猫 🐈 café\n".repeat(4096);
+    let source = clipboard.offer(&mut client);
+    clipboard.serve(&mut client, source, &copied);
+    let offer = host_clipboard.selection(&mut host_client);
+    assert_eq!(
+        host_clipboard.receive(&host_client, offer),
+        copied.as_bytes()
+    );
+    client.sync();
+
+    let pasted = "Host text: λ 猫 🐈\n\tsecond line";
+    let source = host_clipboard.offer(&mut host_client);
+    host_client.sync();
+    pty.master.write_all(&[0x16]).unwrap();
+    host_clipboard.serve(&mut host_client, source, pasted);
+    let offer = clipboard.selection(&mut client);
+    assert_eq!(clipboard.receive(&client, offer), pasted.as_bytes());
+
+    let bracketed = "Terminal paste: 日本語 🐱\r\n";
+    pty.master
+        .write_all(format!("\x1b[200~{bracketed}\x1b[201~").as_bytes())
+        .unwrap();
+    let offer = clipboard.selection(&mut client);
+    assert_eq!(clipboard.receive(&client, offer), bracketed.as_bytes());
+    detach(&mut pty, &mut child);
+}
+
+#[test]
+fn terminal_only_clipboard_copy_uses_osc52() {
+    use support::clipboard::Clipboard;
+
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("OSC 52", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let clipboard = Clipboard::bind(&mut client, false);
+    let mut pty = Pty::open(4, 4, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["attach", "1"])
+            .env("XDG_RUNTIME_DIR", &server.runtime)
+            .env("MEOWLAND_CLIPBOARD", "terminal"),
+    );
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(&mut pty, &mut terminal, &mut child, &rgb, "OSC 52 window");
+    let source = clipboard.offer(&mut client);
+    let text = "remote 猫 🐈\n";
+    clipboard.serve(&mut client, source, text);
+    assert!(wait_for(Duration::from_secs(5), || {
+        terminal.feed(&pty.read_now());
+        terminal.clipboard.as_deref() == Some(text.as_bytes())
+    }));
+    detach(&mut pty, &mut child);
+}
+
+#[test]
 fn edge_mouse_reports_reach_the_client_without_closing_the_pane() {
     let server = Server::start();
     let mut client = Client::connect(&server);

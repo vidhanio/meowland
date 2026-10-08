@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::{
-        fd::AsFd,
+        fd::{AsFd, OwnedFd},
         unix::{
             fs::{DirBuilderExt, FileTypeExt as _},
             net::UnixStream,
@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+pub mod clipboard;
 pub mod dmabuf;
 pub mod fake;
 
@@ -415,6 +416,7 @@ impl Message {
 pub struct Client {
     stream: UnixStream,
     buffer: Vec<u8>,
+    pub fds: Vec<OwnedFd>,
     next_id: u32,
     pub globals: HashMap<String, u32>,
     pub compositor: u32,
@@ -438,6 +440,7 @@ impl Client {
         let mut client = Self {
             stream,
             buffer: Vec::new(),
+            fds: Vec::new(),
             next_id: 3,
             globals: HashMap::new(),
             compositor: 0,
@@ -534,11 +537,31 @@ impl Client {
         Some(message)
     }
 
-    fn fill(&mut self) {
+    fn receive(&mut self) -> std::io::Result<usize> {
         let mut chunk = vec![0u8; 64 * 1024];
-        let read = self.stream.read(&mut chunk).unwrap();
-        assert!(read > 0, "the server closed the connection");
-        self.buffer.extend_from_slice(&chunk[..read]);
+        let mut control = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(16))];
+        let mut ancillary = rustix::net::RecvAncillaryBuffer::new(&mut control);
+        let mut iov = [std::io::IoSliceMut::new(&mut chunk)];
+        let received = rustix::net::recvmsg(
+            &self.stream,
+            &mut iov,
+            &mut ancillary,
+            rustix::net::RecvFlags::CMSG_CLOEXEC,
+        )?;
+        for message in ancillary.drain() {
+            if let rustix::net::RecvAncillaryMessage::ScmRights(fds) = message {
+                self.fds.extend(fds);
+            }
+        }
+        self.buffer.extend_from_slice(&chunk[..received.bytes]);
+        Ok(received.bytes)
+    }
+
+    fn fill(&mut self) {
+        assert!(
+            self.receive().unwrap() > 0,
+            "the server closed the connection"
+        );
     }
 
     pub fn read(&mut self) -> Message {
@@ -558,10 +581,9 @@ impl Client {
             while let Some(message) = self.next_message() {
                 messages.push(message);
             }
-            let mut chunk = vec![0u8; 64 * 1024];
-            match self.stream.read(&mut chunk) {
+            match self.receive() {
                 Ok(0) => break,
-                Ok(read) => self.buffer.extend_from_slice(&chunk[..read]),
+                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => panic!("read failed: {error}"),
             }

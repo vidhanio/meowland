@@ -4,9 +4,11 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{fs, os::unix::net::UnixListener, process::Command, time::Duration};
 
-use support::{Client, Server, program_in_path, wait_for, x11_connection_succeeds};
+use support::{
+    BINARY, Client, Server, program_in_path, temp_dir, wait_for, x11_connection_succeeds,
+};
 
 #[test]
 fn detached_server_accepts_control_requests_and_stops() {
@@ -22,6 +24,12 @@ fn detached_server_accepts_control_requests_and_stops() {
         assert!(client.has_global(global), "missing global {global}");
     }
     assert!(server.list().is_empty());
+    let duplicate = server.cli(&["server"]);
+    assert!(!duplicate.status.success());
+    assert!(
+        server.list().is_empty(),
+        "the original server lost its socket"
+    );
 
     let run = server.cli(&["run", "true"]);
     assert!(
@@ -51,6 +59,78 @@ fn clients_run_without_a_display_when_xwayland_is_off() {
         server.log()
     );
     assert_eq!(std::fs::read_to_string(&probe).unwrap(), "unset");
+}
+
+#[test]
+fn failed_startup_preserves_unowned_socket_paths() {
+    let runtime = temp_dir("meowland-socket-ownership");
+    for name in ["meowland-control.sock", "meowland-pane.sock"] {
+        let path = runtime.join(name);
+        fs::write(&path, "not a socket").unwrap();
+        let result = Command::new(BINARY)
+            .arg("server")
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("MEOWLAND_XWAYLAND", "off")
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "startup replaced a regular file");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not a socket");
+        fs::remove_file(path).unwrap();
+    }
+    let pane_path = runtime.join("meowland-pane.sock");
+    let pane = UnixListener::bind(&pane_path).unwrap();
+    let result = Command::new(BINARY)
+        .arg("server")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("MEOWLAND_XWAYLAND", "off")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(std::os::unix::net::UnixStream::connect(&pane_path).is_ok());
+    assert!(!runtime.join("meowland-control.sock").exists());
+    drop(pane);
+    fs::remove_dir_all(runtime).unwrap();
+}
+
+#[test]
+fn shutdown_kills_helpers_after_their_parent_exits() {
+    let Some(setsid) = program_in_path("setsid") else {
+        eprintln!("skipping: setsid is not on PATH");
+        return;
+    };
+    let mut server = Server::start();
+    let pidfile = server.runtime.join("helper.pid");
+    let script = format!(
+        "{} sh -c 'trap \"\" HUP TERM; echo $$ > {}; exec sleep 60' & wait",
+        setsid.display(),
+        pidfile.display()
+    );
+    assert!(server.cli(&["run", "sh", "-c", &script]).status.success());
+    assert!(wait_for(Duration::from_secs(5), || pidfile.exists()));
+    let pid = fs::read_to_string(pidfile).unwrap().trim().parse().unwrap();
+    let process = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid).unwrap(),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .unwrap();
+    server.stop();
+    let exited = wait_for(Duration::from_secs(3), || {
+        let mut fds = [rustix::event::PollFd::new(
+            &process,
+            rustix::event::PollFlags::IN,
+        )];
+        rustix::event::poll(
+            &mut fds,
+            Some(&rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        )
+        .unwrap()
+            > 0
+    });
+    let _ = rustix::process::pidfd_send_signal(&process, rustix::process::Signal::KILL);
+    assert!(exited, "the orphaned helper survived shutdown escalation");
 }
 
 #[test]
@@ -93,27 +173,4 @@ fn xwayland_gives_clients_a_working_display() {
         socket.display(),
         server.log()
     );
-}
-
-/// A server that has just been asked to stop is still on its way out, and its
-/// socket is still open: starting a new one has to wait for that to finish and
-/// then try again rather than give up on the first refusal.
-#[test]
-fn a_server_starts_right_after_one_is_stopped() {
-    let server = Server::start();
-    let stop = server.cli(&["server", "stop"]);
-    assert!(
-        stop.status.success(),
-        "stop failed: {}",
-        String::from_utf8_lossy(&stop.stderr)
-    );
-    let start = server.cli(&["server", "start"]);
-    assert!(
-        start.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&start.stderr)
-    );
-    // The restarted server answers control requests; `list` panics if it does
-    // not.
-    let _ = server.list();
 }

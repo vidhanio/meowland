@@ -12,15 +12,19 @@ bincode = { version = "2.0.1", default-features = false, features = [
   "serde",
   "std",
 ] }
-crossterm = { version = "0.29.0", default-features = false, features = [
+crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", default-features = false, features = [
   "bracketed-paste",
   "events",
 ] }
 flate2 = "1.1.10"
+libloading = "0.8.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"
 signal-hook = "0.3"
 thiserror = "2.0.17"
+tracing = "0.1"
+tracing-journald = "0.3.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1.1.4", features = [
   "event",
   "net",
@@ -31,9 +35,11 @@ rustix = { version = "1.1.4", features = [
   "shm",
   "termios",
 ] }
-smithay = { version = "0.7", default-features = false, features = [
+smithay = { git = "https://github.com/Smithay/smithay.git", default-features = false, features = [
   "wayland_frontend",
   "desktop",
+  "backend_drm",
+  "renderer_gl",
 ] }
 usage = { package = "usage-rs", version = "6.9.1", default-features = false, features = [
   "completions",
@@ -42,12 +48,12 @@ usage = { package = "usage-rs", version = "6.9.1", default-features = false, fea
 ] }
 
 [dev-dependencies]
-# `cargo bench` only: the encoder and the wire codec are where the frame path
-# spends its time, and the two benchmark targets below are built on these.  The
-# plotting stack (`plotters`, `rayon`) stays off, since text output is what the
-# numbers are read from.
 criterion = { version = "0.8.2", default-features = false, features = [
   "cargo_bench_support",
+] }
+smithay = { git = "https://github.com/Smithay/smithay.git", default-features = false, features = [
+  "backend_gbm",
+  "backend_gbm_has_fd_for_plane",
 ] }
 
 [[bench]]
@@ -62,27 +68,16 @@ harness = false
 [lints.rust]
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
-# missing_docs = "warn"
-# `unsafe` is read out of the shm pool in src/compositor.rs and used for the
-# two `pre_exec` blocks in src/main.rs and tests/support/mod.rs; each site
-# carries a SAFETY comment and a local expectation.
 unsafe_code = "deny"
 
 [lints.clippy]
-# Every `unsafe` block states the invariant that makes it sound; the crate has
-# three of them, all documented.
 undocumented_unsafe_blocks = "warn"
 
-# Pointer positions, frame rectangles and channel arithmetic convert between
-# number types in bulk. The range is known from the invariants around the code,
-# not from the type.
+# Geometry and color conversions are bounded by validated frame dimensions.
 cast_possible_wrap = "allow"
 cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 
-# `missing_errors_doc`, `module_name_repetitions` and the casts below are
-# satisfied by the code as it stands, and the defaults are what the crate
-# wants: they are left to warn rather than being allowed away.
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

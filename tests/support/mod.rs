@@ -1,8 +1,4 @@
-//! Shared fixture for the process-level tests: a detached server plus a raw
-//! Wayland client that speaks the wire protocol directly, without libwayland.
-//!
-//! Each test binary uses a different subset of these helpers, so unused ones
-//! are expected rather than a reason to force every binary to use everything.
+//! Process-level fixtures: a directly spawned server and a raw Wayland client.
 #![expect(
     dead_code,
     reason = "each test binary uses a different subset of the shared fixture"
@@ -21,12 +17,13 @@ use std::{
         },
     },
     path::PathBuf,
-    process::{Child, Command, Output},
+    process::{Child, Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
+pub mod dmabuf;
 pub mod fake;
 
 use meowland::protocol::{self, Hello, PaneToServer, ServerToPane, Show};
@@ -34,9 +31,8 @@ use meowland::protocol::{self, Hello, PaneToServer, ServerToPane, Show};
 pub const BINARY: &str = env!("CARGO_BIN_EXE_meowland");
 
 pub fn temp_dir(prefix: &str) -> PathBuf {
-    // The counter keeps two calls in the same process apart even when they
-    // read the clock in the same nanosecond; the clock keeps runs apart when
-    // a previous run died before cleaning up.
+    // The counter separates same-nanosecond calls; the timestamp separates
+    // runs.
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -51,36 +47,36 @@ pub fn temp_dir(prefix: &str) -> PathBuf {
     path
 }
 
-/// A detached `meowland` server in a private runtime directory.
+/// Server in a private runtime directory, spawned without a user manager.
 pub struct Server {
     pub runtime: PathBuf,
+    child: Child,
     stopped: bool,
 }
 
 impl Server {
-    /// Start a server with Xwayland off, which keeps tests independent of
-    /// whether `xwayland-satellite` is installed.
+    /// Disable Xwayland to avoid depending on `xwayland-satellite`.
     pub fn start() -> Self {
         Self::start_with_env(&[("MEOWLAND_XWAYLAND", "off")])
     }
 
     pub fn start_with_env(env: &[(&str, &str)]) -> Self {
         let runtime = temp_dir("meowland-test");
+        let stderr = fs::File::create(runtime.join("server.stderr")).unwrap();
         let mut command = Command::new(BINARY);
         command
-            .args(["server", "start"])
-            .env("XDG_RUNTIME_DIR", &runtime);
+            .arg("server")
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr);
         for (key, value) in env {
             command.env(key, value);
         }
-        let output = command.output().expect("run meowland server start");
-        assert!(
-            output.status.success(),
-            "server start failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let child = command.spawn().expect("spawn meowland server");
         let server = Self {
             runtime,
+            child,
             stopped: false,
         };
         assert!(
@@ -115,7 +111,6 @@ impl Server {
         protocol::recv(&mut socket).unwrap()
     }
 
-    /// Run the CLI, which is how tests observe `run`, `list` and `stop`.
     pub fn cli(&self, args: &[&str]) -> Output {
         Command::new(BINARY)
             .args(args)
@@ -132,13 +127,12 @@ impl Server {
         }
     }
 
-    /// Wait until the compositor has announced at least one window.
     pub fn wait_for_window(&self, timeout: Duration) -> bool {
         wait_for(timeout, || !self.list().is_empty())
     }
 
     pub fn log(&self) -> String {
-        fs::read_to_string(self.runtime.join("meowland.log")).unwrap_or_default()
+        fs::read_to_string(self.runtime.join("server.stderr")).unwrap_or_default()
     }
 
     pub fn wayland_socket(&self) -> PathBuf {
@@ -151,8 +145,7 @@ impl Server {
         self.find_wayland_socket().unwrap()
     }
 
-    /// The socket, not the `.lock` file next to it: the two share a prefix and
-    /// a directory listing has no order.
+    /// Select the socket, not its similarly named `.lock` file.
     fn find_wayland_socket(&self) -> Option<PathBuf> {
         fs::read_dir(&self.runtime)
             .ok()?
@@ -165,8 +158,7 @@ impl Server {
             .map(|entry| entry.path())
     }
 
-    /// Stop the server, failing the test if it does not go away.  The
-    /// log is reported with the failure.
+    /// Assert the server exits, including its log on failure.
     pub fn stop(&mut self) {
         assert!(
             self.shutdown(),
@@ -175,23 +167,23 @@ impl Server {
         );
     }
 
-    /// Stop the server without asserting, so `Drop` cannot panic while a
-    /// failed test is already unwinding.
+    /// Avoid panicking in `Drop` while a failed test is unwinding.
     fn shutdown(&mut self) -> bool {
         if self.stopped {
             return true;
         }
         self.stopped = true;
-        let stop = self.cli(&["server", "stop"]);
+        if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
         let stopped = wait_for(Duration::from_secs(5), || {
-            !self.runtime.join("meowland-control.sock").exists()
+            matches!(self.child.try_wait(), Ok(Some(_)))
+                && !self.runtime.join("meowland-control.sock").exists()
         });
         if !stopped {
-            eprintln!(
-                "server did not exit: {}\nlog:\n{}",
-                String::from_utf8_lossy(&stop.stderr),
-                self.log()
-            );
+            eprintln!("server did not exit;\nlog:\n{}", self.log());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
         stopped
     }
@@ -199,6 +191,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!("server stderr during test failure:\n{}", self.log());
+        }
         let _ = self.shutdown();
         let _ = fs::remove_dir_all(&self.runtime);
     }
@@ -226,7 +221,6 @@ pub fn x11_connection_succeeds(socket: &std::path::Path) -> bool {
     matches!(stream.read_exact(&mut reply), Ok(()) if reply[0] == 1)
 }
 
-/// A pseudo-terminal a test can drive like a kitty-compatible terminal.
 pub struct Pty {
     pub master: fs::File,
     pub slave: PathBuf,
@@ -269,9 +263,8 @@ impl Pty {
         )
     }
 
-    /// Run a child with this pty as its terminal.  The child gets its own
-    /// session so `/dev/tty` cannot reach the terminal running the tests,
-    /// which is what makes crossterm fall back to the pty on stdin/stdout.
+    /// Create a separate session so `/dev/tty` cannot access the test runner's
+    /// terminal and crossterm uses this pty on stdin/stdout.
     #[expect(
         unsafe_code,
         reason = "`pre_exec` is unsafe because its closure runs between fork and exec"
@@ -286,10 +279,8 @@ impl Pty {
             .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
             .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
             .stderr(std::process::Stdio::from(slave));
-        // SAFETY: `pre_exec` runs the closure between fork and exec, where
-        // only async-signal-safe code may run; `setsid` is a raw syscall that
-        // allocates nothing, and its failure is ignored on purpose because the
-        // child only wants to detach from the controlling terminal.
+        // SAFETY: `pre_exec` runs between fork and exec; `setsid` makes no
+        // allocations, and failure to detach is deliberately ignored.
         unsafe {
             command.pre_exec(|| {
                 let _ = rustix::process::setsid();
@@ -299,7 +290,6 @@ impl Pty {
         PtyChild(command.spawn().expect("spawn on pty"))
     }
 
-    /// Everything the pane has written so far, without blocking.
     pub fn read_now(&mut self) -> Vec<u8> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -328,8 +318,7 @@ impl Pty {
     }
 }
 
-/// A pane process running on a pty: killed and reaped when it goes out of
-/// scope, so a failed assertion cannot leave it behind.
+/// Pane process killed and reaped on drop, including after assertion failures.
 #[derive(Debug)]
 pub struct PtyChild(Child);
 
@@ -338,7 +327,6 @@ impl PtyChild {
         self.0.try_wait()
     }
 
-    /// Send the pane process a signal, the way a shell or the server would.
     pub fn signal(&self, signal: rustix::process::Signal) {
         let pid = rustix::process::Pid::from_raw(i32::try_from(self.0.id()).unwrap()).unwrap();
         rustix::process::kill_process(pid, signal).unwrap();
@@ -456,7 +444,7 @@ impl Client {
             shm: 0,
             xdg: 0,
         };
-        // get_registry(2) and sync(3), then wait for the sync callback.
+        // Request the registry, then wait for sync to finish its announcements.
         client.write(&message(1, 1, &u32s(&[2])));
         client.write(&message(1, 0, &u32s(&[3])));
         loop {
@@ -582,7 +570,6 @@ impl Client {
         messages
     }
 
-    /// Read messages until `predicate` accepts one, returning it.
     pub fn read_until(&mut self, mut predicate: impl FnMut(&Message) -> bool) -> Message {
         loop {
             let message = self.read();
@@ -613,14 +600,12 @@ impl Client {
         id
     }
 
-    /// Upload pixels as an `wl_shm` buffer.  The pool fd is passed with
-    /// `SCM_RIGHTS` and the backing file is unlinked immediately.
+    /// Upload a `wl_shm` buffer via `SCM_RIGHTS`; unlink its backing file.
     pub fn shm_buffer(&mut self, width: u32, height: u32, stride: u32, pixels: &[u8]) -> u32 {
         self.shm_buffer_with_file(width, height, stride, pixels).0
     }
 
-    /// As `shm_buffer`, but keeps the writable backing file so a benchmark can
-    /// change a few pixels without re-uploading the whole frame.
+    /// Return the writable backing file for modifying pixels after upload.
     pub fn shm_buffer_with_file(
         &mut self,
         width: u32,
@@ -642,12 +627,10 @@ impl Client {
         file.set_len(u64::from(stride) * u64::from(height)).unwrap();
         (&file).write_all(pixels).unwrap();
         self.send_fd(self.shm, 0, &u32s(&[pool_id, stride * height]), &file);
-        // The pool fd keeps the inode alive, so neither the file nor the
-        // directory it was staged in is needed once the fd has been sent.
+        // The sent pool fd keeps the inode alive after unlinking.
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&staging).unwrap();
-        // Argb8888: premultiplied 4-byte pixels, which the compositor reads as
-        // B, G, R and ignores the alpha byte of.
+        // Argb8888 pixels are B, G, R, alpha; the compositor ignores alpha.
         self.request(pool_id, 0, &u32s(&[buffer_id, 0, width, height, stride, 0]));
         self.request(pool_id, 1, &[]);
         (buffer_id, file)
@@ -676,7 +659,6 @@ impl Client {
         self.attach_surface(toplevel.surface, buffer, width, height);
     }
 
-    /// Attach a buffer to any surface and commit it.
     pub fn attach_surface(&mut self, surface: u32, buffer: u32, width: u32, height: u32) {
         self.request(surface, 1, &u32s(&[buffer, 0, 0]));
         self.request(surface, 2, &u32s(&[0, 0, width, height]));
@@ -691,7 +673,6 @@ impl Client {
         self.request(toplevel, 2, &string_arg(title));
     }
 
-    /// The window geometry a popup is positioned against.
     pub fn set_window_geometry(&mut self, xdg_surface: u32, x: i32, y: i32, w: i32, h: i32) {
         self.request(xdg_surface, 3, &i32s(&[x, y, w, h]));
     }
@@ -711,8 +692,7 @@ impl Client {
         self.request(subsurface, 5, &[]);
     }
 
-    /// Create a popup whose anchor rectangle sits at `anchor_rect` inside the
-    /// parent's window geometry.  The popup is `size` pixels.
+    /// Anchor the popup within the parent's window geometry.
     pub fn create_popup(
         &mut self,
         parent_xdg_surface: u32,
@@ -778,8 +758,7 @@ impl Client {
         id
     }
 
-    /// Request a frame callback.  Like every surface request it is
-    /// double-buffered, so this commits the surface to apply it.
+    /// Frame callbacks are double-buffered, so commit the request.
     pub fn frame_callback(&mut self, surface: u32) -> u32 {
         let id = self.alloc();
         self.request(surface, 3, &u32s(&[id]));
@@ -805,7 +784,6 @@ pub struct Window {
 pub struct Popup {
     pub surface: u32,
     pub xdg_surface: u32,
-    /// The `xdg_popup` object the compositor maps.
     pub handle: u32,
 }
 

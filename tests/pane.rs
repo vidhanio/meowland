@@ -5,16 +5,18 @@
 mod support;
 
 use std::{
-    io::Write as _,
-    os::unix::fs::FileExt as _,
+    io::{Read as _, Write as _},
+    os::unix::{fs::FileExt as _, net::UnixListener},
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-use support::{BINARY, Client, Pty, PtyChild, Server, fake::FakeTerminal, wait_for};
+use support::{BINARY, Client, Pty, PtyChild, Server, fake::FakeTerminal, temp_dir, wait_for};
 
-const SIDE: u32 = 4;
+/// Four cells each way at 2x2 pixels: a one-cell change stays well inside the
+/// quarter of the frame that still goes out as a patch.
+const SIDE: u32 = 8;
 
 fn gradient() -> Vec<u8> {
     let mut rgb = Vec::new();
@@ -75,7 +77,7 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
         "window was never announced"
     );
 
-    let mut pty = Pty::open(2, 2, (2, 2));
+    let mut pty = Pty::open(4, 4, (2, 2));
     let mut child = pty.spawn(
         Command::new(BINARY)
             .args(["attach", "1"])
@@ -135,8 +137,33 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
         (1, 1),
         "the second frame should be a single patch over the first image"
     );
+    let mut two_patches = patched;
+    for row in 6..8 {
+        for column in 6..8 {
+            let offset = ((row * SIDE + column) * 3) as usize;
+            two_patches[offset..offset + 3].copy_from_slice(&[0x40, 0x50, 0x60]);
+        }
+    }
+    let mut bottom_only = rgb.clone();
+    bottom_only[(6 * SIDE * 3) as usize..].copy_from_slice(&two_patches[(6 * SIDE * 3) as usize..]);
+    for (expected, what) in [
+        (&two_patches, "two distant patches"),
+        (&bottom_only, "the first patch reverted"),
+        (&rgb, "both patches reverted"),
+    ] {
+        let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(expected));
+        client.attach(&toplevel, buffer, SIDE, SIDE);
+        pump_until_drawn(&mut pty, &mut terminal, &mut child, expected, what);
+        assert_eq!(
+            terminal.whole_frames, 1,
+            "small changes and reversions must retain the whole-image base"
+        );
+    }
 
-    // Alt+W detaches; the pane must hand the terminal back.
+    detach(&mut pty, &mut child);
+}
+
+fn detach(pty: &mut Pty, child: &mut PtyChild) {
     pty.master.write_all(b"\x1bw").unwrap();
     assert!(
         wait_for(Duration::from_secs(10), || child
@@ -157,6 +184,53 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
     );
 }
 
+#[test]
+fn edge_mouse_reports_reach_the_client_without_closing_the_pane() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("edge clicks", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let seat = client.seat();
+    let pointer = client.get_pointer(seat);
+    let mut pty = Pty::open(4, 4, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["attach", "1"])
+            .env("XDG_RUNTIME_DIR", &server.runtime),
+    );
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(&mut pty, &mut terminal, &mut child, &rgb, "the first frame");
+
+    for (x, y) in [(3u16, 4u16), (0, 3), (3, 0), (0, 0), (1, 3)] {
+        write!(pty.master, "\x1b[<0;{x};{y}M").unwrap();
+        let motion = client
+            .read_until(|message| message.object == pointer && matches!(message.opcode, 0 | 2));
+        let offset = if motion.opcode == 0 { 2 } else { 1 };
+        assert_eq!(
+            (motion.u32_at(offset), motion.u32_at(offset + 1)),
+            (
+                u32::from(x.saturating_sub(1)) << 8,
+                u32::from(y.saturating_sub(1)) << 8
+            ),
+            "mouse report ({x}, {y}) reached the wrong pixel"
+        );
+        let press = client.read_until(|message| message.object == pointer && message.opcode == 3);
+        assert_eq!((press.u32_at(2), press.u32_at(3)), (0x110, 1));
+        write!(pty.master, "\x1b[<0;{x};{y}m").unwrap();
+        let release = client.read_until(|message| message.object == pointer && message.opcode == 3);
+        assert_eq!((release.u32_at(2), release.u32_at(3)), (0x110, 0));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "edge click closed the pane"
+        );
+    }
+    assert_eq!(server.list().len(), 1);
+    detach(&mut pty, &mut child);
+}
+
 /// A pane killed from outside hands the terminal back: raw mode, the
 /// alternate screen and mouse reporting all outlive a default-action death,
 /// and the shell that comes after it has no way to undo them.
@@ -173,7 +247,7 @@ fn a_signalled_pane_restores_the_terminal() {
         "window was never announced"
     );
 
-    let mut pty = Pty::open(2, 2, (2, 2));
+    let mut pty = Pty::open(4, 4, (2, 2));
     let mut child = pty.spawn(
         Command::new(BINARY)
             .args(["attach", "1"])
@@ -199,4 +273,105 @@ fn a_signalled_pane_restores_the_terminal() {
         text.contains("\x1b[?1003l"),
         "mouse reporting was left on: {text:?}"
     );
+}
+
+#[test]
+fn partial_server_packets_do_not_prevent_pane_shutdown() {
+    for (packet, signal) in [
+        (&[1][..], true),
+        (&[16, 0, 0, 0, 0][..], true),
+        (&[1][..], false),
+    ] {
+        let runtime = temp_dir("meowland-partial-packet");
+        let listener = UnixListener::bind(runtime.join("meowland-pane.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut pty = Pty::open(4, 4, (2, 2));
+        let mut child = pty.spawn(
+            Command::new(BINARY)
+                .args(["attach", "1"])
+                .env("XDG_RUNTIME_DIR", &runtime),
+        );
+        let mut terminal = FakeTerminal::new(8, 8, (2, 2));
+        let mut connection = None;
+        let mut hello = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let replies = terminal.feed(&pty.read_now());
+            pty.master.write_all(&replies).unwrap();
+            if connection.is_none() {
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        socket.set_nonblocking(true).unwrap();
+                        connection = Some(socket);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("accepting pane: {error}"),
+                }
+            }
+            if let Some(socket) = &mut connection {
+                let mut bytes = [0; 256];
+                match socket.read(&mut bytes) {
+                    Ok(count) => hello.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("reading pane hello: {error}"),
+                }
+            }
+            if hello.len() >= 4 {
+                let size = u32::from_le_bytes(hello[..4].try_into().unwrap()) as usize;
+                if hello.len() >= size + 4 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "pane hello was incomplete");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let mut socket = connection.unwrap();
+        socket.set_nonblocking(false).unwrap();
+        if signal {
+            let mut messages = Vec::new();
+            let rgb = gradient();
+            meowland::protocol::send(&mut messages, &meowland::protocol::ServerToPane::HelloOk)
+                .unwrap();
+            meowland::protocol::send(
+                &mut messages,
+                &meowland::protocol::ServerToPane::Frame {
+                    width: SIDE,
+                    height: SIDE,
+                    y: 0,
+                    rgb: rgb.clone(),
+                },
+            )
+            .unwrap();
+            for byte in messages {
+                socket.write_all(&[byte]).unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            pump_until_drawn(
+                &mut pty,
+                &mut terminal,
+                &mut child,
+                &rgb,
+                "a fragmented frame",
+            );
+        }
+        socket.write_all(packet).unwrap();
+        if signal {
+            thread::sleep(Duration::from_millis(100));
+            child.signal(rustix::process::Signal::TERM);
+        }
+        assert!(
+            wait_for(Duration::from_secs(2), || child
+                .try_wait()
+                .unwrap()
+                .is_some()),
+            "partial packet blocked termination or the handshake deadline"
+        );
+        let text = String::from_utf8_lossy(&pty.read_now()).into_owned();
+        assert!(
+            text.contains("\x1b[?1049l"),
+            "terminal was not restored: {text:?}"
+        );
+        assert!(!signal || child.try_wait().unwrap().unwrap().success());
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
 }

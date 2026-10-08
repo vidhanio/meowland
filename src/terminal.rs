@@ -1,15 +1,9 @@
-//! Terminal side of a meowland pane.
-//!
-//! The terminal is deliberately kept in this module: the server never needs
-//! to know about raw mode, terminal escape sequences, or crossterm events.
+//! Terminal input, graphics, and mode management for a pane.
 
 use std::{
-    fs,
     io::{self, Write},
     os::unix::net::UnixStream,
     path::Path,
-    process,
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -23,69 +17,65 @@ use rustix::{
 };
 
 use crate::{
-    Error, Result, diag,
+    Error, Result,
     kitty::{Presenter, SharedMemory},
     protocol::{self, Hello, Input, PaneToServer, ServerToPane, Show},
+    signals,
 };
 
 const CELL_WIDTH: u16 = 10;
 const CELL_HEIGHT: u16 = 20;
-/// The size of a cell a pane assumes when the terminal never reported one, so
-/// that a pane in a quiet terminal still has a size to send.
+/// Cell size assumed when the terminal reports none.
 const FALLBACK_CELL: (u16, u16) = (CELL_WIDTH, CELL_HEIGHT);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-/// After the last reply, a terminal gets this long to send stragglers.
+/// Quiet period after device attributes, allowing late probe replies.
 const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
 const GRAPHICS_ID: u32 = 31;
 
-/// Everything a pane asks the terminal after it takes it over.  Device
-/// attributes are asked for last: they are the one reply every terminal gives,
-/// so the reply is the end of the handshake.
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;AAAA\x1b\\";
+/// Query device attributes last so their reply starts the handshake's quiet
+/// window.
 const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[c";
 
-/// What a terminal said about itself.
+/// Terminal capabilities discovered during the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProbeInfo {
     pub pixel_width: Option<u32>,
     pub pixel_height: Option<u32>,
     pub cell_width: Option<u16>,
     pub cell_height: Option<u16>,
-    /// The graphics query was answered with `OK`.
     pub graphics: bool,
-    /// The one-pixel shared memory query was answered with `OK`.
     pub shared_memory: bool,
-    /// `Some(true)` when the terminal reports `SGR-Pixels` mouse mode.
+    /// `Some(true)` when `SGR-Pixels` mouse mode is supported.
     pub sgr_pixels: Option<bool>,
-    /// The name from an `XTVERSION` reply, if the terminal sent one.
     pub name: Option<String>,
 }
 
-/// The coordinates a terminal reports with mouse events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MouseUnits {
     Pixels,
     Cells,
 }
 
-/// Ask the terminal about itself and read the replies.  The reads are raw, so
-/// they stay in step with the poll that says there is something to read; going
-/// through a buffered reader would leave bytes invisible to the next poll.
-fn terminal_probe() -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
+/// Probe using unbuffered reads: buffered input could hide bytes from `poll`.
+fn terminal_probe(
+    interrupted: &signals::TerminationFlag,
+) -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
     let slot = SharedMemory::new();
     let shared_probe = slot.probe();
-    let mut query = Vec::from(PROBE_QUERY);
-    query.extend(shared_probe.iter().flatten().copied());
-    query.extend_from_slice(PROBE_QUERY_TAIL);
     let mut out = io::stdout();
-    out.write_all(&query)?;
+    out.write_all(PROBE_QUERY)?;
+    if let Some(command) = &shared_probe {
+        out.write_all(command)?;
+    }
+    out.write_all(PROBE_QUERY_TAIL)?;
     out.flush()?;
     let stdin = io::stdin();
     let mut bytes = Vec::new();
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut quiet_deadline = None;
-    loop {
+    while !interrupted.interrupted() {
         let now = Instant::now();
         let stop_at = quiet_deadline.unwrap_or(deadline);
         if now >= stop_at {
@@ -100,7 +90,13 @@ fn terminal_probe() -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
             tv_sec: wait.as_secs() as i64,
             tv_nsec: wait.subsec_nanos().into(),
         };
-        if poll(&mut fds, Some(&timeout))? == 0 {
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        }
+        if interrupted.interrupted() {
             break;
         }
         if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR) {
@@ -124,8 +120,8 @@ fn terminal_probe() -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
     }
     let mut probe = parse_probe_bytes(&bytes);
     probe.shared_memory &= shared_probe.is_some();
-    // A terminal that answered `OK` has read, and so unlinked, the probe
-    // object; clear it again for the ones that answer without reading.
+    // Even an `OK` reply may leave the probe object linked; clear the slot
+    // before handing it to the presenter.
     let shared = if probe.shared_memory {
         slot.clear();
         Some(slot)
@@ -135,9 +131,8 @@ fn terminal_probe() -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
     Ok((probe, shared))
 }
 
-/// Whether a device-attributes reply is in `bytes`.  That reply is what ends
-/// the probe's quiet window, and the DECRQM reply is a `CSI ?` sequence too,
-/// so the whole `CSI ? <params> c` shape is matched rather than a stray `c`.
+/// Match a complete device-attributes reply, not a DECRQM `CSI ?` reply or
+/// an incidental `c`, before starting the quiet window.
 fn device_attributes_seen(bytes: &[u8]) -> bool {
     let mut index = 0;
     while let Some(offset) = find(&bytes[index..], b"\x1b[?") {
@@ -163,8 +158,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Parse the terminal replies.  Keeping this separate from the read loop makes
-/// it testable against captured handshakes.
 fn parse_probe_bytes(bytes: &[u8]) -> ProbeInfo {
     let mut out = ProbeInfo::default();
     let mut index = 0;
@@ -219,7 +212,6 @@ fn parse_probe_bytes(bytes: &[u8]) -> ProbeInfo {
     out
 }
 
-/// Split a control sequence at `start` into its body and final byte.
 fn control_sequence(bytes: &[u8], start: usize) -> Option<(&[u8], u8, usize)> {
     let body_start = start + 2;
     let mut index = body_start;
@@ -233,8 +225,8 @@ fn control_sequence(bytes: &[u8], start: usize) -> Option<(&[u8], u8, usize)> {
     None
 }
 
-/// `CSI 4 ; height ; width t` is the text area, `CSI 6 ; height ; width t` one
-/// cell.  Zero is how terminals answer "no idea", and is treated as no answer.
+/// `CSI 4` reports text-area pixels; `CSI 6` reports cell pixels.
+/// A zero dimension means the terminal has no answer.
 fn parse_size_reply(body: &[u8], out: &mut ProbeInfo) {
     let body = body.strip_prefix(b"?").unwrap_or(body);
     let mut fields = body.split(|byte| *byte == b';');
@@ -261,8 +253,7 @@ fn parse_size_reply(body: &[u8], out: &mut ProbeInfo) {
     }
 }
 
-/// `CSI ? mode ; value $ y`: zero means unsupported, anything else means the
-/// terminal knows the mode.
+/// DECRQM `CSI ? mode ; value $ y`: zero means unsupported.
 fn parse_decrqm_reply(body: &[u8], out: &mut ProbeInfo) {
     let Some(body) = body.strip_prefix(b"?") else {
         return;
@@ -280,7 +271,7 @@ fn parse_decrqm_reply(body: &[u8], out: &mut ProbeInfo) {
     }
 }
 
-/// A kitty graphics reply: `i=<id> ; <message>`.
+/// Kitty graphics reply: `i=<id> ; <message>`.
 fn kitty_reply(body: &[u8], id: u32) -> Option<bool> {
     let (control, payload) = body
         .iter()
@@ -298,9 +289,8 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.trim().parse().ok()
 }
 
-/// `SGR-Pixels` is preferred, but it is not universally answered, so the
-/// terminal's name decides: the terminals that implement it are the ones that
-/// prefix their version with these names.
+/// Prefer reported `SGR-Pixels` support; otherwise infer it from terminal
+/// names.
 fn mouse_units(probe: &ProbeInfo) -> MouseUnits {
     match probe.sgr_pixels {
         Some(true) => MouseUnits::Pixels,
@@ -323,13 +313,8 @@ fn mouse_units(probe: &ProbeInfo) -> MouseUnits {
     }
 }
 
-/// Per-second frame counters, appended to the same log the server writes.
-///
-/// A pane's terminal is its display, so its own diagnostics cannot go there;
-/// the log is where a slow terminal is told apart from a slow compositor.
+/// Log pane throughput to the user journal once per second.
 struct PaneStats {
-    log: Option<fs::File>,
-    pid: u32,
     window: Instant,
     frames: u32,
     drawn: u32,
@@ -340,10 +325,8 @@ struct PaneStats {
 }
 
 impl PaneStats {
-    fn new(socket: &Path) -> Self {
+    fn new() -> Self {
         Self {
-            log: diag::open(&diag::path(socket)).ok(),
-            pid: process::id(),
             window: Instant::now(),
             frames: 0,
             drawn: 0,
@@ -354,28 +337,18 @@ impl PaneStats {
         }
     }
 
-    fn line(&mut self, message: &str) {
-        let Some(file) = self.log.as_mut() else {
-            return;
-        };
-        let _ = writeln!(file, "{} pane {}: {message}", diag::seconds(), self.pid);
+    fn capabilities(probe: &ProbeInfo, width: u32, height: u32) {
+        tracing::info!(
+            width, height,
+            cell = ?probe.cell_width.zip(probe.cell_height),
+            terminal = ?probe.name,
+            graphics = probe.graphics,
+            shared_memory = probe.shared_memory,
+            sgr_pixels = ?probe.sgr_pixels,
+            "pane attached"
+        );
     }
 
-    /// What the terminal said about itself, and the size it is drawn at.
-    fn capabilities(&mut self, probe: &ProbeInfo, width: u32, height: u32) {
-        self.line(&format!(
-            "attached {width}x{height} cell={:?} terminal={:?} graphics={} shared_memory={} \
-             sgr_pixels={:?}",
-            probe.cell_width.zip(probe.cell_height),
-            probe.name,
-            probe.graphics,
-            probe.shared_memory,
-            probe.sgr_pixels,
-        ));
-    }
-
-    /// One frame taken from the compositor: what it cost to encode and to
-    /// write, and whether anything was written at all.
     fn frame(&mut self, bytes: usize, dropped: bool, encoded: Duration, written: Duration) {
         self.frames += 1;
         self.drawn += u32::from(bytes > 0);
@@ -394,33 +367,31 @@ impl PaneStats {
         let written = std::mem::take(&mut self.written);
         let dropped = std::mem::take(&mut self.dropped);
         self.window = Instant::now();
-        let per_frame = f64::from(frames.max(1));
-        self.line(&format!(
-            "frames={:.1}/s drawn={drawn} dropped={dropped} unchanged={} out={:.2}MB/s encode={:.1}ms \
-             write={:.1}ms",
-            f64::from(frames) / elapsed,
-            frames.saturating_sub(drawn).saturating_sub(dropped),
-            bytes as f64 / elapsed / 1e6,
-            encoded.as_secs_f64() * 1000.0 / per_frame,
-            written.as_secs_f64() * 1000.0 / per_frame,
-        ));
+        tracing::info!(
+            fps = f64::from(frames) / elapsed,
+            drawn,
+            dropped,
+            unchanged = frames.saturating_sub(drawn).saturating_sub(dropped),
+            mb_per_second = bytes as f64 / elapsed / 1e6,
+            encode_ms = encoded.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+            write_ms = written.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
+            "pane throughput"
+        );
     }
 }
 
-/// Attach this process's terminal to a pane socket and run until released.
+/// Attach this terminal to a pane until release or disconnection.
 ///
 /// # Errors
-/// Returns an error when the pane socket cannot be reached, when the terminal
-/// cannot be taken over or does not answer the handshake, and when the pane
-/// connection fails.  Being released by the server is not an error: the pane
-/// prints the reason and returns `Ok`.
+/// Fails if the terminal cannot be configured or probed, or the pane
+/// connection fails. Server-initiated release restores the terminal and
+/// returns `Ok`.
 #[expect(
     clippy::too_many_lines,
-    reason = "the pane's single event loop; every arm shares the same socket, probe and \
-              terminal guard"
+    reason = "terminal setup and the readiness-driven pane event loop"
 )]
 pub fn attach(socket: &Path, show: Show) -> Result<()> {
-    let mut stream = UnixStream::connect(socket).map_err(|error| {
+    let stream = UnixStream::connect(socket).map_err(|error| {
         Error::io(
             format!(
                 "could not reach the pane socket {} (is the server running?)",
@@ -430,21 +401,20 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         )
     })?;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    // A pane killed from outside must still hand the terminal back: raw mode,
-    // the alternate screen and mouse reporting all outlive a default-action
-    // death, and the shell that comes after it cannot undo them.  The handlers
-    // go in before the terminal is taken over, so a signal during the probe is
-    // not a window in which the modes outlive the pane.
-    let interrupted = diag::termination_flag()?;
+    // Install termination handlers before taking over the terminal so signals
+    // during the probe cannot leave raw mode or the alternate screen active.
+    let interrupted = signals::termination_flag()?;
     let mut mode = TerminalGuard::enter()?;
-    let (probe, shared) = terminal_probe()?;
+    let (probe, shared) = terminal_probe(&interrupted)?;
+    if interrupted.interrupted() {
+        mode.restore()?;
+        return Ok(());
+    }
     if !probe.graphics {
         return Err(Error::GraphicsUnsupported);
     }
     let units = mouse_units(&probe);
     mode.enable_mouse(units)?;
-    // The size of a cell is what the probe answered, or the fallback the pane
-    // assumes so a terminal that stayed quiet still has a geometry.
     let mut cell = probe.cell_width.zip(probe.cell_height);
     let (width, height) = pane_pixels(
         probe.pixel_width.zip(probe.pixel_height),
@@ -462,47 +432,46 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
     let mut presenter = Presenter::new(cell, shared);
-    let mut stats = PaneStats::new(socket);
-    stats.capabilities(&probe, hello.width, hello.height);
+    let mut stats = PaneStats::new();
+    PaneStats::capabilities(&probe, hello.width, hello.height);
 
     let handshake_deadline = Instant::now() + Duration::from_secs(1);
     let mut handshake_done = false;
+    let mut reader = protocol::MessageReader::default();
     let stdin = io::stdin();
     let stdout = io::stdout();
     loop {
-        if interrupted.load(Ordering::Relaxed) {
-            // Something asked the pane to leave; the terminal goes back the
-            // same way it does on any other exit.
+        if interrupted.interrupted() {
             mode.restore()?;
             return Ok(());
         }
         if !handshake_done && Instant::now() >= handshake_deadline {
             return Err(Error::PaneHandshakeTimeout);
         }
-        // Wait on the terminal, the pane socket and the handshake in one go.
-        // Waiting on the socket itself, rather than on a relay thread's
-        // channel, is what lets a frame be drawn the moment it arrives.
+        // Poll the socket directly so incoming frames wake the renderer.
         let mut fds = [
             PollFd::new(&stdin, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&stdout, PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
         ];
-        // The wait is open-ended once the handshake is answered: every source
-        // wakes the poll on its own, so there is nothing to poll for.
-        let timeout = (!handshake_done).then(|| {
-            let wait = handshake_deadline.saturating_duration_since(Instant::now());
-            Timespec {
-                tv_sec: wait.as_secs() as i64,
-                tv_nsec: wait.subsec_nanos().into(),
-            }
-        });
-        // A signal that is not one of the pane's own (a resize, say) lands
-        // here; the flag is read at the top of the loop, so waiting again is
-        // all that is left to do.
-        match poll(&mut fds, timeout.as_ref()) {
+        // Bound idle waits because a signal can arrive just before poll,
+        // after the flag check, and therefore not interrupt the syscall.
+        let mut wait = Duration::from_millis(100);
+        if !handshake_done {
+            wait = wait.min(handshake_deadline.saturating_duration_since(Instant::now()));
+        }
+        let timeout = Timespec {
+            tv_sec: wait.as_secs() as i64,
+            tv_nsec: wait.subsec_nanos().into(),
+        };
+        // Interrupted polls resume after the termination flag is checked.
+        match poll(&mut fds, Some(&timeout)) {
             Err(Errno::INTR) => continue,
             Err(error) => return Err(io::Error::from(error).into()),
             Ok(_) => {}
+        }
+        if interrupted.interrupted() {
+            continue;
         }
         if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR)
             || fds[1].revents().intersects(PollFlags::HUP | PollFlags::ERR)
@@ -513,137 +482,155 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             .revents()
             .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
         {
-            let Ok(message) = protocol::recv::<ServerToPane>(&mut stream) else {
+            let Ok(message) = reader.try_recv::<ServerToPane>(&stream) else {
                 mode.restore_with_message("server disconnected")?;
                 return Ok(());
             };
-            match message {
-                ServerToPane::HelloOk => handshake_done = true,
-                ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
-                    mode.restore_with_message(&reason)?;
-                    return Ok(());
-                }
-                ServerToPane::Title(title) => set_title(&title),
-                ServerToPane::Cursor(shape) => set_cursor(shape.as_deref()),
-                ServerToPane::Frame {
-                    width,
-                    height,
-                    y,
-                    rgb,
-                } => {
-                    let started = Instant::now();
-                    let update = presenter.present(width, height, y, rgb);
-                    let encoded = started.elapsed();
-                    let written = Instant::now();
-                    if !update.is_empty() {
-                        io::stdout().write_all(&update)?;
-                        io::stdout().flush()?;
+            if let Some(message) = message {
+                match message {
+                    ServerToPane::HelloOk => handshake_done = true,
+                    ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
+                        mode.restore_with_message(&reason)?;
+                        return Ok(());
                     }
-                    stats.frame(
-                        update.len(),
-                        presenter.dropped(),
-                        encoded,
-                        written.elapsed(),
-                    );
-                    protocol::send(
-                        &mut tx,
-                        &PaneToServer::Ack {
-                            drawn: !presenter.dropped(),
-                        },
-                    )?;
+                    ServerToPane::Title(title) => set_title(&title),
+                    ServerToPane::Cursor(shape) => set_cursor(shape.as_deref()),
+                    ServerToPane::Frame {
+                        width,
+                        height,
+                        y,
+                        rgb,
+                    } => draw_frame(width, height, y, rgb, &mut presenter, &mut stats, &mut tx)?,
                 }
             }
         }
-        // Everything the terminal has already sent, not one event per wakeup.
-        while event::poll(Duration::ZERO)? {
-            match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if let Some(code) = binding_code(key) {
-                        send_key_bits(&mut tx, code, modifier_bits(key.modifiers))?;
-                        continue;
-                    }
-                    if let Some((code, modifiers)) = key_input(key) {
-                        send_key_bits(&mut tx, code, modifiers)?;
-                    }
-                }
-                Event::Resize(cols, rows) => {
-                    let pixels = window_pixels();
-                    // A font zoom changes the cell the terminal draws with
-                    // without changing the answer the probe got, so the cell
-                    // is derived again from this reading.
-                    cell = derived_cell(pixels, (cols, rows)).or(cell);
-                    presenter.set_cell_size(cell);
-                    let (width, height) =
-                        pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
-                    protocol::send(&mut tx, &PaneToServer::Resize { width, height })?;
-                }
-                Event::Mouse(mouse) => {
-                    let (pressed, button, scroll) = match mouse.kind {
-                        MouseEventKind::Down(b) => (true, Some(b as u8), 0),
-                        MouseEventKind::Up(b) => (false, Some(b as u8), 0),
-                        MouseEventKind::ScrollUp => (true, None, 15),
-                        MouseEventKind::ScrollDown => (true, None, -15),
-                        _ => (false, None, 0),
-                    };
-                    let (x, y) = match units {
-                        MouseUnits::Pixels => (f64::from(mouse.column), f64::from(mouse.row)),
-                        // Without `SGR-Pixels` the cell is the unit; aim at its
-                        // middle so a click lands inside the cell.
-                        MouseUnits::Cells => {
-                            let (cell_width, cell_height) = cell.unwrap_or(FALLBACK_CELL);
-                            let (cell_width, cell_height) =
-                                (f64::from(cell_width), f64::from(cell_height));
-                            (
-                                f64::from(mouse.column).mul_add(cell_width, cell_width / 2.0),
-                                f64::from(mouse.row).mul_add(cell_height, cell_height / 2.0),
-                            )
-                        }
-                    };
-                    protocol::send(
-                        &mut tx,
-                        &PaneToServer::Input(Input::Pointer {
-                            x,
-                            y,
-                            button,
-                            pressed,
-                            scroll,
-                        }),
-                    )?;
-                }
-                Event::Paste(text) => {
-                    // A paste copied from a system that ends lines with CRLF
-                    // is one line break, not two.
-                    let mut characters = text.chars().peekable();
-                    while let Some(character) = characters.next() {
-                        let code = match character {
-                            '\r' if characters.peek() == Some(&'\n') => {
-                                characters.next();
-                                Some(28)
-                            }
-                            '\n' | '\r' => Some(28),
-                            '\t' => Some(15),
-                            _ => evdev_char_code(character),
-                        };
-                        if let Some(code) = code {
-                            send_key_bits(&mut tx, code, u8::from(needs_shift(character)))?;
-                        }
-                    }
-                }
-                _ => {}
-            }
+        // Drain all queued terminal events on each wakeup.
+        while !interrupted.interrupted() && event::poll(Duration::ZERO)? {
+            send_event(event::read()?, &mut tx, &mut presenter, &mut cell, units)?;
         }
     }
 }
 
-/// The Linux input code and modifier bits a key event carries, or `None` for
-/// a key the pane cannot express as one.
+/// Present exactly one frame before acknowledging it to the compositor.
+fn draw_frame(
+    width: u32,
+    height: u32,
+    y: u32,
+    rgb: Vec<u8>,
+    presenter: &mut Presenter,
+    stats: &mut PaneStats,
+    tx: &mut UnixStream,
+) -> Result<()> {
+    let started = Instant::now();
+    let update = presenter.present(width, height, y, rgb);
+    let encoded = started.elapsed();
+    let written = Instant::now();
+    if !update.is_empty() {
+        io::stdout().write_all(&update)?;
+        io::stdout().flush()?;
+    }
+    stats.frame(
+        update.len(),
+        presenter.dropped(),
+        encoded,
+        written.elapsed(),
+    );
+    protocol::send(
+        tx,
+        &PaneToServer::Ack {
+            drawn: !presenter.dropped(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Translate a terminal event using the current pane geometry.
+fn send_event(
+    event: Event,
+    tx: &mut UnixStream,
+    presenter: &mut Presenter,
+    cell: &mut Option<(u16, u16)>,
+    units: MouseUnits,
+) -> Result<()> {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            if let Some(code) = binding_code(key) {
+                send_key_bits(tx, code, modifier_bits(key.modifiers))?;
+            } else if let Some((code, modifiers)) = key_input(key) {
+                send_key_bits(tx, code, modifiers)?;
+            }
+        }
+        Event::Resize(cols, rows) => {
+            let pixels = window_pixels();
+            // Recalculate cell size after font zoom, which need not change
+            // the dimensions reported by the initial probe.
+            *cell = derived_cell(pixels, (cols, rows)).or(*cell);
+            presenter.set_cell_size(*cell);
+            let (width, height) =
+                pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
+            protocol::send(tx, &PaneToServer::Resize { width, height })?;
+        }
+        Event::Mouse(mouse) => {
+            let (pressed, button, scroll) = match mouse.kind {
+                MouseEventKind::Down(b) => (true, Some(b as u8), 0),
+                MouseEventKind::Up(b) => (false, Some(b as u8), 0),
+                MouseEventKind::ScrollUp => (true, None, 15),
+                MouseEventKind::ScrollDown => (true, None, -15),
+                _ => (false, None, 0),
+            };
+            let (x, y) = match units {
+                MouseUnits::Pixels => (f64::from(mouse.column), f64::from(mouse.row)),
+                // Cell mouse coordinates target the center of each cell.
+                MouseUnits::Cells => {
+                    let (cell_width, cell_height) = cell.unwrap_or(FALLBACK_CELL);
+                    let (cell_width, cell_height) = (f64::from(cell_width), f64::from(cell_height));
+                    (
+                        f64::from(mouse.column).mul_add(cell_width, cell_width / 2.0),
+                        f64::from(mouse.row).mul_add(cell_height, cell_height / 2.0),
+                    )
+                }
+            };
+            protocol::send(
+                tx,
+                &PaneToServer::Input(Input::Pointer {
+                    x,
+                    y,
+                    button,
+                    pressed,
+                    scroll,
+                }),
+            )?;
+        }
+        Event::Paste(text) => {
+            // Treat pasted CRLF as one newline.
+            let mut characters = text.chars().peekable();
+            while let Some(character) = characters.next() {
+                let code = match character {
+                    '\r' if characters.peek() == Some(&'\n') => {
+                        characters.next();
+                        Some(28)
+                    }
+                    '\n' | '\r' => Some(28),
+                    '\t' => Some(15),
+                    _ => evdev_char_code(character),
+                };
+                if let Some(code) = code {
+                    send_key_bits(tx, code, u8::from(needs_shift(character)))?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Convert a terminal key event to a Linux input code and modifier bits.
 fn key_input(key: KeyEvent) -> Option<(u16, u8)> {
     let mut modifiers = key.modifiers;
     if let KeyCode::Char(character) = key.code
         && needs_shift(character)
     {
-        // Legacy terminal input reports the shifted character without a
-        // modifier, so the shift is restored here.
+        // Legacy input can send a shifted character without the Shift modifier.
         modifiers.insert(KeyModifiers::SHIFT);
     }
     let code = match key.code {
@@ -662,9 +649,7 @@ fn key_input(key: KeyEvent) -> Option<(u16, u8)> {
         KeyCode::PageDown => 109,
         KeyCode::Delete => 111,
         KeyCode::Insert => 110,
-        // The function keys are not in one run in evdev: `KEY_F1`..`KEY_F10`
-        // are 59..68, `KEY_F11` and `KEY_F12` are 87 and 88, and `KEY_F13` and
-        // up continue from 183.
+        // evdev F1–F10, F11–F12, and F13–F24 occupy separate ranges.
         KeyCode::F(n) => match n {
             1..=10 => 58 + u16::from(n),
             11 => 87,
@@ -752,14 +737,12 @@ const fn evdev_char_code(c: char) -> Option<u16> {
     })
 }
 
-/// Whether typing this character needs Shift held on the `us` layout, which is
-/// the layout [`evdev_char_code`] is a table of.
+/// Shift requirement on the US keyboard layout used by `evdev_char_code`.
 fn needs_shift(c: char) -> bool {
     c.is_ascii_uppercase() || "!@#$%^&*()_+{}:\"~|<>?".contains(c)
 }
 
-/// The terminal's size in pixels as the kernel last saw it.  Terminals that
-/// do not report pixels at all answer with zeros, which is no answer.
+/// Kernel-reported window pixels; zero dimensions mean unavailable.
 fn window_pixels() -> Option<(u32, u32)> {
     terminal::window_size()
         .ok()
@@ -767,10 +750,8 @@ fn window_pixels() -> Option<(u32, u32)> {
         .filter(|(width, height)| *width > 0 && *height > 0)
 }
 
-/// The pane's size in pixels for a window of `cells` cells.  A pixel size the
-/// terminal reported wins over the cells: `reported` is what the terminal
-/// answered itself, `fresh` what the kernel was told just now, and a window
-/// neither of them describes is its cells times the size of a cell.
+/// Prefer terminal-reported pixels, then fresh kernel pixels, then cell
+/// geometry.
 fn pane_pixels(
     reported: Option<(u32, u32)>,
     fresh: Option<(u32, u32)>,
@@ -785,9 +766,7 @@ fn pane_pixels(
     })
 }
 
-/// The size of a cell derived from a window reading.  A font zoom changes the
-/// cell the terminal draws with and leaves no other trace, so this is how a
-/// pane notices one.
+/// Recalculate cell size from window pixels after font zoom.
 fn derived_cell(pixels: Option<(u32, u32)>, cells: (u16, u16)) -> Option<(u16, u16)> {
     let (width, height) = pixels?;
     let (cols, rows) = (u32::from(cells.0), u32::from(cells.1));
@@ -801,7 +780,6 @@ fn derived_cell(pixels: Option<(u32, u32)>, cells: (u16, u16)) -> Option<(u16, u
     (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
-/// The terminal's modifier flags as the bits the pane protocol packs.
 fn modifier_bits(modifiers: KeyModifiers) -> u8 {
     use protocol::modifiers::{ALT, CONTROL, SHIFT, SUPER};
     let mut bits = 0;
@@ -818,8 +796,7 @@ fn modifier_bits(modifiers: KeyModifiers) -> u8 {
     bits
 }
 
-/// `Alt+Q` asks the shown window to close and `Alt+W` detaches, in Linux input
-/// codes.  Only without Ctrl or Super, so everything else reaches the client.
+/// Intercept Alt+Q and Alt+W only without Ctrl or Super.
 fn binding_code(key: KeyEvent) -> Option<u16> {
     if !protocol::modifiers::alt_only(modifier_bits(key.modifiers)) {
         return None;
@@ -837,8 +814,7 @@ fn set_title(title: &str) {
     let _ = io::stdout().flush();
 }
 
-/// The kitty pointer shape: a CSS cursor name, or an empty name to let the
-/// terminal draw its own pointer again.
+/// Set the kitty pointer shape; an empty name restores the terminal default.
 fn set_cursor(shape: Option<&str>) {
     let name: String = shape
         .unwrap_or_default()
@@ -850,7 +826,7 @@ fn set_cursor(shape: Option<&str>) {
     let _ = io::stdout().flush();
 }
 
-/// The terminal modes a pane turns on, and the exact set it turns back off.
+/// Restores the terminal modes enabled by this pane.
 struct TerminalGuard {
     active: bool,
     mouse: Option<MouseUnits>,
@@ -858,8 +834,8 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        // The guard exists before the modes are turned on, so any failure
-        // below still undoes what has already been applied.
+        // Establish the guard before further mode changes so failures unwind
+        // them.
         let guard = Self {
             active: true,
             mouse: None,
@@ -874,8 +850,6 @@ impl TerminalGuard {
         Ok(guard)
     }
 
-    /// Reporting is chosen after the probe, so the mouse is not enabled
-    /// together with the other modes.
     fn enable_mouse(&mut self, units: MouseUnits) -> io::Result<()> {
         let modes: &[u8] = match units {
             MouseUnits::Pixels => b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h",
@@ -893,10 +867,8 @@ impl TerminalGuard {
         writeln!(io::stdout(), "meowland: {clean}")
     }
 
-    /// Undo every mode the pane turned on.  Each step is attempted even after
-    /// one of them fails: a shell cannot live with any of them left behind,
-    /// and the ones that follow raw mode are exactly the ones a broken write
-    /// would otherwise skip.
+    /// Attempt every restoration step even if an earlier one fails; a shell
+    /// must not inherit terminal modes after a partial cleanup.
     fn restore(&mut self) -> io::Result<()> {
         if !self.active {
             return Ok(());
@@ -908,8 +880,7 @@ impl TerminalGuard {
                 failure = result.err();
             }
         };
-        // Raw mode is the one mode that survives a writer that cannot reach
-        // the terminal, so it is undone before any write that could fail.
+        // Disable raw mode before potentially failing terminal writes.
         note(terminal::disable_raw_mode());
         if let Some(units) = self.mouse.take() {
             let off: &[u8] = match units {
@@ -1016,8 +987,6 @@ mod tests {
         assert_eq!(key('a', KeyModifiers::NONE), Some((30, 0)));
     }
 
-    /// Windows-style F1..F24 are not one run of codes in evdev, and F11 and
-    /// F12 in particular sit far away from F10.
     #[test]
     fn function_keys_use_their_evdev_codes() {
         let key = |n| key_input(KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE));
@@ -1038,9 +1007,7 @@ mod tests {
         );
     }
 
-    /// The probe's quiet window is armed by the device-attributes reply, and
-    /// both the DECRQM reply and the terminal name contain the letters that
-    /// a substring match would trip over.
+    /// A DECRQM reply or terminal name must not start the probe's quiet window.
     #[test]
     fn only_a_complete_device_attributes_reply_ends_the_probe() {
         assert!(!device_attributes_seen(b"\x1b[?1016;2$y"));
@@ -1049,9 +1016,6 @@ mod tests {
         assert!(device_attributes_seen(b"\x1b[?1016;2$y\x1b[?62;4;6;22c"));
     }
 
-    /// A pane reports the pixels the terminal does, and a cell size derived
-    /// from them when the probe's answer is all it has: the two must agree
-    /// about the same window.
     #[test]
     fn pane_size_prefers_reported_pixels() {
         assert_eq!(

@@ -29,33 +29,30 @@
             ...
           }:
           let
-            craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (
-              p:
-              p.rust-bin.stable.latest.default.override {
-                extensions = [
-                  "rust-src"
-                  "rust-analyzer"
-                ];
-              }
-            );
-
-            craneLibNightly = (inputs.crane.mkLib pkgs).overrideToolchain (
+            nightlyToolchain =
               p:
               p.rust-bin.nightly.latest.default.override {
                 extensions = [
                   "rust-src"
                   "rust-analyzer"
                 ];
-              }
-            );
+              };
+            craneLib = (inputs.crane.mkLib pkgs).overrideToolchain nightlyToolchain;
 
-            src = craneLibNightly.cleanCargoSource ./.;
+            # Keep rustfmt.toml in crane's filtered source for nightly formatting.
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter =
+                path: type:
+                craneLib.filterCargoSources path type || pkgs.lib.baseNameOf (toString path) == "rustfmt.toml";
+            };
 
             nativeBuildInputs = [ pkgs.pkg-config ];
 
             buildInputs = [
               pkgs.libglvnd
               pkgs.libxkbcommon
+              pkgs.libgbm
             ];
 
             runtimeInputs = [
@@ -91,6 +88,11 @@
                     --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]} \
                     --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
 
+                  install -Dm644 ${./share/systemd/user/meowland.service} \
+                    $out/share/systemd/user/meowland.service
+                  substituteInPlace $out/share/systemd/user/meowland.service \
+                    --replace-fail 'ExecStart=meowland ' "ExecStart=$out/bin/meowland "
+
                   installShellCompletion --cmd meowland \
                     --bash <($out/bin/meowland completions bash) \
                     --fish <($out/bin/meowland completions fish) \
@@ -108,7 +110,7 @@
             packages.default = meowland;
 
             checks = {
-              clippy = craneLibNightly.cargoClippy (
+              clippy = craneLib.cargoClippy (
                 commonArgs
                 // {
                   inherit cargoArtifacts;
@@ -116,7 +118,7 @@
                 }
               );
 
-              test = craneLibNightly.cargoTest (
+              test = craneLib.cargoTest (
                 commonArgs
                 // {
                   inherit cargoArtifacts;
@@ -124,7 +126,7 @@
                 }
               );
 
-              fmt = craneLibNightly.cargoFmt { inherit src; };
+              fmt = craneLib.cargoFmt { inherit src; };
             };
 
             devShells.default = craneLib.devShell {
@@ -150,7 +152,7 @@
                 deadnix.enable = true;
                 rustfmt = {
                   enable = true;
-                  package = pkgs.rust-bin.nightly.latest.rustfmt;
+                  package = nightlyToolchain pkgs;
                 };
                 taplo.enable = true;
               };

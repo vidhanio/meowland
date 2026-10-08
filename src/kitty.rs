@@ -1,12 +1,9 @@
-//! Encoding of RGB frames for the kitty graphics protocol.
-//!
-//! `Presenter` deliberately owns the previous frame.  Callers can therefore
-//! hand it a frame and immediately reuse their frame storage after this
-//! method returns.  The output is one synchronized terminal update.
+//! Encode RGB frames for the kitty graphics protocol.
 
 use std::{
     fs::File,
     io::Write,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,25 +15,22 @@ use flate2::{Compression, write::ZlibEncoder};
 use rustix::{fs::Mode, shm};
 
 const MAX_PATCHES: usize = 32;
-/// Whole frames a terminal may leave unread before the shared object is
-/// cleared and the frame goes down the pty instead.  A terminal that is a
-/// frame behind catches up well inside this; one that never does must not
-/// freeze the pane.
+/// Consecutive unread frames before abandoning shared memory permanently.
 const DROP_LIMIT: u32 = 30;
+/// Most of a frame a cell-aligned diff may cover while a shared slot is
+/// available: past this, one whole transfer into the object costs less than
+/// megabytes of patches on the pty.
+const SHARED_PATCH_DIVISOR: u64 = 4;
 const CHUNK: usize = 4096;
-/// Payload bytes whose base64 is exactly one chunk: 4 characters per 3 bytes,
-/// and a chunk has to be a whole number of base64 quanta.
+/// Base64 payload bytes per 4096-character chunk.
 const CHUNK_PAYLOAD: usize = CHUNK / 4 * 3;
 const SCREEN_ID: u32 = 1;
 const FIRST_PATCH_ID: u32 = 2;
-/// The image id of the one-pixel query that discovers shared-memory support.
+/// Image ID reserved for the shared-memory capability probe.
 pub const PROBE_ID: u32 = 32;
 
-/// A POSIX shared memory slot a whole frame can be handed over in.
-///
-/// A terminal that reads one unlinks it, so a name that still resolves means
-/// the previous frame has not been read: that frame goes over the pty instead,
-/// which keeps the two transfers in the order they were made.
+/// POSIX shared-memory slot for whole frames. A terminal unlinks each object
+/// after reading it; persistent unread objects disable this path.
 #[derive(Debug)]
 pub struct SharedMemory {
     name: String,
@@ -56,8 +50,8 @@ impl SharedMemory {
         slot
     }
 
-    /// Ask the terminal to read a one-pixel object, which is how the shared
-    /// memory path is discovered.  Absent when the object cannot be made.
+    /// Query shared-memory support with a one-pixel object, if creation
+    /// succeeds.
     #[must_use]
     pub fn probe(&self) -> Option<Vec<u8>> {
         let mut file = self.create()?;
@@ -71,12 +65,10 @@ impl SharedMemory {
         )
     }
 
-    /// Forget an object the terminal left behind.
     pub fn clear(&self) {
         let _ = shm::unlink(self.name.as_str());
     }
 
-    /// A fresh object, or `None` while the previous frame is still unread.
     fn create(&self) -> Option<File> {
         shm::open(
             self.name.as_str(),
@@ -87,8 +79,6 @@ impl SharedMemory {
         .map(File::from)
     }
 
-    /// Hand a whole frame over in an object `file` names, or report that it
-    /// has to go the pty's way.
     fn transfer(
         &self,
         out: &mut Vec<u8>,
@@ -103,9 +93,9 @@ impl SharedMemory {
         }
         let payload = STANDARD.encode(self.name.as_bytes());
         out.reserve(payload.len() + 96);
-        out.extend_from_slice(
-            format!("\x1b_G{},t=s;", transmit(SCREEN_ID, width, height, 0)).as_bytes(),
-        );
+        out.extend_from_slice(b"\x1b_G");
+        transmit(out, SCREEN_ID, width, height, 0);
+        out.extend_from_slice(b",t=s;");
         out.extend_from_slice(payload.as_bytes());
         out.extend_from_slice(b"\x1b\\");
         true
@@ -124,30 +114,26 @@ impl Drop for SharedMemory {
     }
 }
 
-/// Stateful kitty image presenter.
-///
-/// The compositor sends only the rows of a frame that changed, so the
-/// presenter keeps the frame itself: bands are applied to it, and the terminal
-/// is sent whatever the change makes it show.
+/// Retains composed frames to encode changed bands as whole images or patches.
 #[derive(Debug, Default)]
 pub struct Presenter {
     cell_size: Option<(u16, u16)>,
-    /// The frame as it has been handed in, band by band: what the terminal
-    /// would be showing if every frame had been drawn.  Shared with `base`
-    /// while the two are the same picture, so a band copies it at most once.
+    /// Composed pixels; full-frame input transfers ownership of its allocation.
     image: Arc<Vec<u8>>,
     width: u32,
     height: u32,
-    /// The whole frame the terminal is showing under the patch layer.
+    /// Base under patches, or a shared frame awaiting confirmation.
     base: Option<Frame>,
     patch_count: usize,
+    /// Whether `image` is already displayed.
+    display_current: bool,
+    rects: Vec<Rect>,
+    /// Rows that may differ from the whole-image base, including live patches.
+    damage: Range<u32>,
     shared: Option<SharedMemory>,
     encoder: EncodingBuffers,
-    /// Whether the last frame handed to [`Presenter::present`] was dropped
-    /// rather than drawn.
+    patch_pixels: Vec<u8>,
     dropped: bool,
-    /// Whole frames dropped in a row because the terminal had not read the
-    /// shared object yet.
     drops: u32,
 }
 
@@ -166,8 +152,6 @@ struct Rect {
     height: u32,
 }
 
-/// Scratch space retained across images so compression does not allocate in
-/// the frame path.
 #[derive(Debug, Default)]
 struct EncodingBuffers {
     compressed: Vec<u8>,
@@ -175,9 +159,8 @@ struct EncodingBuffers {
 }
 
 impl Presenter {
-    /// Construct a presenter.  Patches are enabled only when the terminal's
-    /// reported cell dimensions are supplied, and whole frames go through
-    /// `shared` when the terminal proved it reads shared memory.
+    /// Enable patches with known cell dimensions and shared frames with a
+    /// terminal-confirmed shared-memory slot.
     #[must_use]
     pub fn new(cell_size: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
         Self {
@@ -186,140 +169,182 @@ impl Presenter {
             width: 0,
             height: 0,
             base: None,
+            display_current: false,
+            rects: Vec::new(),
+            damage: 0..0,
             patch_count: 0,
             shared,
             encoder: EncodingBuffers::default(),
+            patch_pixels: Vec::new(),
             dropped: false,
             drops: 0,
         }
     }
 
-    /// Replace the grid patches are aligned to.  A grid that changed makes the
-    /// patches on the screen meaningless, so the next frame is sent whole.
+    /// Changing the grid invalidates displayed patches.
     pub fn set_cell_size(&mut self, cell_size: Option<(u16, u16)>) {
         if self.cell_size != cell_size {
             self.cell_size = cell_size;
             self.base = None;
             self.patch_count = 0;
+            self.display_current = false;
         }
     }
 
-    /// Whether the last frame was dropped instead of drawn, which happens
-    /// when the terminal is still reading the previous one.
+    /// Whether the latest update was dropped while shared memory remained
+    /// unread.
     #[must_use]
     pub const fn dropped(&self) -> bool {
         self.dropped
     }
 
-    /// Hand in the rows `y` and up that a `width` by `height` frame changed
-    /// by, and encode what the terminal has to be sent for it.
+    /// Compose a changed row band and encode its terminal update.
     ///
-    /// The band is applied to the frame the presenter keeps, so a frame that
-    /// arrives in several bands is composed here.  A band that does not fit
-    /// the frame is ignored and returns an empty update.
+    /// Out-of-bounds or malformed bands leave the frame unchanged.
     #[must_use]
     pub fn present(&mut self, width: u32, height: u32, y: u32, band: Vec<u8>) -> Vec<u8> {
-        // Every call decides again: a call that returns without writing leaves
-        // the flag saying what *this* call did, not what the last one did.
         self.dropped = false;
-        if !self.apply_band(width, height, y, band) {
+        let Some(changed) = self.apply_band(width, height, y, band) else {
+            return Vec::new();
+        };
+        if !changed && self.display_current {
             return Vec::new();
         }
 
-        // With no patches on the screen, `base` is the whole of what the
-        // terminal shows, so a frame that equals it is nothing to draw — even
-        // when a cell size is unknown and the difference cannot be measured in
-        // cells.
+        // Without patches, restoring the old base after a dropped frame needs
+        // no transfer: it is still on screen.
         if self.patch_count == 0
             && self.base.as_ref().is_some_and(|old| {
                 old.width == width
                     && old.height == height
-                    && (Arc::ptr_eq(&old.pixels, &self.image) || old.pixels == self.image)
+                    && (Arc::ptr_eq(&old.pixels, &self.image) || {
+                        let stride = width as usize * 3;
+                        let rows =
+                            self.damage.start as usize * stride..self.damage.end as usize * stride;
+                        old.pixels[rows.clone()] == self.image[rows]
+                    })
             })
         {
+            self.drops = 0;
+            self.display_current = true;
             return Vec::new();
         }
 
-        // Superseded patches are always deleted before the next ones are
-        // drawn, so the live patch ids are exactly `2 ..= patch_count + 1`.
-        let rects = self
-            .base
-            .as_ref()
-            .filter(|old| old.width == width && old.height == height)
-            .and_then(|old| self.changed_rects(old, &self.image));
-        let patches = match rects {
-            // The frame is the base image again, so only the patches covering
-            // the difference have to go.
-            Some(rects) if rects.is_empty() => Some(Vec::new()),
-            Some(rects) if within_patch_budget(&rects, width, height) => Some(rects),
-            _ => None,
+        // Replaced patches are deleted; live IDs span `2 ..= patch_count + 1`.
+        let patches = self.select_patches(width, height);
+
+        let file = if patches {
+            None
+        } else {
+            match self.ready_shared() {
+                Ok(file) => file,
+                Err(()) => return Vec::new(),
+            }
         };
 
-        // A whole frame goes through shared memory when the terminal reads it.
-        // An object that is still there is one the terminal has not read: it
-        // is behind, and the pty fallback would put ten times the bytes in
-        // front of it, which is how a terminal that fell behind stays behind.
-        // The frame is dropped instead — the next one supersedes it — and the
-        // ack says so, so the compositor knows the pane is a frame behind.
-        // A terminal that never reads the object, though, would drop every
-        // whole frame for the rest of the session, so a run of drops clears
-        // the object and takes the pty for this frame: the pane stays on the
-        // session's newest scene either way.
-        let slot = self.shared.as_ref();
-        let mut file = None;
-        if patches.is_none()
-            && let Some(slot) = slot
-        {
-            file = slot.create();
-            if file.is_none() {
-                self.drops += 1;
-                if self.drops < DROP_LIMIT {
-                    self.dropped = true;
-                    return Vec::new();
-                }
-                self.drops = 0;
-                slot.clear();
+        // Size inline output for the selected compressed or raw payload.
+        let prepared =
+            (!patches && file.is_none()).then(|| prepare_image(&mut self.encoder, &self.image));
+        let capacity = prepared.map_or(64, |compressed| {
+            let bytes = if compressed {
+                self.encoder.compressed.len()
             } else {
-                self.drops = 0;
-            }
-        }
-
-        let mut out = Vec::with_capacity(64);
+                self.image.len()
+            };
+            encoded_capacity(bytes) + 64
+        });
+        let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(b"\x1b[?2026h");
 
-        if let Some(rects) = patches {
-            for index in 0..self.patch_count {
-                delete_image(
-                    &mut out,
-                    FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX),
-                );
-            }
-            for (index, rect) in rects.iter().enumerate() {
-                let id = FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX);
-                let payload = extract(&self.image, width, *rect);
-                move_cursor(&mut out, rect.x, rect.y, self.cell_size);
-                image(
-                    &mut out,
-                    &mut self.encoder,
-                    id,
-                    rect.width,
-                    rect.height,
-                    &payload,
-                    true,
-                );
-            }
-            self.patch_count = rects.len();
+        if patches {
+            self.write_patches(&mut out, width);
         } else {
-            // `2J` also destroys images, so the layer is wiped before the
-            // replacement is transmitted.
-            delete_all(&mut out);
-            out.extend_from_slice(b"\x1b[2J\x1b[H");
-            let shared = slot.zip(file).is_some_and(|(slot, file)| {
-                slot.transfer(&mut out, file, width, height, &self.image)
-            });
-            if !shared {
+            self.write_whole(&mut out, width, height, file, prepared);
+        }
+
+        out.extend_from_slice(b"\x1b[?2026l");
+        self.display_current = true;
+        out
+    }
+
+    /// Drop frames while the terminal is briefly behind, then permanently
+    /// fall back to pty transfer rather than cycling through freezes.
+    fn ready_shared(&mut self) -> Result<Option<File>, ()> {
+        let Some(slot) = &self.shared else {
+            return Ok(None);
+        };
+        let file = slot.create();
+        if file.is_some() {
+            self.drops = 0;
+            return Ok(file);
+        }
+        self.drops += 1;
+        if self.drops < DROP_LIMIT {
+            self.dropped = true;
+            self.display_current = false;
+            return Err(());
+        }
+        self.drops = 0;
+        slot.clear();
+        self.shared = None;
+        Ok(None)
+    }
+
+    fn write_patches(&mut self, out: &mut Vec<u8>, width: u32) {
+        for index in 0..self.patch_count {
+            delete_image(
+                out,
+                FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX),
+            );
+        }
+        for (index, rect) in self.rects.iter().enumerate() {
+            let id = FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX);
+            extract(&self.image, width, *rect, &mut self.patch_pixels);
+            move_cursor(out, rect.x, rect.y, self.cell_size);
+            image(
+                out,
+                &mut self.encoder,
+                id,
+                rect.width,
+                rect.height,
+                &self.patch_pixels,
+                true,
+            );
+        }
+        self.drops = 0;
+        self.patch_count = self.rects.len();
+    }
+
+    fn write_whole(
+        &mut self,
+        out: &mut Vec<u8>,
+        width: u32,
+        height: u32,
+        file: Option<File>,
+        prepared: Option<bool>,
+    ) {
+        // Delete image data and clear placements before replacement.
+        delete_all(out);
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        let shared = self
+            .shared
+            .as_ref()
+            .zip(file)
+            .is_some_and(|(slot, file)| slot.transfer(out, file, width, height, &self.image));
+        if !shared {
+            if let Some(compressed) = prepared {
+                write_image(
+                    out,
+                    &self.encoder,
+                    SCREEN_ID,
+                    (width, height),
+                    &self.image,
+                    false,
+                    compressed,
+                );
+            } else {
                 image(
-                    &mut out,
+                    out,
                     &mut self.encoder,
                     SCREEN_ID,
                     width,
@@ -328,131 +353,187 @@ impl Presenter {
                     false,
                 );
             }
-            self.patch_count = 0;
-            // The patch layer starts from this frame, so the frame is what the
-            // next band is compared against — shared rather than copied, and
-            // only copied when a band changes it.
-            self.base = Some(Frame {
-                width,
-                height,
-                pixels: Arc::clone(&self.image),
-            });
         }
-
-        out.extend_from_slice(b"\x1b[?2026l");
-        out
+        self.patch_count = 0;
+        // Retain a base only for patches or recovery from dropped shared
+        // frames.
+        self.base = (self.cell_size.is_some() || self.shared.is_some()).then(|| Frame {
+            width,
+            height,
+            pixels: Arc::clone(&self.image),
+        });
+        self.damage = 0..0;
     }
 
-    /// Apply the rows `y` and down to the frame the pane keeps, reporting
-    /// whether they fit it.  A band that does not is ignored, and the frame
-    /// keeps the size it had.
-    fn apply_band(&mut self, width: u32, height: u32, y: u32, band: Vec<u8>) -> bool {
+    fn apply_band(&mut self, width: u32, height: u32, y: u32, band: Vec<u8>) -> Option<bool> {
         let (Ok(stride), Ok(rows), Ok(top)) = (
             usize::try_from(width),
             usize::try_from(height),
             usize::try_from(y),
         ) else {
-            return false;
+            return None;
         };
-        let Some(stride) = stride.checked_mul(3) else {
-            return false;
-        };
+        let stride = stride.checked_mul(3)?;
         if width == 0 || height == 0 || band.is_empty() || !band.len().is_multiple_of(stride) {
-            return false;
+            return None;
         }
-        let Some(start) = top.checked_mul(stride) else {
-            return false;
-        };
-        let Some(end) = start.checked_add(band.len()) else {
-            return false;
-        };
-        if end > rows * stride {
-            return false;
+        let start = top.checked_mul(stride)?;
+        let end = start.checked_add(band.len())?;
+        if end > rows.checked_mul(stride)? {
+            return None;
         }
 
-        // A band that is the whole frame is the frame itself: it is taken over
-        // rather than copied into the one the pane keeps.
+        // Preserve the allocation for identical full frames, including a shared
+        // base.
         if start == 0 && end == rows * stride {
+            if self.width == width
+                && self.height == height
+                && self.image.as_slice() == band.as_slice()
+            {
+                return Some(false);
+            }
             self.width = width;
             self.height = height;
             self.image = Arc::new(band);
-            return true;
+            self.damage = 0..height;
+            return Some(true);
         }
 
-        // A frame of another size starts over: its first band covers the whole
-        // of it.  What the terminal shows is still the frame `base` and the
-        // patch ids describe, so they are left to be compared against.
+        // A resized partial frame starts empty; `base` still describes the
+        // terminal's old image for comparison.
         if self.width != width || self.height != height {
             self.width = width;
             self.height = height;
             self.image = Arc::new(vec![0; rows * stride]);
+            self.damage = 0..height;
+        } else if &self.image[start..end] == band.as_slice() {
+            return Some(false);
         }
         Arc::make_mut(&mut self.image)[start..end].copy_from_slice(&band);
-        true
+        let bottom = (end / stride) as u32;
+        self.damage = if self.damage.is_empty() {
+            y..bottom
+        } else {
+            self.damage.start.min(y)..self.damage.end.max(bottom)
+        };
+        Some(true)
     }
 
-    fn changed_rects(&self, old: &Frame, new: &[u8]) -> Option<Vec<Rect>> {
-        let (cell_w, cell_h) = self.cell_size?;
-        let (cell_w, cell_h) = (u32::from(cell_w), u32::from(cell_h));
+    /// Compare cell-aligned patches against the last whole image. A shared
+    /// slot only pays for a diff small enough that the whole-frame transfer it
+    /// replaces would be the larger one.
+    fn select_patches(&mut self, width: u32, height: u32) -> bool {
+        self.rects.clear();
+        let Some(old) = self
+            .base
+            .as_ref()
+            .filter(|old| old.width == width && old.height == height)
+        else {
+            return false;
+        };
+        let Some((cell_w, cell_h)) = self.cell_size else {
+            return false;
+        };
         if cell_w == 0 || cell_h == 0 {
-            return None;
+            return false;
         }
-        let cols = old.width.div_ceil(cell_w);
-        let rows = old.height.div_ceil(cell_h);
-        let mut rects: Vec<Rect> = Vec::new();
-        for row in 0..rows {
-            let y = row * cell_h;
-            let h = cell_h.min(old.height - y);
-            let row_start = y as usize * old.width as usize * 3;
-            let row_end = (y + h) as usize * old.width as usize * 3;
-            if old.pixels[row_start..row_end] == new[row_start..row_end] {
+        let area = u64::from(width) * u64::from(height);
+        let limit = if self.shared.is_some() {
+            area / SHARED_PATCH_DIVISOR
+        } else {
+            area
+        };
+        let patches = changed_rects(
+            old,
+            &self.image,
+            u32::from(cell_w),
+            u32::from(cell_h),
+            limit,
+            self.damage.clone(),
+            &mut self.rects,
+        );
+        if patches {
+            self.damage = self.rects.iter().fold(0..0, |rows, rect| {
+                if rows.is_empty() {
+                    rect.y..rect.y + rect.height
+                } else {
+                    rows.start.min(rect.y)..rows.end.max(rect.y + rect.height)
+                }
+            });
+        }
+        patches
+    }
+}
+
+/// Build cell-aligned changes; more than `limit` covered pixels or more than
+/// [`MAX_PATCHES`] patches goes whole.
+fn changed_rects(
+    old: &Frame,
+    new: &[u8],
+    cell_w: u32,
+    cell_h: u32,
+    limit: u64,
+    damage: Range<u32>,
+    rects: &mut Vec<Rect>,
+) -> bool {
+    let cols = old.width.div_ceil(cell_w);
+    let rows = damage.start / cell_h..damage.end.div_ceil(cell_h);
+    let mut covered = 0u64;
+    for row in rows {
+        let y = row * cell_h;
+        let h = cell_h.min(old.height - y);
+        let row_start = y as usize * old.width as usize * 3;
+        let row_end = (y + h) as usize * old.width as usize * 3;
+        if old.pixels[row_start..row_end] == new[row_start..row_end] {
+            continue;
+        }
+        let mut col = 0;
+        while col < cols {
+            let x = col * cell_w;
+            let w = cell_w.min(old.width - x);
+            if !different(old, new, x, y, w, h) {
+                col += 1;
                 continue;
             }
-            let mut col = 0;
+            let start = col;
+            col += 1;
             while col < cols {
-                let x = col * cell_w;
-                let w = cell_w.min(old.width - x);
-                if !different(old, new, x, y, w, h) {
-                    col += 1;
-                    continue;
+                let next_x = col * cell_w;
+                let next_w = cell_w.min(old.width - next_x);
+                if !different(old, new, next_x, y, next_w, h) {
+                    break;
                 }
-                let start = col;
                 col += 1;
-                while col < cols {
-                    let next_x = col * cell_w;
-                    let next_w = cell_w.min(old.width - next_x);
-                    if !different(old, new, next_x, y, next_w, h) {
-                        break;
-                    }
-                    col += 1;
-                }
-                let rect = Rect {
-                    x: start * cell_w,
-                    y,
-                    width: ((col - start) * cell_w).min(old.width - start * cell_w),
-                    height: h,
-                };
-                if !rect.width.is_multiple_of(cell_w) || !rect.height.is_multiple_of(cell_h) {
-                    return None;
-                }
-                // Merge vertically adjacent equal-width runs.  This keeps
-                // flat UI changes compact without expensive rectangle packing.
-                if let Some(last) = rects.last_mut()
-                    && last.x == rect.x
-                    && last.width == rect.width
-                    && last.y + last.height == rect.y
-                {
-                    last.height += rect.height;
-                    continue;
-                }
-                rects.push(rect);
-                if rects.len() > MAX_PATCHES {
-                    return Some(rects);
-                }
+            }
+            let rect = Rect {
+                x: start * cell_w,
+                y,
+                width: ((col - start) * cell_w).min(old.width - start * cell_w),
+                height: h,
+            };
+            if !rect.width.is_multiple_of(cell_w) || !rect.height.is_multiple_of(cell_h) {
+                return false;
+            }
+            covered += u64::from(rect.width) * u64::from(rect.height);
+            if covered >= limit {
+                return false;
+            }
+            // Merge vertically adjacent equal-width runs.
+            if let Some(last) = rects.last_mut()
+                && last.x == rect.x
+                && last.width == rect.width
+                && last.y + last.height == rect.y
+            {
+                last.height += rect.height;
+                continue;
+            }
+            rects.push(rect);
+            if rects.len() > MAX_PATCHES {
+                return false;
             }
         }
-        Some(rects)
     }
+    true
 }
 
 fn different(old: &Frame, new: &[u8], x: u32, y: u32, width: u32, height: u32) -> bool {
@@ -469,38 +550,24 @@ fn different(old: &Frame, new: &[u8], x: u32, y: u32, width: u32, height: u32) -
     false
 }
 
-/// A patch set is worth sending only while it stays small, stays under the
-/// patch id budget and moves less pixel data than a whole frame would.
-fn within_patch_budget(rects: &[Rect], width: u32, height: u32) -> bool {
-    !rects.is_empty()
-        && rects.len() <= MAX_PATCHES
-        && rects
-            .iter()
-            .map(|rect| u64::from(rect.width) * u64::from(rect.height))
-            .sum::<u64>()
-            < u64::from(width) * u64::from(height)
-}
-
-fn extract(image: &[u8], width: u32, rect: Rect) -> Vec<u8> {
+fn extract(image: &[u8], width: u32, rect: Rect, out: &mut Vec<u8>) {
     let stride = width as usize * 3;
     let row_len = rect.width as usize * 3;
-    let mut out = Vec::with_capacity(row_len * rect.height as usize);
+    out.clear();
+    out.reserve(row_len * rect.height as usize);
     for row in rect.y as usize..(rect.y + rect.height) as usize {
         let start = rect.x as usize * 3;
         out.extend_from_slice(&image[row * stride + start..row * stride + start + row_len]);
     }
-    out
 }
 
 fn move_cursor(out: &mut Vec<u8>, x: u32, y: u32, cell_size: Option<(u16, u16)>) {
-    // A grid without cells is a grid of one pixel per cell, and a cell of
-    // nothing is not one at all: the two callers that can supply a cell size
-    // both reject zero, and this is where that would divide by it.
+    // Zero cell dimensions must not divide cursor coordinates.
     let (cell_w, cell_h) =
         cell_size.map_or((1, 1), |(w, h)| (u32::from(w).max(1), u32::from(h).max(1)));
     let col = x / cell_w + 1;
     let row = y / cell_h + 1;
-    out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
+    write!(out, "\x1b[{row};{col}H").expect("writing to Vec cannot fail");
 }
 
 fn delete_all(out: &mut Vec<u8>) {
@@ -508,13 +575,16 @@ fn delete_all(out: &mut Vec<u8>) {
 }
 
 fn delete_image(out: &mut Vec<u8>, id: u32) {
-    out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2;\x1b\\").as_bytes());
+    write!(out, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\").expect("writing to Vec cannot fail");
 }
 
-/// The keys every transmitted image shares, whichever way its pixels travel;
-/// the caller appends `,t=s;`, the compression, or the chunk continuation.
-fn transmit(id: u32, width: u32, height: u32, placement: u32) -> String {
-    format!("a=T,f=24,s={width},v={height},i={id},p={placement},z=1,C=1,q=2")
+/// Common kitty transmission keys; callers append transport and chunk keys.
+fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, placement: u32) {
+    write!(
+        out,
+        "a=T,f=24,s={width},v={height},i={id},p={placement},z=1,C=1,q=2"
+    )
+    .expect("writing to Vec cannot fail");
 }
 
 fn image(
@@ -526,19 +596,40 @@ fn image(
     pixels: &[u8],
     patch: bool,
 ) {
-    let zlib = compress(&mut encoder.compressed, &mut encoder.sample, pixels)
-        && encoder.compressed.len() * 4 <= pixels.len() * 3;
+    let compressed = prepare_image(encoder, pixels);
+    write_image(out, encoder, id, (width, height), pixels, patch, compressed);
+}
+
+fn prepare_image(encoder: &mut EncodingBuffers, pixels: &[u8]) -> bool {
+    compress(&mut encoder.compressed, &mut encoder.sample, pixels)
+        && encoder.compressed.len() * 4 <= pixels.len() * 3
+}
+
+fn encoded_capacity(payload_len: usize) -> usize {
+    // Budget at most 16 bytes per continuation and 96 for the first command.
+    let chunks = payload_len.div_ceil(CHUNK_PAYLOAD).max(1);
+    payload_len.div_ceil(3) * 4 + chunks * 16 + 96
+}
+
+fn write_image(
+    out: &mut Vec<u8>,
+    encoder: &EncodingBuffers,
+    id: u32,
+    size: (u32, u32),
+    pixels: &[u8],
+    patch: bool,
+    zlib: bool,
+) {
+    let (width, height) = size;
     let payload: &[u8] = if zlib { &encoder.compressed } else { pixels };
-    let compression = if zlib { ",o=z" } else { "" };
-    let control = transmit(id, width, height, u32::from(patch));
-    // Reserve once: growing to a whole 1080p frame in doublings copies it
-    // about twenty times.  Every chunk carries its base64 plus the escape
-    // around it, which is what the framing term is for.
-    let chunks = payload.len().div_ceil(CHUNK_PAYLOAD).max(1);
-    out.reserve(payload.len().div_ceil(3) * 4 + chunks * (control.len() + 16));
-    // Each chunk is encoded where it goes: encoding the payload into one
-    // string and copying it out in chunks would touch every byte of a frame
-    // twice more.
+    let compression = if zlib {
+        b",o=z".as_slice()
+    } else {
+        b"".as_slice()
+    };
+    out.reserve(encoded_capacity(payload.len()));
+    // Encode directly into output chunks rather than allocating a whole
+    // base64 payload and copying it.
     let mut encoded_chunk = [0u8; CHUNK];
     let mut chunks = payload.chunks(CHUNK_PAYLOAD).peekable();
     let mut first = true;
@@ -546,12 +637,16 @@ fn image(
         let bytes = STANDARD
             .encode_slice(chunk, &mut encoded_chunk)
             .expect("a chunk of payload always fits its base64");
-        // Every chunk but the last says `m=1`; a whole image in one chunk
-        // carries no `m` key at all.
+        // Only continuations use `m=0`; earlier chunks use `m=1`.
         let more = chunks.peek().is_some();
         if first {
-            let marker = if more { ",m=1" } else { "" };
-            out.extend_from_slice(format!("\x1b_G{control}{compression}{marker};").as_bytes());
+            out.extend_from_slice(b"\x1b_G");
+            transmit(out, id, width, height, u32::from(patch));
+            out.extend_from_slice(compression);
+            if more {
+                out.extend_from_slice(b",m=1");
+            }
+            out.push(b';');
             first = false;
         } else if more {
             out.extend_from_slice(b"\x1b_Gm=1;");
@@ -563,12 +658,7 @@ fn image(
     }
 }
 
-/// Compress `data` into `compressed`, or report that the full pass would not
-/// pay.
-///
-/// Compressing megabytes of already-compressed pixels costs more than a whole
-/// frame's time budget, and the result would be thrown away, so four spread
-/// samples decide first.
+/// Sample large frames before spending a full compression pass on noise.
 fn compress(compressed: &mut Vec<u8>, sample: &mut Vec<u8>, data: &[u8]) -> bool {
     const SAMPLE_BYTES: usize = 16 * 1024;
     const SAMPLES: usize = 4;
@@ -586,8 +676,7 @@ fn compress(compressed: &mut Vec<u8>, sample: &mut Vec<u8>, data: &[u8]) -> bool
     zlib(compressed, data)
 }
 
-/// zlib `data` into `out`, which is cleared first.  Reusing the output keeps a
-/// whole frame from allocating, and faulting in, a buffer per pass.
+/// Compress into reusable output storage.
 fn zlib(out: &mut Vec<u8>, data: &[u8]) -> bool {
     out.clear();
     let mut encoder = ZlibEncoder::new(&mut *out, Compression::fast());
@@ -598,14 +687,12 @@ fn zlib(out: &mut Vec<u8>, data: &[u8]) -> bool {
 mod tests {
     use std::{collections::HashMap, io::Read};
 
-    /// Hand a whole frame in as the band it is.
     fn whole(presenter: &mut Presenter, width: u32, height: u32, frame: &[u8]) -> Vec<u8> {
         presenter.present(width, height, 0, frame.to_vec())
     }
 
     use super::*;
 
-    /// One placement of transmitted image data, keyed the way kitty keys it.
     #[derive(Debug)]
     struct Placement {
         z: i32,
@@ -617,11 +704,7 @@ mod tests {
         height: usize,
     }
 
-    /// Independent decoder for the emitted stream.  It models the image layer
-    /// the terminal keeps: transmitted data, placements anchored to cell
-    /// positions, z-ordering by `(z, image id, placement id)`, `a=d,d=A`
-    /// freeing every image, `a=d,d=I` freeing one, and `2J` destroying the
-    /// placements on screen.
+    /// Decode emitted kitty commands into a simulated image layer.
     struct Replay {
         width: usize,
         height: usize,
@@ -629,8 +712,7 @@ mod tests {
         cursor: (usize, usize),
         images: HashMap<u32, Vec<u8>>,
         placements: HashMap<(u32, u32), Placement>,
-        /// A terminal that has not looked at its input yet ignores a shared
-        /// object transfer until it does.
+        /// Simulates a terminal that has not consumed the shared object.
         read_shared: bool,
     }
 
@@ -665,8 +747,6 @@ mod tests {
             }
         }
 
-        /// Consumes one graphics command, chunk continuations included, and
-        /// returns the offset just past it.
         fn command(&mut self, stream: &[u8], pos: usize) -> usize {
             const ALLOWED: [&str; 12] =
                 ["a", "f", "s", "v", "i", "p", "z", "C", "q", "o", "m", "t"];
@@ -786,8 +866,7 @@ mod tests {
         }
     }
 
-    /// The terminal side of `t=s`: the object holds the pixels, and reading it
-    /// is what unlinking it means.
+    /// Simulate the terminal unlinking a shared object after reading it.
     fn read_shared_object(encoded: &[u8]) -> Vec<u8> {
         let name = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
         let path = std::path::Path::new("/dev/shm").join(name.trim_start_matches('/'));
@@ -799,8 +878,7 @@ mod tests {
     fn shared_memory() -> Option<SharedMemory> {
         let slot = SharedMemory::new();
         slot.probe()?;
-        // No terminal is here to read and unlink the probe object, so it is
-        // dropped here before the presenter takes the slot.
+        // No terminal will unlink the test probe object.
         slot.clear();
         Some(slot)
     }
@@ -854,7 +932,6 @@ mod tests {
         decoded
     }
 
-    /// Control strings of every graphics command in `stream`.
     fn commands(stream: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut pos = 0;
@@ -919,7 +996,6 @@ mod tests {
         (0..len).map(|_| next(state) as u8).collect()
     }
 
-    /// Fills the `w` by `h` pixel block at `(x, y)` with one value.
     fn put_block(frame: &mut [u8], width: u32, x: u32, y: u32, w: u32, h: u32, value: u8) {
         for row in 0..h {
             let start = ((y + row) * width + x) as usize * 3;
@@ -1085,7 +1161,7 @@ mod tests {
     #[test]
     fn changes_beyond_the_patch_budget_go_whole() {
         let runs = MAX_PATCHES as u32 + 1;
-        // One changed cell, then one untouched cell, per run.
+        // Alternate changed and untouched cells to exceed the patch limit.
         let width = runs * 4 + 2;
         let mut presenter = Presenter::new(Some((2, 2)), None);
         let base = vec![0; width as usize * 2 * 3];
@@ -1120,6 +1196,48 @@ mod tests {
             "a partial cell cannot be patched"
         );
         assert_eq!(replay(&[first, second], 5, 2, (2, 2)), ragged);
+    }
+
+    /// A slot only pays for diffs small enough that the whole transfer it
+    /// replaces would be the larger one.
+    #[test]
+    fn a_shared_slot_turns_a_large_diff_into_a_whole_frame() {
+        let Some(shared) = shared_memory() else {
+            return;
+        };
+        let base = vec![0; 8 * 8 * 3];
+        let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
+        let mut replay = Replay::new(8, 8, (2, 2));
+        replay.feed(&whole(&mut presenter, 8, 8, &base));
+
+        // One cell, 4 of 64 pixels: a patch.
+        let mut small = base.clone();
+        small[..6].fill(0xff);
+        let update = whole(&mut presenter, 8, 8, &small);
+        assert_eq!(patches(&update).len(), 1, "a small diff stays a patch");
+        assert_eq!(whole_frames(&update).len(), 0);
+        replay.feed(&update);
+        assert_eq!(replay.screen(), small);
+
+        // Half the frame, 32 of 64 pixels: one transfer through the slot.
+        let mut large = base.clone();
+        for row in 0..4 {
+            let start = row * 8 * 3;
+            large[start..start + 8 * 3].fill(0xff);
+        }
+        let update = whole(&mut presenter, 8, 8, &large);
+        let control = whole_frames(&update);
+        assert_eq!(control.len(), 1, "a large diff goes whole");
+        assert!(control[0].contains("t=s"), "through the slot: {control:?}");
+        replay.feed(&update);
+        assert_eq!(replay.screen(), large);
+
+        // The same diff without a slot is cheaper as one patch.
+        let mut pty = Presenter::new(Some((2, 2)), None);
+        let _ = whole(&mut pty, 8, 8, &base);
+        let update = whole(&mut pty, 8, 8, &large);
+        assert_eq!(patches(&update).len(), 1, "without a slot it stays patches");
+        assert_eq!(whole_frames(&update).len(), 0);
     }
 
     #[test]
@@ -1232,10 +1350,8 @@ mod tests {
         assert_eq!(replay(&[update], 4, 2, (2, 2)), frame);
     }
 
-    /// A terminal that has not read the object is behind, and a whole frame
-    /// pushed down the pty is ten times the bytes in front of it: the frame is
-    /// dropped, the ack says so, and the next one goes through shared memory
-    /// once the terminal catches up.
+    /// An unread shared object drops the next frame until the terminal catches
+    /// up.
     #[test]
     fn a_slot_the_terminal_has_not_read_drops_the_frame() {
         let Some(shared) = shared_memory() else {
@@ -1253,8 +1369,6 @@ mod tests {
         assert!(presenter.dropped(), "the pane has to say it drew nothing");
         assert_eq!(whole_frames(&update), Vec::<String>::new());
 
-        // The terminal catches up, reads what it was sent, and the next frame
-        // goes through shared memory again.
         replay.read_shared = true;
         replay.feed(&first);
         let update = whole(&mut presenter, 4, 4, &second);
@@ -1267,8 +1381,6 @@ mod tests {
         assert_eq!(replay.screen(), second);
     }
 
-    /// The compositor hands in only the rows that changed, so the presenter
-    /// has to compose them: the terminal must end up with the whole frame.
     #[test]
     fn bands_compose_into_the_frame_the_terminal_shows() {
         const WIDTH: u32 = 4;
@@ -1281,7 +1393,6 @@ mod tests {
         let mut replay = Replay::new(WIDTH as usize, HEIGHT as usize, (2, 2));
         replay.feed(&first);
 
-        // Two rows change, and only those rows are handed in.
         for row in 2..HEIGHT {
             for column in 0..WIDTH {
                 let at = ((row * WIDTH + column) * 3) as usize;
@@ -1294,19 +1405,72 @@ mod tests {
         replay.feed(&update);
         assert_eq!(replay.screen(), frame, "the composed frame is on screen");
 
-        // Handing the same rows in again costs a patch, never the frame.
         let again = presenter.present(WIDTH, HEIGHT, 2, band);
-        assert!(
-            whole_frames(&again).is_empty(),
-            "a band must not become a whole frame"
-        );
+        assert_eq!(again.len(), 0, "an unchanged band needs no transfer");
         replay.feed(&again);
         assert_eq!(replay.screen(), frame);
     }
 
-    /// A frame that is dropped must not leave the pane reporting `drawn:
-    /// false` for the next frame that needs nothing drawn: the compositor
-    /// would keep re-sending frames nothing changes.
+    #[test]
+    fn an_unchanged_band_still_redraws_after_the_grid_changes() {
+        let mut presenter = Presenter::new(None, None);
+        let frame = vec![17; 4 * 4 * 3];
+        let first = whole(&mut presenter, 4, 4, &frame);
+        let band = frame[2 * 4 * 3..].to_vec();
+        assert_eq!(
+            presenter.present(4, 4, 2, band.clone()).len(),
+            0,
+            "an unchanged band needs no transfer"
+        );
+
+        presenter.set_cell_size(Some((2, 2)));
+        let redraw = presenter.present(4, 4, 2, band);
+        assert_eq!(whole_frames(&redraw).len(), 1);
+        assert_eq!(replay(&[first, redraw], 4, 4, (2, 2)), frame);
+    }
+
+    #[test]
+    fn a_partial_band_without_a_patch_grid_replaces_the_whole_image() {
+        let mut presenter = Presenter::new(None, None);
+        let mut frame = vec![17; 4 * 4 * 3];
+        let first = whole(&mut presenter, 4, 4, &frame);
+        let band = vec![31; 2 * 4 * 3];
+        frame[2 * 4 * 3..].copy_from_slice(&band);
+        let next = presenter.present(4, 4, 2, band);
+        assert_eq!(whole_frames(&next).len(), 1);
+        assert_eq!(replay(&[first, next], 4, 4, (1, 1)), frame);
+    }
+
+    #[test]
+    fn unchanged_band_retries_a_dropped_shared_frame() {
+        let Some(shared) = shared_memory() else {
+            return;
+        };
+        let mut presenter = Presenter::new(None, Some(shared));
+        let base = vec![0; 4 * 4 * 3];
+        let first = whole(&mut presenter, 4, 4, &base);
+        let band = vec![93; 2 * 4 * 3];
+        assert_eq!(
+            presenter.present(4, 4, 2, band.clone()).len(),
+            0,
+            "an unchanged band needs no transfer"
+        );
+        assert!(presenter.dropped());
+
+        // An unchanged band still needs transfer after a dropped attempt.
+        let mut terminal = Replay::new(4, 4, (1, 1));
+        terminal.feed(&first);
+        let update = presenter.present(4, 4, 2, band.clone());
+        assert!(!presenter.dropped());
+        assert!(whole_frames(&update)[0].contains("t=s"));
+        terminal.feed(&update);
+        let mut expected = base;
+        expected[2 * 4 * 3..].copy_from_slice(&band);
+        assert_eq!(terminal.screen(), expected);
+    }
+
+    /// Recovering the displayed frame after a drop must not report another
+    /// drop.
     #[test]
     fn an_unchanged_frame_after_a_drop_is_not_reported_dropped() {
         let Some(shared) = shared_memory() else {
@@ -1317,20 +1481,16 @@ mod tests {
         assert_ne!(whole(&mut presenter, 4, 2, &first), Vec::<u8>::new());
         assert!(!presenter.dropped(), "the first frame is drawn");
 
-        // Nothing has read the first frame, so the next whole one is dropped.
         let second = noise(&mut 5, 4 * 4 * 3);
         assert_eq!(whole(&mut presenter, 4, 4, &second), Vec::<u8>::new());
         assert!(presenter.dropped());
 
-        // The frame that is on screen is the one the pane already holds, so
-        // there is nothing to draw, which is not the same as a drop.
+        // The old frame is already displayed; no transfer is needed.
         assert_eq!(whole(&mut presenter, 4, 2, &first), Vec::<u8>::new());
         assert!(!presenter.dropped());
     }
 
-    /// A terminal that answers the probe but never reads the object must not
-    /// be able to freeze the pane: after a run of drops the object is cleared
-    /// and the frame goes down the pty.
+    /// Permanently fall back to pty frames if shared objects stay unread.
     #[test]
     fn a_slot_that_is_never_read_falls_back_to_the_pty() {
         let Some(shared) = shared_memory() else {
@@ -1345,8 +1505,7 @@ mod tests {
         assert!(!presenter.dropped());
 
         for step in 1..DROP_LIMIT {
-            // Differences in every cell cannot be patched, so each of these
-            // needs the shared object.
+            // Every cell differs, ruling out patches.
             frame.fill(step as u8);
             let update = whole(&mut presenter, 4, 4, &frame);
             assert!(update.is_empty(), "step {step} wrote something");
@@ -1356,7 +1515,6 @@ mod tests {
             );
         }
 
-        // The run is over: this frame is not dropped but drawn.
         frame.fill(0xab);
         let update = whole(&mut presenter, 4, 4, &frame);
         assert!(!update.is_empty(), "the fallback frame must be drawn");
@@ -1368,6 +1526,18 @@ mod tests {
             "the fallback is a pty frame: {update:?}"
         );
         replay.feed(&update);
+        assert_eq!(replay.screen(), frame);
+
+        // Fallback must not restart the shared-memory drop cycle.
+        frame.fill(0xcd);
+        let next = whole(&mut presenter, 4, 4, &frame);
+        assert!(!presenter.dropped());
+        assert!(
+            whole_frames(&next)
+                .iter()
+                .all(|control| !control.contains("t=s"))
+        );
+        replay.feed(&next);
         assert_eq!(replay.screen(), frame);
     }
 

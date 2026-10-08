@@ -2,7 +2,6 @@ use std::{io, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
-/// An error produced by meowland's application-level operations.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
@@ -17,7 +16,7 @@ pub enum Error {
     RuntimeDirectoryUnset,
     #[error("XDG_RUNTIME_DIR is not a directory: {0}")]
     RuntimeDirectoryInvalid(PathBuf),
-    #[error("server already listening at {0}")]
+    #[error("a meowland server is already running ({0})")]
     ServerAlreadyListening(PathBuf),
     #[error("run requires a command")]
     RunRequiresCommand,
@@ -33,12 +32,10 @@ pub enum Error {
     UnexpectedWindowListResponse,
     #[error("server rejected the request: {0}")]
     ServerResponse(String),
-    #[error("server did not become ready; see {}", log.display())]
-    ServerStartup { log: PathBuf },
 }
 
 impl Error {
-    pub(crate) fn io(action: impl Into<String>, source: io::Error) -> Self {
+    pub fn io(action: impl Into<String>, source: io::Error) -> Self {
         Self::IoContext {
             action: action.into(),
             source,
@@ -46,5 +43,4 @@ impl Error {
     }
 }
 
-/// The result type returned by meowland's application-level operations.
 pub type Result<T> = std::result::Result<T, Error>;

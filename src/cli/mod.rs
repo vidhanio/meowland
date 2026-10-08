@@ -1,21 +1,18 @@
 use std::{
     collections::HashSet,
-    env,
     ffi::OsString,
     io::IsTerminal,
-    os::unix::{net::UnixStream, process::CommandExt as _},
-    process::{Child, Command},
+    os::unix::net::UnixStream,
     thread,
     time::{Duration, Instant},
 };
 
-use usage::{Args, Cli, Subcommands, ValueEnum};
-
-use crate::{
-    Error, Result, diag,
+use meowland::{
+    Error, Result,
     protocol::{self, ControlRequest, ControlResponse, Show, WindowInfo},
     server, terminal,
 };
+use usage::{Args, Cli, Subcommands, ValueEnum};
 
 #[derive(Cli)]
 #[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
@@ -32,11 +29,10 @@ enum Commands {
     Attach(AttachArgs),
     /// List windows.
     List,
-    /// Start or stop the compositor server.
-    Server(ServerArgs),
+    /// Start the compositor server in the foreground.
+    Server,
     /// Generate a shell completion script.
     Completions(CompletionArgs),
-    InternalServer(InternalServerArgs),
 }
 
 #[derive(Args)]
@@ -74,20 +70,6 @@ fn window_ids(
 }
 
 #[derive(Args)]
-struct ServerArgs {
-    #[usage(subcommand)]
-    command: ServerCommands,
-}
-
-#[derive(Subcommands)]
-enum ServerCommands {
-    /// Start the server if it is not already running.
-    Start,
-    /// Stop the running server.
-    Stop,
-}
-
-#[derive(Args)]
 struct CompletionArgs {
     /// The shell to generate a completion script for.
     #[usage(value_enum)]
@@ -119,10 +101,6 @@ impl From<CompletionShell> for usage::complete::Shell {
     }
 }
 
-#[derive(Args)]
-#[usage(hide)]
-struct InternalServerArgs;
-
 /// Parse the process command line and run the selected meowland command.
 ///
 /// # Errors
@@ -130,14 +108,7 @@ struct InternalServerArgs;
 pub fn start() -> Result<()> {
     let cli = Meowland::parse();
     match cli.command {
-        Commands::InternalServer(_) => server::serve(&server::Paths::discover()?),
-        Commands::Server(ServerArgs { command }) => {
-            let paths = server::Paths::discover()?;
-            match command {
-                ServerCommands::Start => ensure_server(&paths),
-                ServerCommands::Stop => request(&paths, &ControlRequest::Stop).map(|_| ()),
-            }
-        }
+        Commands::Server => server::serve(&server::Paths::discover()?),
         Commands::List => {
             let paths = server::Paths::discover()?;
             for window in list(&paths)? {
@@ -153,7 +124,6 @@ pub fn start() -> Result<()> {
         }
         Commands::Run(RunArgs { command: client }) => {
             let paths = server::Paths::discover()?;
-            ensure_server(&paths)?;
             let before = list(&paths)?;
             request(&paths, &ControlRequest::Run(client))?;
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -176,8 +146,6 @@ pub fn start() -> Result<()> {
     }
 }
 
-/// The window list, as the server last reported it.  `request` has already
-/// turned an error reply into an `Err`.
 fn list(paths: &server::Paths) -> Result<Vec<WindowInfo>> {
     list_with_timeout(paths, Duration::from_secs(2))
 }
@@ -221,8 +189,12 @@ fn request_with_timeout(
     value: &ControlRequest,
     timeout: Duration,
 ) -> Result<ControlResponse> {
-    let mut socket = std::os::unix::net::UnixStream::connect(&paths.control)
-        .map_err(|error| Error::io("server is not running", error))?;
+    let mut socket = UnixStream::connect(&paths.control).map_err(|error| {
+        Error::io(
+            "server is not running; start it with `meowland server`",
+            error,
+        )
+    })?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(timeout))?;
     protocol::send(&mut socket, value)?;
@@ -231,73 +203,6 @@ fn request_with_timeout(
         return Err(Error::ServerResponse(error.clone()));
     }
     Ok(reply)
-}
-
-/// Launchers one `ensure_server` may start before it gives up and reports the
-/// log: enough to step over a server that is on its way out, not enough to
-/// hammer a binary that cannot start at all.
-const LAUNCH_LIMIT: u32 = 4;
-
-fn ensure_server(paths: &server::Paths) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut launcher: Option<Child> = None;
-    let mut started = 0;
-    loop {
-        if request(paths, &ControlRequest::Ping).is_ok() {
-            return Ok(());
-        }
-        // Another server still holding the socket makes a launcher fail to
-        // bind, so a new one is started only while nothing is listening and
-        // the last launcher has exited: a server on its way out is one that
-        // this has to wait for and then replace.  A launcher that dies for
-        // any other reason must not be started over and over either.
-        let listening = UnixStream::connect(&paths.control).is_ok();
-        let exited = launcher
-            .as_mut()
-            .is_none_or(|child| matches!(child.try_wait(), Ok(Some(_))));
-        if !listening && exited && started < LAUNCH_LIMIT {
-            launcher = Some(spawn_server(paths)?);
-            started += 1;
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::ServerStartup {
-                log: paths.log.clone(),
-            });
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// Start a detached server, with its output going to the log.
-fn spawn_server(paths: &server::Paths) -> Result<Child> {
-    let executable = env::current_exe()?;
-    let log = diag::open(&paths.log)?;
-    let mut command = Command::new(executable);
-    command
-        .arg("internal-server")
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    // Its own session, so the server outlives this terminal and has no
-    // controlling terminal to be hung up on.  `setsid` is done here rather
-    // than by spawning an external program that may not be installed.
-    #[expect(
-        unsafe_code,
-        reason = "`CommandExt::pre_exec` is unsafe by signature; the closure only calls setsid"
-    )]
-    // SAFETY: `pre_exec` is unsafe because the closure runs in the child
-    // between fork and exec, where only async-signal-safe work is allowed.
-    // `setsid` is a bare syscall that allocates nothing, and the closure
-    // captures nothing.
-    unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid().map_err(std::io::Error::from)?;
-            Ok(())
-        });
-    }
-    command
-        .spawn()
-        .map_err(|error| Error::io("starting detached server", error))
 }
 
 #[cfg(test)]
@@ -312,15 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn internal_server_is_a_strict_parser_command() {
-        let cli = parse(&["meowland", "internal-server"]).expect("hidden command should parse");
-        assert!(matches!(cli.command, Commands::InternalServer(_)));
-        assert!(parse(&["meowland", "internal-server", "unexpected"]).is_err());
-
-        let help =
-            Meowland::render_help(Meowland::command(), true).expect("root help should exist");
-        assert!(help.contains("completions"));
-        assert!(!help.contains("internal-server"));
+    fn server_takes_no_arguments() {
+        let cli = parse(&["meowland", "server"]).expect("server should parse");
+        assert!(matches!(cli.command, Commands::Server));
+        assert!(parse(&["meowland", "server", "unexpected"]).is_err());
     }
 
     #[test]

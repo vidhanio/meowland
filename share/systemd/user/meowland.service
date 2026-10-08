@@ -1,0 +1,15 @@
+[Unit]
+Description=meowland Wayland compositor
+
+[Service]
+Type=simple
+# The service PATH holds /usr/bin and friends only; the Nix package rewrites
+# this to an absolute store path, and systemctl --user edit adds a drop-in
+# elsewhere. RUST_LOG and MEOWLAND_XWAYLAND come from the user manager
+# environment (`systemctl --user set-environment`).
+ExecStart=meowland server
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=default.target

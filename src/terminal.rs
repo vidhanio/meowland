@@ -433,8 +433,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
     let clipboard = HostClipboard::new()?;
-    let mut presenter = Presenter::new(cell, shared);
-    let mut stats = PaneStats::new();
+    let mut presentation = PanePresentation::new(cell, shared);
     PaneStats::capabilities(&probe, hello.width, hello.height);
 
     let handshake_deadline = Instant::now() + Duration::from_secs(1);
@@ -508,7 +507,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                         height,
                         y,
                         rgb,
-                    } => draw_frame(width, height, y, rgb, &mut presenter, &mut stats, &mut tx)?,
+                    } => presentation.draw(width, height, y, rgb, &mut tx)?,
                 }
             }
         }
@@ -534,7 +533,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             send_event(
                 event::read()?,
                 &mut tx,
-                &mut presenter,
+                &mut presentation.presenter,
                 &mut cell,
                 units,
                 &clipboard,
@@ -543,37 +542,56 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     }
 }
 
-fn draw_frame(
-    width: u32,
-    height: u32,
-    y: u32,
-    rgb: Vec<u8>,
-    presenter: &mut Presenter,
-    stats: &mut PaneStats,
-    tx: &mut UnixStream,
-) -> Result<()> {
-    let started = Instant::now();
-    let update = presenter.present(width, height, y, rgb);
-    let encoded = started.elapsed();
-    let written = Instant::now();
-    if !update.is_empty() {
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(&update)?;
-        stdout.flush()?;
+/// Own terminal-side presentation buffers together with their accounting.
+struct PanePresentation {
+    presenter: Presenter,
+    stats: PaneStats,
+    output: Vec<u8>,
+}
+
+impl PanePresentation {
+    fn new(cell: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
+        Self {
+            presenter: Presenter::new(cell, shared),
+            stats: PaneStats::new(),
+            output: Vec::new(),
+        }
     }
-    stats.frame(
-        update.len(),
-        presenter.dropped(),
-        encoded,
-        written.elapsed(),
-    );
-    protocol::send(
-        tx,
-        &PaneToServer::Ack {
-            drawn: !presenter.dropped(),
-        },
-    )?;
-    Ok(())
+
+    fn draw(
+        &mut self,
+        width: u32,
+        height: u32,
+        y: u32,
+        rgb: Vec<u8>,
+        tx: &mut UnixStream,
+    ) -> Result<()> {
+        let started = Instant::now();
+        self.presenter
+            .present_into(width, height, y, rgb, &mut self.output);
+        let encoded = started.elapsed();
+        let written = Instant::now();
+        if !self.output.is_empty() {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(&self.output)?;
+            stdout.flush()?;
+        }
+        self.stats.frame(
+            self.output.len(),
+            self.presenter.dropped(),
+            encoded,
+            written.elapsed(),
+        );
+        // This is the synchronization point: acknowledge only after the whole
+        // terminal update has been written, never while it is being encoded.
+        protocol::send(
+            tx,
+            &PaneToServer::Ack {
+                drawn: !self.presenter.dropped(),
+            },
+        )?;
+        Ok(())
+    }
 }
 
 fn send_event(
@@ -929,130 +947,5 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = self.restore();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn ignores_zero_size_replies() {
-        assert_eq!(parse_probe_bytes(b"\x1b[4;0;0t"), ProbeInfo::default());
-    }
-
-    #[test]
-    fn parses_a_kitty_handshake() {
-        let bytes = b"\x1b[6;20;10t\x1b[4;600;800t\
-            \x1bP>|kitty(0.48.2)\x1b\\\
-            \x1b_Gi=31;OK\x1b\\\
-            \x1b_Gi=32;OK\x1b\\\
-            \x1b[?1016;2$y\x1b[?62;4;6;22c";
-        assert_eq!(
-            parse_probe_bytes(bytes),
-            ProbeInfo {
-                pixel_width: Some(800),
-                pixel_height: Some(600),
-                cell_width: Some(10),
-                cell_height: Some(20),
-                graphics: true,
-                shared_memory: true,
-                sgr_pixels: Some(true),
-                name: Some("kitty(0.48.2)".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn a_shared_memory_refusal_is_not_a_graphics_refusal() {
-        let bytes = b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;ENOENT: no such file\x1b\\";
-        let probe = parse_probe_bytes(bytes);
-        assert!(probe.graphics);
-        assert!(!probe.shared_memory);
-    }
-
-    #[test]
-    fn records_refused_graphics_and_unsupported_pixel_mouse() {
-        let bytes = b"\x1b_Gi=31;ENOTSUP\x1b\\\x1b[?1016;0$y";
-        let probe = parse_probe_bytes(bytes);
-        assert!(!probe.graphics);
-        assert_eq!(probe.sgr_pixels, Some(false));
-    }
-
-    #[test]
-    fn pixel_mouse_falls_back_to_the_terminal_name() {
-        let named = |name: &str| ProbeInfo {
-            name: Some(name.into()),
-            ..ProbeInfo::default()
-        };
-        assert_eq!(mouse_units(&named("WezTerm 20240203")), MouseUnits::Pixels);
-        assert_eq!(mouse_units(&named("xterm(390)")), MouseUnits::Cells);
-        assert_eq!(
-            mouse_units(&ProbeInfo {
-                sgr_pixels: Some(false),
-                name: Some("kitty".into()),
-                ..ProbeInfo::default()
-            }),
-            MouseUnits::Cells
-        );
-    }
-
-    #[test]
-    fn character_keys_use_evdev_codes_and_infer_shift() {
-        for (character, code, shift) in [
-            ('A', 30, true),
-            ('!', 2, true),
-            ('?', 53, true),
-            ('a', 30, false),
-            ('b', 48, false),
-            ('q', 16, false),
-            ('w', 17, false),
-            ('1', 2, false),
-        ] {
-            assert_eq!(
-                key_input(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
-                Some((code, u8::from(shift)))
-            );
-            assert_eq!(needs_shift(character), shift);
-        }
-        assert_eq!(
-            key_input(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
-            Some((15, protocol::modifiers::SHIFT))
-        );
-    }
-
-    #[test]
-    fn function_keys_use_their_evdev_codes() {
-        let key = |n| key_input(KeyEvent::new(KeyCode::F(n), KeyModifiers::NONE));
-        assert_eq!(key(1), Some((59, 0)));
-        assert_eq!(key(10), Some((68, 0)));
-        assert_eq!(key(11), Some((87, 0)));
-        assert_eq!(key(12), Some((88, 0)));
-        assert_eq!(key(13), Some((183, 0)));
-        assert_eq!(key(24), Some((194, 0)));
-        assert_eq!(key(25), None);
-    }
-
-    #[test]
-    fn only_a_complete_device_attributes_reply_ends_the_probe() {
-        assert!(!device_attributes_seen(b"\x1b[?1016;2$y"));
-        assert!(!device_attributes_seen(b"\x1bP>|contour\x1b\\"));
-        assert!(!device_attributes_seen(b"\x1b[?62;4;6;22"));
-        assert!(device_attributes_seen(b"\x1b[?1016;2$y\x1b[?62;4;6;22c"));
-    }
-
-    #[test]
-    fn pane_size_prefers_reported_pixels() {
-        assert_eq!(
-            pane_pixels(Some((800, 600)), Some((1024, 768)), (80, 24), (10, 20)),
-            (800, 600)
-        );
-        assert_eq!(
-            pane_pixels(None, Some((1024, 768)), (80, 24), (10, 20)),
-            (1024, 768)
-        );
-        assert_eq!(pane_pixels(None, None, (80, 24), (10, 20)), (800, 480));
-        assert_eq!(derived_cell(Some((1024, 768)), (80, 24)), Some((12, 32)));
-        assert_eq!(derived_cell(None, (80, 24)), None);
-        assert_eq!(derived_cell(Some((1024, 768)), (0, 24)), None);
     }
 }

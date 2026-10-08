@@ -11,8 +11,8 @@ use smithay::{
 };
 
 use super::{
-    Input, State, apply_window_state,
-    render::{extents, hit_test, popup_origin, viewport_of, window_geometry},
+    Input, State,
+    render::{extents, popup_origin, viewport_of, window_geometry},
 };
 use crate::protocol::modifiers;
 
@@ -32,7 +32,7 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
     }
     state.cursor_pane = Some(pane);
     if state.deciding.insert(window, pane) != Some(pane) {
-        apply_window_state(state, window);
+        state.apply_window_state(window);
     }
     match *event {
         Input::Key {
@@ -53,10 +53,13 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
             pressed,
             scroll,
         } => {
+            if !x.is_finite() || !y.is_finite() {
+                return;
+            }
             if pressed && button.is_some() && !point_in_popups(state, window, x, y) {
                 dismiss_popups(state, window);
             }
-            let hit = hit_test(state, window, x, y);
+            let hit = state.hit_test(window, x, y);
             let location = Point::from((x, y));
             if let Some(pointer) = state.pointer.take() {
                 let time = InputTime::now();
@@ -110,12 +113,12 @@ fn point_in_popups(state: &State, window: u64, x: f64, y: f64) -> bool {
     let Some(root) = state
         .windows
         .get(&window)
-        .map(|entry| entry.surface.wl_surface().clone())
+        .map(|entry| entry.surface.wl_surface())
     else {
         return false;
     };
-    let geometry = window_geometry(&root);
-    PopupManager::popups_for_surface(&root).any(|(popup, location)| {
+    let geometry = window_geometry(root);
+    PopupManager::popups_for_surface(root).any(|(popup, location)| {
         let surface = popup.wl_surface();
         let Some(snapshot) = state.snapshots.get(surface) else {
             return false;

@@ -19,7 +19,8 @@ use smithay::{
 };
 use thiserror::Error;
 
-use super::{MAX_SURFACE_PIXELS, MAX_SURFACE_SIDE, snapshot::Snapshot};
+use super::snapshot::Snapshot;
+use crate::pixels::FrameSize;
 
 #[derive(Debug, Error)]
 enum BackendError {
@@ -229,17 +230,14 @@ impl DmabufBackend {
         &self,
         dmabuf: &Dmabuf,
         bound: Option<(u32, u32)>,
-    ) -> Result<(u32, u32), SnapshotError> {
+    ) -> Result<FrameSize, SnapshotError> {
         let size = dmabuf.size();
         if size.w <= 0 || size.h <= 0 {
             return Err(SnapshotError::safe(BackendError::InvalidDimensions));
         }
-        let (width, height) = (size.w as u32, size.h as u32);
-        if width > MAX_SURFACE_SIDE
-            || height > MAX_SURFACE_SIDE
-            || width as usize * height as usize > MAX_SURFACE_PIXELS
-            || bound.is_some_and(|(max_width, max_height)| width > max_width || height > max_height)
-        {
+        let size = FrameSize::new(size.w as u32, size.h as u32)
+            .ok_or_else(|| SnapshotError::safe(BackendError::SnapshotBounds))?;
+        if !size.fits(bound) {
             return Err(SnapshotError::safe(BackendError::SnapshotBounds));
         }
         if dmabuf.flags().bits() & !DmabufFlags::Y_INVERT.bits() != 0 {
@@ -248,7 +246,7 @@ impl DmabufBackend {
         if !self.formats.contains(&dmabuf.format()) {
             return Err(SnapshotError::safe(BackendError::UnsupportedFormat));
         }
-        Ok((width, height))
+        Ok(size)
     }
 
     pub(super) fn validate(&mut self, dmabuf: &Dmabuf) -> bool {
@@ -343,7 +341,7 @@ impl DmabufBackend {
         bound: Option<(u32, u32)>,
         pixels: &mut Vec<u8>,
     ) -> Result<Snapshot, SnapshotError> {
-        let (width, height) = self.dimensions(dmabuf, bound)?;
+        let size = self.dimensions(dmabuf, bound)?;
         let mapping = self.readback(dmabuf)?;
         let top_down = mapping.flipped();
         // Mapping the PBO blocks until readback completes. Nothing below this
@@ -352,15 +350,12 @@ impl DmabufBackend {
             .renderer
             .map_texture(&mapping)
             .map_err(SnapshotError::safe)?;
-        let row_bytes = width as usize * 4;
-        let needed = row_bytes * height as usize;
+        let row_bytes = size.rgba_stride();
+        let needed = size.rgba_len();
         if bytes.len() != needed {
             return Err(SnapshotError::safe(BackendError::ReadbackLength));
         }
-        pixels.resize(needed, 0);
-        if pixels.capacity() >= needed.saturating_mul(4).max(1 << 20) {
-            pixels.shrink_to_fit();
-        }
+        Snapshot::resize_pixels(pixels, size);
         // GLES reports flipped mappings because its normal projection puts
         // surface row zero at GL row zero. A non-flipped mapping is bottom-up.
         if top_down {
@@ -383,8 +378,8 @@ impl DmabufBackend {
             }
         }
         Ok(Snapshot {
-            width,
-            height,
+            width: size.width(),
+            height: size.height(),
             pixels: std::mem::take(pixels),
             opaque,
         })

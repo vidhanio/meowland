@@ -5,6 +5,7 @@ mod clipboard;
 pub mod compositor;
 mod error;
 pub mod kitty;
+mod pixels;
 pub mod protocol;
 pub mod server;
 pub mod signals;

@@ -48,7 +48,7 @@ Pane protocol version 5 adds clipboard messages; restart the server after upgrad
 - `src/compositor/frame.rs`: independent Wayland callback clock and single-in-flight pane frames.
 - `src/compositor/render.rs`, `input.rs`: surface composition/hit testing and terminal input translation.
 - `src/server/mod.rs`, `transport.rs`, `process.rs`: service state, socket I/O and client lifecycle.
-- `src/terminal.rs`, `kitty.rs`, `kitty/encoding.rs`: terminal event loop, retained-frame presenter and reusable kitty encoder.
+- `src/terminal.rs`, `terminal/input.rs`, `kitty.rs`, `kitty/encoding.rs`: terminal event loop, scoped nonblocking input, retained-frame presenter and reusable kitty encoder.
 - `src/pixels.rs`: nonzero, bounded frame dimensions and checked row-band ranges.
 - `src/protocol.rs`: bounded control and pane messages.
 - `src/main.rs`, `src/cli/`: binary-owned CLI and tracing subscribers.
@@ -62,7 +62,7 @@ DMA-BUF feedback identifies the selected DRM device and its actual supported RGB
 
 Pane sockets are received incrementally without changing their blocking write flags. Partial packets do not block terminal input, termination signals or the handshake deadline; each readiness pass consumes at most 64 KiB of body data. Both directions reject messages larger than 64 MiB, and the encoder's reusable scratch buffer is bounded to that limit plus its four-byte header.
 
-The Crossterm Git dependency includes the upstream zero-coordinate mouse parser fix, so reports at the left or top edge cannot underflow and crash the pane. The pane integration suite checks edge press/release events all the way through to Wayland pointer coordinates.
+The Crossterm Git dependency includes the upstream zero-coordinate mouse parser fix, so reports at the left or top edge cannot underflow and crash the pane. After capability probing, the pane temporarily installs independently opened, nonblocking terminal input for Crossterm, restoring the original stdin descriptor on exit. It does not change the inherited open-file description's flags: stdout, stderr and the parent shell keep blocking I/O. Rejected negative-coordinate reports and fragmented mouse/paste packets cannot stall frame reception or acknowledgements. The pane integration suite checks edge press/release events all the way through to Wayland pointer coordinates, redraws during rejected or incomplete terminal input, and termination with incomplete input.
 
 Server socket owners remove only their own paths; startup preserves regular files and live listeners and reclaims only refused, stale sockets. Shutdown cancels unfinished handshakes, closes stalled panes after the existing grace period, and joins transport threads. Normal detach still delivers Release after any in-flight frame. Process shutdown retains pidfds across signal escalation, so already-discovered helpers remain reachable if their parent exits and they become orphaned.
 

@@ -24,6 +24,10 @@ use crate::{
     signals,
 };
 
+mod input;
+
+use input::InputGuard;
+
 const CELL_WIDTH: u16 = 10;
 const CELL_HEIGHT: u16 = 20;
 /// Cell size assumed when the terminal reports none.
@@ -383,6 +387,10 @@ impl PaneStats {
 
 /// Attach this terminal to a pane until release or disconnection.
 ///
+/// This invocation exclusively owns terminal input and raw mode. Do not read
+/// stdin concurrently; its descriptor is temporarily replaced for nonblocking
+/// event parsing and restored when attachment ends.
+///
 /// # Errors
 /// Fails if the terminal cannot be configured or probed, or the pane
 /// connection fails. Server-initiated release restores the terminal and
@@ -414,6 +422,9 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     if !probe.graphics {
         return Err(Error::GraphicsUnsupported);
     }
+    // The capability probe uses blocking, unbuffered reads. Only subsequent
+    // Crossterm event parsing needs an independent nonblocking descriptor.
+    let _input = InputGuard::enter()?;
     let units = mouse_units(&probe);
     mode.enable_mouse(units)?;
     let mut cell = probe.cell_width.zip(probe.cell_height);

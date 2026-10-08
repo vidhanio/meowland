@@ -1,175 +1,177 @@
-//! Independent Wayland callback clock and coalesced, single-in-flight pane
-//! frames.
+//! Independent Wayland callback clock and single-in-flight pane frames.
 
 use std::{
     ops::Range,
     time::{Duration, Instant},
 };
 
-use super::{
-    DISPLAY_POLL_INTERVAL, Event, FRAME_INTERVAL, State, SurfaceAttributes, render_frame,
-    surface_stack, with_states,
-};
+use super::{DISPLAY_POLL_INTERVAL, Event, FRAME_INTERVAL, State, SurfaceAttributes, with_states};
+use crate::pixels::FrameSize;
+
+/// Each pane owns its scheduling state. No separate dirty-pane index can drift
+/// out of sync with attachment, resizing, or acknowledgements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presentation {
+    Clean,
+    Dirty,
+    InFlight { dirty: bool },
+}
 
 pub(super) struct PaneState {
     pub(super) window: u64,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    /// At most one frame awaits an ack; subsequent commits coalesce in `dirty`.
-    pub(super) in_flight: bool,
-    pub(super) dirty: bool,
+    pub(super) size: FrameSize,
+    presentation: Presentation,
     next_frame: Instant,
     shown: Vec<u8>,
-    shown_size: Option<(u32, u32)>,
-    /// An undrawn frame cannot be used as the basis for a row-band diff.
-    shown_stale: bool,
+    /// None means the retained pixels are not a valid basis for a row diff.
+    shown_size: Option<FrameSize>,
 }
 
 impl PaneState {
-    pub(super) fn new(window: u64, width: u32, height: u32) -> Self {
+    pub(super) fn new(window: u64, size: FrameSize) -> Self {
         Self {
             window,
-            width,
-            height,
-            in_flight: false,
-            dirty: false,
+            size,
+            presentation: Presentation::Clean,
             next_frame: Instant::now(),
             shown: Vec::new(),
             shown_size: None,
-            shown_stale: false,
         }
     }
-}
 
-/// Cap the unpollable command wait by the next frame or display I/O deadline.
-pub(super) fn next_wakeup(state: &State, now: Instant) -> Duration {
-    let mut wait = DISPLAY_POLL_INTERVAL;
-    for window in state.windows.values() {
-        wait = wait.min(window.callback_due.saturating_duration_since(now));
-    }
-    for pane in &state.pending {
-        if let Some(entry) = state.panes.get(pane)
-            && !entry.in_flight
-        {
-            wait = wait.min(entry.next_frame.saturating_duration_since(now));
-        }
-    }
-    wait
-}
-
-/// Run Wayland callbacks per window at ~60Hz, independently of terminal acks.
-/// An unresponsive pane cannot stall its client's drawing or event handling.
-pub(super) fn frame_callbacks(state: &mut State) {
-    let now = Instant::now();
-    for window in state.windows.values_mut() {
-        if now < window.callback_due {
-            continue;
-        }
-        // Skip missed ticks instead of bursting callbacks or drifting the
-        // clock.
-        let late = now.duration_since(window.callback_due).as_nanos();
-        let ticks = late / FRAME_INTERVAL.as_nanos() + 1;
-        window.callback_due += FRAME_INTERVAL * u32::try_from(ticks).unwrap_or(u32::MAX);
-        let root = window.surface.wl_surface().clone();
-        let time = state.started.elapsed().as_millis() as u32;
-        for (surface, _) in surface_stack(&root) {
-            with_states(&surface, |states| {
-                for callback in states
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .current()
-                    .frame_callbacks
-                    .drain(..)
-                {
-                    callback.done(time);
-                }
-            });
-        }
-    }
-}
-
-/// A pane ack frees only its presentation slot, not Wayland callbacks.
-pub(super) fn pane_ack(state: &mut State, pane: u64, drawn: bool) {
-    let Some(entry) = state.panes.get_mut(&pane) else {
-        return;
-    };
-    if !entry.in_flight {
-        return;
-    }
-    entry.in_flight = false;
-    entry.shown_stale = !drawn;
-    if std::mem::take(&mut entry.dirty) || !drawn {
-        state.mark_dirty(pane);
-    }
-}
-
-/// Coalesce pending changes, sending at most one frame per pane per tick.
-pub(super) fn dispatch_frames(state: &mut State) {
-    if state.pending.is_empty() {
-        return;
-    }
-    let now = Instant::now();
-    let due: Vec<u64> = state
-        .pending
-        .iter()
-        .copied()
-        .filter(|pane| {
-            state
-                .panes
-                .get(pane)
-                .is_some_and(|entry| !entry.in_flight && now >= entry.next_frame)
-        })
-        .collect();
-    for pane in due {
-        state.pending.remove(&pane);
-        if !render_frame(state, pane) {
-            continue;
-        }
-        let Some(entry) = state.panes.get_mut(&pane) else {
-            continue;
+    pub(super) const fn mark_dirty(&mut self) {
+        self.presentation = match self.presentation {
+            Presentation::InFlight { .. } => Presentation::InFlight { dirty: true },
+            Presentation::Clean | Presentation::Dirty => Presentation::Dirty,
         };
-        entry.next_frame = now + FRAME_INTERVAL;
-        let stride = entry.width as usize * 3;
-        let rows = if entry.shown_stale || entry.shown_size != Some((entry.width, entry.height)) {
-            Some(0..entry.height as usize)
+    }
+
+    const fn ack(&mut self, drawn: bool) {
+        let Presentation::InFlight { dirty } = self.presentation else {
+            return;
+        };
+        if !drawn {
+            self.shown_size = None;
+        }
+        self.presentation = if dirty || !drawn {
+            Presentation::Dirty
         } else {
-            changed_rows(&entry.shown, &state.scratch, stride)
+            Presentation::Clean
         };
-        let Some(rows) = rows else {
-            continue;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.presentation == Presentation::Dirty && now >= self.next_frame
+    }
+
+    /// Record exactly the pixels sent, not a newer commit or an unacknowledged
+    /// assumption. The allocation crossing threads is only the changed band.
+    fn frame(&mut self, pane: u64, pixels: &[u8], now: Instant) -> Option<Event> {
+        self.presentation = Presentation::Clean;
+        self.next_frame = now + FRAME_INTERVAL;
+        let stride = self.size.rgb_stride();
+        let rows = if self.shown_size == Some(self.size) {
+            self.changed_rows(pixels, stride)?
+        } else {
+            0..self.size.height() as usize
         };
-        let start = rows.start * stride;
-        let end = rows.end * stride;
-        let band = state.scratch[start..end].to_vec();
-        entry.shown.resize(state.scratch.len(), 0);
-        entry.shown[start..end].copy_from_slice(&band);
-        entry.shown_size = Some((entry.width, entry.height));
-        entry.in_flight = true;
-        let _ = state.events.send(Event::Frame {
+        let bytes = rows.start * stride..rows.end * stride;
+        self.shown.resize(pixels.len(), 0);
+        self.shown[bytes.clone()].copy_from_slice(&pixels[bytes.clone()]);
+        self.shown_size = Some(self.size);
+        self.presentation = Presentation::InFlight { dirty: false };
+        Some(Event::Frame {
             pane,
-            width: entry.width,
-            height: entry.height,
+            width: self.size.width(),
+            height: self.size.height(),
             y: rows.start as u32,
-            rgb: band,
-        });
+            rgb: pixels[bytes].to_vec(),
+        })
+    }
+
+    fn changed_rows(&self, pixels: &[u8], stride: usize) -> Option<Range<usize>> {
+        if self.shown.len() != pixels.len() {
+            return Some(0..pixels.len() / stride);
+        }
+        let differs = |(old, new): (&[u8], &[u8])| old != new;
+        let mut rows = self
+            .shown
+            .chunks_exact(stride)
+            .zip(pixels.chunks_exact(stride));
+        let first = rows.position(differs)?;
+        // `rows` now starts just after `first`, so a matching tail does not
+        // rescan the first differing row.
+        let end = rows
+            .rposition(differs)
+            .map_or(first + 1, |last| first + last + 2);
+        Some(first..end)
     }
 }
 
-fn changed_rows(shown: &[u8], buffer: &[u8], stride: usize) -> Option<Range<usize>> {
-    if stride == 0 {
-        return None;
+impl State {
+    /// Cap the command wait by the next dirty pane or display I/O deadline.
+    pub(super) fn next_wakeup(&self, now: Instant) -> Duration {
+        let mut wait = DISPLAY_POLL_INTERVAL;
+        for window in self.windows.values() {
+            wait = wait.min(window.callback_due.saturating_duration_since(now));
+        }
+        for pane in self.panes.values() {
+            if pane.presentation == Presentation::Dirty {
+                wait = wait.min(pane.next_frame.saturating_duration_since(now));
+            }
+        }
+        wait
     }
-    let rows = buffer.len() / stride;
-    if shown.len() != buffer.len() {
-        return Some(0..rows);
+
+    /// Run Wayland callbacks at ~60Hz, independently of terminal acks.
+    pub(super) fn frame_callbacks(&mut self) {
+        let now = Instant::now();
+        let time = self.started.elapsed().as_millis() as u32;
+        for window in self.windows.values_mut() {
+            if now < window.callback_due {
+                continue;
+            }
+            // Skip missed ticks instead of bursting callbacks or drifting.
+            let late = now.duration_since(window.callback_due).as_nanos();
+            let ticks = late / FRAME_INTERVAL.as_nanos() + 1;
+            window.callback_due += FRAME_INTERVAL * u32::try_from(ticks).unwrap_or(u32::MAX);
+            self.renderer.stack.rebuild(window.surface.wl_surface());
+            for (surface, _) in &self.renderer.stack.surfaces {
+                with_states(surface, |states| {
+                    for callback in states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .frame_callbacks
+                        .drain(..)
+                    {
+                        callback.done(time);
+                    }
+                });
+            }
+            self.renderer.stack.clear();
+        }
     }
-    let differs = |row: usize| {
-        shown[row * stride..(row + 1) * stride] != buffer[row * stride..(row + 1) * stride]
-    };
-    let first = (0..rows).find(|row| differs(*row))?;
-    let last = (first..rows)
-        .rev()
-        .find(|row| differs(*row))
-        .unwrap_or(first);
-    Some(first..last + 1)
+
+    pub(super) fn pane_ack(&mut self, pane: u64, drawn: bool) {
+        if let Some(entry) = self.panes.get_mut(&pane) {
+            entry.ack(drawn);
+        }
+    }
+
+    /// Borrow disjoint fields instead of allocating a list of due pane IDs.
+    pub(super) fn dispatch_frames(&mut self) {
+        let now = Instant::now();
+        for (&pane, entry) in &mut self.panes {
+            if !entry.due(now) {
+                continue;
+            }
+            let pixels =
+                self.renderer
+                    .render(&self.windows, &self.snapshots, entry.window, entry.size);
+            if let Some(frame) = entry.frame(pane, pixels, now) {
+                let _ = self.events.send(frame);
+            }
+        }
+    }
 }

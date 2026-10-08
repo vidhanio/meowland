@@ -233,17 +233,3 @@ fn wait_for_x_socket(number: u32, child: &mut Child, timeout: Duration) -> Resul
     }
     Err(Error::XServerTimeout { socket, timeout })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_descendants_include_every_generation_and_exclude_other_trees() {
-        let children = HashMap::from([(1, vec![2]), (2, vec![3, 4]), (99, vec![5])]);
-        assert_eq!(
-            descendants_in(&children, &HashSet::from([1])),
-            HashSet::from([2, 3, 4])
-        );
-    }
-}

@@ -21,10 +21,8 @@ use transport::{Pane, accept_control, accept_panes, bind};
 
 use crate::{
     Error, Result,
-    compositor::{
-        self, Command as CompositorCommand, Event as CompositorEvent, MAX_SURFACE_PIXELS,
-        MAX_SURFACE_SIDE,
-    },
+    compositor::{self, Command as CompositorCommand, Event as CompositorEvent},
+    pixels::FrameSize,
     protocol::{
         self, ControlRequest, ControlResponse, Hello, KEY_Q, KEY_W, PaneToServer, ServerToPane,
         WindowInfo,
@@ -325,7 +323,7 @@ impl Server {
             );
             return;
         }
-        if !valid_size(hello.width, hello.height) {
+        if FrameSize::new(hello.width, hello.height).is_none() {
             let _ = protocol::send(
                 &mut writer,
                 &ServerToPane::Reject("invalid pane dimensions".into()),
@@ -393,7 +391,7 @@ impl Server {
                 }
             },
             PaneToServer::Resize { width, height } => {
-                if valid_size(width, height) {
+                if FrameSize::new(width, height).is_some() {
                     let _ = self.commands.send(CompositorCommand::Resize {
                         pane: id,
                         width,
@@ -467,12 +465,4 @@ impl Server {
         let _ = self.commands.send(CompositorCommand::Shutdown);
         let _ = compositor_thread.join();
     }
-}
-
-fn valid_size(width: u32, height: u32) -> bool {
-    width > 0
-        && height > 0
-        && width <= MAX_SURFACE_SIDE
-        && height <= MAX_SURFACE_SIDE
-        && u64::from(width) * u64::from(height) <= MAX_SURFACE_PIXELS as u64
 }

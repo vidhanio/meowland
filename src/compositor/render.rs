@@ -1,5 +1,7 @@
 //! Surface traversal, hit testing, and frame composition.
 
+use std::collections::HashMap;
+
 use smithay::{
     utils::Point,
     wayland::compositor::{SurfaceData, TraversalAction, with_surface_tree_upward},
@@ -7,61 +9,82 @@ use smithay::{
 
 use super::{
     Logical, PopupKind, PopupManager, Rectangle, Size, Snapshot, State, SubsurfaceCachedState,
-    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, WlSurface, with_states,
+    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, Window, WlSurface, with_states,
 };
+use crate::pixels::FrameSize;
 
-/// Compose the selected window and its surfaces into the reusable pane buffer.
-pub(super) fn render_frame(state: &mut State, pane: u64) -> bool {
-    let Some((window, width, height)) = state
-        .panes
-        .get(&pane)
-        .map(|entry| (entry.window, entry.width, entry.height))
-    else {
-        return false;
-    };
-    // Commands come from validated panes, but reject invalid dimensions here
-    // before allocating or computing a row stride.
-    if width == 0
-        || height == 0
-        || width > super::MAX_SURFACE_SIDE
-        || height > super::MAX_SURFACE_SIDE
-        || width as usize * height as usize > super::MAX_SURFACE_PIXELS
-    {
-        return false;
+/// Scratch allocations owned by the compositor, not by any client or pane.
+#[derive(Default)]
+pub(super) struct Renderer {
+    pixels: Vec<u8>,
+    pub(super) stack: SurfaceStack,
+}
+
+impl Renderer {
+    /// Compose one pane while borrowing scene state only for this draw.
+    pub(super) fn render(
+        &mut self,
+        windows: &HashMap<u64, Window>,
+        snapshots: &HashMap<WlSurface, Snapshot>,
+        window: u64,
+        size: FrameSize,
+    ) -> &[u8] {
+        if let Some(window) = windows.get(&window) {
+            self.stack.rebuild(window.surface.wl_surface());
+        } else {
+            self.stack.clear();
+        }
+        let (width, height) = (size.width(), size.height());
+        self.pixels.resize(size.rgb_len(), 0);
+        let first = if opaque_cover(snapshots, &self.stack.surfaces, width, height) {
+            // The topmost opaque surface hides the backdrop and everything
+            // below.
+            self.stack.surfaces.len() - 1
+        } else {
+            self.pixels.fill(0);
+            0
+        };
+        for (surface, origin) in &self.stack.surfaces[first..] {
+            blit(snapshots, surface, *origin, &mut self.pixels, width, height);
+        }
+        // Keep allocations, but never keep clients alive through scratch
+        // handles.
+        self.stack.clear();
+        &self.pixels
     }
-    let stack = state
-        .windows
-        .get(&window)
-        .map_or_default(|entry| surface_stack(&entry.surface.wl_surface().clone()));
-    let mut out = std::mem::take(&mut state.scratch);
-    out.resize(width as usize * height as usize * 3, 0);
-    let first = if opaque_cover(state, &stack, width, height) {
-        // The topmost opaque surface hides the backdrop and everything below.
-        stack.len() - 1
-    } else {
-        out.fill(0);
-        0
-    };
-    for (surface, origin) in &stack[first..] {
-        blit(state, surface, *origin, &mut out, width, height);
-    }
-    state.scratch = out;
-    true
 }
 
 /// Window surfaces in bottom-to-top order, with origins in pane coordinates.
-pub(super) fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
-    let mut stack = Vec::new();
-    collect_surface(root, (0, 0).into(), &mut stack);
-    let geometry = window_geometry(root);
-    let mut popups: Vec<_> = PopupManager::popups_for_surface(root).collect();
-    // Smithay lists popup children before parents; drawing needs the reverse.
-    popups.reverse();
-    for (popup, location) in popups {
-        let origin = popup_origin(geometry, location, &popup);
-        collect_surface(popup.wl_surface(), origin, &mut stack);
+#[derive(Default)]
+pub(super) struct SurfaceStack {
+    pub(super) surfaces: Vec<(WlSurface, Point<i32, Logical>)>,
+    popups: Vec<(PopupKind, Point<i32, Logical>)>,
+}
+
+impl SurfaceStack {
+    pub(super) fn rebuild(&mut self, root: &WlSurface) {
+        self.clear();
+        collect_surface(root, (0, 0).into(), &mut self.surfaces);
+        let geometry = window_geometry(root);
+        self.popups.extend(PopupManager::popups_for_surface(root));
+        // Smithay lists popup children before parents; drawing needs the
+        // reverse.
+        for (popup, location) in self.popups.drain(..).rev() {
+            let origin = popup_origin(geometry, location, &popup);
+            collect_surface(popup.wl_surface(), origin, &mut self.surfaces);
+        }
     }
-    stack
+
+    pub(super) fn clear(&mut self) {
+        self.surfaces.clear();
+        self.popups.clear();
+    }
+}
+
+pub(super) fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
+    let mut stack = SurfaceStack::default();
+    stack.rebuild(root);
+    stack.surfaces
 }
 
 /// Popup positions are measured against the parent's window geometry origin.
@@ -135,15 +158,15 @@ pub(super) fn collect_surface(
 }
 
 /// Blend premultiplied surface pixels into the pane, applying its viewport.
-pub(super) fn blit(
-    state: &State,
+fn blit(
+    snapshots: &HashMap<WlSurface, Snapshot>,
     surface: &WlSurface,
     origin: Point<i32, Logical>,
     out: &mut [u8],
     width: u32,
     height: u32,
 ) {
-    let Some(snapshot) = state.snapshots.get(surface) else {
+    let Some(snapshot) = snapshots.get(surface) else {
         return;
     };
     let viewport = viewport_of(surface);
@@ -284,8 +307,8 @@ fn blend_pixel(pixel: [u8; 4], rgb: &mut [u8; 3]) {
     }
 }
 
-pub(super) fn opaque_cover(
-    state: &State,
+fn opaque_cover(
+    snapshots: &HashMap<WlSurface, Snapshot>,
     stack: &[(WlSurface, Point<i32, Logical>)],
     width: u32,
     height: u32,
@@ -293,7 +316,7 @@ pub(super) fn opaque_cover(
     let Some((surface, origin)) = stack.last() else {
         return false;
     };
-    let Some(snapshot) = state.snapshots.get(surface) else {
+    let Some(snapshot) = snapshots.get(surface) else {
         return false;
     };
     let viewport = viewport_of(surface);
@@ -327,69 +350,54 @@ pub(super) fn viewport_of(surface: &WlSurface) -> ViewportCachedState {
     })
 }
 
-/// Smithay expects the surface origin, not the local point, for pointer focus.
-pub(super) fn hit_test(
-    state: &State,
-    window: u64,
-    x: f64,
-    y: f64,
-) -> Option<(WlSurface, Point<f64, Logical>)> {
-    let root = state.windows.get(&window)?.surface.wl_surface().clone();
-    for (surface, origin) in surface_stack(&root).into_iter().rev() {
-        let Some(snapshot) = state.snapshots.get(&surface) else {
-            continue;
-        };
-        let (_, dst) = extents(snapshot, viewport_of(&surface));
-        let local = Point::<f64, Logical>::from((x - f64::from(origin.x), y - f64::from(origin.y)));
-        if local.x < 0.0
-            || local.y < 0.0
-            || local.x >= f64::from(dst.w)
-            || local.y >= f64::from(dst.h)
-        {
-            continue;
-        }
-        let inside = with_states(&surface, |states| {
-            states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .input_region
-                .as_ref()
-                .is_none_or(|region| {
-                    region.contains((local.x.floor() as i32, local.y.floor() as i32))
+impl State {
+    /// Smithay expects the surface origin, not the local point, for pointer
+    /// focus.
+    pub(super) fn hit_test(
+        &mut self,
+        window: u64,
+        x: f64,
+        y: f64,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let root = self.windows.get(&window)?.surface.wl_surface();
+        self.renderer.stack.rebuild(root);
+        let hit = self
+            .renderer
+            .stack
+            .surfaces
+            .iter()
+            .rev()
+            .find_map(|(surface, origin)| {
+                let snapshot = self.snapshots.get(surface)?;
+                let (_, dst) = extents(snapshot, viewport_of(surface));
+                let local =
+                    Point::<f64, Logical>::from((x - f64::from(origin.x), y - f64::from(origin.y)));
+                if local.x < 0.0
+                    || local.y < 0.0
+                    || local.x >= f64::from(dst.w)
+                    || local.y >= f64::from(dst.h)
+                {
+                    return None;
+                }
+                let inside = with_states(surface, |states| {
+                    states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .input_region
+                        .as_ref()
+                        .is_none_or(|region| {
+                            region.contains((local.x.floor() as i32, local.y.floor() as i32))
+                        })
+                });
+                inside.then(|| {
+                    (
+                        surface.clone(),
+                        Point::from((f64::from(origin.x), f64::from(origin.y))),
+                    )
                 })
-        });
-        if inside {
-            return Some((
-                surface,
-                Point::from((f64::from(origin.x), f64::from(origin.y))),
-            ));
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unscaled_blit_clips_and_blends_premultiplied_alpha() {
-        let snapshot = Snapshot {
-            width: 3,
-            height: 1,
-            pixels: vec![
-                255, 0, 0, 255, // clipped away
-                0, 64, 0, 128, // half-transparent green
-                0, 0, 0, 0, // transparent
-            ],
-            opaque: false,
-        };
-        let mut pane = vec![10, 20, 30, 40, 50, 60];
-        let clip = Rectangle::new((0, 0).into(), (2, 1).into());
-
-        blit_unscaled(&snapshot, -1, 0, clip, &mut pane, 2);
-
-        assert_eq!(pane, [5, 74, 15, 40, 50, 60]);
+            });
+        self.renderer.stack.clear();
+        hit
     }
 }

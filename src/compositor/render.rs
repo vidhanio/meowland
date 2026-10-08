@@ -1,11 +1,13 @@
 //! Surface traversal, hit testing, and frame composition.
 
-use smithay::utils::Point;
+use smithay::{
+    utils::Point,
+    wayland::compositor::{SurfaceData, TraversalAction, with_surface_tree_upward},
+};
 
 use super::{
     Logical, PopupKind, PopupManager, Rectangle, Size, Snapshot, State, SubsurfaceCachedState,
-    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, WlSurface, get_children,
-    with_states,
+    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, WlSurface, with_states,
 };
 
 /// Compose the selected window and its surfaces into the reusable pane buffer.
@@ -81,7 +83,15 @@ pub(super) fn popup_origin(
     location: Point<i32, Logical>,
     popup: &PopupKind,
 ) -> Point<i32, Logical> {
-    parent_geometry + location - popup.geometry().loc
+    let geometry = popup.geometry().loc;
+    let coordinate = |parent, location, geometry| {
+        (i64::from(parent) + i64::from(location) - i64::from(geometry))
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    };
+    Point::from((
+        coordinate(parent_geometry.x, location.x, geometry.x),
+        coordinate(parent_geometry.y, location.y, geometry.y),
+    ))
 }
 
 pub(super) fn collect_surface(
@@ -89,17 +99,39 @@ pub(super) fn collect_surface(
     origin: Point<i32, Logical>,
     stack: &mut Vec<(WlSurface, Point<i32, Logical>)>,
 ) {
-    stack.push((surface.clone(), origin));
-    for child in get_children(surface) {
-        let offset = with_states(&child, |states| {
-            states
-                .cached_state
-                .get::<SubsurfaceCachedState>()
-                .current()
-                .location
-        });
-        collect_surface(&child, origin + offset, stack);
-    }
+    let position = |node: &WlSurface, states: &SurfaceData, parent: &(i64, i64)| {
+        if node == surface {
+            return *parent;
+        }
+        let offset = states
+            .cached_state
+            .get::<SubsurfaceCachedState>()
+            .current()
+            .location;
+        (
+            parent.0 + i64::from(offset.x),
+            parent.1 + i64::from(offset.y),
+        )
+    };
+    // Smithay preserves client stacking, including children below their parent.
+    // Wide coordinates allow offscreen descendants to return into view.
+    with_surface_tree_upward(
+        surface,
+        (i64::from(origin.x), i64::from(origin.y)),
+        |node, states, parent| TraversalAction::DoChildren(position(node, states, parent)),
+        |node, states, parent| {
+            let (x, y) = position(node, states, parent);
+            stack.push((
+                node.clone(),
+                (
+                    x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                )
+                    .into(),
+            ));
+        },
+        |_, _, _| true,
+    );
 }
 
 /// Blend premultiplied surface pixels into the pane, applying its viewport.

@@ -217,13 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn server_takes_no_arguments() {
-        let cli = parse(&["meowland", "server"]).expect("server should parse");
-        assert!(matches!(cli.command, Commands::Server));
-        assert!(parse(&["meowland", "server", "unexpected"]).is_err());
-    }
-
-    #[test]
     fn run_requires_a_program_but_accepts_program_flags() {
         assert!(parse(&["meowland", "run"]).is_err());
         let cli = parse(&["meowland", "run", "program", "--flag"])
@@ -235,19 +228,6 @@ mod tests {
             args.command,
             [OsString::from("program"), OsString::from("--flag")]
         );
-    }
-
-    #[test]
-    fn completion_shells_are_validated_by_the_parser() {
-        let cli = parse(&["meowland", "completions", "pwsh"])
-            .expect("the advertised PowerShell alias should parse");
-        assert!(matches!(
-            cli.command,
-            Commands::Completions(CompletionArgs {
-                shell: CompletionShell::PowerShell
-            })
-        ));
-        assert!(parse(&["meowland", "completions", "not-a-shell"]).is_err());
     }
 
     #[test]

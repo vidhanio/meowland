@@ -630,7 +630,6 @@ impl Client {
         // The sent pool fd keeps the inode alive after unlinking.
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&staging).unwrap();
-        // Argb8888 pixels are B, G, R, alpha; the compositor ignores alpha.
         self.request(pool_id, 0, &u32s(&[buffer_id, 0, width, height, stride, 0]));
         self.request(pool_id, 1, &[]);
         (buffer_id, file)
@@ -686,6 +685,10 @@ impl Client {
 
     pub fn subsurface_position(&mut self, subsurface: u32, x: i32, y: i32) {
         self.request(subsurface, 1, &i32s(&[x, y]));
+    }
+
+    pub fn subsurface_below(&mut self, subsurface: u32, sibling: u32) {
+        self.request(subsurface, 3, &u32s(&[sibling]));
     }
 
     pub fn subsurface_desync(&mut self, subsurface: u32) {

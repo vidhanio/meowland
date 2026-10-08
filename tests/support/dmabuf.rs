@@ -1,4 +1,4 @@
-use std::{error::Error, fs::OpenOptions, path::PathBuf};
+use std::{fs::OpenOptions, io, path::PathBuf};
 
 use smithay::{
     backend::{
@@ -8,19 +8,36 @@ use smithay::{
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
         drm::NodeType,
-        egl::{EGLContext, EGLDevice, EGLDisplay},
+        egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError},
         renderer::{
             Bind, Color32F, Frame, Renderer,
-            gles::{Capability, GlesRenderer},
-            sync::SyncPoint,
+            gles::{Capability, GlesError, GlesRenderer},
+            sync::{Interrupted, SyncPoint},
         },
     },
     utils::{Rectangle, Transform},
 };
+use thiserror::Error;
 
 use super::{Client, u32s};
 
-type TestError = Box<dyn Error>;
+#[derive(Debug, Error)]
+pub enum ProducerError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Egl(#[from] EglError),
+    #[error(transparent)]
+    Gles(#[from] GlesError),
+    #[error(transparent)]
+    Wait(#[from] Interrupted),
+    #[error("GPU scenario requires EGL fence synchronization")]
+    MissingFenceSync,
+    #[error("GPU scenario requires GLES 3 and EGL synchronization")]
+    MissingRendererSync,
+    #[error("no allocatable advertised RGBA format/modifier: {}", .0.join("; "))]
+    Allocation(Vec<String>),
+}
 
 pub struct Producer {
     pub node: PathBuf,
@@ -91,7 +108,7 @@ impl Producer {
     }
 
     #[allow(unsafe_code)]
-    fn initialize(device: EGLDevice, node: PathBuf) -> Result<Self, TestError> {
+    fn initialize(device: EGLDevice, node: PathBuf) -> Result<Self, ProducerError> {
         let fd = OpenOptions::new().read(true).write(true).open(&node)?;
         let allocator = GbmAllocator::new(GbmDevice::new(fd)?, GbmBufferFlags::RENDERING);
         // SAFETY: this owned EGL device/display/context is used only on the
@@ -102,7 +119,7 @@ impl Producer {
             .iter()
             .any(|extension| extension == "EGL_KHR_fence_sync")
         {
-            return Err("GPU scenario requires EGL fence synchronization".into());
+            return Err(ProducerError::MissingFenceSync);
         }
         let formats = display.dmabuf_render_formats().iter().copied().collect();
         let context = EGLContext::new(&display)?;
@@ -111,7 +128,7 @@ impl Producer {
         if !renderer.capabilities().contains(&Capability::Fencing)
             || !renderer.capabilities().contains(&Capability::ExportFence)
         {
-            return Err("GPU scenario requires GLES 3 and EGL synchronization".into());
+            return Err(ProducerError::MissingRendererSync);
         }
         Ok(Self {
             node,
@@ -126,7 +143,7 @@ impl Producer {
         width: u32,
         height: u32,
         advertised: &[Format],
-    ) -> Result<GpuBuffer, TestError> {
+    ) -> Result<GpuBuffer, ProducerError> {
         let mut failures = Vec::new();
         for format in advertised.iter().filter(|format| {
             matches!(format.code, Fourcc::Argb8888 | Fourcc::Abgr8888)
@@ -163,18 +180,14 @@ impl Producer {
                 Err(error) => failures.push(error.to_string()),
             }
         }
-        Err(format!(
-            "no allocatable advertised RGBA format/modifier: {}",
-            failures.join("; ")
-        )
-        .into())
+        Err(ProducerError::Allocation(failures))
     }
 
     pub fn paint(
         &mut self,
         buffer: &mut GpuBuffer,
         rgba: &[[u8; 4]],
-    ) -> Result<SyncPoint, TestError> {
+    ) -> Result<SyncPoint, ProducerError> {
         let size = buffer.dmabuf.size();
         assert_eq!(rgba.len(), (size.w * size.h) as usize);
         let mut target = self.renderer.bind(&mut buffer.dmabuf)?;

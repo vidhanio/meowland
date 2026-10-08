@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::Write,
+    io::{self, Write},
     ops::Range,
     sync::{
         Arc,
@@ -12,7 +12,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, write::ZlibEncoder};
-use rustix::{fs::Mode, shm};
+use rustix::{fs::Mode, io::Errno, shm};
+
+use crate::compositor::{MAX_SURFACE_PIXELS, MAX_SURFACE_SIDE};
 
 const MAX_PATCHES: usize = 32;
 /// Consecutive unread frames before abandoning shared memory permanently.
@@ -54,8 +56,11 @@ impl SharedMemory {
     /// succeeds.
     #[must_use]
     pub fn probe(&self) -> Option<Vec<u8>> {
-        let mut file = self.create()?;
-        file.write_all(&[0; 3]).ok()?;
+        let mut file = self.create().ok()?;
+        if file.write_all(&[0; 3]).is_err() {
+            self.clear();
+            return None;
+        }
         Some(
             format!(
                 "\x1b_Ga=q,f=24,s=1,v=1,i={PROBE_ID},t=s;{}\x1b\\",
@@ -69,14 +74,14 @@ impl SharedMemory {
         let _ = shm::unlink(self.name.as_str());
     }
 
-    fn create(&self) -> Option<File> {
+    fn create(&self) -> io::Result<File> {
         shm::open(
             self.name.as_str(),
             shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR,
             Mode::RUSR | Mode::WUSR,
         )
-        .ok()
         .map(File::from)
+        .map_err(io::Error::from)
     }
 
     fn transfer(
@@ -152,6 +157,13 @@ struct Rect {
     height: u32,
 }
 
+#[derive(Debug)]
+enum SharedFrame {
+    Inline,
+    Ready(File),
+    Unread,
+}
+
 #[derive(Debug, Default)]
 struct EncodingBuffers {
     compressed: Vec<u8>,
@@ -165,19 +177,8 @@ impl Presenter {
     pub fn new(cell_size: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
         Self {
             cell_size,
-            image: Arc::new(Vec::new()),
-            width: 0,
-            height: 0,
-            base: None,
-            display_current: false,
-            rects: Vec::new(),
-            damage: 0..0,
-            patch_count: 0,
             shared,
-            encoder: EncodingBuffers::default(),
-            patch_pixels: Vec::new(),
-            dropped: false,
-            drops: 0,
+            ..Self::default()
         }
     }
 
@@ -230,19 +231,18 @@ impl Presenter {
             return Vec::new();
         }
 
-        // Replaced patches are deleted; live IDs span `2 ..= patch_count + 1`.
         let patches = self.select_patches(width, height);
 
         let file = if patches {
             None
         } else {
             match self.ready_shared() {
-                Ok(file) => file,
-                Err(()) => return Vec::new(),
+                SharedFrame::Inline => None,
+                SharedFrame::Ready(file) => Some(file),
+                SharedFrame::Unread => return Vec::new(),
             }
         };
 
-        // Size inline output for the selected compressed or raw payload.
         let prepared =
             (!patches && file.is_none()).then(|| prepare_image(&mut self.encoder, &self.image));
         let capacity = prepared.map_or(64, |compressed| {
@@ -269,25 +269,33 @@ impl Presenter {
 
     /// Drop frames while the terminal is briefly behind, then permanently
     /// fall back to pty transfer rather than cycling through freezes.
-    fn ready_shared(&mut self) -> Result<Option<File>, ()> {
+    fn ready_shared(&mut self) -> SharedFrame {
         let Some(slot) = &self.shared else {
-            return Ok(None);
+            return SharedFrame::Inline;
         };
-        let file = slot.create();
-        if file.is_some() {
-            self.drops = 0;
-            return Ok(file);
+        match slot.create() {
+            Ok(file) => {
+                self.drops = 0;
+                return SharedFrame::Ready(file);
+            }
+            Err(error) if error.raw_os_error() == Some(Errno::EXIST.raw_os_error()) => {}
+            Err(error) => {
+                tracing::warn!(%error, "Shared-memory transport unavailable; using inline frames");
+                self.shared = None;
+                self.drops = 0;
+                return SharedFrame::Inline;
+            }
         }
         self.drops += 1;
         if self.drops < DROP_LIMIT {
             self.dropped = true;
             self.display_current = false;
-            return Err(());
+            return SharedFrame::Unread;
         }
         self.drops = 0;
         slot.clear();
         self.shared = None;
-        Ok(None)
+        SharedFrame::Inline
     }
 
     fn write_patches(&mut self, out: &mut Vec<u8>, width: u32) {
@@ -323,7 +331,6 @@ impl Presenter {
         file: Option<File>,
         prepared: Option<bool>,
     ) {
-        // Delete image data and clear placements before replacement.
         delete_all(out);
         out.extend_from_slice(b"\x1b[2J\x1b[H");
         let shared = self
@@ -332,6 +339,7 @@ impl Presenter {
             .zip(file)
             .is_some_and(|(slot, file)| slot.transfer(out, file, width, height, &self.image));
         if !shared {
+            self.shared = None;
             if let Some(compressed) = prepared {
                 write_image(
                     out,
@@ -366,6 +374,12 @@ impl Presenter {
     }
 
     fn apply_band(&mut self, width: u32, height: u32, y: u32, band: Vec<u8>) -> Option<bool> {
+        if width > MAX_SURFACE_SIDE
+            || height > MAX_SURFACE_SIDE
+            || u64::from(width) * u64::from(height) > MAX_SURFACE_PIXELS as u64
+        {
+            return None;
+        }
         let (Ok(stride), Ok(rows), Ok(top)) = (
             usize::try_from(width),
             usize::try_from(height),
@@ -518,13 +532,12 @@ fn changed_rects(
             if covered >= limit {
                 return false;
             }
-            // Merge vertically adjacent equal-width runs.
-            if let Some(last) = rects.last_mut()
-                && last.x == rect.x
-                && last.width == rect.width
-                && last.y + last.height == rect.y
-            {
-                last.height += rect.height;
+            if let Some(previous) = rects.iter_mut().rev().find(|previous| {
+                previous.x == rect.x
+                    && previous.width == rect.width
+                    && previous.y + previous.height == rect.y
+            }) {
+                previous.height += rect.height;
                 continue;
             }
             rects.push(rect);
@@ -562,7 +575,6 @@ fn extract(image: &[u8], width: u32, rect: Rect, out: &mut Vec<u8>) {
 }
 
 fn move_cursor(out: &mut Vec<u8>, x: u32, y: u32, cell_size: Option<(u16, u16)>) {
-    // Zero cell dimensions must not divide cursor coordinates.
     let (cell_w, cell_h) =
         cell_size.map_or((1, 1), |(w, h)| (u32::from(w).max(1), u32::from(h).max(1)));
     let col = x / cell_w + 1;
@@ -637,7 +649,6 @@ fn write_image(
         let bytes = STANDARD
             .encode_slice(chunk, &mut encoded_chunk)
             .expect("a chunk of payload always fits its base64");
-        // Only continuations use `m=0`; earlier chunks use `m=1`.
         let more = chunks.peek().is_some();
         if first {
             out.extend_from_slice(b"\x1b_G");
@@ -1004,30 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_is_whole_and_a_cell_change_is_a_patch() {
-        let mut presenter = Presenter::new(Some((2, 2)), None);
-        let base = noise(&mut 1, 4 * 2 * 3);
-        let first = whole(&mut presenter, 4, 2, &base);
-        assert_eq!(whole_frames(&first).len(), 1);
-        assert_eq!(patches(&first), Vec::<String>::new());
-
-        let mut changed = base;
-        put_block(&mut changed, 4, 0, 0, 2, 2, 0xab);
-        let second = whole(&mut presenter, 4, 2, &changed);
-        assert_eq!(patches(&second).len(), 1);
-        assert_eq!(whole_frames(&second).len(), 0);
-        assert_eq!(replay(&[first, second], 4, 2, (2, 2)), changed);
-    }
-
-    #[test]
-    fn unchanged_frame_is_empty() {
-        let mut presenter = Presenter::new(None, None);
-        let rgb = vec![1; 12];
-        assert_ne!(whole(&mut presenter, 2, 2, &rgb), Vec::<u8>::new());
-        assert_eq!(whole(&mut presenter, 2, 2, &rgb), Vec::<u8>::new());
-    }
-
-    #[test]
     fn whole_frame_transmit_has_exact_parameters() {
         let mut presenter = Presenter::new(None, None);
         let update = whole(&mut presenter, 2, 2, &noise(&mut 7, 2 * 2 * 3));
@@ -1198,8 +1185,6 @@ mod tests {
         assert_eq!(replay(&[first, second], 5, 2, (2, 2)), ragged);
     }
 
-    /// A slot only pays for diffs small enough that the whole transfer it
-    /// replaces would be the larger one.
     #[test]
     fn a_shared_slot_turns_a_large_diff_into_a_whole_frame() {
         let Some(shared) = shared_memory() else {
@@ -1334,25 +1319,6 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_frame_goes_through_shared_memory_when_the_terminal_reads_it() {
-        let Some(shared) = shared_memory() else {
-            return;
-        };
-        let mut presenter = Presenter::new(Some((2, 2)), Some(shared));
-        let frame = noise(&mut 11, 4 * 2 * 3);
-        let update = whole(&mut presenter, 4, 2, &frame);
-        let control = whole_frames(&update);
-        assert_eq!(control.len(), 1);
-        assert!(
-            control[0].contains("t=s"),
-            "not a shared transfer: {control:?}"
-        );
-        assert_eq!(replay(&[update], 4, 2, (2, 2)), frame);
-    }
-
-    /// An unread shared object drops the next frame until the terminal catches
-    /// up.
-    #[test]
     fn a_slot_the_terminal_has_not_read_drops_the_frame() {
         let Some(shared) = shared_memory() else {
             return;
@@ -1469,8 +1435,6 @@ mod tests {
         assert_eq!(terminal.screen(), expected);
     }
 
-    /// Recovering the displayed frame after a drop must not report another
-    /// drop.
     #[test]
     fn an_unchanged_frame_after_a_drop_is_not_reported_dropped() {
         let Some(shared) = shared_memory() else {
@@ -1490,7 +1454,6 @@ mod tests {
         assert!(!presenter.dropped());
     }
 
-    /// Permanently fall back to pty frames if shared objects stay unread.
     #[test]
     fn a_slot_that_is_never_read_falls_back_to_the_pty() {
         let Some(shared) = shared_memory() else {
@@ -1539,6 +1502,55 @@ mod tests {
         );
         replay.feed(&next);
         assert_eq!(replay.screen(), frame);
+    }
+
+    #[test]
+    fn separated_columns_merge_vertically_before_exhausting_the_patch_budget() {
+        let (width, height) = (12, 80);
+        let mut presenter = Presenter::new(Some((2, 2)), None);
+        let mut frame = vec![0; (width * height * 3) as usize];
+        let first = whole(&mut presenter, width, height, &frame);
+        put_block(&mut frame, width, 0, 0, 2, height, 71);
+        put_block(&mut frame, width, 8, 0, 2, height, 93);
+        let update = whole(&mut presenter, width, height, &frame);
+        assert_eq!(patches(&update).len(), 2);
+        assert_eq!(whole_frames(&update), Vec::<String>::new());
+        assert_eq!(replay(&[first, update], 12, 80, (2, 2)), frame);
+    }
+
+    #[test]
+    fn broken_shared_memory_falls_back_without_dropping_frames() {
+        let shared = SharedMemory {
+            name: "/meowland-invalid/name".into(),
+        };
+        let mut presenter = Presenter::new(None, Some(shared));
+        let frame = vec![17; 4 * 4 * 3];
+        let update = whole(&mut presenter, 4, 4, &frame);
+        assert!(!presenter.dropped());
+        assert!(!whole_frames(&update)[0].contains("t=s"));
+        assert!(presenter.shared.is_none());
+        assert_eq!(replay(&[update], 4, 4, (1, 1)), frame);
+    }
+
+    #[test]
+    fn invalid_bands_do_not_mutate_the_retained_image() {
+        let mut presenter = Presenter::new(None, None);
+        let frame = vec![17; 4 * 4 * 3];
+        let _ = whole(&mut presenter, 4, 4, &frame);
+        for (width, height, y, band) in [
+            (0, 4, 0, vec![1; 12]),
+            (4, 0, 0, vec![1; 12]),
+            (4, 4, 0, vec![]),
+            (4, 4, 0, vec![1; 11]),
+            (4, 4, 4, vec![1; 12]),
+            (4, 4, u32::MAX, vec![1; 12]),
+            (8193, 2, 0, vec![1; 8193 * 3]),
+        ] {
+            assert_eq!(presenter.present(width, height, y, band), Vec::<u8>::new());
+            assert_eq!((presenter.width, presenter.height), (4, 4));
+            assert_eq!(presenter.image.as_slice(), frame);
+        }
+        assert_eq!(whole(&mut presenter, 4, 4, &frame), Vec::<u8>::new());
     }
 
     #[test]

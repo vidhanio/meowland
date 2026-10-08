@@ -448,7 +448,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         if !handshake_done && Instant::now() >= handshake_deadline {
             return Err(Error::PaneHandshakeTimeout);
         }
-        // Poll the socket directly so incoming frames wake the renderer.
         let mut fds = [
             PollFd::new(&stdin, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&stdout, PollFlags::HUP | PollFlags::ERR),
@@ -464,7 +463,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             tv_sec: wait.as_secs() as i64,
             tv_nsec: wait.subsec_nanos().into(),
         };
-        // Interrupted polls resume after the termination flag is checked.
         match poll(&mut fds, Some(&timeout)) {
             Err(Errno::INTR) => continue,
             Err(error) => return Err(io::Error::from(error).into()),
@@ -504,14 +502,12 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 }
             }
         }
-        // Drain all queued terminal events on each wakeup.
         while !interrupted.interrupted() && event::poll(Duration::ZERO)? {
             send_event(event::read()?, &mut tx, &mut presenter, &mut cell, units)?;
         }
     }
 }
 
-/// Present exactly one frame before acknowledging it to the compositor.
 fn draw_frame(
     width: u32,
     height: u32,
@@ -526,8 +522,9 @@ fn draw_frame(
     let encoded = started.elapsed();
     let written = Instant::now();
     if !update.is_empty() {
-        io::stdout().write_all(&update)?;
-        io::stdout().flush()?;
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(&update)?;
+        stdout.flush()?;
     }
     stats.frame(
         update.len(),
@@ -544,7 +541,6 @@ fn draw_frame(
     Ok(())
 }
 
-/// Translate a terminal event using the current pane geometry.
 fn send_event(
     event: Event,
     tx: &mut UnixStream,
@@ -969,22 +965,27 @@ mod tests {
     }
 
     #[test]
-    fn uses_linux_evdev_us_positions() {
-        assert_eq!(evdev_char_code('a'), Some(30));
-        assert_eq!(evdev_char_code('b'), Some(48));
-        assert_eq!(evdev_char_code('q'), Some(16));
-        assert_eq!(evdev_char_code('w'), Some(17));
-        assert_eq!(evdev_char_code('!'), Some(2));
-        assert_eq!(evdev_char_code('?'), Some(53));
-    }
-
-    #[test]
-    fn shifted_characters_carry_the_shift_bit() {
-        let key =
-            |character, modifiers| key_input(KeyEvent::new(KeyCode::Char(character), modifiers));
-        assert_eq!(key('A', KeyModifiers::NONE), Some((30, 1)));
-        assert_eq!(key('!', KeyModifiers::NONE), Some((2, 1)));
-        assert_eq!(key('a', KeyModifiers::NONE), Some((30, 0)));
+    fn character_keys_use_evdev_codes_and_infer_shift() {
+        for (character, code, shift) in [
+            ('A', 30, true),
+            ('!', 2, true),
+            ('?', 53, true),
+            ('a', 30, false),
+            ('b', 48, false),
+            ('q', 16, false),
+            ('w', 17, false),
+            ('1', 2, false),
+        ] {
+            assert_eq!(
+                key_input(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                Some((code, u8::from(shift)))
+            );
+            assert_eq!(needs_shift(character), shift);
+        }
+        assert_eq!(
+            key_input(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some((15, protocol::modifiers::SHIFT))
+        );
     }
 
     #[test]
@@ -999,15 +1000,6 @@ mod tests {
         assert_eq!(key(25), None);
     }
 
-    #[test]
-    fn shift_tab_is_a_tab_with_the_shift_bit() {
-        assert_eq!(
-            key_input(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
-            Some((15, protocol::modifiers::SHIFT))
-        );
-    }
-
-    /// A DECRQM reply or terminal name must not start the probe's quiet window.
     #[test]
     fn only_a_complete_device_attributes_reply_ends_the_probe() {
         assert!(!device_attributes_seen(b"\x1b[?1016;2$y"));
@@ -1030,13 +1022,5 @@ mod tests {
         assert_eq!(derived_cell(Some((1024, 768)), (80, 24)), Some((12, 32)));
         assert_eq!(derived_cell(None, (80, 24)), None);
         assert_eq!(derived_cell(Some((1024, 768)), (0, 24)), None);
-    }
-
-    #[test]
-    fn paste_shift_matches_us_keymap() {
-        assert!(needs_shift('A'));
-        assert!(needs_shift('!'));
-        assert!(!needs_shift('a'));
-        assert!(!needs_shift('1'));
     }
 }

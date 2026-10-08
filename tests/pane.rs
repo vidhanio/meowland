@@ -467,3 +467,87 @@ fn partial_server_packets_do_not_prevent_pane_shutdown() {
         std::fs::remove_dir_all(runtime).unwrap();
     }
 }
+
+/// Ghostty can report negative pixel coordinates when leaving the top or left
+/// edge. Rejected reports, partial mouse packets and partial paste packets must
+/// yield to frame reception instead of reading stdin again with no deadline.
+#[test]
+fn negative_and_fragmented_terminal_input_do_not_stall_frames() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("input starvation", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let mut pty = Pty::open(4, 4, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["attach", "1"])
+            .env("XDG_RUNTIME_DIR", &server.runtime),
+    );
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(&mut pty, &mut terminal, &mut child, &rgb, "the first frame");
+
+    for (index, (packet, remainder)) in [
+        (b"\x1b[<35;-1;2M".as_slice(), b"".as_slice()),
+        (b"\x1b[<35;2;-1M".as_slice(), b"".as_slice()),
+        (b"\x1b[<35;-1;-1M".as_slice(), b"".as_slice()),
+        (b"\x1b[<35;".as_slice(), b"1;1M".as_slice()),
+        (b"\x1b[200~unfinished".as_slice(), b"\x1b[201~".as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        pty.master.write_all(packet).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let pixel = [index as u8 + 1, 20, 30];
+        let rgb = pixel.repeat((SIDE * SIDE) as usize);
+        let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+        client.attach(&window, buffer, SIDE, SIDE);
+        // No more terminal input is sent until this new frame has been drawn.
+        pump_until_drawn(
+            &mut pty,
+            &mut terminal,
+            &mut child,
+            &rgb,
+            "a frame during rejected or incomplete input",
+        );
+        pty.master.write_all(remainder).unwrap();
+    }
+    detach(&mut pty, &mut child);
+}
+
+#[test]
+fn incomplete_terminal_input_does_not_prevent_shutdown() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("input shutdown", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&window, buffer, SIDE, SIDE);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let mut pty = Pty::open(4, 4, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["attach", "1"])
+            .env("XDG_RUNTIME_DIR", &server.runtime),
+    );
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(&mut pty, &mut terminal, &mut child, &rgb, "the first frame");
+    pty.master.write_all(b"\x1b[<35;").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    child.signal(rustix::process::Signal::TERM);
+    assert!(
+        wait_for(Duration::from_secs(2), || child
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "incomplete input blocked SIGTERM"
+    );
+    assert!(child.try_wait().unwrap().unwrap().success());
+    assert!(
+        String::from_utf8_lossy(&pty.read_now()).contains("\x1b[?1049l"),
+        "terminal was not restored"
+    );
+}

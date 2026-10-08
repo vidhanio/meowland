@@ -33,6 +33,7 @@ rustix = { version = "1.1.4", features = [
   "pty",
   "runtime",
   "shm",
+  "stdio",
   "termios",
 ] }
 smithay = { git = "https://github.com/Smithay/smithay.git", default-features = false, features = [

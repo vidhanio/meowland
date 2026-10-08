@@ -26,6 +26,7 @@ pub struct FakeTerminal {
     pub patches: u32,
     pub shared_frames: u32,
     pub text: Vec<u8>,
+    pub clipboard: Option<Vec<u8>>,
     pending: Vec<u8>,
     base: Vec<u8>,
     screen: Vec<u8>,
@@ -47,6 +48,7 @@ impl FakeTerminal {
             patches: 0,
             shared_frames: 0,
             text: Vec::new(),
+            clipboard: None,
             pending: Vec::new(),
             screen: base.clone(),
             base,
@@ -104,18 +106,23 @@ impl FakeTerminal {
                 b']' => {
                     let end = self.pending[2..]
                         .iter()
-                        .position(|byte| *byte == 0x07 || *byte == 0x1b);
-                    match end {
-                        Some(offset) => {
-                            let end = if self.pending[2 + offset] == 0x07 {
-                                2 + offset + 1
-                            } else {
-                                2 + offset + 2
-                            };
-                            self.pending.drain(..end);
-                        }
-                        None => break,
+                        .position(|byte| *byte == 0x07)
+                        .map(|offset| (offset + 2, 1))
+                        .into_iter()
+                        .chain(
+                            self.pending[2..]
+                                .windows(2)
+                                .position(|bytes| bytes == b"\x1b\\")
+                                .map(|offset| (offset + 2, 2)),
+                        )
+                        .min_by_key(|(end, _)| *end);
+                    let Some((end, terminator)) = end else {
+                        break;
+                    };
+                    if let Some(payload) = self.pending[2..end].strip_prefix(b"52;c;") {
+                        self.clipboard = Some(STANDARD.decode(payload).unwrap());
                     }
+                    self.pending.drain(..end + terminator);
                 }
                 _ => {
                     self.pending.drain(..2);

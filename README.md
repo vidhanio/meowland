@@ -28,11 +28,22 @@ systemctl --user enable --now meowland.service
 
 Server and launched-client stdout/stderr go to the user journal: `journalctl --user -u meowland.service -f`; a foreground server writes them to its own terminal instead. Pane throughput and terminal capabilities go directly to the journal through `tracing-journald` (`journalctl --user -t meowland -f`), without writing to the terminal. `RUST_LOG`, `MEOWLAND_XWAYLAND` and `MEOWLAND_RENDER_NODE` are read from the environment of the server process (`systemctl --user set-environment` for the unit), and there is no `MEOWLAND_LOG` file.
 
+## Clipboard
+
+In a local Wayland session, copying text in an application updates the host clipboard, and Ctrl+V or Shift+Insert in a pane imports host text into the application's Wayland clipboard before issuing Ctrl+V. Terminal bracketed paste (usually Ctrl+Shift+V) follows the same path, preserving Unicode and newlines instead of simulating US-layout keystrokes.
+
+Host access uses [`wl-clipboard-rs`](https://github.com/YaLTeR/wl-clipboard-rs) from the pane process and requires the host compositor's `ext-data-control` or `wlr-data-control` protocol. It uses the pane's original `WAYLAND_DISPLAY`, not meowland's nested display. Clipboard reads happen only on an explicit paste shortcut. If native access fails, copy falls back to OSC 52 and Ctrl+V falls back to the application's existing clipboard. The terminal must permit OSC 52 clipboard writes for the copy fallback to work.
+
+SSH sessions use OSC 52 copy and terminal bracketed paste without accessing the remote desktop clipboard. Set `MEOWLAND_CLIPBOARD=terminal` when attaching to force that behavior locally too. The bridge handles plain UTF-8 text up to 1 MiB; images, rich text and primary/middle-click selection are not bridged. Meowland also advertises `wlr-data-control` for clipboard utilities running inside its display.
+
+Pane protocol version 5 adds clipboard messages; restart the server after upgrading so panes and server use the same version.
+
 ## Code map
 
 - `src/compositor/mod.rs`: Smithay display, window/pane ownership and command dispatch.
 - `src/compositor/snapshot.rs`: bounded, owned copies of committed shared-memory buffers.
 - `src/compositor/dmabuf.rs`: optional EGL/GLES import and synchronous readback into owned snapshots.
+- `src/clipboard.rs`, `src/compositor/clipboard.rs`: host clipboard worker and bounded Wayland selection transfers.
 - `src/compositor/frame.rs`: independent Wayland callback clock and single-in-flight pane frames.
 - `src/compositor/render.rs`, `input.rs`: surface composition/hit testing and terminal input translation.
 - `src/server/mod.rs`, `transport.rs`, `process.rs`: service state, socket I/O and client lifecycle.

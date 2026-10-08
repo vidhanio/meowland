@@ -50,6 +50,7 @@ use smithay::{
             data_device::{
                 DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
             },
+            wlr_data_control::{DataControlHandler, DataControlState},
         },
         shell::xdg::{
             PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
@@ -62,6 +63,7 @@ use smithay::{
 
 use crate::protocol::{Input, Show, WindowInfo};
 
+mod clipboard;
 mod dmabuf;
 mod frame;
 mod input;
@@ -82,7 +84,7 @@ const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(16);
 pub const MAX_SURFACE_SIDE: u32 = 8192;
 pub const MAX_SURFACE_PIXELS: usize = 16_000_000;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Command {
     Attach {
         pane: u64,
@@ -106,6 +108,10 @@ pub enum Command {
         pane: u64,
         drawn: bool,
     },
+    Paste {
+        pane: u64,
+        text: String,
+    },
     CloseAll,
     CloseShown {
         pane: u64,
@@ -128,6 +134,10 @@ pub enum Event {
         shape: Option<String>,
     },
     Focus(u64),
+    Clipboard {
+        pane: u64,
+        text: String,
+    },
     Frame {
         pane: u64,
         width: u32,
@@ -213,6 +223,10 @@ struct State {
     _viewporter: ViewporterState,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
+    data_control: DataControlState,
+    clipboard_request: Option<(u64, String)>,
+    clipboard_read: Option<(u64, crate::clipboard::Transfer)>,
+    clipboard_writes: Vec<clipboard::PendingWrite>,
     _cursor_shape: CursorShapeManagerState,
     popups: PopupManager,
     seats: SeatState<Self>,
@@ -459,6 +473,10 @@ impl State {
             _viewporter: ViewporterState::new::<Self>(&display_handle),
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),
+            data_control: DataControlState::new::<Self, _>(&display_handle, None, |_| true),
+            clipboard_request: None,
+            clipboard_read: None,
+            clipboard_writes: Vec::new(),
             _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
             popups: PopupManager::default(),
             seats: seat_state,
@@ -1031,14 +1049,67 @@ const fn cursor_name(icon: CursorIcon) -> &'static str {
 }
 
 impl SelectionHandler for State {
-    type SelectionUserData = ();
+    type SelectionUserData = Arc<str>;
 
     fn new_selection(
         &mut self,
-        _target: SelectionTarget,
-        _source: Option<SelectionSource>,
+        target: SelectionTarget,
+        source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
+        if target != SelectionTarget::Clipboard {
+            return;
+        }
+        self.clipboard_request = None;
+        self.clipboard_read = None;
+        let Some(source) = source else {
+            return;
+        };
+        let types = source.mime_types();
+        let Some(mime) = crate::clipboard::TEXT_MIMES
+            .into_iter()
+            .find(|mime| types.iter().any(|offered| offered == mime))
+        else {
+            return;
+        };
+        let pane = self
+            .cursor_pane
+            .filter(|pane| {
+                self.panes
+                    .get(pane)
+                    .is_some_and(|pane| Some(pane.window) == self.focused)
+            })
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .filter(|(_, pane)| Some(pane.window) == self.focused)
+                    .map(|(id, _)| *id)
+                    .min()
+            });
+        if let Some(pane) = pane {
+            self.clipboard_request = Some((pane, mime.to_owned()));
+        }
+    }
+
+    fn send_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime: String,
+        fd: std::os::fd::OwnedFd,
+        _seat: Seat<Self>,
+        text: &Self::SelectionUserData,
+    ) {
+        if target == SelectionTarget::Clipboard
+            && crate::clipboard::TEXT_MIMES.contains(&mime.as_str())
+        {
+            clipboard::send(self, fd, text);
+        }
+    }
+}
+
+impl DataControlHandler for State {
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control
     }
 }
 
@@ -1104,6 +1175,7 @@ fn run(
         }
         let _ = display.dispatch_clients(&mut state);
         poll_imports(&mut state);
+        clipboard::poll(&mut state);
         frame_callbacks(&mut state);
         dispatch_frames(&mut state);
         let _ = display.flush_clients();
@@ -1185,6 +1257,7 @@ fn handle_command(state: &mut State, command: Command) {
             apply_window_state(state, window);
         }
         Command::Input { pane, event } => pane_input(state, pane, &event),
+        Command::Paste { pane, text } => clipboard::paste(state, pane, text),
         Command::Ack { pane, drawn } => pane_ack(state, pane, drawn),
         Command::CloseAll => {
             for window in state.windows.values() {

@@ -238,6 +238,9 @@ impl Server {
             CompositorEvent::Cursor { pane, shape } => {
                 self.to_pane(pane, ServerToPane::Cursor(shape));
             }
+            CompositorEvent::Clipboard { pane, text } => {
+                self.to_pane(pane, ServerToPane::Clipboard(text));
+            }
             CompositorEvent::Focus(id) => {
                 for window in self.windows.values_mut() {
                     window.active = window.id == id;
@@ -353,6 +356,13 @@ impl Server {
     fn pane_message(&mut self, id: u64, message: PaneToServer) {
         match message {
             PaneToServer::Hello(_) => {}
+            PaneToServer::Paste(text) => {
+                if self.panes.contains_key(&id) && text.len() <= crate::clipboard::MAX_TEXT {
+                    let _ = self
+                        .commands
+                        .send(CompositorCommand::Paste { pane: id, text });
+                }
+            }
             PaneToServer::Input(event) => match &event {
                 protocol::Input::Key {
                     code: KEY_W,

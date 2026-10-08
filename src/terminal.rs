@@ -18,6 +18,7 @@ use rustix::{
 
 use crate::{
     Error, Result,
+    clipboard::{HostClipboard, MAX_TEXT, Response as ClipboardResponse, write_osc52},
     kitty::{Presenter, SharedMemory},
     protocol::{self, Hello, Input, PaneToServer, ServerToPane, Show},
     signals,
@@ -431,6 +432,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
 
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
+    let clipboard = HostClipboard::new()?;
     let mut presenter = Presenter::new(cell, shared);
     let mut stats = PaneStats::new();
     PaneStats::capabilities(&probe, hello.width, hello.height);
@@ -452,6 +454,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             PollFd::new(&stdin, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&stdout, PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+            PollFd::new(&clipboard.wake, PollFlags::IN),
         ];
         // Bound idle waits because a signal can arrive just before poll,
         // after the flag check, and therefore not interrupt the syscall.
@@ -491,6 +494,13 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                         mode.restore_with_message(&reason)?;
                         return Ok(());
                     }
+                    ServerToPane::Clipboard(text) => {
+                        if text.len() <= MAX_TEXT
+                            && let Some(text) = clipboard.copy(text)
+                        {
+                            write_osc52(&mut io::stdout().lock(), &text)?;
+                        }
+                    }
                     ServerToPane::Title(title) => set_title(&title),
                     ServerToPane::Cursor(shape) => set_cursor(shape.as_deref()),
                     ServerToPane::Frame {
@@ -502,8 +512,33 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 }
             }
         }
+        for response in clipboard.drain() {
+            match response {
+                ClipboardResponse::CopyFallback(text) => {
+                    write_osc52(&mut io::stdout().lock(), &text)?;
+                }
+                ClipboardResponse::Paste {
+                    code,
+                    modifiers,
+                    text,
+                } => {
+                    if let Some(text) = text {
+                        send_paste(&mut tx, text)?;
+                    } else {
+                        send_key_bits(&mut tx, code, modifiers)?;
+                    }
+                }
+            }
+        }
         while !interrupted.interrupted() && event::poll(Duration::ZERO)? {
-            send_event(event::read()?, &mut tx, &mut presenter, &mut cell, units)?;
+            send_event(
+                event::read()?,
+                &mut tx,
+                &mut presenter,
+                &mut cell,
+                units,
+                &clipboard,
+            )?;
         }
     }
 }
@@ -547,13 +582,18 @@ fn send_event(
     presenter: &mut Presenter,
     cell: &mut Option<(u16, u16)>,
     units: MouseUnits,
+    clipboard: &HostClipboard,
 ) -> Result<()> {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
             if let Some(code) = binding_code(key) {
                 send_key_bits(tx, code, modifier_bits(key.modifiers))?;
             } else if let Some((code, modifiers)) = key_input(key) {
-                send_key_bits(tx, code, modifiers)?;
+                let paste = (code == 47 && modifiers == protocol::modifiers::CONTROL)
+                    || (code == 110 && modifiers == protocol::modifiers::SHIFT);
+                if !paste || !clipboard.paste(code, modifiers) {
+                    send_key_bits(tx, code, modifiers)?;
+                }
             }
         }
         Event::Resize(cols, rows) => {
@@ -597,25 +637,17 @@ fn send_event(
                 }),
             )?;
         }
-        Event::Paste(text) => {
-            // Treat pasted CRLF as one newline.
-            let mut characters = text.chars().peekable();
-            while let Some(character) = characters.next() {
-                let code = match character {
-                    '\r' if characters.peek() == Some(&'\n') => {
-                        characters.next();
-                        Some(28)
-                    }
-                    '\n' | '\r' => Some(28),
-                    '\t' => Some(15),
-                    _ => evdev_char_code(character),
-                };
-                if let Some(code) = code {
-                    send_key_bits(tx, code, u8::from(needs_shift(character)))?;
-                }
-            }
-        }
+        Event::Paste(text) => send_paste(tx, text)?,
         _ => {}
+    }
+    Ok(())
+}
+
+fn send_paste(tx: &mut UnixStream, text: String) -> Result<()> {
+    if text.len() <= MAX_TEXT {
+        protocol::send(tx, &PaneToServer::Paste(text))?;
+    } else {
+        tracing::warn!("Ignoring pasted text larger than {MAX_TEXT} bytes");
     }
     Ok(())
 }

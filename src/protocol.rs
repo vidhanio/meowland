@@ -8,7 +8,7 @@ use std::{
 use rustix::{io::Errno, net::RecvFlags};
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 const HEADER: usize = 4;
@@ -28,7 +28,7 @@ pub mod modifiers {
     /// Whether a key carrying these modifiers is a compositor binding.
     ///
     /// Alt alone is one, so a client can still receive the same key from any
-    /// terminal that reports Ctrl or Super with it.
+    /// terminal that reports `Ctrl` or `Super` with it.
     #[must_use]
     pub const fn alt_only(modifiers: u8) -> bool {
         modifiers & (CONTROL | SUPER) == 0 && modifiers & ALT != 0
@@ -81,7 +81,7 @@ pub enum Input {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PaneToServer {
     Hello(Hello),
     Input(Input),
@@ -94,6 +94,7 @@ pub enum PaneToServer {
     Ack {
         drawn: bool,
     },
+    Paste(String),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -112,6 +113,7 @@ pub enum ServerToPane {
     Title(String),
     /// The pointer shape the terminal should show, or `None` for its own.
     Cursor(Option<String>),
+    Clipboard(String),
 }
 
 #[derive(Debug, Deserialize, Serialize)]

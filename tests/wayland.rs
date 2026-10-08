@@ -128,9 +128,7 @@ fn unsupported_pane_protocol_version_is_rejected() {
     }
 }
 
-/// End-to-end frame rate: client commit -> compositor copy -> pane socket ->
-/// pane ack, for full 1080p RGB frames.  Run with
-/// `cargo test --release --test wayland -- --ignored --nocapture`.
+/// Run with `cargo test --release --test wayland -- --ignored --nocapture`.
 #[test]
 #[ignore = "manual performance check"]
 fn throughput_of_1080p_frames() {
@@ -141,7 +139,7 @@ fn throughput_of_1080p_frames() {
     let toplevel = client.create_toplevel("bench", "meowland.bench");
     let (width, height) = (1920u32, 1080u32);
     let stride = width * 4;
-    let pixels = vec![0x33; (stride * height) as usize];
+    let mut pixels = solid(width, height, [0x33; 3]);
     let (buffer, file) = client.shm_buffer_with_file(width, height, stride, &pixels);
     client.attach(&toplevel, buffer, width, height);
     assert!(
@@ -169,17 +167,20 @@ fn throughput_of_1080p_frames() {
             assert!(Instant::now() < deadline, "buffer was never released");
             thread::sleep(Duration::from_millis(1));
         }
-        let offset = (frames * 4096) % u64::from(stride * height);
-        file.write_at(&[0xa5], offset).unwrap();
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel[0] ^= 1;
+        }
+        file.write_all_at(&pixels, 0).unwrap();
         client.attach(&toplevel, buffer, width, height);
-        let (frame_width, _, _) = pane.frame();
-        bytes += u64::from(frame_width) * u64::from(pane.band().1) * 3;
+        let (frame_width, frame_height, _) = pane.frame();
+        assert_eq!(pane.band(), (0, height));
+        bytes += u64::from(frame_width) * u64::from(frame_height) * 3;
         pane.send(&protocol::PaneToServer::Ack { drawn: true });
         frames += 1;
     }
     let elapsed = start.elapsed();
     eprintln!(
-        "1080p pane throughput: {frames} frames in {elapsed:?} ({:.1} fps, {:.2} MiB/s of frame bands)",
+        "1080p pane throughput: {frames} whole frames in {elapsed:?} ({:.1} fps, {:.2} MiB/s)",
         f64::from(frames as u32) / elapsed.as_secs_f64(),
         bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
     );
@@ -224,7 +225,7 @@ fn at(frame: &(u32, u32, Vec<u8>), x: u32, y: u32) -> [u8; 3] {
 }
 
 #[test]
-fn subsurface_is_drawn_at_its_position() {
+fn subsurface_position_and_stacking_follow_parent_commits() {
     let server = Server::start();
     let mut client = Client::connect(&server);
     let window = client.create_toplevel("subsurface", "meowland.test");
@@ -250,6 +251,45 @@ fn subsurface_is_drawn_at_its_position() {
     assert_eq!(at(&frame, 1, 1), [200, 100, 50]);
     assert_eq!(at(&frame, 2, 2), [200, 100, 50]);
     assert_eq!(at(&frame, 3, 0), background);
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    client.subsurface_below(subsurface, window.surface);
+    client.commit(window.surface);
+    assert_eq!(at(&pane.frame(), 1, 1), background);
+}
+
+#[test]
+fn nested_subsurface_positions_do_not_overflow() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("extreme offsets", "meowland.test");
+    let background = [10, 20, 30];
+    let buffer = client.shm_buffer(WIDTH, HEIGHT, WIDTH * 4, &solid(WIDTH, HEIGHT, background));
+    client.attach(&window, buffer, WIDTH, HEIGHT);
+    let child = client.create_surface();
+    let subsurface = client.create_subsurface(child, window.surface);
+    client.subsurface_position(subsurface, i32::MAX, 0);
+    client.subsurface_desync(subsurface);
+    let buffer = client.shm_buffer(2, 2, 8, &solid(2, 2, [40, 50, 60]));
+    client.attach_surface(child, buffer, 2, 2);
+    let grandchild = client.create_surface();
+    let nested = client.create_subsurface(grandchild, child);
+    client.subsurface_position(nested, i32::MAX, 0);
+    client.subsurface_desync(nested);
+    let buffer = client.shm_buffer(4, 2, 16, &solid(4, 2, [70, 80, 90]));
+    client.attach_surface(grandchild, buffer, 4, 2);
+    client.commit(child);
+    client.commit(window.surface);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let mut pane = Pane::attach(&server, hello(WIDTH, HEIGHT, Show::Newest));
+    assert_eq!(at(&pane.frame(), 0, 0), background);
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    client.subsurface_position(nested, -i32::MAX, 0);
+    client.commit(grandchild);
+    client.commit(child);
+    client.commit(window.surface);
+    assert_eq!(at(&pane.frame(), 0, 0), [70, 80, 90]);
 }
 
 #[test]
@@ -600,8 +640,6 @@ fn a_pane_bound_covers_both_axes() {
     assert_eq!(at(&frame, 0, 0), painted, "the tall pane shows the redraw");
 }
 
-/// The pane has only one presentation slot: two client commits while it is
-/// blocked coalesce into the most recent image when it acknowledges the first.
 #[test]
 fn an_unacked_pane_receives_only_the_latest_frame_after_its_ack() {
     let server = Server::start();
@@ -627,8 +665,6 @@ fn an_unacked_pane_receives_only_the_latest_frame_after_its_ack() {
     );
 }
 
-/// A change of one row must cost one row on the wire: the pane is sent the
-/// band that changed, not the frame it is part of.
 #[test]
 fn a_small_change_reaches_the_pane_as_a_band() {
     const SIDE: u32 = 64;
@@ -648,7 +684,6 @@ fn a_small_change_reaches_the_pane_as_a_band() {
     assert_eq!(pane.band(), (0, SIDE), "the first frame is the whole of it");
     pane.send(&protocol::PaneToServer::Ack { drawn: true });
 
-    // One row of pixels changes.
     let mut raw = solid(SIDE, SIDE, [1, 2, 3]);
     for pixel in raw[..(SIDE * 4) as usize].as_chunks_mut::<4>().0 {
         pixel.copy_from_slice(&[9, 9, 9, 0xff]);
@@ -662,6 +697,29 @@ fn a_small_change_reaches_the_pane_as_a_band() {
     assert!(y + rows >= 1, "the changed row was not in the band");
     assert_eq!(at(&frame, 0, 0), [9, 9, 9], "the change is in the picture");
     assert_eq!(at(&frame, 0, SIDE - 1), [1, 2, 3], "the rest is untouched");
+}
+
+#[test]
+fn resizing_an_unacked_pane_with_equal_pixel_area_sends_a_full_frame() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("resize", "meowland.test");
+    let buffer = client.shm_buffer(8, 8, 32, &solid(8, 8, [7, 8, 9]));
+    client.attach(&window, buffer, 8, 8);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+
+    let mut pane = Pane::attach(&server, hello(8, 4, Show::Newest));
+    let first = pane.frame();
+    assert_eq!((first.0, first.1), (8, 4));
+    pane.send(&protocol::PaneToServer::Resize {
+        width: 4,
+        height: 8,
+    });
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+    let resized = pane.frame();
+    assert_eq!((resized.0, resized.1), (4, 8));
+    assert_eq!(pane.band(), (0, 8));
+    assert_eq!(resized.2, [7, 8, 9].repeat(32));
 }
 
 /// A pane that stops reading and comes back later must still be connected: a

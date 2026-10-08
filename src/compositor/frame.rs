@@ -20,6 +20,7 @@ pub(super) struct PaneState {
     pub(super) dirty: bool,
     next_frame: Instant,
     shown: Vec<u8>,
+    shown_size: Option<(u32, u32)>,
     /// An undrawn frame cannot be used as the basis for a row-band diff.
     shown_stale: bool,
 }
@@ -34,6 +35,7 @@ impl PaneState {
             dirty: false,
             next_frame: Instant::now(),
             shown: Vec::new(),
+            shown_size: None,
             shown_stale: false,
         }
     }
@@ -128,7 +130,7 @@ pub(super) fn dispatch_frames(state: &mut State) {
         };
         entry.next_frame = now + FRAME_INTERVAL;
         let stride = entry.width as usize * 3;
-        let rows = if entry.shown_stale {
+        let rows = if entry.shown_stale || entry.shown_size != Some((entry.width, entry.height)) {
             Some(0..entry.height as usize)
         } else {
             changed_rows(&entry.shown, &state.scratch, stride)
@@ -138,10 +140,10 @@ pub(super) fn dispatch_frames(state: &mut State) {
         };
         let start = rows.start * stride;
         let end = rows.end * stride;
-        // The event buffer must not alias the pane's retained diff baseline.
         let band = state.scratch[start..end].to_vec();
         entry.shown.resize(state.scratch.len(), 0);
         entry.shown[start..end].copy_from_slice(&band);
+        entry.shown_size = Some((entry.width, entry.height));
         entry.in_flight = true;
         let _ = state.events.send(Event::Frame {
             pane,

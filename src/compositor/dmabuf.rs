@@ -1,4 +1,4 @@
-use std::{error::Error, ffi::OsStr, fmt, fs::OpenOptions, io};
+use std::{ffi::OsStr, fs::OpenOptions, io};
 
 use smithay::{
     backend::{
@@ -7,26 +7,60 @@ use smithay::{
             dmabuf::{Dmabuf, DmabufFlags},
         },
         drm::{DrmNode, NodeType},
-        egl::{EGLContext, EGLDevice, EGLDisplay, fence::EGLFence},
+        egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError, fence::EGLFence},
         renderer::{
             Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter,
             TextureMapping,
-            gles::{Capability, GlesRenderbuffer, GlesRenderer},
+            gles::{Capability, GlesError, GlesRenderbuffer, GlesRenderer},
+            sync::Interrupted,
         },
     },
     utils::{Rectangle, Transform},
 };
+use thiserror::Error;
 
 use super::{MAX_SURFACE_PIXELS, MAX_SURFACE_SIDE, snapshot::Snapshot};
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+enum BackendError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Egl(#[from] EglError),
+    #[error(transparent)]
+    Gles(#[from] GlesError),
+    #[error(transparent)]
+    Wait(#[from] Interrupted),
+    #[error("DRM render node has no path")]
+    MissingNodePath,
+    #[error("EGL fence synchronization is unavailable")]
+    MissingFenceSync,
+    #[error("DMA-BUF readback requires GLES 3 and EGL synchronization")]
+    MissingRendererSync,
+    #[error("EGL exposes no sampleable RGB32 DMA-BUF formats")]
+    NoFormats,
+    #[error("invalid DMA-BUF dimensions")]
+    InvalidDimensions,
+    #[error("DMA-BUF exceeds snapshot bounds")]
+    SnapshotBounds,
+    #[error("unsupported DMA-BUF flags")]
+    UnsupportedFlags,
+    #[error("unsupported DMA-BUF format/modifier")]
+    UnsupportedFormat,
+    #[error("unexpected RGBA readback length")]
+    ReadbackLength,
+}
+
+#[derive(Debug, Error)]
+#[error("{source}")]
 pub(super) struct SnapshotError {
-    source: Box<dyn Error>,
+    #[source]
+    source: BackendError,
     release_safe: bool,
 }
 
 impl SnapshotError {
-    fn safe(source: impl Into<Box<dyn Error>>) -> Self {
+    fn safe(source: impl Into<BackendError>) -> Self {
         Self {
             source: source.into(),
             release_safe: true,
@@ -35,18 +69,6 @@ impl SnapshotError {
 
     pub(super) const fn release_safe(&self) -> bool {
         self.release_safe
-    }
-}
-
-impl fmt::Display for SnapshotError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.source, formatter)
-    }
-}
-
-impl Error for SnapshotError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.as_ref())
     }
 }
 
@@ -81,14 +103,12 @@ impl DmabufBackend {
             },
             None => None,
         };
-        // Keep the library loaded until Smithay takes its own reference; its
-        // lazy loader panics rather than returning an error for a missing EGL.
         #[expect(
             unsafe_code,
             reason = "loading the installed graphics library before Smithay's infallible loader"
         )]
-        // SAFETY: EGL supports dynamic loading on this thread. The library
-        // stays loaded until Smithay has acquired its own reference.
+        // SAFETY: EGL supports dynamic loading on this thread. Keep the library
+        // alive until Smithay's infallible lazy loader acquires its own reference.
         let _egl = match unsafe { libloading::Library::new("libEGL.so.1") } {
             Ok(library) => library,
             Err(error) => {
@@ -129,10 +149,8 @@ impl DmabufBackend {
         unsafe_code,
         reason = "Smithay owns the EGL display; the fresh context is never shared or used on another thread"
     )]
-    fn initialize(device: EGLDevice, node: DrmNode) -> Result<Self, Box<dyn Error>> {
-        let path = node
-            .dev_path()
-            .ok_or_else(|| io::Error::other("DRM render node has no path"))?;
+    fn initialize(device: EGLDevice, node: DrmNode) -> Result<Self, BackendError> {
+        let path = node.dev_path().ok_or(BackendError::MissingNodePath)?;
         let _access = OpenOptions::new().read(true).write(true).open(path)?;
         // SAFETY: Only Smithay creates/terminates this display. The new context
         // is transferred to one renderer and is never active on another thread.
@@ -142,7 +160,7 @@ impl DmabufBackend {
             .iter()
             .any(|extension| extension == "EGL_KHR_fence_sync")
         {
-            return Err(io::Error::other("EGL fence synchronization is unavailable").into());
+            return Err(BackendError::MissingFenceSync);
         }
         let context = EGLContext::new(&display)?;
         // SAFETY: The freshly created context has not been made current
@@ -151,10 +169,7 @@ impl DmabufBackend {
         if !renderer.capabilities().contains(&Capability::Fencing)
             || !renderer.capabilities().contains(&Capability::ExportFence)
         {
-            return Err(io::Error::other(
-                "DMA-BUF readback requires GLES 3 and EGL synchronization",
-            )
-            .into());
+            return Err(BackendError::MissingRendererSync);
         }
         let formats: Vec<_> = renderer
             .dmabuf_formats()
@@ -168,7 +183,7 @@ impl DmabufBackend {
             })
             .collect();
         if formats.is_empty() {
-            return Err(io::Error::other("EGL exposes no sampleable RGB32 DMA-BUF formats").into());
+            return Err(BackendError::NoFormats);
         }
         renderer.downscale_filter(TextureFilter::Nearest)?;
         renderer.upscale_filter(TextureFilter::Nearest)?;
@@ -217,9 +232,7 @@ impl DmabufBackend {
     ) -> Result<(u32, u32), SnapshotError> {
         let size = dmabuf.size();
         if size.w <= 0 || size.h <= 0 {
-            return Err(SnapshotError::safe(io::Error::other(
-                "Invalid DMA-BUF dimensions",
-            )));
+            return Err(SnapshotError::safe(BackendError::InvalidDimensions));
         }
         let (width, height) = (size.w as u32, size.h as u32);
         if width > MAX_SURFACE_SIDE
@@ -227,19 +240,13 @@ impl DmabufBackend {
             || width as usize * height as usize > MAX_SURFACE_PIXELS
             || bound.is_some_and(|(max_width, max_height)| width > max_width || height > max_height)
         {
-            return Err(SnapshotError::safe(io::Error::other(
-                "DMA-BUF exceeds snapshot bounds",
-            )));
+            return Err(SnapshotError::safe(BackendError::SnapshotBounds));
         }
         if dmabuf.flags().bits() & !DmabufFlags::Y_INVERT.bits() != 0 {
-            return Err(SnapshotError::safe(io::Error::other(
-                "Unsupported DMA-BUF flags",
-            )));
+            return Err(SnapshotError::safe(BackendError::UnsupportedFlags));
         }
         if !self.formats.contains(&dmabuf.format()) {
-            return Err(SnapshotError::safe(io::Error::other(
-                "Unsupported DMA-BUF format/modifier",
-            )));
+            return Err(SnapshotError::safe(BackendError::UnsupportedFormat));
         }
         Ok((width, height))
     }
@@ -303,8 +310,8 @@ impl DmabufBackend {
             (drawn, Frame::finish(frame))
         };
         let completion = match finished {
-            Ok(sync) => sync.wait().map_err(Box::<dyn Error>::from),
-            Err(error) => Err(Box::<dyn Error>::from(error)),
+            Ok(sync) => sync.wait().map_err(BackendError::from),
+            Err(error) => Err(BackendError::from(error)),
         };
         if let Err(error) = completion {
             let display = self.renderer.egl_context().display().clone();
@@ -348,9 +355,7 @@ impl DmabufBackend {
         let row_bytes = width as usize * 4;
         let needed = row_bytes * height as usize;
         if bytes.len() != needed {
-            return Err(SnapshotError::safe(io::Error::other(
-                "Unexpected RGBA readback length",
-            )));
+            return Err(SnapshotError::safe(BackendError::ReadbackLength));
         }
         pixels.resize(needed, 0);
         if pixels.capacity() >= needed.saturating_mul(4).max(1 << 20) {

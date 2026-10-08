@@ -7,7 +7,6 @@ use std::{hint::black_box, time::Duration};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use meowland::kitty::{Presenter, SharedMemory};
 
-/// Cell dimensions reported by `CSI 14 t`.
 const CELL: (u16, u16) = (10, 20);
 const FLAT: u8 = 17;
 const CHANGED: u8 = 0xab;
@@ -56,14 +55,12 @@ fn one_cell(base: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// A 100x400-pixel block that merges into one patch.
 fn block(base: &[u8]) -> Vec<u8> {
     let mut frame = base.to_vec();
     put_block(&mut frame, WIDTH, 100, 100, 100, 400, CHANGED);
     frame
 }
 
-/// Thirty-two scattered cells, the encoder's patch limit.
 fn scattered(base: &[u8]) -> Vec<u8> {
     let mut frame = base.to_vec();
     for index in 0..32 {
@@ -122,71 +119,36 @@ fn patches(c: &mut Criterion) {
 
     let base = vec![FLAT; BYTES];
 
-    // A single-cell patch after a full-row diff.
     let cell = one_cell(&base);
-    group.bench_function("one_cell_1080p", |b| {
-        b.iter_batched(
-            || {
-                let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
-                (presenter, cell.clone())
-            },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
-            BatchSize::LargeInput,
-        );
-    });
-
     let repainted = block(&base);
-    group.bench_function("block_1080p", |b| {
-        b.iter_batched(
-            || {
-                let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
-                (presenter, repainted.clone())
-            },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
-            BatchSize::LargeInput,
-        );
-    });
-
-    // Exhaust the 32-patch budget.
     let spread = scattered(&base);
-    group.bench_function("scattered_1080p", |b| {
-        b.iter_batched(
-            || {
-                let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
-                (presenter, spread.clone())
-            },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
-            BatchSize::LargeInput,
-        );
-    });
+    let mut columns = base.clone();
+    put_block(&mut columns, WIDTH, 100, 100, 100, 800, CHANGED);
+    put_block(&mut columns, WIDTH, 1200, 100, 100, 800, CHANGED);
 
-    group.bench_function("revert_1080p", |b| {
-        b.iter_batched(
-            || {
-                let mut presenter = Presenter::new(Some(CELL), None);
-                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
-                black_box(presenter.present(WIDTH, HEIGHT, 0, cell.clone()));
-                (presenter, base.clone())
-            },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
-            BatchSize::LargeInput,
-        );
-    });
-
-    group.bench_function("unchanged_1080p", |b| {
-        b.iter_batched(
-            || {
-                let mut presenter = Presenter::new(None, None);
-                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
-                (presenter, base.clone())
-            },
-            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
-            BatchSize::LargeInput,
-        );
-    });
+    for (name, grid, previous, frame) in [
+        ("one_cell_1080p", Some(CELL), None, &cell),
+        ("block_1080p", Some(CELL), None, &repainted),
+        ("scattered_1080p", Some(CELL), None, &spread),
+        ("columns_1080p", Some(CELL), None, &columns),
+        ("revert_1080p", Some(CELL), Some(&cell), &base),
+        ("unchanged_1080p", None, None, &base),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let mut presenter = Presenter::new(grid, None);
+                    black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
+                    if let Some(previous) = previous {
+                        black_box(presenter.present(WIDTH, HEIGHT, 0, previous.clone()));
+                    }
+                    (presenter, frame.clone())
+                },
+                |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
+                BatchSize::LargeInput,
+            );
+        });
+    }
 
     group.finish();
 }

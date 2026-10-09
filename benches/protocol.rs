@@ -39,7 +39,6 @@ fn frames(c: &mut Criterion) {
         let bytes = pixels(width, height);
         group.throughput(Throughput::Bytes(bytes as u64));
 
-        // Server-to-pane frame encoding.
         group.bench_function(BenchmarkId::new("encode", name), |b| {
             b.iter_batched(
                 || (frame(width, height), Vec::with_capacity(bytes + 64)),
@@ -51,7 +50,6 @@ fn frames(c: &mut Criterion) {
             );
         });
 
-        // Server-to-pane frame decoding.
         group.bench_function(BenchmarkId::new("decode", name), |b| {
             b.iter_batched(
                 || {
@@ -94,7 +92,6 @@ fn input(c: &mut Criterion) {
     });
 
     for (name, message) in [("key", &key), ("pointer", &pointer)] {
-        // Reuse the pane's output buffer to measure per-event encoding.
         let mut out = Vec::with_capacity(64);
         group.bench_with_input(BenchmarkId::new("encode", name), message, |b, message| {
             b.iter(|| {

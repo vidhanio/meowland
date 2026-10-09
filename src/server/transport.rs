@@ -76,8 +76,6 @@ pub(super) fn bind(path: &Path) -> Result<BoundSocket> {
             match UnixStream::connect(path) {
                 Ok(_) => return Err(Error::ServerAlreadyListening(path.to_path_buf())),
                 Err(refused) if refused.kind() == io::ErrorKind::ConnectionRefused => {
-                    // Do not unlink a path replaced while the listener was
-                    // probed.
                     match SocketIdentity::at(path) {
                         Ok(Some(current)) if current == identity => match fs::remove_file(path) {
                             Ok(()) => {}
@@ -88,8 +86,6 @@ pub(super) fn bind(path: &Path) -> Result<BoundSocket> {
                         _ => return Err(error.into()),
                     }
                 }
-                // A concurrent owner may have removed its path. Retry the bind
-                // without removing anything; a replacement still wins.
                 Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -104,8 +100,6 @@ fn own_socket(path: &Path, listener: UnixListener) -> Result<BoundSocket> {
     let identity = SocketIdentity::at(path)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::AddrInUse, "bound socket path was replaced")
     })?;
-    // Establish path ownership before allocating the cancellation channel so
-    // a failed setup still removes only the socket we just bound.
     let path = SocketPath {
         path: path.to_path_buf(),
         identity,
@@ -131,10 +125,7 @@ pub(super) struct AcceptLoop {
 impl Drop for AcceptLoop {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Relaxed);
-        // The read half wakes poll immediately, including a stop that arrived
-        // just before the worker entered the syscall.
         let _ = self.wake.shutdown(std::net::Shutdown::Both);
-        // Stop advertising the socket before waiting for its workers.
         self.path.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -240,8 +231,6 @@ where
                 rustix::event::PollFd::new(&listener, rustix::event::PollFlags::IN),
                 rustix::event::PollFd::new(&cancel, rustix::event::PollFlags::IN),
             ];
-            // The timeout only reaps finished handshake workers. Accepts and
-            // shutdown wake on readiness, not on this housekeeping deadline.
             match rustix::event::poll(
                 &mut fds,
                 Some(&rustix::event::Timespec {
@@ -362,7 +351,6 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        // A library shutdown must also cancel a reader or blocked frame writer.
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
         self.sender.take();
         if let Some(writer) = self.writer.take() {
@@ -376,8 +364,6 @@ impl Drop for Pane {
 
 /// A stalled terminal must resume its frame rather than lose a partial packet.
 fn pane_writer(mut socket: UnixStream, rx: Receiver<ServerToPane>) {
-    // Cloned descriptors retain the handshake write timeout; frames need no
-    // deadline.
     if let Err(error) = socket.set_write_timeout(None) {
         let _ = socket.shutdown(std::net::Shutdown::Both);
         tracing::warn!(%error, "pane: cannot clear handshake write timeout");
@@ -389,7 +375,5 @@ fn pane_writer(mut socket: UnixStream, rx: Receiver<ServerToPane>) {
             break;
         }
     }
-    // Closing the peer-facing write half alone leaves the reader blocked while
-    // its peer keeps the connection open after Release.
     let _ = socket.shutdown(std::net::Shutdown::Both);
 }

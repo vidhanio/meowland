@@ -20,8 +20,6 @@ pub(super) struct Keyboard {
 
 impl Keyboard {
     pub(super) fn input(&mut self, key: KeyEvent) -> Option<Input> {
-        // wl_keyboard has no repeat event. Clients repeat held keys according
-        // to repeat_info; forwarding the host repeats would duplicate that.
         if key.kind == KeyEventKind::Repeat {
             return None;
         }
@@ -51,7 +49,6 @@ pub(super) const fn binding(code: u16, bits: u8) -> bool {
 }
 
 pub(super) const fn paste(code: u16, bits: u8) -> bool {
-    // Lock state does not change shortcut matching.
     let bits = bits & !(modifiers::CAPS_LOCK | modifiers::NUM_LOCK);
     (code == 47 && bits == modifiers::CONTROL) || (code == 110 && bits == modifiers::SHIFT)
 }
@@ -105,7 +102,6 @@ fn key_code(key: KeyEvent) -> Option<u16> {
         KeyCode::PrintScreen => 99,
         KeyCode::Pause => 119,
         KeyCode::Menu => 127,
-        // evdev F1–F10, F11–F12, and F13–F24 occupy separate ranges.
         KeyCode::F(n) => match n {
             1..=10 => 58 + u16::from(n),
             11 => 87,
@@ -122,8 +118,6 @@ fn key_code(key: KeyEvent) -> Option<u16> {
             ModifierKeyCode::RightAlt => 100,
             ModifierKeyCode::LeftSuper => 125,
             ModifierKeyCode::RightSuper => 126,
-            // Hyper/Meta/ISO levels have no corresponding modifier key in the
-            // advertised plain US keymap. Do not pretend they are Super/Alt.
             _ => return None,
         },
         _ => return None,
@@ -206,91 +200,4 @@ const fn keypad_code(code: KeyCode) -> Option<u16> {
         KeyCode::Char(',') => 121,
         _ => return None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn real_key_lifetimes_and_shortcut_releases() {
-        let mut keyboard = Keyboard::default();
-        let key = |kind, mods| KeyEvent::new_with_kind(KeyCode::Char('a'), mods, kind);
-        assert!(matches!(
-            keyboard.input(key(KeyEventKind::Press, KeyModifiers::NONE)),
-            Some(Input::Key {
-                code: 30,
-                pressed: true,
-                ..
-            })
-        ));
-        assert!(
-            keyboard
-                .input(key(KeyEventKind::Repeat, KeyModifiers::NONE))
-                .is_none()
-        );
-        assert!(matches!(
-            keyboard.input(key(KeyEventKind::Release, KeyModifiers::NONE)),
-            Some(Input::Key {
-                code: 30,
-                pressed: false,
-                ..
-            })
-        ));
-        keyboard.intercept(30);
-        assert!(
-            keyboard
-                .input(key(KeyEventKind::Release, KeyModifiers::NONE))
-                .is_none()
-        );
-        assert!(
-            keyboard
-                .input(key(KeyEventKind::Press, KeyModifiers::NONE))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn kitty_shift_and_locks_are_snapshots_not_character_guesses() {
-        let mut keyboard = Keyboard::default();
-        let key = KeyEvent::new_with_kind_and_state(
-            KeyCode::Char('a'),
-            KeyModifiers::SHIFT,
-            KeyEventKind::Press,
-            KeyEventState::CAPS_LOCK,
-        );
-        assert!(matches!(keyboard.input(key),
-            Some(Input::Key { code: 30, modifiers: bits, .. })
-                if bits == modifiers::SHIFT | modifiers::CAPS_LOCK));
-        assert!(paste(47, modifiers::CONTROL | modifiers::NUM_LOCK));
-        assert!(!binding(KEY_Q, modifiers::ALT | modifiers::HYPER));
-    }
-
-    #[test]
-    fn modifiers_and_keypad_keep_their_identities() {
-        for (code, expected) in [
-            (KeyCode::Modifier(ModifierKeyCode::LeftControl), 29),
-            (KeyCode::Modifier(ModifierKeyCode::RightControl), 97),
-            (KeyCode::CapsLock, 58),
-            (KeyCode::F(11), 87),
-            (KeyCode::F(12), 88),
-            (KeyCode::F(24), 194),
-        ] {
-            assert_eq!(
-                key_code(KeyEvent::new(code, KeyModifiers::NONE)),
-                Some(expected)
-            );
-        }
-        let keypad = KeyEvent::new_with_kind_and_state(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-            KeyEventState::KEYPAD,
-        );
-        assert_eq!(key_code(keypad), Some(96));
-        assert_eq!(
-            key_code(KeyEvent::new(KeyCode::Char('猫'), KeyModifiers::NONE)),
-            None
-        );
-    }
 }

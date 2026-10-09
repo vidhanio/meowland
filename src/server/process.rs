@@ -64,7 +64,6 @@ pub(super) fn terminate_tree(roots: &HashSet<u32>) {
         for process in processes.values() {
             let _ = pidfd_send_signal(process, signal);
         }
-        // Detached helpers may leave the tree but remain in the process group.
         for raw in roots {
             if let Some(group) = process_id(*raw) {
                 let _ = kill_process_group(group, signal);

@@ -233,8 +233,6 @@ impl Presenter {
             return;
         }
 
-        // Without patches, restoring the old base after a dropped frame needs
-        // no transfer: it is still on screen.
         if self.patch_count == 0
             && self.base.as_ref().is_some_and(|old| {
                 Some(old.size) == self.size
@@ -333,8 +331,6 @@ impl Presenter {
             }
             rect.extract(&self.image, width, &mut self.patch_pixels);
             move_cursor(out, rect.x, rect.y, self.cell_size);
-            // Re-transmitting an ID removes its old placements, including when
-            // this slot moves. No explicit delete-before-upload is necessary.
             let encoding = self.encoder.prepare(&self.patch_pixels);
             self.encoder.write(
                 out,
@@ -398,8 +394,6 @@ impl Presenter {
         }
         self.patch_count = 0;
         self.patches.clear();
-        // Retain a base only for patches or recovery from dropped shared
-        // frames.
         self.base = self
             .size
             .filter(|_| self.cell_size.is_some() || self.shared.is_some())
@@ -417,8 +411,6 @@ impl Presenter {
         let stride = size.rgb_stride();
         let rows = height as usize;
 
-        // Preserve the allocation for identical full frames, including a shared
-        // base.
         if start == 0 && end == rows * stride {
             if self.size == Some(size) && self.image.as_slice() == band.as_slice() {
                 return Some(false);
@@ -429,8 +421,6 @@ impl Presenter {
             return Some(true);
         }
 
-        // A resized partial frame starts empty; `base` still describes the
-        // terminal's old image for comparison.
         if self.size != Some(size) {
             self.size = Some(size);
             self.image = Arc::new(vec![0; rows * stride]);
@@ -616,8 +606,6 @@ fn delete_image(out: &mut Vec<u8>, id: u32) {
 
 /// Common kitty transmission keys; callers append transport and chunk keys.
 fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, placement: u32) {
-    // Patches must sit above the retained whole frame regardless of image IDs.
-    // Equal-z images stack by ID, and multiplexers such as Herdr remap IDs.
     let z = if placement == 0 { 1 } else { 2 };
     write!(
         out,

@@ -25,8 +25,6 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
         }
         return;
     }
-    // Late releases from an unfocused pane cannot steal focus, resize
-    // ownership, or release another pane's held keys.
     if matches!(event, Input::Key { pressed: false, .. }) && state.keyboard_pane != Some(pane) {
         return;
     }
@@ -126,18 +124,11 @@ fn pointer_input(
         }
         let amount = -f64::from(scroll) * SCROLL_FACTOR;
         if amount != 0.0 {
-            // Terminal wheel reports also carry pointer coordinates.
-            // Flush enter/motion/button first: GTK 3 otherwise flushes
-            // that event instead of the axes at wl_pointer.frame,
-            // leaving wheel input pending indefinitely.
             pointer.frame(state);
             pointer.axis(
                 state,
                 AxisFrame::new(time)
                     .source(AxisSource::Wheel)
-                    // Scale distance and value120 together, like Niri.
-                    // value120 is an integer on the wire; fractional
-                    // results truncate rather than synthesize clicks.
                     .value(Axis::Vertical, amount * (15.0 / 120.0))
                     .v120(Axis::Vertical, amount as i32),
             );
@@ -251,9 +242,6 @@ fn inject_key(
     } else {
         KeyState::Released
     };
-    // Update real held-key state first, then apply the terminal's modifier
-    // snapshot before forwarding. This also picks up modifiers already held
-    // when we attached, without inventing modifier key presses.
     if keyboard
         .input_from_source(
             source,
@@ -269,8 +257,6 @@ fn inject_key(
         return;
     }
     let mut modifiers = snapshot(bits);
-    // Crossterm unconditionally sets a modifier key's own bit, even for a
-    // release. Real left/right key transitions are authoritative for that bit.
     let held = |left: u32, right: u32| {
         let keys = keyboard.pressed_keys();
         keys.contains(&Keycode::from(left + 8)) || keys.contains(&Keycode::from(right + 8))
@@ -286,9 +272,6 @@ fn inject_key(
     if before != keyboard.modifier_state() {
         keyboard.advertise_modifier_state(state);
     }
-    // Smithay normally sends its modifier update after the key. A snapshot
-    // can introduce modifiers without a preceding modifier key, so advertise
-    // it first and suppress the redundant post-key update.
     keyboard.input_forward(state, keycode, direction, serial, time, false);
 }
 

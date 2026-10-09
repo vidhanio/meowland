@@ -108,8 +108,6 @@ impl DmabufBackend {
             unsafe_code,
             reason = "loading the installed graphics library before Smithay's infallible loader"
         )]
-        // SAFETY: EGL supports dynamic loading on this thread. Keep the library
-        // alive until Smithay's infallible lazy loader acquires its own reference.
         let _egl = match unsafe { libloading::Library::new("libEGL.so.1") } {
             Ok(library) => library,
             Err(error) => {
@@ -153,8 +151,6 @@ impl DmabufBackend {
     fn initialize(device: EGLDevice, node: DrmNode) -> Result<Self, BackendError> {
         let path = node.dev_path().ok_or(BackendError::MissingNodePath)?;
         let _access = OpenOptions::new().read(true).write(true).open(path)?;
-        // SAFETY: Only Smithay creates/terminates this display. The new context
-        // is transferred to one renderer and is never active on another thread.
         let display = unsafe { EGLDisplay::new(device)? };
         if !display
             .extensions()
@@ -164,8 +160,6 @@ impl DmabufBackend {
             return Err(BackendError::MissingFenceSync);
         }
         let context = EGLContext::new(&display)?;
-        // SAFETY: The freshly created context has not been made current
-        // elsewhere.
         let mut renderer = unsafe { GlesRenderer::new(context)? };
         if !renderer.capabilities().contains(&Capability::Fencing)
             || !renderer.capabilities().contains(&Capability::ExportFence)
@@ -273,11 +267,6 @@ impl DmabufBackend {
             .bind(&mut self.target)
             .map_err(SnapshotError::safe)?;
         let destination = Rectangle::from_size((size.w, size.h).into());
-        // Mark the entire copy opaque to disable blending, not to discard
-        // alpha: the shader copies the client's already-premultiplied
-        // RGBA unchanged. Smithay negates Y_INVERT texture coordinates
-        // without translating them; the negative source origin supplies
-        // that translation, yielding 1 - y.
         let source = Rectangle::new(
             (
                 0.0,
@@ -344,8 +333,6 @@ impl DmabufBackend {
         let size = self.dimensions(dmabuf, bound)?;
         let mapping = self.readback(dmabuf)?;
         let top_down = mapping.flipped();
-        // Mapping the PBO blocks until readback completes. Nothing below this
-        // point borrows the client's storage or can return a partial snapshot.
         let bytes = self
             .renderer
             .map_texture(&mapping)
@@ -356,8 +343,6 @@ impl DmabufBackend {
             return Err(SnapshotError::safe(BackendError::ReadbackLength));
         }
         Snapshot::resize_pixels(pixels, size);
-        // GLES reports flipped mappings because its normal projection puts
-        // surface row zero at GL row zero. A non-flipped mapping is bottom-up.
         if top_down {
             pixels.copy_from_slice(bytes);
         } else {

@@ -5,7 +5,7 @@ use meowland::{
     protocol::{self, ControlRequest, ControlResponse, Show, WindowInfo},
     server, terminal,
 };
-use usage::{Args, Cli, Subcommands, ValueEnum};
+use usage_rs::{Args, Cli, Subcommands, ValueEnum};
 
 #[derive(Cli)]
 #[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
@@ -39,7 +39,7 @@ struct RunArgs {
     #[usage(
         required,
         double_dash = "automatic",
-        value_hint = usage::ValueHint::CommandWithArguments
+        value_hint = usage_rs::ValueHint::CommandWithArguments
     )]
     command: Vec<OsString>,
 }
@@ -62,20 +62,20 @@ impl WindowArgs {
 }
 
 fn window_targets(
-    _partial: &<WindowArgs as usage::spec::CommandArgs>::Partial,
-    _context: &usage::complete::CompleteCtx<'_>,
-) -> Vec<usage::complete::Candidate<'static>> {
+    _partial: &<WindowArgs as usage_rs::spec::CommandArgs>::Partial,
+    _context: &usage_rs::complete::CompleteCtx<'_>,
+) -> Vec<usage_rs::complete::Candidate<'static>> {
     complete_windows(true)
 }
 
 fn app_ids(
-    _partial: &<RunArgs as usage::spec::CommandArgs>::Partial,
-    _context: &usage::complete::CompleteCtx<'_>,
-) -> Vec<usage::complete::Candidate<'static>> {
+    _partial: &<RunArgs as usage_rs::spec::CommandArgs>::Partial,
+    _context: &usage_rs::complete::CompleteCtx<'_>,
+) -> Vec<usage_rs::complete::Candidate<'static>> {
     complete_windows(false)
 }
 
-fn complete_windows(include_ids: bool) -> Vec<usage::complete::Candidate<'static>> {
+fn complete_windows(include_ids: bool) -> Vec<usage_rs::complete::Candidate<'static>> {
     let Ok(paths) = server::Paths::discover() else {
         return Vec::new();
     };
@@ -95,7 +95,7 @@ fn complete_windows(include_ids: bool) -> Vec<usage::complete::Candidate<'static
     targets.dedup();
     targets
         .into_iter()
-        .map(usage::complete::Candidate::new)
+        .map(usage_rs::complete::Candidate::new)
         .collect()
 }
 
@@ -118,7 +118,7 @@ enum CompletionShell {
     PowerShell,
 }
 
-impl From<CompletionShell> for usage::complete::Shell {
+impl From<CompletionShell> for usage_rs::complete::Shell {
     fn from(shell: CompletionShell) -> Self {
         match shell {
             CompletionShell::Bash => Self::Bash,

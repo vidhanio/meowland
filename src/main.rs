@@ -13,8 +13,6 @@ fn init_logging() {
                 .init();
         }
         Some(command) if command == "run" || command == "attach" => {
-            // Writing logs to stderr would corrupt the pane's terminal
-            // graphics.
             if let Ok(layer) = tracing_journald::layer() {
                 tracing_subscriber::registry()
                     .with(filter)

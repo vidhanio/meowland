@@ -48,8 +48,6 @@ const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;
 /// window.
 const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?u\x1b[c";
 
-// Alternate-key reporting is deliberately absent: Crossterm replaces the key
-// identity with its shifted alternate and discards the base-layout key.
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
@@ -132,8 +130,6 @@ fn terminal_probe(
     }
     let mut probe = parse_probe_bytes(&bytes);
     probe.shared_memory &= shared_probe.is_some();
-    // Even an `OK` reply may leave the probe object linked; clear the slot
-    // before handing it to the presenter.
     let shared = if probe.shared_memory {
         slot.clear();
         Some(slot)
@@ -401,8 +397,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         )
     })?;
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    // Install termination handlers before taking over the terminal so signals
-    // during the probe cannot leave raw mode or the alternate screen active.
     let interrupted = signals::termination_flag()?;
     let mut mode = TerminalGuard::enter()?;
     let (probe, shared) = terminal_probe(&interrupted)?;
@@ -413,8 +407,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     if !probe.graphics {
         return Err(Error::GraphicsUnsupported);
     }
-    // The capability probe uses blocking, unbuffered reads. Only subsequent
-    // Crossterm event parsing needs an independent nonblocking descriptor.
     let _input = InputGuard::enter()?;
     if !probe.sgr_pixels {
         return Err(Error::PixelMouseUnsupported);
@@ -475,13 +467,10 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&clipboard.wake, PollFlags::IN),
         ];
-        // Bound idle waits because a signal can arrive just before poll,
-        // after the flag check, and therefore not interrupt the syscall.
         let mut wait = Duration::from_millis(100);
         if !handshake_done {
             wait = wait.min(handshake_deadline.saturating_duration_since(Instant::now()));
         }
-        // Crossterm can retain parsed events after the per-turn input budget.
         if event::poll(Duration::ZERO)? {
             wait = Duration::ZERO;
         }
@@ -489,8 +478,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             tv_sec: wait.as_secs() as i64,
             tv_nsec: wait.subsec_nanos().into(),
         };
-        // Omit backpressured descriptors entirely: poll reports HUP even
-        // with an empty interest mask, which would otherwise busy-loop.
         let watched = if receiving {
             &mut fds[..]
         } else {
@@ -548,7 +535,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 }
             }
         }
-        // Do not accumulate clipboard output indefinitely on a stalled tty.
         if receiving {
             for response in clipboard.drain() {
                 match response {
@@ -656,8 +642,6 @@ impl PanePresentation {
             frame.encoded,
             frame.started.elapsed(),
         );
-        // This is the synchronization point: acknowledge only after the whole
-        // terminal update has been written, never while it is being encoded.
         protocol::send(
             tx,
             &PaneToServer::Ack {
@@ -702,8 +686,6 @@ fn send_event(
         }
         Event::Resize(cols, rows) => {
             let pixels = window_pixels();
-            // Recalculate cell size after font zoom, which need not change
-            // the dimensions reported by the initial probe.
             *cell = derived_cell(pixels, (cols, rows)).or(*cell);
             presenter.set_cell_size(*cell);
             let (width, height) =
@@ -807,8 +789,6 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        // Establish the guard before further mode changes so failures unwind
-        // them.
         let guard = Self {
             active: true,
             mouse: false,
@@ -851,7 +831,6 @@ impl TerminalGuard {
                 failure = result.err();
             }
         };
-        // Disable raw mode before potentially failing terminal writes.
         note(terminal::disable_raw_mode());
         if self.mouse {
             self.mouse = false;

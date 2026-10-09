@@ -1,3 +1,5 @@
+//! Length-prefixed Postcard messages for control and pane sockets.
+
 use std::{
     cell::RefCell,
     ffi::OsString,
@@ -152,25 +154,15 @@ pub enum ControlResponse {
 pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
     SCRATCH.with_borrow_mut(|buffer| {
         loop {
-            // The buffer's length is the room this thread remembers for a
-            // message; it is never shortened, so a steady stream of
-            // frames encodes into the same allocation.
             if buffer.len() < HEADER {
                 buffer.resize(HEADER, 0);
             }
-            let config = bincode::config::standard().with_limit::<MAX_MESSAGE>();
-            match bincode::serde::encode_into_slice(value, &mut buffer[HEADER..], config) {
+            match postcard::to_slice(value, &mut buffer[HEADER..]).map(|encoded| encoded.len()) {
                 Ok(size) => {
-                    if size > MAX_MESSAGE {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "message too large",
-                        ));
-                    }
                     buffer[..HEADER].copy_from_slice(&(size as u32).to_le_bytes());
                     return writer.write_all(&buffer[..HEADER + size]);
                 }
-                Err(bincode::error::EncodeError::UnexpectedEnd) => {
+                Err(postcard::Error::SerializeBufferFull) => {
                     let maximum = HEADER + MAX_MESSAGE;
                     if buffer.len() == maximum {
                         return Err(io::Error::new(
@@ -219,12 +211,9 @@ fn message_size(header: [u8; HEADER]) -> io::Result<usize> {
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
-    let (value, used) = bincode::serde::decode_from_slice(
-        bytes,
-        bincode::config::standard().with_limit::<MAX_MESSAGE>(),
-    )
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if used != bytes.len() {
+    let (value, remaining) = postcard::take_from_bytes(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !remaining.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "trailing message bytes",
@@ -262,7 +251,6 @@ impl MessageReader {
                 return Ok(None);
             }
             self.body_size = message_size(self.header)?;
-            // Remember initialized room just as the blocking receiver does.
             if self.body.len() < self.body_size {
                 self.body.resize(self.body_size, 0);
             }
@@ -282,8 +270,6 @@ impl MessageReader {
 
 /// Return currently available bytes, or zero on would-block/interruption.
 fn receive_available(socket: &UnixStream, bytes: &mut [u8]) -> io::Result<usize> {
-    // O_NONBLOCK would also change cloned writers. DONTWAIT affects only this
-    // receive call, leaving Hello, input and acknowledgements blocking.
     match rustix::net::recv(socket, bytes, RecvFlags::DONTWAIT) {
         Ok((0, _)) => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,

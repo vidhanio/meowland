@@ -67,7 +67,6 @@ impl Encoder {
     ) {
         let payload = self.payload(pixels, encoding);
         out.reserve(encoded_capacity(payload.len()));
-        // Encode directly into output chunks, not a second frame-sized buffer.
         let mut encoded_chunk = [0u8; CHUNK];
         let mut chunks = payload.chunks(CHUNK_PAYLOAD).peekable();
         let mut first = true;
@@ -126,7 +125,6 @@ impl Encoder {
 }
 
 fn encoded_capacity(payload_len: usize) -> usize {
-    // Budget at most 16 bytes per continuation and 96 for the first command.
     let chunks = payload_len.div_ceil(CHUNK_PAYLOAD).max(1);
     payload_len.div_ceil(3) * 4 + chunks * 16 + 96
 }

@@ -13,12 +13,52 @@
     inputs.flake-parts.lib.mkFlake { inherit inputs; } (
       {
         inputs,
+        self,
         ...
       }:
       {
         imports = [ inputs.treefmt-nix.flakeModule ];
 
         systems = import inputs.systems;
+
+        flake.homeModules.default =
+          {
+            config,
+            lib,
+            pkgs,
+            ...
+          }:
+          let
+            cfg = config.programs.meowland;
+          in
+          {
+            options.programs.meowland = {
+              enable = lib.mkEnableOption "meowland";
+
+              package = lib.mkOption {
+                type = lib.types.package;
+                default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+                description = "Package to install for Meowland.";
+              };
+            };
+
+            config = lib.mkIf cfg.enable {
+              home.packages = [ cfg.package ];
+
+              systemd.user.services.meowland = {
+                Unit.Description = "meowland Wayland compositor";
+
+                Service = {
+                  Type = "simple";
+                  ExecStart = "${lib.getExe cfg.package} server";
+                  Restart = "on-failure";
+                  RestartSec = "1s";
+                };
+
+                Install.WantedBy = [ "default.target" ];
+              };
+            };
+          };
 
         perSystem =
           {

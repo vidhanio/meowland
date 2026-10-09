@@ -14,7 +14,7 @@ use calloop::{EventLoop, Interest, Mode as PollMode, PostAction, channel, generi
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_dispatch2,
-    desktop::{PopupKind, PopupManager},
+    desktop::{PopupKind, PopupManager, get_popup_toplevel_coords},
     input::{
         Seat, SeatHandler, SeatState,
         dnd::DndGrabHandler,
@@ -958,25 +958,22 @@ fn metadata(surface: &ToplevelSurface) -> (String, String) {
 /// Where a popup may be placed: the pane showing its window, in the
 /// coordinates popup geometry is expressed in (the parent's window geometry).
 fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> {
-    let geometry = popup
-        .get_parent_surface()
-        .and_then(|parent| {
-            with_states(&parent, |states| {
-                states
-                    .cached_state
-                    .get::<SurfaceCachedState>()
-                    .current()
-                    .geometry
-            })
-        })
-        .unwrap_or_default();
-    let size = state
-        .window_for_surface(popup.wl_surface())
-        .map_or(state.mode, |window| state.pane_size(window));
+    let window = state.window_for_surface(popup.wl_surface());
+    let geometry = window
+        .and_then(|window| state.windows.get(&window))
+        .map_or_else(
+            || (0, 0).into(),
+            |window| render::window_geometry(window.surface.wl_surface()),
+        );
+    // A submenu's parent geometry is already offset within the toplevel.
+    // Include every ancestor's configured position, not the immediate
+    // parent's surface-local geometry inset (e.g. its shadow margins).
+    let parent = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+    let size = window.map_or(state.mode, |window| state.pane_size(window));
     Rectangle::new(
         (
-            geometry.loc.x.saturating_neg(),
-            geometry.loc.y.saturating_neg(),
+            geometry.x.saturating_add(parent.x).saturating_neg(),
+            geometry.y.saturating_add(parent.y).saturating_neg(),
         )
             .into(),
         size,

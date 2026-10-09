@@ -10,7 +10,10 @@ use std::{
 };
 
 use meowland::protocol::{self, Hello, ServerToPane, Show};
-use support::{Client, Pane, Server, hello, wait_for};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+    ConstraintAdjustment, Gravity,
+};
+use support::{Client, Pane, Server, hello, u32s, wait_for};
 
 const WIDTH: u32 = 4;
 const HEIGHT: u32 = 3;
@@ -374,6 +377,155 @@ fn popup_is_drawn_where_the_window_geometry_puts_it() {
     assert_eq!(done.opcode, 1, "xdg_popup.popup_done");
     let frame = pane.frame();
     assert_eq!(at(&frame, 3, 2), background);
+}
+
+#[test]
+fn nested_popup_flips_or_slides_at_the_pane_edges() {
+    for (adjustments, expected) in [
+        (
+            ConstraintAdjustment::FlipX | ConstraintAdjustment::FlipY,
+            (1, 1),
+        ),
+        (
+            ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY,
+            (1, 2),
+        ),
+    ] {
+        let server = Server::start();
+        let mut client = Client::connect(&server);
+        let window = client.create_toplevel("nested popup constraints", "meowland.test");
+        client.set_window_geometry(window.xdg_surface, 2, 1, 10, 9);
+        let background = [10, 20, 30];
+        let buffer = client.shm_buffer(12, 10, 48, &solid(12, 10, background));
+        client.attach(&window, buffer, 12, 10);
+        assert!(server.wait_for_window(Duration::from_secs(5)));
+        let mut pane = Pane::attach(&server, hello(12, 10, Show::Newest));
+        let _ = pane.frame();
+        pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+        // The menu geometry is at (8,5) in the pane, against its right and
+        // bottom edges. Its shadow inset must not affect submenu placement.
+        let menu = client.create_popup(window.xdg_surface, (4, 5), (6, 4, 1, 1));
+        client.set_window_geometry(menu.xdg_surface, 1, 2, 4, 5);
+        assert_eq!(
+            menu.map(&mut client, 6, 9, &solid(6, 9, [40, 50, 60])),
+            (6, 4)
+        );
+        let _ = pane.frame();
+        pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+        // Without adjustment the submenu would be at (11,8), outside the
+        // pane. The configure must remain relative to the menu's geometry.
+        let positioner = client.create_positioner((3, 3), (3, 3, 1, 1));
+        client.request(positioner, 5, &u32s(&[adjustments.bits()]));
+        let submenu = client.create_popup_with_positioner(menu.xdg_surface, positioner);
+        client.request(positioner, 0, &[]);
+        client.set_window_geometry(submenu.xdg_surface, 1, 1, 3, 3);
+        let color = [200, 100, 50];
+        assert_eq!(
+            submenu.map(&mut client, 5, 5, &solid(5, 5, color)),
+            expected,
+            "{adjustments:?} must account for the parent menu's pane position"
+        );
+        let frame = pane.frame();
+        assert_eq!(at(&frame, 9, (5 + expected.1) as u32), color);
+        assert_eq!(at(&frame, 0, 0), background);
+
+        // Rendering and hit testing must agree on the submenu's surface
+        // origin, including both the ancestor offsets and its own inset.
+        let seat = client.seat();
+        let pointer = client.get_pointer(seat);
+        let _ = client.sync();
+        pane.send(&protocol::PaneToServer::Input(protocol::Input::Pointer {
+            x: 9.5,
+            y: 5.5 + f64::from(expected.1),
+            button: None,
+            pressed: false,
+            scroll: 0,
+        }));
+        let enter = client.read_until(|message| message.object == pointer && message.opcode == 0);
+        assert_eq!(enter.u32_at(1), submenu.surface);
+        assert_eq!((enter.u32_at(2), enter.u32_at(3)), (384, 384));
+    }
+}
+
+#[test]
+fn nested_popups_can_open_left_and_above_their_parents() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let window = client.create_toplevel("nested popup offsets", "meowland.test");
+    client.set_window_geometry(window.xdg_surface, 2, 1, 10, 9);
+    let background = [10, 20, 30];
+    let buffer = client.shm_buffer(12, 10, 48, &solid(12, 10, background));
+    client.attach(&window, buffer, 12, 10);
+    assert!(server.wait_for_window(Duration::from_secs(5)));
+    let mut pane = Pane::attach(&server, hello(12, 10, Show::Newest));
+    let _ = pane.frame();
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    let menu = client.create_popup(window.xdg_surface, (4, 5), (6, 4, 1, 1));
+    client.set_window_geometry(menu.xdg_surface, 1, 2, 4, 5);
+    assert_eq!(
+        menu.map(&mut client, 6, 9, &solid(6, 9, [40, 50, 60])),
+        (6, 4)
+    );
+    let _ = pane.frame();
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    let adjustments = ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY;
+    let positioner = client.create_positioner((3, 3), (0, 1, 1, 1));
+    client.request(positioner, 4, &u32s(&[Gravity::BottomLeft as u32]));
+    client.request(positioner, 5, &u32s(&[adjustments.bits()]));
+    let submenu = client.create_popup_with_positioner(menu.xdg_surface, positioner);
+    client.request(positioner, 0, &[]);
+    client.set_window_geometry(submenu.xdg_surface, 1, 1, 3, 3);
+    let submenu_color = [100, 150, 200];
+    assert_eq!(
+        submenu.map(&mut client, 5, 5, &solid(5, 5, submenu_color)),
+        (-3, 1),
+        "negative parent-relative coordinates are still inside the pane"
+    );
+    let _ = pane.frame();
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    let positioner = client.create_positioner((3, 3), (0, 0, 1, 1));
+    client.request(positioner, 4, &u32s(&[Gravity::TopLeft as u32]));
+    client.request(positioner, 5, &u32s(&[adjustments.bits()]));
+    let nested = client.create_popup_with_positioner(submenu.xdg_surface, positioner);
+    client.request(positioner, 0, &[]);
+    client.set_window_geometry(nested.xdg_surface, 1, 1, 3, 3);
+    let nested_color = [200, 100, 50];
+    assert_eq!(
+        nested.map(&mut client, 5, 5, &solid(5, 5, nested_color)),
+        (-3, -3),
+        "constraints must include every ancestor's configured position"
+    );
+    let frame = pane.frame();
+    assert_eq!(at(&frame, 2, 3), nested_color);
+    assert_eq!(
+        at(&frame, 4, 5),
+        nested_color,
+        "the child is above its parent"
+    );
+    assert_eq!(at(&frame, 6, 8), submenu_color);
+    assert_eq!(at(&frame, 9, 8), [40, 50, 60]);
+    pane.send(&protocol::PaneToServer::Ack { drawn: true });
+
+    // Reposition uses the same parent-relative constraint area.
+    let positioner = client.create_positioner((3, 3), (2, 2, 1, 1));
+    client.request(positioner, 5, &u32s(&[adjustments.bits()]));
+    client.request(nested.handle, 2, &u32s(&[positioner, 42]));
+    client.request(positioner, 0, &[]);
+    let repositioned = client.read_until(|message| message.object == nested.handle);
+    assert_eq!(repositioned.opcode, 2, "xdg_popup.repositioned");
+    assert_eq!(repositioned.u32_at(0), 42);
+    assert_eq!(
+        nested.map(&mut client, 5, 5, &solid(5, 5, nested_color)),
+        (2, 1)
+    );
+    let frame = pane.frame();
+    assert_eq!(at(&frame, 7, 7), nested_color);
+    assert_eq!(at(&frame, 2, 3), background);
 }
 
 #[test]

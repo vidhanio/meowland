@@ -725,9 +725,19 @@ impl Client {
         size: (i32, i32),
         anchor_rect: (i32, i32, i32, i32),
     ) -> Popup {
-        let surface = self.create_surface();
-        let xdg_surface = self.alloc();
-        self.request(self.xdg, 2, &u32s(&[xdg_surface, surface]));
+        let positioner = self.create_positioner(size, anchor_rect);
+        let popup = self.create_popup_with_positioner(parent_xdg_surface, positioner);
+        self.request(positioner, 0, &[]);
+        popup
+    }
+
+    /// A top-left anchor and bottom-right gravity, without adjustments. Tests
+    /// may change these before creating or repositioning a popup.
+    pub fn create_positioner(
+        &mut self,
+        size: (i32, i32),
+        anchor_rect: (i32, i32, i32, i32),
+    ) -> u32 {
         let positioner = self.alloc();
         self.request(self.xdg, 1, &u32s(&[positioner]));
         self.request(positioner, 1, &i32s(&<[i32; 2]>::from(size)));
@@ -735,13 +745,23 @@ impl Client {
         self.request(positioner, 3, &u32s(&[5]));
         self.request(positioner, 4, &u32s(&[8]));
         self.request(positioner, 5, &u32s(&[0]));
+        positioner
+    }
+
+    pub fn create_popup_with_positioner(
+        &mut self,
+        parent_xdg_surface: u32,
+        positioner: u32,
+    ) -> Popup {
+        let surface = self.create_surface();
+        let xdg_surface = self.alloc();
+        self.request(self.xdg, 2, &u32s(&[xdg_surface, surface]));
         let popup = self.alloc();
         self.request(
             xdg_surface,
             2,
             &u32s(&[popup, parent_xdg_surface, positioner]),
         );
-        self.request(positioner, 0, &[]);
         Popup {
             surface,
             xdg_surface,

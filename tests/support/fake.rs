@@ -203,6 +203,10 @@ impl FakeTerminal {
             .filter_map(|field| field.split_once('='))
             .collect();
         let id = fields.get("i").and_then(|id| id.parse::<u32>().ok());
+        if self.chunk.is_some() && !fields.contains_key("a") {
+            self.graphics(&fields, payload);
+            return;
+        }
         match fields.get("a").copied() {
             Some("q") => {
                 if let Some(id) = id {

@@ -418,7 +418,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
     let clipboard = HostClipboard::new()?;
     let mut presentation = PanePresentation::new(cell, shared);
-    PaneStats::capabilities(&probe, hello.width, hello.height);
+    PaneStats::capabilities(&probe, width, height);
 
     let handshake_deadline = Instant::now() + Duration::from_secs(1);
     let mut handshake_done = false;

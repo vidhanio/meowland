@@ -14,12 +14,15 @@ use rustix::process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, p
 
 use crate::{Error, Result};
 
-pub(super) fn launch_client(args: &[OsString], wayland: &str) -> Result<Child> {
+pub(super) fn launch_client(args: &[OsString], wayland: &str, token: &str) -> Result<Child> {
     let Some(executable) = args.first() else {
         return Err(Error::RunRequiresCommand);
     };
     let mut command = Command::new(executable);
-    command.args(&args[1..]).env("WAYLAND_DISPLAY", wayland);
+    command
+        .args(&args[1..])
+        .env("WAYLAND_DISPLAY", wayland)
+        .env("XDG_ACTIVATION_TOKEN", token);
     command
         .env_remove("DISPLAY")
         .env("GDK_BACKEND", "wayland")

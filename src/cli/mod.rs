@@ -1,11 +1,4 @@
-use std::{
-    collections::HashSet,
-    ffi::OsString,
-    io::IsTerminal,
-    os::unix::net::UnixStream,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration};
 
 use meowland::{
     Error, Result,
@@ -37,6 +30,9 @@ enum Commands {
 
 #[derive(Args)]
 struct RunArgs {
+    /// Attach by app ID for clients without xdg-activation-v1 support.
+    #[usage(long, complete = app_ids)]
+    app_id: Option<String>,
     /// The program and arguments to run.
     #[usage(
         required,
@@ -48,24 +44,46 @@ struct RunArgs {
 
 #[derive(Args)]
 struct AttachArgs {
-    /// The window to show; omit it to follow the focused window.
-    #[usage(complete = window_ids)]
-    id: Option<u64>,
+    /// The integer window ID or app ID to show; omit it for the focused window.
+    #[usage(complete = window_targets)]
+    window: Option<String>,
 }
 
-fn window_ids(
+fn window_targets(
     _partial: &<AttachArgs as usage::spec::CommandArgs>::Partial,
     _context: &usage::complete::CompleteCtx<'_>,
 ) -> Vec<usage::complete::Candidate<'static>> {
+    complete_windows(true)
+}
+
+fn app_ids(
+    _partial: &<RunArgs as usage::spec::CommandArgs>::Partial,
+    _context: &usage::complete::CompleteCtx<'_>,
+) -> Vec<usage::complete::Candidate<'static>> {
+    complete_windows(false)
+}
+
+fn complete_windows(include_ids: bool) -> Vec<usage::complete::Candidate<'static>> {
     let Ok(paths) = server::Paths::discover() else {
         return Vec::new();
     };
     let Ok(windows) = list_with_timeout(&paths, Duration::from_millis(100)) else {
         return Vec::new();
     };
-    windows
+    let mut targets = Vec::new();
+    for window in windows {
+        if include_ids {
+            targets.push(window.id.to_string());
+        }
+        if !window.app_id.is_empty() {
+            targets.push(window.app_id);
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
         .into_iter()
-        .map(|window| usage::complete::Candidate::new(window.id.to_string()))
+        .map(usage::complete::Candidate::new)
         .collect()
 }
 
@@ -122,21 +140,29 @@ pub fn start() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Run(RunArgs { command: client }) => {
+        Commands::Run(RunArgs {
+            app_id,
+            command: client,
+        }) => {
             let paths = server::Paths::discover()?;
-            let before = list(&paths)?;
-            request(&paths, &ControlRequest::Run(client))?;
+            let ControlResponse::Started(token) = request(&paths, &ControlRequest::Run(client))?
+            else {
+                return Err(Error::UnexpectedRunResponse);
+            };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                let show = wait_for_new_window(&paths, &before, Duration::from_secs(10))?
-                    .map_or(Show::Newest, Show::Id);
+                let show = app_id.map_or(Show::Activation(token), Show::AppId);
                 terminal::attach(&paths.pane, show)
             } else {
                 Ok(())
             }
         }
-        Commands::Attach(AttachArgs { id }) => {
+        Commands::Attach(AttachArgs { window }) => {
             let paths = server::Paths::discover()?;
-            let show = id.map_or(Show::Focused, Show::Id);
+            let show = window.map_or(Show::Focused, |window| {
+                window
+                    .parse()
+                    .map_or_else(|_| Show::AppId(window), Show::Id)
+            });
             terminal::attach(&paths.pane, show)
         }
         Commands::Completions(CompletionArgs { shell }) => {
@@ -157,27 +183,6 @@ fn list_with_timeout(paths: &server::Paths, timeout: Duration) -> Result<Vec<Win
         return Err(Error::UnexpectedWindowListResponse);
     };
     Ok(windows)
-}
-
-fn wait_for_new_window(
-    paths: &server::Paths,
-    before: &[WindowInfo],
-    timeout: Duration,
-) -> Result<Option<u64>> {
-    let deadline = Instant::now() + timeout;
-    let existing: HashSet<_> = before.iter().map(|window| window.id).collect();
-    while Instant::now() < deadline {
-        let windows = list(paths)?;
-        if let Some(window) = windows
-            .iter()
-            .rev()
-            .find(|window| !existing.contains(&window.id))
-        {
-            return Ok(Some(window.id));
-        }
-        thread::sleep(Duration::from_millis(40));
-    }
-    Ok(None)
 }
 
 fn request(paths: &server::Paths, value: &ControlRequest) -> Result<ControlResponse> {

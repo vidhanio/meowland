@@ -11,6 +11,15 @@ use crate::{pixels::FrameSize, protocol::Show};
 impl State {
     pub(super) fn handle_command(&mut self, command: Command) {
         match command {
+            Command::CreateActivationToken { reply } => {
+                let token = self.create_activation_token();
+                if reply.send(token.clone()).is_err() {
+                    self.cancel_activation(&token, "launch cancelled");
+                }
+            }
+            Command::CancelActivation { token } => {
+                self.cancel_activation(&token, "launch cancelled");
+            }
             Command::Attach {
                 pane,
                 show,
@@ -72,32 +81,87 @@ impl State {
         }
     }
 
-    /// A missing explicit ID is released; a dynamic selection waits for pixels.
+    /// Explicit app IDs and launch tokens wait for their window, never the
+    /// newest.
     fn attach_pane(&mut self, pane: u64, show: Show, size: FrameSize) {
+        if matches!(&show, Show::Activation(token) if !self.launches.contains_key(token)) {
+            let _ = self.events.send(Event::Release {
+                pane,
+                reason: "no such activation".into(),
+            });
+            return;
+        }
         if matches!(show, Show::Newest) {
             self.following.insert(pane);
         }
-        let id = match show {
-            Show::Id(id) => id,
-            Show::Newest => self.newest.unwrap_or(0),
-            Show::Focused => self.focused.unwrap_or(0),
-        };
-        let announced = self.windows.get(&id).is_some_and(|window| window.announced);
-        if announced {
-            self.insert_pane(pane, PaneState::new(id, size));
-            self.enter_output(id);
-            self.send_title(pane, id);
-            self.mark_dirty(pane);
-            self.apply_window_state(id);
-            self.focus_window(id);
-        } else if matches!(show, Show::Newest | Show::Focused) {
-            self.insert_pane(pane, PaneState::new(0, size));
-            self.following.insert(pane);
-        } else {
+        if let Some(window) = self.selected_window(&show) {
+            self.insert_pane(pane, PaneState::new(window, size));
+            self.show_pane_window(pane, window);
+            if let Show::Activation(token) = show {
+                self.forget_activation(&token);
+            }
+        } else if matches!(show, Show::Id(_)) {
             let _ = self.events.send(Event::Release {
                 pane,
                 reason: "no such window".into(),
             });
+        } else {
+            self.insert_pane(pane, PaneState::new(0, size));
+            match show {
+                Show::AppId(_) | Show::Activation(_) => {
+                    self.pending_shows.insert(pane, show);
+                }
+                Show::Newest | Show::Focused => {
+                    self.following.insert(pane);
+                }
+                Show::Id(_) => unreachable!(),
+            }
+        }
+    }
+
+    fn selected_window(&self, show: &Show) -> Option<u64> {
+        let window = match show {
+            Show::Id(id) => Some(*id),
+            Show::Newest => self.newest,
+            Show::Focused => self.focused,
+            Show::AppId(app_id) => self
+                .windows
+                .iter()
+                .filter(|(_, window)| window.announced && window.app_id == *app_id)
+                .map(|(id, _)| *id)
+                .max(),
+            Show::Activation(token) => self.launches.get(token).and_then(|launch| launch.window),
+        }?;
+        self.windows
+            .get(&window)
+            .filter(|window| window.announced)
+            .map(|_| window)
+    }
+
+    fn show_pane_window(&mut self, pane: u64, window: u64) {
+        if let Some(entry) = self.panes.get_mut(&pane) {
+            entry.window = window;
+            entry.mark_dirty();
+        }
+        self.enter_output(window);
+        self.send_title(pane, window);
+        self.apply_window_state(window);
+        self.focus_window(window);
+    }
+
+    /// Called on mapping, metadata changes and activation, not on a timer.
+    pub(super) fn resolve_pending_panes(&mut self) {
+        let ready: Vec<_> = self
+            .pending_shows
+            .iter()
+            .filter_map(|(pane, show)| self.selected_window(show).map(|window| (*pane, window)))
+            .collect();
+        for (pane, window) in ready {
+            let show = self.pending_shows.remove(&pane);
+            self.show_pane_window(pane, window);
+            if let Some(Show::Activation(token)) = show {
+                self.forget_activation(&token);
+            }
         }
     }
 

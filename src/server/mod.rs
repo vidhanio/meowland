@@ -261,15 +261,38 @@ impl Server {
                 list.sort_by_key(|window| window.id);
                 ControlResponse::Windows(list)
             }
-            ControlRequest::Run(args) => match launch_client(&args, &self.display) {
-                Ok(child) => {
-                    self.child_groups.insert(child.id());
-                    self.children.push(child);
-                    ControlResponse::Ok
+            ControlRequest::Run(args) => {
+                let token = match self.activation_token() {
+                    Ok(token) => token,
+                    Err(error) => return ControlResponse::Error(format!("{error:#}")),
+                };
+                match launch_client(&args, &self.display, &token) {
+                    Ok(child) => {
+                        self.child_groups.insert(child.id());
+                        self.children.push(child);
+                        ControlResponse::Started(token)
+                    }
+                    Err(error) => {
+                        let _ = self
+                            .commands
+                            .send(CompositorCommand::CancelActivation { token });
+                        ControlResponse::Error(format!("{error:#}"))
+                    }
                 }
-                Err(error) => ControlResponse::Error(format!("{error:#}")),
-            },
+            }
         }
+    }
+
+    /// Register the token before spawning, so even immediate activation is
+    /// safe.
+    fn activation_token(&self) -> io::Result<String> {
+        let (reply, token) = mpsc::channel();
+        self.commands
+            .send(CompositorCommand::CreateActivationToken { reply })
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        token
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| io::Error::other(format!("creating activation token: {error}")))
     }
 
     /// Reject unusable panes instead of leaving them to time out.

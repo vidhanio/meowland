@@ -60,12 +60,14 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
         viewporter::{ViewportCachedState, ViewporterState},
+        xdg_activation::XdgActivationState,
     },
 };
 
 pub use crate::pixels::{MAX_SURFACE_PIXELS, MAX_SURFACE_SIDE};
 use crate::protocol::{Input, Show, WindowInfo};
 
+mod activation;
 mod clipboard;
 mod commands;
 mod decoration;
@@ -86,6 +88,12 @@ const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    CreateActivationToken {
+        reply: mpsc::Sender<String>,
+    },
+    CancelActivation {
+        token: String,
+    },
     Attach {
         pane: u64,
         show: Show,
@@ -220,6 +228,8 @@ struct State {
     gpu: Option<DmabufBackend>,
     pending_imports: Vec<PendingImport>,
     xdg: XdgShellState,
+    activation: XdgActivationState,
+    launches: HashMap<String, activation::Launch>,
     _decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
     _viewporter: ViewporterState,
@@ -245,6 +255,8 @@ struct State {
     newest: Option<u64>,
     panes: HashMap<u64, PaneState>,
     following: HashSet<u64>,
+    /// Explicit selections waiting for an app ID or activation and pixels.
+    pending_shows: HashMap<u64, Show>,
     /// For each window, the pane that last interacted with it.  That pane
     /// decides the window's configured size while it is attached.
     deciding: HashMap<u64, u64>,
@@ -469,6 +481,8 @@ impl State {
             gpu,
             pending_imports: Vec::new(),
             xdg: XdgShellState::new::<Self>(&display_handle),
+            activation: XdgActivationState::new::<Self>(&display_handle),
+            launches: HashMap::new(),
             _decoration: XdgDecorationState::new::<Self>(&display_handle),
             kde_decoration: decoration::kde(&display_handle),
             _viewporter: ViewporterState::new::<Self>(&display_handle),
@@ -493,6 +507,7 @@ impl State {
             newest: None,
             panes: HashMap::new(),
             following: HashSet::new(),
+            pending_shows: HashMap::new(),
             deciding: HashMap::new(),
             focused: None,
             cursor_pane: None,
@@ -557,6 +572,7 @@ impl State {
         }
         self.newest = Some(id);
         self.follow_panes(id);
+        self.resolve_pending_panes();
         let info = self.window_info(id);
         let _ = self.events.send(Event::WindowUp(info));
         self.apply_window_state(id);
@@ -625,6 +641,9 @@ impl State {
         let first = self.panes.keys().min() == Some(&pane);
         let window = self.panes.remove(&pane).map(|state| state.window);
         self.following.remove(&pane);
+        if let Some(Show::Activation(token)) = self.pending_shows.remove(&pane) {
+            self.forget_activation(&token);
+        }
         self.deciding.retain(|_, deciding| *deciding != pane);
         if self.cursor_pane == Some(pane) {
             self.cursor_pane = None;
@@ -812,6 +831,7 @@ impl XdgShellHandler for State {
             self.snapshots.remove(&surface);
         }
         self.ids.remove(surface.wl_surface());
+        self.cancel_window_activations(id);
         for pane in self.panes_showing(id) {
             if self.following.contains(&pane) {
                 if let Some(state) = self.panes.get_mut(&pane) {
@@ -905,6 +925,7 @@ impl XdgShellHandler for State {
             window.title = title;
             window.app_id = app_id;
         }
+        self.resolve_pending_panes();
         let info = self.window_info(id);
         let _ = self.events.send(Event::WindowUp(info));
         self.send_titles(id);
@@ -1196,6 +1217,7 @@ fn run(
         let _ = display.dispatch_clients(&mut state);
         poll_imports(&mut state);
         clipboard::poll(&mut state);
+        state.expire_activation_tokens();
         state.frame_callbacks();
         state.dispatch_frames();
         let _ = display.flush_clients();

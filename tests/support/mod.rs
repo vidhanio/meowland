@@ -123,7 +123,9 @@ impl Server {
         match self.control(&protocol::ControlRequest::List) {
             protocol::ControlResponse::Windows(windows) => windows,
             protocol::ControlResponse::Error(error) => panic!("list failed: {error}"),
-            protocol::ControlResponse::Ok => panic!("unexpected list reply"),
+            protocol::ControlResponse::Ok | protocol::ControlResponse::Started(_) => {
+                panic!("unexpected list reply")
+            }
         }
     }
 
@@ -680,6 +682,17 @@ impl Client {
 
     pub fn set_title(&mut self, toplevel: u32, title: &str) {
         self.request(toplevel, 2, &string_arg(title));
+    }
+
+    pub fn set_app_id(&mut self, toplevel: u32, app_id: &str) {
+        self.request(toplevel, 3, &string_arg(app_id));
+    }
+
+    pub fn activate(&mut self, token: &str, surface: u32) {
+        let activation = self.bind("xdg_activation_v1");
+        let mut args = string_arg(token);
+        args.extend_from_slice(&u32s(&[surface]));
+        self.request(activation, 2, &args);
     }
 
     pub fn set_window_geometry(&mut self, xdg_surface: u32, x: i32, y: i32, w: i32, h: i32) {

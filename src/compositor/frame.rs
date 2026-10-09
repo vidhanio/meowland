@@ -121,6 +121,9 @@ impl State {
         } else {
             TRANSFER_POLL_INTERVAL
         };
+        if let Some(deadline) = self.next_activation_deadline() {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
         for window in self.windows.values() {
             wait = wait.min(window.callback_due.saturating_duration_since(now));
         }

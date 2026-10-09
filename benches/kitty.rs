@@ -153,6 +153,40 @@ fn patches(c: &mut Criterion) {
     group.finish();
 }
 
+fn retained_patches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("present/retained_patches");
+    group
+        .sample_size(SAMPLES)
+        .measurement_time(MEASUREMENT)
+        .warm_up_time(WARM_UP);
+    let base = vec![FLAT; BYTES];
+    let mut previous = base.clone();
+    // A persistent, noisy repaint makes redundant compression/transfer costly.
+    let region = noise(&mut 71, pixels(800, 400));
+    for row in 0..400usize {
+        let start = ((row + 100) * WIDTH as usize + 100) * 3;
+        previous[start..start + 800 * 3]
+            .copy_from_slice(&region[row * 800 * 3..(row + 1) * 800 * 3]);
+    }
+    put_block(&mut previous, WIDTH, 1200, 100, 10, 20, CHANGED);
+    let mut next = previous.clone();
+    put_block(&mut next, WIDTH, 1200, 100, 10, 20, FLAT);
+    put_block(&mut next, WIDTH, 1220, 100, 10, 20, CHANGED);
+    group.bench_function("persistent_region_moving_cell_1080p", |b| {
+        b.iter_batched(
+            || {
+                let mut presenter = Presenter::new(Some(CELL), None);
+                black_box(presenter.present(WIDTH, HEIGHT, 0, base.clone()));
+                black_box(presenter.present(WIDTH, HEIGHT, 0, previous.clone()));
+                (presenter, next.clone())
+            },
+            |(mut presenter, frame)| black_box(presenter.present(WIDTH, HEIGHT, 0, frame)),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 fn bands(c: &mut Criterion) {
     let mut group = c.benchmark_group("present/bands");
     group
@@ -289,5 +323,13 @@ fn shared_memory(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, whole_frames, patches, bands, damage, shared_memory);
+criterion_group!(
+    benches,
+    whole_frames,
+    patches,
+    retained_patches,
+    bands,
+    damage,
+    shared_memory
+);
 criterion_main!(benches);

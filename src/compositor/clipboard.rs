@@ -101,15 +101,12 @@ pub(super) fn paste(state: &mut State, pane: u64, text: String) {
         TEXT_MIMES.into_iter().map(str::to_owned).collect(),
         Arc::from(text),
     );
-    for pressed in [true, false] {
-        pane_input(
-            state,
-            pane,
-            &Input::Key {
-                code: 47,
-                pressed,
-                modifiers: modifiers::CONTROL,
-            },
-        );
-    }
+    pane_input(
+        state,
+        pane,
+        &Input::KeyTap {
+            code: 47,
+            modifiers: modifiers::CONTROL,
+        },
+    );
 }

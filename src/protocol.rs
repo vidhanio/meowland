@@ -23,14 +23,17 @@ pub mod modifiers {
     pub const CONTROL: u8 = 2;
     pub const ALT: u8 = 4;
     pub const SUPER: u8 = 8;
+    pub const HYPER: u8 = 16;
+    pub const META: u8 = 32;
+    pub const CAPS_LOCK: u8 = 64;
+    pub const NUM_LOCK: u8 = 128;
 
     /// Whether a key carrying these modifiers is a compositor binding.
     ///
-    /// Alt alone is one, so a client can still receive the same key from any
-    /// terminal that reports `Ctrl` or `Super` with it.
+    /// Shift and lock state are allowed; other shortcut modifiers are not.
     #[must_use]
     pub const fn alt_only(modifiers: u8) -> bool {
-        modifiers & (CONTROL | SUPER) == 0 && modifiers & ALT != 0
+        modifiers & (CONTROL | SUPER | HYPER | META) == 0 && modifiers & ALT != 0
     }
 }
 
@@ -70,8 +73,9 @@ pub enum Input {
         /// Linux input code (`KEY_*`), which is 8 below what XKB uses for an
         /// `evdev` keymap; the conversion happens in the compositor alone.
         code: u16,
+        /// A real key transition. It stays down until its release or a reset.
         pressed: bool,
-        /// [`modifiers`] bits.
+        /// [`modifiers`] snapshot, including lock state.
         modifiers: u8,
     },
     Pointer {
@@ -82,6 +86,10 @@ pub enum Input {
         /// Vertical wheel distance: 120 units is one detent; positive is up.
         scroll: i16,
     },
+    /// Release the pane's keyboard state after terminal focus loss.
+    ResetKeyboard,
+    /// An intentional clipboard shortcut, not a physical key transition.
+    KeyTap { code: u16, modifiers: u8 },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

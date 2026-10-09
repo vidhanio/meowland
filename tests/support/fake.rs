@@ -37,6 +37,9 @@ pub struct FakeTerminal {
     pub shared_frames: u32,
     pub text: Vec<u8>,
     pub clipboard: Option<Vec<u8>>,
+    pub keyboard_supported: bool,
+    pub keyboard_flags: u8,
+    keyboard_stack: Vec<u8>,
     pending: Vec<u8>,
     screen: Vec<u8>,
     remap_ids: bool,
@@ -58,6 +61,9 @@ impl FakeTerminal {
             shared_frames: 0,
             text: Vec::new(),
             clipboard: None,
+            keyboard_supported: true,
+            keyboard_flags: 0,
+            keyboard_stack: Vec::new(),
             pending: Vec::new(),
             screen: vec![0; width * height * 3],
             remap_ids: false,
@@ -182,11 +188,14 @@ impl FakeTerminal {
                 "?2027$" => replies.extend_from_slice(b"\x1b[?2027;2$y"),
                 _ => {}
             },
-            b'u' => {
-                if params.starts_with('?') {
-                    // Disable keyboard enhancement for deterministic plain-key
-                    // tests.
-                    replies.extend_from_slice(b"\x1b[?0u");
+            b'u' if self.keyboard_supported => {
+                if params == "?" {
+                    replies.extend_from_slice(format!("\x1b[?{}u", self.keyboard_flags).as_bytes());
+                } else if let Some(flags) = params.strip_prefix('>') {
+                    self.keyboard_stack.push(self.keyboard_flags);
+                    self.keyboard_flags = flags.parse().unwrap_or(0);
+                } else if params.starts_with('<') {
+                    self.keyboard_flags = self.keyboard_stack.pop().unwrap_or(0);
                 }
             }
             b'h' | b'l' => {
@@ -198,7 +207,7 @@ impl FakeTerminal {
                         }
                         self.modes.insert(key);
                     } else {
-                        self.modes.remove(&key);
+                        self.modes.remove(&format!("{mode}h"));
                     }
                 }
             }

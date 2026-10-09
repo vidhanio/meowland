@@ -10,6 +10,7 @@ fn init_logging() {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
+                .with_ansi(false)
                 .init();
         }
         Some(command) if command == "run" || command == "attach" => {

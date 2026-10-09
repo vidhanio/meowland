@@ -1,11 +1,15 @@
 [Unit]
 Description=meowland Wayland compositor
+Requires=meowland.socket
+After=meowland.socket
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=meowland server
 Restart=on-failure
 RestartSec=1s
+UMask=0077
 
 [Install]
-WantedBy=default.target
+Also=meowland.socket

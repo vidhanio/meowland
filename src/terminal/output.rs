@@ -10,7 +10,7 @@ use std::{
 pub(super) fn open() -> io::Result<File> {
     OpenOptions::new()
         .write(true)
-        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .custom_flags((rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits() as i32)
         .open("/proc/self/fd/1")
 }
 

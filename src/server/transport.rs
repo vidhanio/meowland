@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Incoming, Reply};
+use super::{Incoming, Paths, Reply};
 use crate::{
     Error, Result,
     protocol::{self, ControlRequest, PaneToServer, ServerToPane},
@@ -57,11 +57,67 @@ impl Drop for SocketPath {
 #[derive(Debug)]
 pub(super) struct BoundSocket {
     listener: UnixListener,
-    path: SocketPath,
+    path: Option<SocketPath>,
     wake: (UnixStream, UnixStream),
 }
 
-pub(super) fn bind(path: &Path) -> Result<BoundSocket> {
+/// Adopt both systemd listeners by pathname, regardless of descriptor order,
+/// or bind standalone sockets. Inherited paths remain owned by the manager.
+/// Call before spawning threads because `ListenFd` consumes activation
+/// variables.
+pub(super) fn listeners(paths: &Paths) -> Result<(BoundSocket, BoundSocket)> {
+    let mut inherited = listenfd::ListenFd::from_env();
+    if inherited.len() == 0 {
+        return Ok((bind(&paths.control)?, bind(&paths.pane)?));
+    }
+    if inherited.len() != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket activation requires exactly two listeners",
+        )
+        .into());
+    }
+    let mut control = None;
+    let mut pane = None;
+    for index in 0..2 {
+        let listener = inherited.take_unix_listener(index)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing activation listener")
+        })?;
+        let address = listener.local_addr()?;
+        let slot = match address.as_pathname() {
+            Some(path) if path == paths.control => &mut control,
+            Some(path) if path == paths.pane => &mut pane,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unexpected activation socket path",
+                )
+                .into());
+            }
+        };
+        if slot.is_some()
+            || !rustix::net::sockopt::socket_acceptconn(&listener).map_err(io::Error::from)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate or non-listening activation socket",
+            )
+            .into());
+        }
+        listener.set_nonblocking(true)?;
+        *slot = Some(BoundSocket {
+            listener,
+            path: None,
+            wake: UnixStream::pair()?,
+        });
+    }
+    match (control, pane) {
+        (Some(control), Some(pane)) => Ok((control, pane)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "missing activation socket").into()),
+    }
+}
+
+fn bind(path: &Path) -> Result<BoundSocket> {
     let listener = match UnixListener::bind(path) {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
@@ -100,16 +156,16 @@ fn own_socket(path: &Path, listener: UnixListener) -> Result<BoundSocket> {
     let identity = SocketIdentity::at(path)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::AddrInUse, "bound socket path was replaced")
     })?;
-    let path = SocketPath {
+    let owned_path = SocketPath {
         path: path.to_path_buf(),
         identity,
     };
     let socket = BoundSocket {
         listener,
-        path,
+        path: Some(owned_path),
         wake: UnixStream::pair()?,
     };
-    fs::set_permissions(&socket.path.path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     socket.listener.set_nonblocking(true)?;
     Ok(socket)
 }
@@ -285,7 +341,7 @@ where
         }
     });
     AcceptLoop {
-        path: Some(path),
+        path,
         stopping,
         wake,
         thread: Some(thread),

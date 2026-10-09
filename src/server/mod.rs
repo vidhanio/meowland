@@ -17,7 +17,7 @@ mod process;
 mod transport;
 
 use process::{launch_client, terminate_tree};
-use transport::{Pane, accept_control, accept_panes, bind};
+use transport::{Pane, accept_control, accept_panes, listeners};
 
 use crate::{
     Error, Result,
@@ -98,20 +98,10 @@ struct Server {
 /// Fails if startup cannot bind sockets, launch the compositor, or install
 /// signal handlers.
 pub fn serve(paths: &Paths) -> Result<()> {
-    let interrupted = signals::termination_flag()?;
-    if UnixStream::connect(&paths.control).is_ok() {
-        return Err(Error::ServerAlreadyListening(paths.control.clone()));
-    }
+    let (control, pane) = listeners(paths)?;
+    let interrupted = signals::server_termination_flag()?;
+    notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
     let (commands, events, display, compositor_thread) = compositor::spawn()?;
-    let (control, pane) = match bind(&paths.control)
-        .and_then(|control| bind(&paths.pane).map(|pane| (control, pane)))
-    {
-        Ok(sockets) => sockets,
-        Err(error) => {
-            abandon(commands, compositor_thread);
-            return Err(error);
-        }
-    };
     let (incoming, incoming_rx) = mpsc::channel();
     let control = accept_control(control, incoming.clone());
     let pane = accept_panes(pane, incoming.clone());
@@ -138,6 +128,10 @@ pub fn serve(paths: &Paths) -> Result<()> {
         next_pane: 1,
     };
 
+    notify(&[
+        sd_notify::NotifyState::Ready,
+        sd_notify::NotifyState::Status("Accepting control and pane connections"),
+    ]);
     let mut compositor_failed = false;
     while !interrupted.interrupted() {
         match incoming_rx.recv_timeout(Duration::from_millis(100)) {
@@ -166,6 +160,10 @@ pub fn serve(paths: &Paths) -> Result<()> {
         server.releasing_panes.retain(|pane| !pane.finished());
     }
 
+    notify(&[
+        sd_notify::NotifyState::Stopping,
+        sd_notify::NotifyState::Status("Shutting down compositor and clients"),
+    ]);
     drop(incoming_rx);
     drop(control);
     drop(pane);
@@ -180,13 +178,10 @@ pub fn serve(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Release resources from a server that failed to start.
-fn abandon(
-    commands: calloop::channel::Sender<CompositorCommand>,
-    compositor_thread: thread::JoinHandle<()>,
-) {
-    drop(commands);
-    let _ = compositor_thread.join();
+fn notify(state: &[sd_notify::NotifyState<'_>]) {
+    if let Err(error) = sd_notify::notify(state) {
+        tracing::warn!(%error, "Cannot notify service manager");
+    }
 }
 
 impl Server {

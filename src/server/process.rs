@@ -25,6 +25,12 @@ pub(super) fn launch_client(args: &[OsString], wayland: &str, token: &str) -> Re
         .env("XDG_ACTIVATION_TOKEN", token);
     command
         .env_remove("DISPLAY")
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("LISTEN_PID")
+        .env_remove("LISTEN_FDS")
+        .env_remove("LISTEN_FDNAMES")
+        .env_remove("WATCHDOG_PID")
+        .env_remove("WATCHDOG_USEC")
         .env("GDK_BACKEND", "wayland")
         .env("QT_QPA_PLATFORM", "wayland")
         .env("SDL_VIDEODRIVER", "wayland")

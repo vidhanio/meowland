@@ -46,16 +46,37 @@
               home.packages = [ cfg.package ];
 
               systemd.user.services.meowland = {
-                Unit.Description = "meowland Wayland compositor";
+                Unit = {
+                  Description = "meowland Wayland compositor";
+                  Requires = [ "meowland.socket" ];
+                  After = [ "meowland.socket" ];
+                };
 
                 Service = {
-                  Type = "simple";
+                  Type = "notify";
+                  NotifyAccess = "main";
                   ExecStart = "${lib.getExe cfg.package} server";
                   Restart = "on-failure";
                   RestartSec = "1s";
+                  UMask = "0077";
                 };
 
-                Install.WantedBy = [ "default.target" ];
+                Install.Also = [ "meowland.socket" ];
+              };
+
+              systemd.user.sockets.meowland = {
+                Unit.Description = "meowland control and pane sockets";
+
+                Socket = {
+                  ListenStream = [
+                    "%t/meowland-control.sock"
+                    "%t/meowland-pane.sock"
+                  ];
+                  SocketMode = "0600";
+                  RemoveOnStop = true;
+                };
+
+                Install.WantedBy = [ "sockets.target" ];
               };
             };
           };
@@ -125,6 +146,8 @@
 
                   install -Dm644 ${./share/systemd/user/meowland.service} \
                     $out/share/systemd/user/meowland.service
+                  install -Dm644 ${./share/systemd/user/meowland.socket} \
+                    $out/share/systemd/user/meowland.socket
                   substituteInPlace $out/share/systemd/user/meowland.service \
                     --replace-fail 'ExecStart=meowland ' "ExecStart=$out/bin/meowland "
 

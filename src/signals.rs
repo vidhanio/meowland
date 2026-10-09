@@ -34,6 +34,19 @@ impl Drop for TerminationFlag {
 /// # Errors
 /// Returns an error when a signal handler cannot be registered.
 pub fn termination_flag() -> std::io::Result<TerminationFlag> {
+    register_termination(true)
+}
+
+/// Register server termination handlers, ignoring SIGHUP because there is no
+/// reloadable configuration. Terminal panes still treat hangup as termination.
+///
+/// # Errors
+/// Returns an error when a signal handler cannot be registered.
+pub fn server_termination_flag() -> std::io::Result<TerminationFlag> {
+    register_termination(false)
+}
+
+fn register_termination(hangup: bool) -> std::io::Result<TerminationFlag> {
     let mut guard = TerminationFlag {
         flag: Arc::new(AtomicBool::new(false)),
         handlers: [None; 3],
@@ -43,10 +56,12 @@ pub fn termination_flag() -> std::io::Result<TerminationFlag> {
         signal_hook::consts::SIGTERM,
         signal_hook::consts::SIGHUP,
     ]) {
-        *slot = Some(signal_hook::flag::register(
-            signal,
-            Arc::clone(&guard.flag),
-        )?);
+        let flag = if signal == signal_hook::consts::SIGHUP && !hangup {
+            Arc::new(AtomicBool::new(false))
+        } else {
+            Arc::clone(&guard.flag)
+        };
+        *slot = Some(signal_hook::flag::register(signal, flag)?);
     }
     Ok(guard)
 }

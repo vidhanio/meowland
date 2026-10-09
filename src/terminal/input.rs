@@ -32,7 +32,7 @@ impl InputGuard {
         };
         let input = open(
             path,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
             Mode::empty(),
         )?;
         dup2_stdin(&input)?;

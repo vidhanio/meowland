@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: install libraries
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: setup nix
         uses: ./.github/actions/setup-nix
@@ -54,7 +54,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: setup nix
         uses: ./.github/actions/setup-nix

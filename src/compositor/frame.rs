@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use smithay::input::keyboard::KeyboardSource;
+
 use super::{Event, FRAME_INTERVAL, State, SurfaceAttributes, TRANSFER_POLL_INTERVAL, with_states};
 use crate::pixels::FrameSize;
 
@@ -20,6 +22,7 @@ enum Presentation {
 pub(super) struct PaneState {
     pub(super) window: u64,
     pub(super) size: FrameSize,
+    pub(super) keyboard_source: KeyboardSource,
     presentation: Presentation,
     next_frame: Instant,
     shown: Vec<u8>,
@@ -32,6 +35,7 @@ impl PaneState {
         Self {
             window,
             size,
+            keyboard_source: KeyboardSource::new_auxiliary(),
             presentation: Presentation::Clean,
             next_frame: Instant::now(),
             shown: Vec::new(),

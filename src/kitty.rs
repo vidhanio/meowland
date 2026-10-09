@@ -19,6 +19,9 @@ mod encoding;
 use encoding::{Encoder, Encoding};
 
 const MAX_PATCHES: usize = 32;
+/// Small transfers are cheap to resend; keep the shared extraction buffer for
+/// them instead of allocating and retaining a pixel buffer per slot.
+const MIN_CACHED_TRANSFER_BYTES: usize = 4096;
 /// Consecutive unread frames before abandoning shared memory permanently.
 const DROP_LIMIT: u32 = 30;
 /// Most of a frame a cell-aligned diff may cover while a shared slot is
@@ -136,6 +139,9 @@ pub struct Presenter {
     shared: Option<SharedMemory>,
     encoder: Encoder,
     patch_pixels: Vec<u8>,
+    /// Exact pixels and geometry of live patch slots; unchanged slots need no
+    /// compression, transfer, or terminal image replacement.
+    patches: Vec<Option<Patch>>,
     dropped: bool,
     drops: u32,
 }
@@ -146,7 +152,13 @@ struct Frame {
     pixels: Arc<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+struct Patch {
+    rect: Rect,
+    pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rect {
     x: u32,
     y: u32,
@@ -179,6 +191,7 @@ impl Presenter {
             self.cell_size = cell_size;
             self.base = None;
             self.patch_count = 0;
+            self.patches.clear();
             self.display_current = false;
         }
     }
@@ -299,18 +312,54 @@ impl Presenter {
     }
 
     fn write_patches(&mut self, out: &mut Vec<u8>, width: u32) {
-        for index in 0..self.patch_count {
+        for index in self.rects.len()..self.patch_count {
             delete_image(
                 out,
                 FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX),
             );
         }
+        self.patches.truncate(self.rects.len());
         for (index, rect) in self.rects.iter().enumerate() {
             let id = FIRST_PATCH_ID + u32::try_from(index).unwrap_or(u32::MAX);
+            if self
+                .patches
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|patch| {
+                    patch.rect == *rect && rect.matches(&self.image, width, &patch.pixels)
+                })
+            {
+                continue;
+            }
             rect.extract(&self.image, width, &mut self.patch_pixels);
             move_cursor(out, rect.x, rect.y, self.cell_size);
-            self.encoder
-                .image(out, id, (rect.width, rect.height), &self.patch_pixels, true);
+            // Re-transmitting an ID removes its old placements, including when
+            // this slot moves. No explicit delete-before-upload is necessary.
+            let encoding = self.encoder.prepare(&self.patch_pixels);
+            self.encoder.write(
+                out,
+                id,
+                (rect.width, rect.height),
+                &self.patch_pixels,
+                true,
+                encoding,
+            );
+            if self.encoder.capacity(&self.patch_pixels, encoding) < MIN_CACHED_TRANSFER_BYTES {
+                if let Some(slot) = self.patches.get_mut(index) {
+                    *slot = None;
+                }
+            } else if let Some(patch) = self.patches.get_mut(index).and_then(Option::as_mut) {
+                patch.rect = *rect;
+                std::mem::swap(&mut patch.pixels, &mut self.patch_pixels);
+            } else {
+                if self.patches.len() <= index {
+                    self.patches.resize_with(index + 1, || None);
+                }
+                self.patches[index] = Some(Patch {
+                    rect: *rect,
+                    pixels: std::mem::take(&mut self.patch_pixels),
+                });
+            }
         }
         self.drops = 0;
         self.patch_count = self.rects.len();
@@ -348,6 +397,7 @@ impl Presenter {
             }
         }
         self.patch_count = 0;
+        self.patches.clear();
         // Retain a base only for patches or recovery from dropped shared
         // frames.
         self.base = self
@@ -527,6 +577,15 @@ impl Frame {
 }
 
 impl Rect {
+    fn matches(self, image: &[u8], width: u32, pixels: &[u8]) -> bool {
+        let stride = width as usize * 3;
+        let row_len = self.width as usize * 3;
+        pixels.chunks_exact(row_len).enumerate().all(|(row, old)| {
+            let start = (self.y as usize + row) * stride + self.x as usize * 3;
+            old == &image[start..start + row_len]
+        })
+    }
+
     fn extract(self, image: &[u8], width: u32, out: &mut Vec<u8>) {
         let stride = width as usize * 3;
         let row_len = self.width as usize * 3;

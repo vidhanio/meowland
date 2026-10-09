@@ -91,15 +91,21 @@ fn stalled_terminal_keeps_input_responsive_and_defers_ack() {
         reader.try_recv().is_err(),
         "frame was acknowledged before the terminal drained"
     );
-    pty.master.write_all(b"a").unwrap();
     let started = Instant::now();
     for pressed in [true, false] {
+        let kind = if pressed { 1 } else { 3 };
+        write!(pty.master, "\x1b[97;1:{kind}u").unwrap();
         let message = reader
             .recv_timeout(Duration::from_millis(750))
             .expect("terminal backpressure blocked keyboard input");
         assert!(
             matches!(message, PaneToServer::Input(Input::Key { code: 30, pressed: value, .. }) if value == pressed),
             "unexpected message: {message:?}"
+        );
+        pty.master.write_all(b"\x1b[97;1:2u").unwrap();
+        assert!(
+            reader.recv_timeout(Duration::from_millis(50)).is_err(),
+            "input was synthesized or the host repeat was forwarded"
         );
     }
     eprintln!("keyboard while terminal stalled: {:?}", started.elapsed());

@@ -92,6 +92,14 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
         "SGR-Pixels was not enabled: {:?}",
         terminal.modes
     );
+    assert_eq!(
+        terminal.keyboard_flags, 11,
+        "Kitty keyboard reporting was not enabled"
+    );
+    assert!(
+        terminal.modes.contains("1004h"),
+        "focus reporting was not enabled"
+    );
     assert!(terminal.synchronized_updates >= 1, "no synchronized update");
     assert_eq!(
         terminal.shared_frames, 1,
@@ -241,7 +249,7 @@ fn run_app_id_fallback_and_attach_by_app_id_select_the_matching_window() {
 }
 
 fn detach(pty: &mut Pty, child: &mut PtyChild) {
-    pty.master.write_all(b"\x1bw").unwrap();
+    pty.master.write_all(b"\x1b[119;3:1u\x1b[119;1:3u").unwrap();
     assert!(
         wait_for(Duration::from_secs(10), || child
             .try_wait()
@@ -254,6 +262,10 @@ fn detach(pty: &mut Pty, child: &mut PtyChild) {
     assert!(
         text.contains("\x1b[?1049l"),
         "the alternate screen was not left: {text:?}"
+    );
+    assert!(
+        text.contains("\x1b[<1u"),
+        "keyboard mode was not popped: {text:?}"
     );
     assert!(
         text.contains("meowland: detached"),
@@ -308,7 +320,7 @@ fn native_host_clipboard_and_bracketed_paste_preserve_unicode() {
     let pasted = "Host text: λ 猫 🐈\n\tsecond line";
     let source = host_clipboard.offer(&mut host_client);
     host_client.sync();
-    pty.master.write_all(&[0x16]).unwrap();
+    pty.master.write_all(b"\x1b[118;5:1u\x1b[118;1:3u").unwrap();
     host_clipboard.serve(&mut host_client, source, pasted);
     let offer = clipboard.selection(&mut client);
     assert_eq!(clipboard.receive(&client, offer), pasted.as_bytes());
@@ -441,6 +453,15 @@ fn a_signalled_pane_restores_the_terminal() {
     assert!(
         text.contains("\x1b[?1003l"),
         "mouse reporting was left on: {text:?}"
+    );
+    terminal.feed(text.as_bytes());
+    assert_eq!(
+        terminal.keyboard_flags, 0,
+        "keyboard flags leaked after SIGTERM"
+    );
+    assert!(
+        !terminal.modes.contains("1004h"),
+        "focus reporting leaked after SIGTERM"
     );
 }
 

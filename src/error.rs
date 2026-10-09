@@ -24,6 +24,10 @@ pub enum Error {
     PixelMouseUnsupported,
     #[error("terminal does not support kitty graphics")]
     GraphicsUnsupported,
+    #[error(
+        "terminal must support Kitty keyboard disambiguation, event types, and all-key reporting"
+    )]
+    KeyboardUnsupported,
     #[error("pane handshake timed out")]
     PaneHandshakeTimeout,
     #[error("server did not return windows")]

@@ -373,11 +373,6 @@ impl Server {
                         .commands
                         .send(CompositorCommand::CloseShown { pane: id });
                 }
-                protocol::Input::Key {
-                    code: KEY_Q | KEY_W,
-                    pressed: false,
-                    modifiers,
-                } if protocol::modifiers::alt_only(*modifiers) => {}
                 _ => {
                     let _ = self
                         .commands

@@ -248,6 +248,8 @@ struct State {
     seats: SeatState<Self>,
     seat: Seat<Self>,
     keyboard: Option<KeyboardHandle<Self>>,
+    /// One terminal pane owns the seat's held keyboard state at a time.
+    keyboard_pane: Option<u64>,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<u64, Window>,
@@ -501,6 +503,7 @@ impl State {
             seats: seat_state,
             seat,
             keyboard: None,
+            keyboard_pane: None,
             pointer,
             output,
             windows: HashMap::new(),
@@ -642,6 +645,9 @@ impl State {
 
     /// Remove every pane-keyed entry, restoring the remaining output mode.
     fn remove_pane(&mut self, pane: u64) -> Option<u64> {
+        if self.keyboard_pane == Some(pane) {
+            input::reset_keyboard(self);
+        }
         let first = self.panes.keys().min() == Some(&pane);
         let window = self.panes.remove(&pane).map(|state| state.window);
         self.following.remove(&pane);
@@ -680,6 +686,12 @@ impl State {
     }
 
     fn follow_panes(&mut self, window: u64) {
+        if self
+            .keyboard_pane
+            .is_some_and(|pane| self.following.contains(&pane))
+        {
+            input::reset_keyboard(self);
+        }
         for &pane in &self.following {
             if let Some(state) = self.panes.get_mut(&pane) {
                 state.window = window;
@@ -748,6 +760,7 @@ impl State {
         if self.focused == Some(window) {
             return;
         }
+        input::reset_keyboard(self);
         let previous = self.focused.replace(window);
         let surface = self
             .windows
@@ -836,6 +849,12 @@ impl XdgShellHandler for State {
         }
         self.ids.remove(surface.wl_surface());
         self.cancel_window_activations(id);
+        if self
+            .keyboard_pane
+            .is_some_and(|pane| self.panes.get(&pane).is_some_and(|p| p.window == id))
+        {
+            input::reset_keyboard(self);
+        }
         for pane in self.panes_showing(id) {
             if self.following.contains(&pane) {
                 if let Some(state) = self.panes.get_mut(&pane) {
@@ -1159,7 +1178,11 @@ fn run(
         return;
     };
     let mut state = State::new(display.handle(), events);
-    let Ok(keyboard) = state.seat.add_keyboard(XkbConfig::default(), 25, 600) else {
+    let keymap = XkbConfig {
+        layout: "us",
+        ..XkbConfig::default()
+    };
+    let Ok(keyboard) = state.seat.add_keyboard(keymap, 25, 600) else {
         let _ = ready.send(Err(std::io::Error::other(
             "could not compile the keyboard keymap",
         )));

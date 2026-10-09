@@ -8,7 +8,7 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{self, Event, KeyboardEnhancementFlags, MouseEventKind, PushKeyboardEnhancementFlags},
     execute, terminal,
 };
 use rustix::{
@@ -25,9 +25,11 @@ use crate::{
 };
 
 mod input;
+mod keyboard;
 mod output;
 
 use input::InputGuard;
+use keyboard::Keyboard;
 
 const CELL_WIDTH: u16 = 10;
 const CELL_HEIGHT: u16 = 20;
@@ -44,7 +46,14 @@ const WHEEL_STEP: i16 = 120;
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;AAAA\x1b\\";
 /// Query device attributes last so their reply starts the handshake's quiet
 /// window.
-const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[c";
+const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?u\x1b[c";
+
+// Alternate-key reporting is deliberately absent: Crossterm replaces the key
+// identity with its shifted alternate and discards the base-layout key.
+const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        .union(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
 
 /// Terminal capabilities discovered during the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -56,6 +65,8 @@ pub struct ProbeInfo {
     pub graphics: bool,
     pub shared_memory: bool,
     pub sgr_pixels: bool,
+    /// Kitty's active enhancements after pushing the requested flags.
+    pub keyboard_flags: Option<KeyboardEnhancementFlags>,
     pub name: Option<String>,
 }
 
@@ -203,6 +214,13 @@ fn parse_probe_bytes(bytes: &[u8]) -> ProbeInfo {
                 match final_byte {
                     b't' => parse_size_reply(body, &mut out),
                     b'y' => parse_decrqm_reply(body, &mut out),
+                    b'u' => {
+                        out.keyboard_flags = body
+                            .strip_prefix(b"?")
+                            .and_then(parse_u32)
+                            .and_then(|flags| u8::try_from(flags).ok())
+                            .map(KeyboardEnhancementFlags::from_bits_truncate);
+                    }
                     _ => {}
                 }
                 index = next;
@@ -321,7 +339,8 @@ impl PaneStats {
             terminal = ?probe.name,
             graphics = probe.graphics,
             shared_memory = probe.shared_memory,
-            sgr_pixels = ?probe.sgr_pixels,
+            sgr_pixels = probe.sgr_pixels,
+            keyboard_flags = ?probe.keyboard_flags,
             "pane attached"
         );
     }
@@ -400,6 +419,12 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     if !probe.sgr_pixels {
         return Err(Error::PixelMouseUnsupported);
     }
+    if probe
+        .keyboard_flags
+        .is_none_or(|flags| !flags.contains(KEYBOARD_FLAGS))
+    {
+        return Err(Error::KeyboardUnsupported);
+    }
     mode.enable_mouse()?;
     let mut cell = probe.cell_width.zip(probe.cell_height);
     let (width, height) = pane_pixels(
@@ -417,6 +442,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
     let clipboard = HostClipboard::new()?;
+    let mut keyboard = Keyboard::default();
     let mut presentation = PanePresentation::new(cell, shared);
     PaneStats::capabilities(&probe, width, height);
 
@@ -539,7 +565,10 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                         if let Some(text) = text {
                             send_paste(&mut tx, text)?;
                         } else {
-                            send_key_bits(&mut tx, code, modifiers)?;
+                            protocol::send(
+                                &mut tx,
+                                &PaneToServer::Input(Input::KeyTap { code, modifiers }),
+                            )?;
                         }
                     }
                 }
@@ -558,6 +587,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 &mut presentation.presenter,
                 &mut cell,
                 &clipboard,
+                &mut keyboard,
             )?;
         }
     }
@@ -644,18 +674,31 @@ fn send_event(
     presenter: &mut Presenter,
     cell: &mut Option<(u16, u16)>,
     clipboard: &HostClipboard,
+    keyboard: &mut Keyboard,
 ) -> Result<()> {
     match event {
-        Event::Key(key) if key.kind != KeyEventKind::Release => {
-            if let Some(code) = binding_code(key) {
-                send_key_bits(tx, code, modifier_bits(key.modifiers))?;
-            } else if let Some((code, modifiers)) = key_input(key) {
-                let paste = (code == 47 && modifiers == protocol::modifiers::CONTROL)
-                    || (code == 110 && modifiers == protocol::modifiers::SHIFT);
-                if !paste || !clipboard.paste(code, modifiers) {
-                    send_key_bits(tx, code, modifiers)?;
+        Event::Key(key) => {
+            if let Some(
+                input @ Input::Key {
+                    code,
+                    pressed,
+                    modifiers,
+                },
+            ) = keyboard.input(key)
+            {
+                if pressed && keyboard::paste(code, modifiers) && clipboard.paste(code, modifiers) {
+                    keyboard.intercept(code);
+                } else {
+                    if pressed && keyboard::binding(code, modifiers) {
+                        keyboard.intercept(code);
+                    }
+                    protocol::send(tx, &PaneToServer::Input(input))?;
                 }
             }
+        }
+        Event::FocusLost => {
+            keyboard.reset();
+            protocol::send(tx, &PaneToServer::Input(Input::ResetKeyboard))?;
         }
         Event::Resize(cols, rows) => {
             let pixels = window_pixels();
@@ -688,7 +731,7 @@ fn send_event(
             )?;
         }
         Event::Paste(text) => send_paste(tx, text)?,
-        _ => {}
+        Event::FocusGained => {}
     }
     Ok(())
 }
@@ -700,125 +743,6 @@ fn send_paste(tx: &mut UnixStream, text: String) -> Result<()> {
         tracing::warn!("Ignoring pasted text larger than {MAX_TEXT} bytes");
     }
     Ok(())
-}
-
-/// Convert a terminal key event to a Linux input code and modifier bits.
-fn key_input(key: KeyEvent) -> Option<(u16, u8)> {
-    let mut modifiers = key.modifiers;
-    if let KeyCode::Char(character) = key.code
-        && needs_shift(character)
-    {
-        // Printable characters can encode Shift without a separate modifier
-        // bit.
-        modifiers.insert(KeyModifiers::SHIFT);
-    }
-    let code = match key.code {
-        KeyCode::Char(c) => evdev_char_code(c)?,
-        KeyCode::Enter => 28,
-        KeyCode::Esc => 1,
-        KeyCode::Backspace => 14,
-        KeyCode::Tab | KeyCode::BackTab => 15,
-        KeyCode::Up => 103,
-        KeyCode::Down => 108,
-        KeyCode::Left => 105,
-        KeyCode::Right => 106,
-        KeyCode::Home => 102,
-        KeyCode::End => 107,
-        KeyCode::PageUp => 104,
-        KeyCode::PageDown => 109,
-        KeyCode::Delete => 111,
-        KeyCode::Insert => 110,
-        // evdev F1–F10, F11–F12, and F13–F24 occupy separate ranges.
-        KeyCode::F(n) => match n {
-            1..=10 => 58 + u16::from(n),
-            11 => 87,
-            12 => 88,
-            13..=24 => 170 + u16::from(n),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some((code, modifier_bits(modifiers)))
-}
-
-fn send_key_bits(stream: &mut UnixStream, code: u16, modifiers: u8) -> Result<()> {
-    protocol::send(
-        stream,
-        &PaneToServer::Input(Input::Key {
-            code,
-            pressed: true,
-            modifiers,
-        }),
-    )?;
-    protocol::send(
-        stream,
-        &PaneToServer::Input(Input::Key {
-            code,
-            pressed: false,
-            modifiers,
-        }),
-    )?;
-    Ok(())
-}
-
-const fn evdev_char_code(c: char) -> Option<u16> {
-    let c = c.to_ascii_lowercase();
-    Some(match c {
-        'a' => 30,
-        'b' => 48,
-        'c' => 46,
-        'd' => 32,
-        'e' => 18,
-        'f' => 33,
-        'g' => 34,
-        'h' => 35,
-        'i' => 23,
-        'j' => 36,
-        'k' => 37,
-        'l' => 38,
-        'm' => 50,
-        'n' => 49,
-        'o' => 24,
-        'p' => 25,
-        'q' => 16,
-        'r' => 19,
-        's' => 31,
-        't' => 20,
-        'u' => 22,
-        'v' => 47,
-        'w' => 17,
-        'x' => 45,
-        'y' => 21,
-        'z' => 44,
-        '1' | '!' => 2,
-        '2' | '@' => 3,
-        '3' | '#' => 4,
-        '4' | '$' => 5,
-        '5' | '%' => 6,
-        '6' | '^' => 7,
-        '7' | '&' => 8,
-        '8' | '*' => 9,
-        '9' | '(' => 10,
-        '0' | ')' => 11,
-        ' ' => 57,
-        '-' | '_' => 12,
-        '=' | '+' => 13,
-        '[' | '{' => 26,
-        ']' | '}' => 27,
-        ';' | ':' => 39,
-        '\'' | '"' => 40,
-        '`' | '~' => 41,
-        '\\' | '|' => 43,
-        ',' | '<' => 51,
-        '.' | '>' => 52,
-        '/' | '?' => 53,
-        _ => return None,
-    })
-}
-
-/// Shift requirement on the US keyboard layout used by `evdev_char_code`.
-fn needs_shift(c: char) -> bool {
-    c.is_ascii_uppercase() || "!@#$%^&*()_+{}:\"~|<>?".contains(c)
 }
 
 /// Kernel-reported window pixels; zero dimensions mean unavailable.
@@ -859,34 +783,6 @@ fn derived_cell(pixels: Option<(u32, u32)>, cells: (u16, u16)) -> Option<(u16, u
     (cell.0 > 0 && cell.1 > 0).then_some(cell)
 }
 
-fn modifier_bits(modifiers: KeyModifiers) -> u8 {
-    use protocol::modifiers::{ALT, CONTROL, SHIFT, SUPER};
-    let mut bits = 0;
-    for (flag, bit) in [
-        (KeyModifiers::SHIFT, SHIFT),
-        (KeyModifiers::CONTROL, CONTROL),
-        (KeyModifiers::ALT, ALT),
-        (KeyModifiers::SUPER, SUPER),
-    ] {
-        if modifiers.contains(flag) {
-            bits |= bit;
-        }
-    }
-    bits
-}
-
-/// Intercept Alt+Q and Alt+W only without Ctrl or Super.
-fn binding_code(key: KeyEvent) -> Option<u16> {
-    if !protocol::modifiers::alt_only(modifier_bits(key.modifiers)) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Char('q') => Some(protocol::KEY_Q),
-        KeyCode::Char('w') => Some(protocol::KEY_W),
-        _ => None,
-    }
-}
-
 fn title_bytes(title: &str) -> Vec<u8> {
     let clean = protocol::sanitize_with_limit(title, 512);
     format!("\x1b]2;{clean}\x07").into_bytes()
@@ -920,7 +816,9 @@ impl TerminalGuard {
         execute!(
             io::stdout(),
             terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide
+            crossterm::cursor::Hide,
+            PushKeyboardEnhancementFlags(KEYBOARD_FLAGS),
+            event::EnableFocusChange
         )?;
         io::stdout().write_all(b"\x1b[?7l\x1b[?25l\x1b[?2004h")?;
         io::stdout().flush()?;
@@ -962,6 +860,8 @@ impl TerminalGuard {
         note(io::stdout().write_all(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\"));
         note(execute!(
             io::stdout(),
+            event::DisableFocusChange,
+            event::PopKeyboardEnhancementFlags,
             crossterm::cursor::Show,
             terminal::LeaveAlternateScreen
         ));

@@ -28,6 +28,8 @@ pub enum Error {
     PaneHandshakeTimeout,
     #[error("server did not return windows")]
     UnexpectedWindowListResponse,
+    #[error("server did not return a launch activation token")]
+    UnexpectedRunResponse,
     #[error("server rejected the request: {0}")]
     ServerResponse(String),
 }

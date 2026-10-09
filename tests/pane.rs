@@ -163,6 +163,82 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
     detach(&mut pty, &mut child);
 }
 
+#[test]
+fn run_attaches_to_the_surface_that_redeems_its_activation_token() {
+    let server = Server::start();
+    let tokenfile = server.runtime.join("launch-token");
+    let script = format!(
+        "printf '%s' \"$XDG_ACTIVATION_TOKEN\" > {}; exec sleep 60",
+        tokenfile.display()
+    );
+    let mut pty = Pty::open(4, 4, (2, 2));
+    let mut child = pty.spawn(
+        Command::new(BINARY)
+            .args(["run", "sh", "-c", &script])
+            .env("XDG_RUNTIME_DIR", &server.runtime),
+    );
+    assert!(wait_for(Duration::from_secs(5), || {
+        std::fs::read_to_string(&tokenfile).is_ok_and(|token| !token.is_empty())
+    }));
+    let token = std::fs::read_to_string(tokenfile).unwrap();
+    let mut client = Client::connect(&server);
+    let target = client.create_toplevel("run target", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&target, buffer, SIDE, SIDE);
+    client.activate(&token, target.surface);
+    // Activation can arrive before the terminal has even sent its Hello.
+    let unrelated = client.create_toplevel("unrelated newer window", "meowland.test");
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &[0xff; (SIDE * SIDE * 4) as usize]);
+    client.attach(&unrelated, buffer, SIDE, SIDE);
+    client.sync();
+
+    let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    pump_until_drawn(
+        &mut pty,
+        &mut terminal,
+        &mut child,
+        &rgb,
+        "the activated window",
+    );
+    detach(&mut pty, &mut child);
+}
+
+#[test]
+fn run_app_id_fallback_and_attach_by_app_id_select_the_matching_window() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let target = client.create_toplevel("app ID target", "meowland.test");
+    let rgb = gradient();
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &raw_from_rgb(&rgb));
+    client.attach(&target, buffer, SIDE, SIDE);
+    let unrelated = client.create_toplevel("unrelated newer window", "other.app-id");
+    let buffer = client.shm_buffer(SIDE, SIDE, SIDE * 4, &[0xff; (SIDE * SIDE * 4) as usize]);
+    client.attach(&unrelated, buffer, SIDE, SIDE);
+    client.sync();
+
+    for args in [
+        &["run", "--app-id", "meowland.test", "--", "true"][..],
+        &["attach", "meowland.test"][..],
+    ] {
+        let mut pty = Pty::open(4, 4, (2, 2));
+        let mut child = pty.spawn(
+            Command::new(BINARY)
+                .args(args)
+                .env("XDG_RUNTIME_DIR", &server.runtime),
+        );
+        let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+        pump_until_drawn(
+            &mut pty,
+            &mut terminal,
+            &mut child,
+            &rgb,
+            "the app ID match",
+        );
+        detach(&mut pty, &mut child);
+    }
+}
+
 fn detach(pty: &mut Pty, child: &mut PtyChild) {
     pty.master.write_all(b"\x1bw").unwrap();
     assert!(

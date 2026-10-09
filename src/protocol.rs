@@ -38,11 +38,15 @@ pub mod modifiers {
 pub const KEY_Q: u16 = 16;
 pub const KEY_W: u16 = 17;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Show {
     Id(u64),
     Newest,
     Focused,
+    /// Select the newest mapped window with this app ID, waiting if necessary.
+    AppId(String),
+    /// Select the window that redeems this launch's activation token.
+    Activation(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -53,7 +57,7 @@ pub struct WindowInfo {
     pub active: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Hello {
     pub width: u32,
     pub height: u32,
@@ -127,6 +131,8 @@ pub enum ControlResponse {
     Ok,
     Windows(Vec<WindowInfo>),
     Error(String),
+    /// The client was launched with this `XDG_ACTIVATION_TOKEN`.
+    Started(String),
 }
 
 /// Write one length-prefixed message.

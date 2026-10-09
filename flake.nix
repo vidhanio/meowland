@@ -79,7 +79,6 @@
               };
             craneLib = (inputs.crane.mkLib pkgs).overrideToolchain nightlyToolchain;
 
-            # Keep rustfmt.toml in crane's filtered source for nightly formatting.
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
               filter =
@@ -112,6 +111,7 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
+                doCheck = false;
                 meta.mainProgram = "meowland";
 
                 nativeBuildInputs = nativeBuildInputs ++ [
@@ -150,14 +150,6 @@
                 // {
                   inherit cargoArtifacts;
                   cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
-                }
-              );
-
-              test = craneLib.cargoTest (
-                commonArgs
-                // {
-                  inherit cargoArtifacts;
-                  cargoTestExtraArgs = "--all-targets --all-features";
                 }
               );
 

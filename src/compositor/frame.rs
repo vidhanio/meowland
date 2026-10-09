@@ -103,8 +103,6 @@ impl PaneState {
             .chunks_exact(stride)
             .zip(pixels.chunks_exact(stride));
         let first = rows.position(differs)?;
-        // `rows` now starts just after `first`, so a matching tail does not
-        // rescan the first differing row.
         let end = rows
             .rposition(differs)
             .map_or(first + 1, |last| first + last + 2);
@@ -147,7 +145,6 @@ impl State {
             if now < window.callback_due {
                 continue;
             }
-            // Skip missed ticks instead of bursting callbacks or drifting.
             let late = now.duration_since(window.callback_due).as_nanos();
             let ticks = late / FRAME_INTERVAL.as_nanos() + 1;
             window.callback_due += FRAME_INTERVAL * u32::try_from(ticks).unwrap_or(u32::MAX);

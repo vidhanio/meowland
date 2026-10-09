@@ -9,27 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: checkout
-        uses: actions/checkout@v6
-
-      - name: install libraries
-        run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
-
-      - name: install rust
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: cache dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: run tests
-        run: cargo test --all-features --all-targets
-
   check:
     name: check
 

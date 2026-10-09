@@ -99,8 +99,6 @@ struct Server {
 /// signal handlers.
 pub fn serve(paths: &Paths) -> Result<()> {
     let interrupted = signals::termination_flag()?;
-    // Binding below decides ownership; avoid initializing another compositor
-    // when the control socket already has a listener.
     if UnixStream::connect(&paths.control).is_ok() {
         return Err(Error::ServerAlreadyListening(paths.control.clone()));
     }
@@ -143,7 +141,6 @@ pub fn serve(paths: &Paths) -> Result<()> {
     let mut compositor_failed = false;
     while !interrupted.interrupted() {
         match incoming_rx.recv_timeout(Duration::from_millis(100)) {
-            // A client that has given up must not have its request acted on.
             Ok(Incoming::Control(request, reply)) => {
                 if reply.waiting() {
                     let response = server.control(request);
@@ -161,7 +158,6 @@ pub fn serve(paths: &Paths) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Do not keep accepting clients into a display whose thread panicked.
         if compositor_thread.is_finished() {
             compositor_failed = true;
             break;
@@ -170,8 +166,6 @@ pub fn serve(paths: &Paths) -> Result<()> {
         server.releasing_panes.retain(|pane| !pane.finished());
     }
 
-    // Pending requests and handshakes must not become new clients during
-    // shutdown. Dropping replies also wakes waiting control workers.
     drop(incoming_rx);
     drop(control);
     drop(pane);
@@ -191,7 +185,6 @@ fn abandon(
     commands: calloop::channel::Sender<CompositorCommand>,
     compositor_thread: thread::JoinHandle<()>,
 ) {
-    // Dropping the last sender is what tells the compositor thread to leave.
     drop(commands);
     let _ = compositor_thread.join();
 }
@@ -312,7 +305,6 @@ impl Server {
 
     /// Reject unusable panes instead of leaving them to time out.
     fn attach_pane(&mut self, hello: Hello, socket: UnixStream) {
-        // Descriptor exhaustion must reject this pane, not end the server.
         let Ok(mut writer) = socket.try_clone() else {
             tracing::warn!("pane: cannot clone socket; dropping connection");
             return;
@@ -412,13 +404,8 @@ impl Server {
     }
 
     fn reap_children(&mut self) {
-        // A child that is gone takes its pid with it: the raw number is only
-        // safe to signal while the process is known to be alive, since a
-        // reused pid would put SIGKILL on an unrelated process at shutdown.
         let child_groups = &mut self.child_groups;
         self.children.retain_mut(|child| {
-            // A child that cannot be waited for must not remain in the process
-            // group set.
             let running = matches!(child.try_wait(), Ok(None));
             if !running {
                 child_groups.remove(&child.id());
@@ -434,8 +421,6 @@ impl Server {
             pane.release("server stopped".into());
         }
         thread::sleep(Duration::from_millis(250));
-        // Unlike normal detach, final shutdown cannot wait for a stalled pane
-        // forever. Close both halves and join every established transport.
         self.panes.clear();
         self.releasing_panes.clear();
         terminate_tree(&self.child_groups);

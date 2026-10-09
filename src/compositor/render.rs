@@ -37,8 +37,6 @@ impl Renderer {
         let (width, height) = (size.width(), size.height());
         self.pixels.resize(size.rgb_len(), 0);
         let first = if opaque_cover(snapshots, &self.stack.surfaces, width, height) {
-            // The topmost opaque surface hides the backdrop and everything
-            // below.
             self.stack.surfaces.len() - 1
         } else {
             self.pixels.fill(0);
@@ -47,8 +45,6 @@ impl Renderer {
         for (surface, origin) in &self.stack.surfaces[first..] {
             blit(snapshots, surface, *origin, &mut self.pixels, width, height);
         }
-        // Keep allocations, but never keep clients alive through scratch
-        // handles.
         self.stack.clear();
         &self.pixels
     }
@@ -67,8 +63,6 @@ impl SurfaceStack {
         collect_surface(root, (0, 0).into(), &mut self.surfaces);
         let geometry = window_geometry(root);
         self.popups.extend(PopupManager::popups_for_surface(root));
-        // Smithay lists popup children before parents; drawing needs the
-        // reverse.
         for (popup, location) in self.popups.drain(..).rev() {
             let origin = popup_origin(geometry, location, &popup);
             collect_surface(popup.wl_surface(), origin, &mut self.surfaces);
@@ -136,8 +130,6 @@ pub(super) fn collect_surface(
             parent.1 + i64::from(offset.y),
         )
     };
-    // Smithay preserves client stacking, including children below their parent.
-    // Wide coordinates allow offscreen descendants to return into view.
     with_surface_tree_upward(
         surface,
         (i64::from(origin.x), i64::from(origin.y)),
@@ -179,7 +171,6 @@ fn blit(
     let top = origin.y;
     let clip_left = left.max(0);
     let clip_top = top.max(0);
-    // Client-chosen extents can overflow if added without saturation.
     let clip_right = left.saturating_add(dst.w).min(width as i32);
     let clip_bottom = top.saturating_add(dst.h).min(height as i32);
     if clip_right <= clip_left || clip_bottom <= clip_top {
@@ -214,7 +205,6 @@ fn blit_scaled<const OPAQUE: bool>(
     let stride = snapshot.width as usize;
     let pixels = snapshot.pixels.as_chunks::<4>().0;
     let columns = clip.size.w as usize;
-    // Reuse each column map across rows without allocating a frame-width map.
     let mut source_columns = [0; 256];
     for start in (0..columns).step_by(source_columns.len()) {
         let count = (columns - start).min(source_columns.len());
@@ -271,7 +261,6 @@ fn blit_unscaled_inner<const OPAQUE: bool>(
     let row_bytes = columns * 4;
     let stride = snapshot.width as usize * 4;
     let pane_stride = width as usize * 3;
-    // Clipping to snapshot bounds keeps the indexed spans below in bounds.
     let first = (clip.loc.x - left) as usize;
     let first_row = (clip.loc.y - top) as usize;
     for row in 0..clip.size.h as usize {

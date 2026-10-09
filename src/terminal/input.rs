@@ -25,9 +25,6 @@ pub(super) struct InputGuard {
 impl InputGuard {
     pub(super) fn enter() -> io::Result<Self> {
         let original = fcntl_dupfd_cloexec(stdin(), 3)?;
-        // Linux's proc fd path opens a new file description for the same tty.
-        // Unlike /dev/tty, this also works on a pty without a controlling tty.
-        // Redirected stdin uses Crossterm's normal controlling-tty fallback.
         let path = if isatty(stdin()) {
             "/proc/self/fd/0"
         } else {

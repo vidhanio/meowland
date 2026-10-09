@@ -161,7 +161,6 @@ fn retained_patches(c: &mut Criterion) {
         .warm_up_time(WARM_UP);
     let base = vec![FLAT; BYTES];
     let mut previous = base.clone();
-    // A persistent, noisy repaint makes redundant compression/transfer costly.
     let region = noise(&mut 71, pixels(800, 400));
     for row in 0..400usize {
         let start = ((row + 100) * WIDTH as usize + 100) * 3;
@@ -196,7 +195,6 @@ fn bands(c: &mut Criterion) {
     let base = vec![FLAT; BYTES];
     let cell = one_cell(&base);
 
-    // An unchanged band should not detach or resend the retained frame.
     let unchanged_band = base[..pixels(WIDTH, u32::from(CELL.1))].to_vec();
     group.bench_function("unchanged_band_1080p", |b| {
         b.iter_batched(
@@ -222,7 +220,6 @@ fn bands(c: &mut Criterion) {
         );
     });
 
-    // Without a patch grid, update the retained frame in place.
     let changed_band = vec![CHANGED; unchanged_band.len()];
     group.bench_function("changed_band_no_grid_1080p", |b| {
         b.iter_batched(
@@ -240,7 +237,6 @@ fn bands(c: &mut Criterion) {
 }
 
 fn damage(c: &mut Criterion) {
-    // Full-screen damage after a row-by-row diff.
     let mut group = c.benchmark_group("present/damage");
     group
         .sample_size(SAMPLES)
@@ -266,7 +262,6 @@ fn damage(c: &mut Criterion) {
 }
 
 fn shared_memory(c: &mut Criterion) {
-    // The shared-memory path writes pixels to an object and sends its name.
     let slot = SharedMemory::new();
     let usable = slot.probe().is_some();
     slot.clear();
@@ -284,7 +279,6 @@ fn shared_memory(c: &mut Criterion) {
     let noisy = noise(&mut 21, BYTES);
     let other = noise(&mut 22, BYTES);
 
-    // A fresh presenter models each frame having an available shared object.
     group.throughput(Throughput::Bytes(BYTES as u64));
     group.bench_function("transferred_1080p", |b| {
         b.iter_batched(
@@ -299,7 +293,6 @@ fn shared_memory(c: &mut Criterion) {
         );
     });
 
-    // An unread object causes the second frame to be dropped.
     group.throughput(Throughput::Bytes((BYTES * 2) as u64));
     group.bench_function("unread_drops_1080p", |b| {
         b.iter_batched(

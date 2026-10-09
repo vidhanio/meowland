@@ -48,10 +48,6 @@ impl Snapshot {
         if offset.checked_add(stride.checked_mul(size.height() as usize)?)? > len {
             return None;
         }
-        // SAFETY: `with_buffer_contents` supplies the pool mapping and its
-        // length. The checked offset, stride and height keep every
-        // pixel read in bounds. The client may modify the mapping; no
-        // reference to it escapes this copy.
         let source = unsafe { std::slice::from_raw_parts(ptr, len) };
         Self::resize_pixels(pixels, size);
         let opaque = if data.format == wl_shm::Format::Xrgb8888 {

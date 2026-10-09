@@ -128,8 +128,6 @@ impl XdgActivationHandler for State {
         let Some(window) = self.ids.get(&surface).copied() else {
             return;
         };
-        // Consume the protocol token once, but retain its target until the pane
-        // attaches. This covers clients that activate immediately after launch.
         self.activation.remove_token(&token);
         if let Some(launch) = self.launches.get_mut(token.as_str()) {
             launch.window = Some(window);

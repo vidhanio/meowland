@@ -369,8 +369,6 @@ impl CompositorHandler for State {
         } else {
             self.viewport_geometry.remove(surface).is_some()
         };
-        // Frame-only commits on plain toplevels do not change pixels; tree
-        // metadata can still move a child or popup without buffer damage.
         let visual_change = assignment.is_some()
             || damaged
             || viewport_changed
@@ -381,8 +379,6 @@ impl CompositorHandler for State {
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = self.pane_bound(surface);
-                // Reuse the previous snapshot's storage; preserve its pixels
-                // on screen if the new buffer cannot be copied.
                 let mut previous = self.snapshots.remove(surface);
                 let mut reuse = previous
                     .as_mut()
@@ -830,14 +826,12 @@ impl XdgShellHandler for State {
         _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
         _serial: smithay::utils::Serial,
     ) {
-        // Popup grabs are handled by dismissing outside clicks in pane_input.
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
             return;
         };
-        // Find descendants before removing the toplevel that identifies them.
         let stale: Vec<WlSurface> = self
             .snapshots
             .keys()
@@ -870,8 +864,6 @@ impl XdgShellHandler for State {
                 });
             }
         }
-        // Leave the output before removing the window used to find its
-        // surfaces.
         self.leave_output(id);
         self.windows.remove(&id);
         self.deciding.remove(&id);
@@ -913,8 +905,6 @@ impl XdgShellHandler for State {
             }
             None => return,
         };
-        // A fullscreen request switches following panes only once this window
-        // has pixels to show.
         if announced {
             self.follow_panes(id);
         }
@@ -984,9 +974,6 @@ fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> 
             || (0, 0).into(),
             |window| render::window_geometry(window.surface.wl_surface()),
         );
-    // A submenu's parent geometry is already offset within the toplevel.
-    // Include every ancestor's configured position, not the immediate
-    // parent's surface-local geometry inset (e.g. its shadow margins).
     let parent = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
     let size = window.map_or(state.mode, |window| state.pane_size(window));
     Rectangle::new(
@@ -1215,8 +1202,6 @@ fn run(
                 },
             )
             .map_err(std::io::Error::other)?;
-        // The duplicated descriptor watches the backend; the display remains
-        // owned here for dispatch and flushing, never shared across threads.
         handle
             .insert_source(
                 Generic::new(rustix::io::dup(&display)?, Interest::READ, PollMode::Level),

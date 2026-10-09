@@ -572,8 +572,9 @@ fn alt_q_asks_the_window_to_close_and_alt_w_detaches() {
         pressed: true,
         modifiers: 0b0100,
     }));
-    let close = client.read_until(|message| message.object == window.xdg_toplevel);
-    assert_eq!(close.opcode, 0, "xdg_toplevel.close");
+    let close =
+        client.read_until(|message| message.object == window.xdg_toplevel && message.opcode == 1);
+    assert_eq!(close.opcode, 1, "xdg_toplevel.close");
 
     // Alt+W detaches the pane and leaves the window running.
     pane.send(&protocol::PaneToServer::Input(protocol::Input::Key {

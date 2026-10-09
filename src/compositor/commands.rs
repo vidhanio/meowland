@@ -2,7 +2,12 @@
 //! thread.
 
 use smithay::{
-    output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel, utils::Size,
+    output::Mode,
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::{Resource, backend::DisconnectReason},
+    },
+    utils::Size,
 };
 
 use super::{Command, Event, State, clipboard, frame::PaneState, input::pane_input};
@@ -19,6 +24,9 @@ impl State {
             }
             Command::CancelActivation { token } => {
                 self.cancel_activation(&token, "launch cancelled");
+            }
+            Command::Kill { show, reply } => {
+                let _ = reply.send(self.kill_client(&show));
             }
             Command::Attach {
                 pane,
@@ -117,6 +125,24 @@ impl State {
                 Show::Id(_) => unreachable!(),
             }
         }
+    }
+
+    /// Disconnect the owning client rather than sending a voluntary close
+    /// request.
+    fn kill_client(&mut self, show: &Show) -> Result<(), String> {
+        let client = self
+            .selected_window(show)
+            .and_then(|window| self.windows.get(&window))
+            .and_then(|window| window.surface.wl_surface().client())
+            .ok_or_else(|| "no such window".to_owned())?;
+        let id = client.id();
+        self.display
+            .backend_handle()
+            .kill_client(id.clone(), DisconnectReason::ConnectionClosed);
+        // A server-side kill need not produce a readable socket event. Dispatch
+        // it explicitly in the outer loop to destroy windows and release panes.
+        self.killed_clients.push(id);
+        Ok(())
     }
 
     fn selected_window(&self, show: &Show) -> Option<u64> {

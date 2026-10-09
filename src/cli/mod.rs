@@ -19,7 +19,9 @@ enum Commands {
     /// Start a client and show its window in this terminal.
     Run(RunArgs),
     /// Show a window in this terminal.
-    Attach(AttachArgs),
+    Attach(WindowArgs),
+    /// Kill a window's Wayland client, removing all of its windows.
+    Kill(WindowArgs),
     /// List windows.
     List,
     /// Start the compositor server in the foreground.
@@ -43,14 +45,24 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct AttachArgs {
-    /// The integer window ID or app ID to show; omit it for the focused window.
+struct WindowArgs {
+    /// The integer window ID or app ID; omit it to select the focused window.
     #[usage(complete = window_targets)]
     window: Option<String>,
 }
 
+impl WindowArgs {
+    fn show(self) -> Show {
+        self.window.map_or(Show::Focused, |window| {
+            window
+                .parse()
+                .map_or_else(|_| Show::AppId(window), Show::Id)
+        })
+    }
+}
+
 fn window_targets(
-    _partial: &<AttachArgs as usage::spec::CommandArgs>::Partial,
+    _partial: &<WindowArgs as usage::spec::CommandArgs>::Partial,
     _context: &usage::complete::CompleteCtx<'_>,
 ) -> Vec<usage::complete::Candidate<'static>> {
     complete_windows(true)
@@ -156,14 +168,14 @@ pub fn start() -> Result<()> {
                 Ok(())
             }
         }
-        Commands::Attach(AttachArgs { window }) => {
+        Commands::Attach(args) => {
             let paths = server::Paths::discover()?;
-            let show = window.map_or(Show::Focused, |window| {
-                window
-                    .parse()
-                    .map_or_else(|_| Show::AppId(window), Show::Id)
-            });
-            terminal::attach(&paths.pane, show)
+            terminal::attach(&paths.pane, args.show())
+        }
+        Commands::Kill(args) => {
+            let paths = server::Paths::discover()?;
+            request(&paths, &ControlRequest::Kill(args.show()))?;
+            Ok(())
         }
         Commands::Completions(CompletionArgs { shell }) => {
             print!("{}", Meowland::completion_script(shell.into()));

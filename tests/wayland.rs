@@ -128,6 +128,64 @@ fn unsupported_pane_protocol_version_is_rejected() {
     }
 }
 
+/// Measure the existing threaded transport at small and larger pane counts.
+#[test]
+#[ignore = "manual performance check"]
+fn transport_fanout_cost() {
+    for count in [1, 8, 64] {
+        let server = Server::start_with_env(&[
+            ("MEOWLAND_XWAYLAND", "off"),
+            ("MEOWLAND_RENDER_NODE", "off"),
+        ]);
+        let started = Instant::now();
+        let panes: Vec<_> = (0..count)
+            .map(|_| Pane::attach(&server, hello(8, 8, Show::Newest)))
+            .collect();
+        let attach = started.elapsed();
+        let mut samples = Vec::new();
+        for _ in 0..40 {
+            let started = Instant::now();
+            assert!(matches!(
+                server.control(&protocol::ControlRequest::Ping),
+                protocol::ControlResponse::Ok
+            ));
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let status = server.process_status();
+        let resources: Vec<_> = status
+            .lines()
+            .filter(|line| line.starts_with("Threads:") || line.starts_with("VmRSS:"))
+            .collect();
+        eprintln!(
+            "{count} panes: attach {attach:?}, control median {:?}, p95 {:?}, {}",
+            samples[20],
+            samples[38],
+            resources.join(", ")
+        );
+        drop(panes);
+    }
+}
+
+/// Isolate Wayland readiness latency from the 60Hz presentation clock.
+#[test]
+#[ignore = "manual performance check"]
+fn idle_wayland_roundtrip_latency() {
+    let server = Server::start();
+    let mut client = Client::connect(&server);
+    let mut samples = Vec::new();
+    for _ in 0..200 {
+        let started = Instant::now();
+        client.sync();
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    eprintln!(
+        "idle Wayland roundtrip: median {:?}, p95 {:?}, max {:?}",
+        samples[100], samples[190], samples[199]
+    );
+}
+
 /// Run with `cargo test --release --test wayland -- --ignored --nocapture`.
 #[test]
 #[ignore = "manual performance check"]

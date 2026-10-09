@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{DISPLAY_POLL_INTERVAL, Event, FRAME_INTERVAL, State, SurfaceAttributes, with_states};
+use super::{Event, FRAME_INTERVAL, State, SurfaceAttributes, TRANSFER_POLL_INTERVAL, with_states};
 use crate::pixels::FrameSize;
 
 /// Each pane owns its scheduling state. No separate dirty-pane index can drift
@@ -109,9 +109,18 @@ impl PaneState {
 }
 
 impl State {
-    /// Cap the command wait by the next dirty pane or display I/O deadline.
+    /// Sleep until frame work is due; only unfinished transfers require
+    /// polling.
     pub(super) fn next_wakeup(&self, now: Instant) -> Duration {
-        let mut wait = DISPLAY_POLL_INTERVAL;
+        let mut wait = if self.pending_imports.is_empty()
+            && self.clipboard_read.is_none()
+            && self.clipboard_request.is_none()
+            && self.clipboard_writes.is_empty()
+        {
+            Duration::from_secs(60)
+        } else {
+            TRANSFER_POLL_INTERVAL
+        };
         for window in self.windows.values() {
             wait = wait.min(window.callback_due.saturating_duration_since(now));
         }

@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use calloop::{EventLoop, Interest, Mode as PollMode, PostAction, channel, generic::Generic};
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_dispatch2,
@@ -51,7 +52,7 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
-            XdgShellState, XdgToplevelSurfaceData,
+            XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState,
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
         viewporter::{ViewportCachedState, ViewporterState},
@@ -63,6 +64,7 @@ use crate::protocol::{Input, Show, WindowInfo};
 
 mod clipboard;
 mod commands;
+mod decoration;
 mod dmabuf;
 mod frame;
 mod input;
@@ -75,9 +77,8 @@ use render::{Renderer, surface_stack};
 use snapshot::Snapshot;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
-/// Check display connections and newly accepted clients at least this often;
-/// the command channel has no pollable descriptor.
-const DISPLAY_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// Transfers and implicit DMA-BUF fences still need periodic progress checks.
+const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -148,7 +149,7 @@ pub enum Event {
 }
 
 pub type Handle = (
-    mpsc::Sender<Command>,
+    channel::Sender<Command>,
     mpsc::Receiver<Event>,
     String,
     thread::JoinHandle<()>,
@@ -160,7 +161,7 @@ pub type Handle = (
 /// Returns an error if the thread, display, keymap or socket cannot start, or
 /// if readiness is not reported within two seconds.
 pub fn spawn() -> crate::Result<Handle> {
-    let (commands, rx) = mpsc::channel();
+    let (commands, rx) = channel::channel();
     let (tx, events) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let socket = format!("wayland-meowland-{}", std::process::id());
@@ -215,6 +216,7 @@ struct State {
     gpu: Option<DmabufBackend>,
     pending_imports: Vec<PendingImport>,
     xdg: XdgShellState,
+    _decoration: XdgDecorationState,
     _viewporter: ViewporterState,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
@@ -462,6 +464,7 @@ impl State {
             gpu,
             pending_imports: Vec::new(),
             xdg: XdgShellState::new::<Self>(&display_handle),
+            _decoration: XdgDecorationState::new::<Self>(&display_handle),
             _viewporter: ViewporterState::new::<Self>(&display_handle),
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),
@@ -1117,7 +1120,7 @@ delegate_dispatch2!(State);
 )]
 fn run(
     name: String,
-    rx: mpsc::Receiver<Command>,
+    rx: channel::Channel<Command>,
     events: mpsc::Sender<Event>,
     ready: mpsc::Sender<std::io::Result<()>>,
 ) {
@@ -1139,21 +1142,50 @@ fn run(
         let _ = ready.send(Err(std::io::Error::other("could not bind Wayland socket")));
         return;
     };
+    let setup = (|| -> std::io::Result<_> {
+        let event_loop = EventLoop::<State>::try_new().map_err(std::io::Error::other)?;
+        let handle = event_loop.handle();
+        handle
+            .insert_source(rx, |event, (), state| match event {
+                channel::Event::Msg(command) => state.handle_command(command),
+                channel::Event::Closed => state.shutdown = true,
+            })
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        handle
+            .insert_source(
+                Generic::new(listener, Interest::READ, PollMode::Level),
+                |_, listener, state| {
+                    while let Some(stream) = listener.accept()? {
+                        let _ = state
+                            .display
+                            .insert_client(stream, Arc::new(ClientState::default()));
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(std::io::Error::other)?;
+        // The duplicated descriptor watches the backend; the display remains
+        // owned here for dispatch and flushing, never shared across threads.
+        handle
+            .insert_source(
+                Generic::new(rustix::io::dup(&display)?, Interest::READ, PollMode::Level),
+                |_, _, _| Ok(PostAction::Continue),
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(event_loop)
+    })();
+    let mut event_loop = match setup {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     let _ = ready.send(Ok(()));
     while !state.shutdown {
-        // Bound the unpollable command channel wait by frame and I/O deadlines.
-        match rx.recv_timeout(state.next_wakeup(Instant::now())) {
-            Ok(command) => state.handle_command(command),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        while let Ok(command) = rx.try_recv() {
-            state.handle_command(command);
-        }
-        if let Ok(Some(stream)) = listener.accept() {
-            let _ = state
-                .display
-                .insert_client(stream, Arc::new(ClientState::default()));
+        if let Err(error) = event_loop.dispatch(state.next_wakeup(Instant::now()), &mut state) {
+            tracing::warn!(%error, "compositor readiness loop stopped");
+            break;
         }
         let _ = display.dispatch_clients(&mut state);
         poll_imports(&mut state);

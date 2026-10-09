@@ -58,6 +58,7 @@ impl Drop for SocketPath {
 pub(super) struct BoundSocket {
     listener: UnixListener,
     path: SocketPath,
+    wake: (UnixStream, UnixStream),
 }
 
 pub(super) fn bind(path: &Path) -> Result<BoundSocket> {
@@ -103,14 +104,18 @@ fn own_socket(path: &Path, listener: UnixListener) -> Result<BoundSocket> {
     let identity = SocketIdentity::at(path)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::AddrInUse, "bound socket path was replaced")
     })?;
+    // Establish path ownership before allocating the cancellation channel so
+    // a failed setup still removes only the socket we just bound.
+    let path = SocketPath {
+        path: path.to_path_buf(),
+        identity,
+    };
     let socket = BoundSocket {
         listener,
-        path: SocketPath {
-            path: path.to_path_buf(),
-            identity,
-        },
+        path,
+        wake: UnixStream::pair()?,
     };
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&socket.path.path, fs::Permissions::from_mode(0o600))?;
     socket.listener.set_nonblocking(true)?;
     Ok(socket)
 }
@@ -119,12 +124,16 @@ fn own_socket(path: &Path, listener: UnixListener) -> Result<BoundSocket> {
 pub(super) struct AcceptLoop {
     path: Option<SocketPath>,
     stopping: Arc<AtomicBool>,
+    wake: UnixStream,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for AcceptLoop {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Relaxed);
+        // The read half wakes poll immediately, including a stop that arrived
+        // just before the worker entered the syscall.
+        let _ = self.wake.shutdown(std::net::Shutdown::Both);
         // Stop advertising the socket before waiting for its workers.
         self.path.take();
         if let Some(thread) = self.thread.take() {
@@ -208,7 +217,11 @@ fn accept_connections<F>(
 where
     F: Fn(UnixStream, Sender<Incoming>) + Copy + Send + 'static,
 {
-    let BoundSocket { listener, path } = socket;
+    let BoundSocket {
+        listener,
+        path,
+        wake: (cancel, wake),
+    } = socket;
     let stopping = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&stopping);
     let thread = thread::spawn(move || {
@@ -222,6 +235,29 @@ where
                 } else {
                     index += 1;
                 }
+            }
+            let mut fds = [
+                rustix::event::PollFd::new(&listener, rustix::event::PollFlags::IN),
+                rustix::event::PollFd::new(&cancel, rustix::event::PollFlags::IN),
+            ];
+            // The timeout only reaps finished handshake workers. Accepts and
+            // shutdown wake on readiness, not on this housekeeping deadline.
+            match rustix::event::poll(
+                &mut fds,
+                Some(&rustix::event::Timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                }),
+            ) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, label, "accept readiness stopped");
+                    break;
+                }
+            }
+            if stop.load(Ordering::Relaxed) || !fds[1].revents().is_empty() {
+                break;
             }
             match listener.accept() {
                 Ok((socket, _)) => {
@@ -238,9 +274,7 @@ where
                         thread: thread::spawn(move || handle(socket, incoming)),
                     });
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) if transient_accept(&error) => {
                     tracing::warn!(%error, label, "accept failed; retrying");
                     thread::sleep(Duration::from_millis(50));
@@ -264,6 +298,7 @@ where
     AcceptLoop {
         path: Some(path),
         stopping,
+        wake,
         thread: Some(thread),
     }
 }

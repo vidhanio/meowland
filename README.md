@@ -38,23 +38,32 @@ SSH sessions use OSC 52 copy and terminal bracketed paste without accessing the 
 
 Pane protocol version 5 adds clipboard messages; restart the server after upgrading so panes and server use the same version.
 
+## Window decorations
+
+Meowland advertises `xdg-decoration` and always selects server-side decorations, including when a client requests client-side mode. It draws no server-side titlebars or borders, so applications that support this negotiation appear borderless. Use Alt+Q to ask an application to close and Alt+W to detach the pane.
+
+Applications that do not support decoration negotiation can still draw their own titlebars or integrated headerbars; the compositor cannot remove those without cropping application content. This does not change terminal pane titles or force applications into fullscreen. Restart the server and reopen applications after upgrading to enable the new decoration policy.
+
 ## Code map
 
 - `src/compositor/mod.rs`: Smithay display and window/pane ownership.
 - `src/compositor/commands.rs`: associated command, attachment and configuration methods on compositor state.
+- `src/compositor/decoration.rs`: borderless server-side decoration negotiation.
 - `src/compositor/snapshot.rs`: bounded, owned copies of committed shared-memory buffers.
 - `src/compositor/dmabuf.rs`: optional EGL/GLES import and synchronous readback into owned snapshots.
 - `src/clipboard.rs`, `src/compositor/clipboard.rs`: host clipboard worker and bounded Wayland selection transfers.
 - `src/compositor/frame.rs`: independent Wayland callback clock and single-in-flight pane frames.
 - `src/compositor/render.rs`, `input.rs`: surface composition/hit testing and terminal input translation.
 - `src/server/mod.rs`, `transport.rs`, `process.rs`: service state, socket I/O and client lifecycle.
-- `src/terminal.rs`, `terminal/input.rs`, `kitty.rs`, `kitty/encoding.rs`: terminal event loop, scoped nonblocking input, retained-frame presenter and reusable kitty encoder.
+- `src/terminal.rs`, `terminal/input.rs`, `terminal/output.rs`, `kitty.rs`, `kitty/encoding.rs`: terminal event loop, scoped nonblocking input, resumable output, retained-frame presenter and reusable kitty encoder.
 - `src/pixels.rs`: nonzero, bounded frame dimensions and checked row-band ranges.
 - `src/protocol.rs`: bounded control and pane messages.
 - `src/main.rs`, `src/cli/`: binary-owned CLI and tracing subscribers.
 - `src/signals.rs`: termination registrations scoped to one server or pane invocation.
 
 Each pane owns an explicit clean/dirty/in-flight presentation state; there is no second pending-pane index to keep synchronized. The compositor coalesces client commits while a pane has a frame in flight; the pane acknowledges only after its terminal write completes. Wayland frame callbacks have a separate 60 Hz clock, so a stalled terminal does not stop the client. Pane frames carry only changed rows; the presenter limits its cell diff to rows that may differ from the whole-image base, retaining earlier patch damage until it is replaced or reverted. It patches a cell-aligned diff up to a quarter of the frame and sends one whole frame — through shared memory when the terminal supports it — beyond that. A pane that never acknowledges a frame remains on that frame until it reads again or disconnects; it does not build an unbounded frame queue.
+
+The compositor waits on Wayland readiness, a pollable calloop command channel, and frame deadlines rather than periodically checking an otherwise idle display. Pending clipboard transfers and DMA-BUF fences still have a 16 ms progress check. Pane graphics, titles, cursor commands and OSC 52 share an ordered nonblocking output buffer; writable turns drain at most 64 KiB while input remains responsive. Frame acknowledgement is deferred until the update has fully drained. Server reads and clipboard response draining pause while pane output is pending. Server accept threads also wait on readiness, with an explicit cancellation descriptor for shutdown. See [the readiness experiment](docs/readiness-performance.md) for measurements and remaining synchronous paths.
 
 Composition, callback dispatch and pointer hit testing reuse surface-traversal allocations, clearing their resource handles after use. The terminal retains its encoded-output allocation across frames through `Presenter::present_into`; `present` remains available when owned output is needed. CPU composition specializes opaque copies separately from premultiplied-alpha blending. Viewport scaling reuses horizontal sample indices across rows in bounded stack storage, without allocating a frame-width lookup table. These optimizations follow the damage-local rendering approach in [terminal-browser](https://github.com/zenbu-labs/terminal-browser/tree/main/pixel/engine/crates/pixel-core/src/terminal/present); meowland keeps its existing bounded patch replacement rather than adding a retained patch pool.
 
@@ -66,4 +75,4 @@ The Crossterm Git dependency includes the upstream zero-coordinate mouse parser 
 
 Server socket owners remove only their own paths; startup preserves regular files and live listeners and reclaims only refused, stale sockets. Shutdown cancels unfinished handshakes, closes stalled panes after the existing grace period, and joins transport threads. Normal detach still delivers Release after any in-flight frame. Process shutdown retains pidfds across signal escalation, so already-discovered helpers remain reachable if their parent exits and they become orphaned.
 
-There are no in-source unit tests. Run `cargo test --tests --locked` for process-level Wayland/server integration checks, and `cargo clippy --all-targets --all-features --locked -- -D warnings` for static checks. Pane integration checks drive real attach processes on ptys and compare decoded pixels through whole frames, distant patches, reversions and fragmented packets; they also verify terminal restoration during incomplete packets. Server checks cover socket ownership, startup rollback and orphaned-helper shutdown. `cargo test --locked --test dmabuf -- --nocapture` checks real GPU pixels, alpha, row inversion, release/reuse and snapshot ownership, plus shm-only fallback and rejected imports. GPU-dependent scenarios report a skip when no usable EGL/GBM device exists; the GPU-off scenario always runs. `cargo bench` measures the encoder and wire codec, including changed and unchanged row bands.
+Run `cargo test --locked` for buffered-output unit tests and process-level Wayland/server integration checks, and `cargo clippy --all-targets --all-features --locked -- -D warnings` for static checks. Pane integration checks drive real attach processes on ptys and compare decoded pixels through whole frames, distant patches, reversions and fragmented packets; they also verify terminal restoration during incomplete packets. Server checks cover socket ownership, startup rollback and orphaned-helper shutdown. `cargo test --locked --test dmabuf -- --nocapture` checks real GPU pixels, alpha, row inversion, release/reuse and snapshot ownership, plus shm-only fallback and rejected imports. GPU-dependent scenarios report a skip when no usable EGL/GBM device exists; the GPU-off scenario always runs. `cargo bench` measures the encoder and wire codec, including changed and unchanged row bands.

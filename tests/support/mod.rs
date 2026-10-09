@@ -132,6 +132,10 @@ impl Server {
         wait_for(timeout, || !self.list().is_empty())
     }
 
+    pub fn process_status(&self) -> String {
+        fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap()
+    }
+
     pub fn log(&self) -> String {
         fs::read_to_string(self.runtime.join("server.stderr")).unwrap_or_default()
     }

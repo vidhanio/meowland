@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod input;
+mod output;
 
 use input::InputGuard;
 
@@ -451,7 +452,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     let mut handshake_done = false;
     let mut reader = protocol::MessageReader::default();
     let stdin = io::stdin();
-    let stdout = io::stdout();
+    let mut stdout = output::open()?;
     loop {
         if interrupted.interrupted() {
             mode.restore()?;
@@ -460,9 +461,19 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         if !handshake_done && Instant::now() >= handshake_deadline {
             return Err(Error::PaneHandshakeTimeout);
         }
+        let receiving = !presentation.pending.pending();
         let mut fds = [
             PollFd::new(&stdin, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
-            PollFd::new(&stdout, PollFlags::HUP | PollFlags::ERR),
+            PollFd::new(
+                &stdout,
+                PollFlags::HUP
+                    | PollFlags::ERR
+                    | if presentation.pending.pending() {
+                        PollFlags::OUT
+                    } else {
+                        PollFlags::empty()
+                    },
+            ),
             PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(&clipboard.wake, PollFlags::IN),
         ];
@@ -472,11 +483,22 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         if !handshake_done {
             wait = wait.min(handshake_deadline.saturating_duration_since(Instant::now()));
         }
+        // Crossterm can retain parsed events after the per-turn input budget.
+        if event::poll(Duration::ZERO)? {
+            wait = Duration::ZERO;
+        }
         let timeout = Timespec {
             tv_sec: wait.as_secs() as i64,
             tv_nsec: wait.subsec_nanos().into(),
         };
-        match poll(&mut fds, Some(&timeout)) {
+        // Omit backpressured descriptors entirely: poll reports HUP even
+        // with an empty interest mask, which would otherwise busy-loop.
+        let watched = if receiving {
+            &mut fds[..]
+        } else {
+            &mut fds[..2]
+        };
+        match poll(watched, Some(&timeout)) {
             Err(Errno::INTR) => continue,
             Err(error) => return Err(io::Error::from(error).into()),
             Ok(_) => {}
@@ -489,9 +511,11 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         {
             return Ok(());
         }
-        if fds[2]
-            .revents()
-            .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+        let writable = fds[1].revents().contains(PollFlags::OUT);
+        if receiving
+            && fds[2]
+                .revents()
+                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
         {
             let Ok(message) = reader.try_recv::<ServerToPane>(&stream) else {
                 mode.restore_with_message("server disconnected")?;
@@ -508,11 +532,15 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                         if text.len() <= MAX_TEXT
                             && let Some(text) = clipboard.copy(text)
                         {
-                            write_osc52(&mut io::stdout().lock(), &text)?;
+                            let mut bytes = Vec::new();
+                            write_osc52(&mut bytes, &text)?;
+                            presentation.pending.append(&bytes);
                         }
                     }
-                    ServerToPane::Title(title) => set_title(&title),
-                    ServerToPane::Cursor(shape) => set_cursor(shape.as_deref()),
+                    ServerToPane::Title(title) => presentation.pending.append(&title_bytes(&title)),
+                    ServerToPane::Cursor(shape) => {
+                        presentation.pending.append(&cursor_bytes(shape.as_deref()));
+                    }
                     ServerToPane::Frame {
                         width,
                         height,
@@ -522,25 +550,36 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 }
             }
         }
-        for response in clipboard.drain() {
-            match response {
-                ClipboardResponse::CopyFallback(text) => {
-                    write_osc52(&mut io::stdout().lock(), &text)?;
-                }
-                ClipboardResponse::Paste {
-                    code,
-                    modifiers,
-                    text,
-                } => {
-                    if let Some(text) = text {
-                        send_paste(&mut tx, text)?;
-                    } else {
-                        send_key_bits(&mut tx, code, modifiers)?;
+        // Do not accumulate clipboard output indefinitely on a stalled tty.
+        if receiving {
+            for response in clipboard.drain() {
+                match response {
+                    ClipboardResponse::CopyFallback(text) => {
+                        let mut bytes = Vec::new();
+                        write_osc52(&mut bytes, &text)?;
+                        presentation.pending.append(&bytes);
+                    }
+                    ClipboardResponse::Paste {
+                        code,
+                        modifiers,
+                        text,
+                    } => {
+                        if let Some(text) = text {
+                            send_paste(&mut tx, text)?;
+                        } else {
+                            send_key_bits(&mut tx, code, modifiers)?;
+                        }
                     }
                 }
             }
         }
-        while !interrupted.interrupted() && event::poll(Duration::ZERO)? {
+        if writable {
+            presentation.drain(&mut stdout, &mut tx)?;
+        }
+        for _ in 0..64 {
+            if interrupted.interrupted() || !event::poll(Duration::ZERO)? {
+                break;
+            }
             send_event(
                 event::read()?,
                 &mut tx,
@@ -557,7 +596,15 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
 struct PanePresentation {
     presenter: Presenter,
     stats: PaneStats,
-    output: Vec<u8>,
+    pending: output::Output,
+    frame: Option<PendingFrame>,
+}
+
+struct PendingFrame {
+    started: Instant,
+    encoded: Duration,
+    bytes: usize,
+    dropped: bool,
 }
 
 impl PanePresentation {
@@ -565,7 +612,8 @@ impl PanePresentation {
         Self {
             presenter: Presenter::new(cell, shared),
             stats: PaneStats::new(),
-            output: Vec::new(),
+            pending: output::Output::default(),
+            frame: None,
         }
     }
 
@@ -579,26 +627,40 @@ impl PanePresentation {
     ) -> Result<()> {
         let started = Instant::now();
         self.presenter
-            .present_into(width, height, y, rgb, &mut self.output);
-        let encoded = started.elapsed();
-        let written = Instant::now();
-        if !self.output.is_empty() {
-            let mut stdout = io::stdout().lock();
-            stdout.write_all(&self.output)?;
-            stdout.flush()?;
+            .present_into(width, height, y, rgb, self.pending.buffer());
+        self.frame = Some(PendingFrame {
+            started: Instant::now(),
+            encoded: started.elapsed(),
+            bytes: self.pending.len(),
+            dropped: self.presenter.dropped(),
+        });
+        self.finish(tx)
+    }
+
+    fn drain(&mut self, stdout: &mut impl Write, tx: &mut UnixStream) -> Result<()> {
+        self.pending.drain(stdout)?;
+        self.finish(tx)
+    }
+
+    fn finish(&mut self, tx: &mut UnixStream) -> Result<()> {
+        if self.pending.pending() {
+            return Ok(());
         }
+        let Some(frame) = self.frame.take() else {
+            return Ok(());
+        };
         self.stats.frame(
-            self.output.len(),
-            self.presenter.dropped(),
-            encoded,
-            written.elapsed(),
+            frame.bytes,
+            frame.dropped,
+            frame.encoded,
+            frame.started.elapsed(),
         );
         // This is the synchronization point: acknowledge only after the whole
         // terminal update has been written, never while it is being encoded.
         protocol::send(
             tx,
             &PaneToServer::Ack {
-                drawn: !self.presenter.dropped(),
+                drawn: !frame.dropped,
             },
         )?;
         Ok(())
@@ -865,22 +927,20 @@ fn binding_code(key: KeyEvent) -> Option<u16> {
     }
 }
 
-fn set_title(title: &str) {
+fn title_bytes(title: &str) -> Vec<u8> {
     let clean = protocol::sanitize_with_limit(title, 512);
-    let _ = write!(io::stdout(), "\x1b]2;{clean}\x07");
-    let _ = io::stdout().flush();
+    format!("\x1b]2;{clean}\x07").into_bytes()
 }
 
 /// Set the kitty pointer shape; an empty name restores the terminal default.
-fn set_cursor(shape: Option<&str>) {
+fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
     let name: String = shape
         .unwrap_or_default()
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .take(64)
         .collect();
-    let _ = write!(io::stdout(), "\x1b]22;{name}\x1b\\");
-    let _ = io::stdout().flush();
+    format!("\x1b]22;{name}\x1b\\").into_bytes()
 }
 
 /// Restores the terminal modes enabled by this pane.

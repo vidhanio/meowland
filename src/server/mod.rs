@@ -82,7 +82,7 @@ impl Reply {
 
 struct Server {
     incoming: Sender<Incoming>,
-    commands: Sender<CompositorCommand>,
+    commands: calloop::channel::Sender<CompositorCommand>,
     display: String,
     xwayland: Option<Xwayland>,
     panes: HashMap<u64, Pane>,
@@ -194,7 +194,7 @@ pub fn serve(paths: &Paths) -> Result<()> {
 /// Release resources from a server that failed to start.
 fn abandon(
     xwayland: Option<Xwayland>,
-    commands: Sender<CompositorCommand>,
+    commands: calloop::channel::Sender<CompositorCommand>,
     compositor_thread: thread::JoinHandle<()>,
 ) {
     if let Some(mut xwayland) = xwayland {

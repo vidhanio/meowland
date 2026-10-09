@@ -557,9 +557,12 @@ fn delete_image(out: &mut Vec<u8>, id: u32) {
 
 /// Common kitty transmission keys; callers append transport and chunk keys.
 fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, placement: u32) {
+    // Patches must sit above the retained whole frame regardless of image IDs.
+    // Equal-z images stack by ID, and multiplexers such as Herdr remap IDs.
+    let z = if placement == 0 { 1 } else { 2 };
     write!(
         out,
-        "a=T,f=24,s={width},v={height},i={id},p={placement},z=1,C=1,q=2"
+        "a=T,f=24,s={width},v={height},i={id},p={placement},z={z},C=1,q=2"
     )
     .expect("writing to Vec cannot fail");
 }

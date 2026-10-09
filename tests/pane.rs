@@ -84,6 +84,7 @@ fn pane_draws_whole_and_patch_frames_then_detaches() {
             .env("XDG_RUNTIME_DIR", &server.runtime),
     );
     let mut terminal = FakeTerminal::new(SIDE as usize, SIDE as usize, (2, 2));
+    terminal.remap_image_ids();
     pump_until_drawn(&mut pty, &mut terminal, &mut child, &rgb, "the first frame");
 
     assert!(

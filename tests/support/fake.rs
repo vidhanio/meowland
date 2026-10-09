@@ -8,11 +8,21 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[derive(Debug)]
 struct Image {
     id: u32,
+    z: i32,
     x: usize,
     y: usize,
     width: usize,
     height: usize,
     pixels: Vec<u8>,
+}
+
+struct Transfer {
+    id: u32,
+    patch: bool,
+    size: (usize, usize),
+    z: i32,
+    compressed: bool,
+    data: Vec<u8>,
 }
 
 pub struct FakeTerminal {
@@ -28,16 +38,15 @@ pub struct FakeTerminal {
     pub text: Vec<u8>,
     pub clipboard: Option<Vec<u8>>,
     pending: Vec<u8>,
-    base: Vec<u8>,
     screen: Vec<u8>,
+    remap_ids: bool,
     images: Vec<Image>,
     cursor: (usize, usize),
-    chunk: Option<(u32, bool, usize, usize, bool, Vec<u8>)>,
+    chunk: Option<Transfer>,
 }
 
 impl FakeTerminal {
     pub fn new(width: usize, height: usize, cell: (u16, u16)) -> Self {
-        let base = vec![0; width * height * 3];
         Self {
             width,
             height,
@@ -50,12 +59,19 @@ impl FakeTerminal {
             text: Vec::new(),
             clipboard: None,
             pending: Vec::new(),
-            screen: base.clone(),
-            base,
+            screen: vec![0; width * height * 3],
+            remap_ids: false,
             images: Vec::new(),
             cursor: (0, 0),
             chunk: None,
         }
+    }
+
+    /// Model a multiplexer assigning host image IDs in a different order.
+    /// Equal-z stacking must not accidentally depend on our original IDs.
+    pub fn remap_image_ids(&mut self) {
+        self.remap_ids = true;
+        self.recompose();
     }
 
     pub fn screen(&self) -> &[u8] {
@@ -148,7 +164,7 @@ impl FakeTerminal {
                         .next()
                         .and_then(|p| p.parse::<usize>().ok())
                         .unwrap_or(1);
-                    self.cursor = (row.saturating_sub(1), col.saturating_sub(1));
+                    self.cursor = (col.saturating_sub(1), row.saturating_sub(1));
                 }
             }
             b't' => match params {
@@ -271,7 +287,8 @@ impl FakeTerminal {
             let width = fields["s"].parse().unwrap();
             let height = fields["v"].parse().unwrap();
             let patch = fields.get("p").copied() == Some("1");
-            self.place_pixels(id, patch, width, height, pixels);
+            let z = fields.get("z").map_or(0, |z| z.parse().unwrap());
+            self.place_pixels(id, patch, (width, height), z, pixels);
         }
         true
     }
@@ -280,7 +297,7 @@ impl FakeTerminal {
         let more = fields.get("m") == Some(&"1");
         match self.chunk.as_mut() {
             Some(chunk) if !fields.contains_key("a") => {
-                chunk.5.extend_from_slice(payload);
+                chunk.data.extend_from_slice(payload);
                 if !more {
                     let chunk = self.chunk.take().unwrap();
                     self.place(chunk);
@@ -293,7 +310,14 @@ impl FakeTerminal {
                 let patch = fields.get("p").copied() == Some("1");
                 let compressed = fields.get("o").copied() == Some("z");
                 let data = payload.to_vec();
-                let chunk = (id, patch, width, height, compressed, data);
+                let chunk = Transfer {
+                    id,
+                    patch,
+                    size: (width, height),
+                    z: fields.get("z").map_or(0, |z| z.parse().unwrap()),
+                    compressed,
+                    data,
+                };
                 if more {
                     self.chunk = Some(chunk);
                 } else {
@@ -303,45 +327,62 @@ impl FakeTerminal {
         }
     }
 
-    fn place(
-        &mut self,
-        (id, patch, width, height, compressed, data): (u32, bool, usize, usize, bool, Vec<u8>),
-    ) {
-        let mut decoded = STANDARD.decode(data).expect("base64 payload");
-        if compressed {
+    fn place(&mut self, transfer: Transfer) {
+        let mut decoded = STANDARD.decode(transfer.data).expect("base64 payload");
+        if transfer.compressed {
             let mut zlib = flate2::read::ZlibDecoder::new(decoded.as_slice());
             let mut out = Vec::new();
             std::io::Read::read_to_end(&mut zlib, &mut out).unwrap();
             decoded = out;
         }
-        self.place_pixels(id, patch, width, height, decoded);
+        self.place_pixels(
+            transfer.id,
+            transfer.patch,
+            transfer.size,
+            transfer.z,
+            decoded,
+        );
     }
 
-    fn place_pixels(&mut self, id: u32, patch: bool, width: usize, height: usize, pixels: Vec<u8>) {
+    fn place_pixels(
+        &mut self,
+        id: u32,
+        patch: bool,
+        (width, height): (usize, usize),
+        z: i32,
+        pixels: Vec<u8>,
+    ) {
         assert_eq!(pixels.len(), width * height * 3, "payload size");
         let (cell_width, cell_height) = (self.cell.0 as usize, self.cell.1 as usize);
         if patch {
             self.patches += 1;
-            let image = Image {
-                id,
-                x: self.cursor.0 * cell_width,
-                y: self.cursor.1 * cell_height,
-                width,
-                height,
-                pixels,
-            };
-            self.images.retain(|image| image.id != id);
-            self.images.push(image);
         } else {
             self.whole_frames += 1;
-            self.base = pixels;
-            self.images.clear();
         }
+        let image = Image {
+            id,
+            z,
+            x: self.cursor.0 * cell_width,
+            y: self.cursor.1 * cell_height,
+            width,
+            height,
+            pixels,
+        };
+        self.images.retain(|image| image.id != id);
+        self.images.push(image);
         self.recompose();
     }
 
     fn recompose(&mut self) {
-        self.screen.copy_from_slice(&self.base);
+        self.screen.fill(0);
+        self.images.sort_by_key(|image| {
+            let host_id = if self.remap_ids {
+                u32::MAX - image.id
+            } else {
+                image.id
+            };
+            (image.z, host_id)
+        });
         for image in &self.images {
             for row in 0..image.height {
                 let destination = ((image.y + row) * self.width + image.x) * 3;

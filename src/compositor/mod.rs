@@ -234,9 +234,6 @@ struct State {
     xdg: XdgShellState,
     activation: XdgActivationState,
     launches: HashMap<String, activation::Launch>,
-    /// Backend-killed clients need explicit dispatch to run resource
-    /// destructors.
-    killed_clients: Vec<ClientId>,
     _decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
     _viewporter: ViewporterState,
@@ -490,7 +487,6 @@ impl State {
             xdg: XdgShellState::new::<Self>(&display_handle),
             activation: XdgActivationState::new::<Self>(&display_handle),
             launches: HashMap::new(),
-            killed_clients: Vec::new(),
             _decoration: XdgDecorationState::new::<Self>(&display_handle),
             kde_decoration: decoration::kde(&display_handle),
             _viewporter: ViewporterState::new::<Self>(&display_handle),
@@ -1221,9 +1217,6 @@ fn run(
         if let Err(error) = event_loop.dispatch(state.next_wakeup(Instant::now()), &mut state) {
             tracing::warn!(%error, "compositor readiness loop stopped");
             break;
-        }
-        for client in std::mem::take(&mut state.killed_clients) {
-            let _ = display.backend().dispatch_single_client(&mut state, client);
         }
         let _ = display.dispatch_clients(&mut state);
         poll_imports(&mut state);

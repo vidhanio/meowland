@@ -20,7 +20,7 @@ enum Commands {
     Run(RunArgs),
     /// Show a window in this terminal.
     Attach(WindowArgs),
-    /// Kill a window's Wayland client, removing all of its windows.
+    /// Ask a window to close.
     Kill(WindowArgs),
     /// List windows.
     List,

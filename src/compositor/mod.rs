@@ -50,9 +50,13 @@ use smithay::{
             },
             wlr_data_control::{DataControlHandler, DataControlState},
         },
-        shell::xdg::{
-            PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
-            XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState,
+        shell::{
+            kde::decoration::KdeDecorationState,
+            xdg::{
+                PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
+                XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
+                decoration::XdgDecorationState,
+            },
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
         viewporter::{ViewportCachedState, ViewporterState},
@@ -217,6 +221,7 @@ struct State {
     pending_imports: Vec<PendingImport>,
     xdg: XdgShellState,
     _decoration: XdgDecorationState,
+    kde_decoration: KdeDecorationState,
     _viewporter: ViewporterState,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
@@ -465,6 +470,7 @@ impl State {
             pending_imports: Vec::new(),
             xdg: XdgShellState::new::<Self>(&display_handle),
             _decoration: XdgDecorationState::new::<Self>(&display_handle),
+            kde_decoration: decoration::kde(&display_handle),
             _viewporter: ViewporterState::new::<Self>(&display_handle),
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),

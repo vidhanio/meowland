@@ -111,32 +111,12 @@ fn closing_the_toplevel_releases_its_pane() {
         .is_empty()));
 }
 
-#[test]
-fn unsupported_pane_protocol_version_is_rejected() {
-    let server = Server::start();
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(server.runtime.join("meowland-pane.sock")).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut handshake = hello(640, 480, Show::Newest);
-    handshake.version = protocol::VERSION + 1;
-    protocol::send(&mut stream, &protocol::PaneToServer::Hello(handshake)).unwrap();
-    match protocol::recv::<ServerToPane>(&mut stream).unwrap() {
-        ServerToPane::Reject(reason) => assert!(reason.contains("version")),
-        other => panic!("expected rejection, got {other:?}"),
-    }
-}
-
 /// Measure the existing threaded transport at small and larger pane counts.
 #[test]
 #[ignore = "manual performance check"]
 fn transport_fanout_cost() {
     for count in [1, 8, 64] {
-        let server = Server::start_with_env(&[
-            ("MEOWLAND_XWAYLAND", "off"),
-            ("MEOWLAND_RENDER_NODE", "off"),
-        ]);
+        let server = Server::start_with_env(&[("MEOWLAND_RENDER_NODE", "off")]);
         let started = Instant::now();
         let panes: Vec<_> = (0..count)
             .map(|_| Pane::attach(&server, hello(8, 8, Show::Newest)))
@@ -254,7 +234,6 @@ fn oversized_pane_hello_is_rejected() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let bad: Hello = Hello {
-        version: protocol::VERSION,
         width: u32::MAX,
         height: 2,
         show: Show::Newest,

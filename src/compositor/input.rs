@@ -16,6 +16,8 @@ use super::{
 };
 use crate::protocol::modifiers;
 
+const SCROLL_FACTOR: f64 = 0.5;
+
 /// Pane modifier bits paired with evdev keycodes.
 const MODIFIER_KEYS: [(u8, u16); 4] = [
     (modifiers::SHIFT, 42),
@@ -92,13 +94,22 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
                         },
                     );
                 }
-                if scroll != 0 {
+                let amount = -f64::from(scroll) * SCROLL_FACTOR;
+                if amount != 0.0 {
+                    // Terminal wheel reports also carry pointer coordinates.
+                    // Flush enter/motion/button first: GTK 3 otherwise flushes
+                    // that event instead of the axes at wl_pointer.frame,
+                    // leaving wheel input pending indefinitely.
+                    pointer.frame(state);
                     pointer.axis(
                         state,
                         AxisFrame::new(time)
                             .source(AxisSource::Wheel)
-                            .value(Axis::Vertical, -f64::from(scroll))
-                            .v120(Axis::Vertical, -i32::from(scroll.signum()) * 120),
+                            // Scale distance and value120 together, like Niri.
+                            // value120 is an integer on the wire; fractional
+                            // results truncate rather than synthesize clicks.
+                            .value(Axis::Vertical, amount * (15.0 / 120.0))
+                            .v120(Axis::Vertical, amount as i32),
                     );
                 }
                 pointer.frame(state);

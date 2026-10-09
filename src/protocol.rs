@@ -8,7 +8,6 @@ use std::{
 use rustix::{io::Errno, net::RecvFlags};
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 5;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 const HEADER: usize = 4;
@@ -56,7 +55,6 @@ pub struct WindowInfo {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct Hello {
-    pub version: u32,
     pub width: u32,
     pub height: u32,
     pub show: Show,
@@ -77,6 +75,7 @@ pub enum Input {
         y: f64,
         button: Option<u8>,
         pressed: bool,
+        /// Vertical wheel distance: 120 units is one detent; positive is up.
         scroll: i16,
     },
 }

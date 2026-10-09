@@ -16,7 +16,7 @@ use thiserror::Error;
 use wl_clipboard_rs::{copy, paste};
 
 pub const MAX_TEXT: usize = 1024 * 1024;
-pub const TEXT_MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+pub const TEXT_MIMES: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]

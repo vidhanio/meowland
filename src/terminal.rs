@@ -38,6 +38,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
 const GRAPHICS_ID: u32 = 31;
+/// One complete wheel detent per terminal report, in Wayland value120 units.
+const WHEEL_STEP: i16 = 120;
 
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;AAAA\x1b\\";
 /// Query device attributes last so their reply starts the handshake's quiet
@@ -53,15 +55,8 @@ pub struct ProbeInfo {
     pub cell_height: Option<u16>,
     pub graphics: bool,
     pub shared_memory: bool,
-    /// `Some(true)` when `SGR-Pixels` mouse mode is supported.
-    pub sgr_pixels: Option<bool>,
+    pub sgr_pixels: bool,
     pub name: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MouseUnits {
-    Pixels,
-    Cells,
 }
 
 /// Probe using unbuffered reads: buffered input could hide bytes from `poll`.
@@ -273,7 +268,7 @@ fn parse_decrqm_reply(body: &[u8], out: &mut ProbeInfo) {
         return;
     };
     if mode == 1016 {
-        out.sgr_pixels = Some(value != 0);
+        out.sgr_pixels = matches!(value, 1..=3);
     }
 }
 
@@ -293,30 +288,6 @@ fn kitty_reply(body: &[u8], id: u32) -> Option<bool> {
 
 fn parse_u32(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.trim().parse().ok()
-}
-
-/// Prefer reported `SGR-Pixels` support; otherwise infer it from terminal
-/// names.
-fn mouse_units(probe: &ProbeInfo) -> MouseUnits {
-    match probe.sgr_pixels {
-        Some(true) => MouseUnits::Pixels,
-        Some(false) => MouseUnits::Cells,
-        None => {
-            let name = probe
-                .name
-                .as_deref()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if ["kitty", "ghostty", "wezterm"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-            {
-                MouseUnits::Pixels
-            } else {
-                MouseUnits::Cells
-            }
-        }
-    }
 }
 
 /// Log pane throughput to the user journal once per second.
@@ -426,8 +397,10 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     // The capability probe uses blocking, unbuffered reads. Only subsequent
     // Crossterm event parsing needs an independent nonblocking descriptor.
     let _input = InputGuard::enter()?;
-    let units = mouse_units(&probe);
-    mode.enable_mouse(units)?;
+    if !probe.sgr_pixels {
+        return Err(Error::PixelMouseUnsupported);
+    }
+    mode.enable_mouse()?;
     let mut cell = probe.cell_width.zip(probe.cell_height);
     let (width, height) = pane_pixels(
         probe.pixel_width.zip(probe.pixel_height),
@@ -436,7 +409,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         cell.unwrap_or(FALLBACK_CELL),
     );
     let hello = Hello {
-        version: protocol::VERSION,
         width,
         height,
         show,
@@ -585,7 +557,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 &mut tx,
                 &mut presentation.presenter,
                 &mut cell,
-                units,
                 &clipboard,
             )?;
         }
@@ -672,7 +643,6 @@ fn send_event(
     tx: &mut UnixStream,
     presenter: &mut Presenter,
     cell: &mut Option<(u16, u16)>,
-    units: MouseUnits,
     clipboard: &HostClipboard,
 ) -> Result<()> {
     match event {
@@ -701,22 +671,11 @@ fn send_event(
             let (pressed, button, scroll) = match mouse.kind {
                 MouseEventKind::Down(b) => (true, Some(b as u8), 0),
                 MouseEventKind::Up(b) => (false, Some(b as u8), 0),
-                MouseEventKind::ScrollUp => (true, None, 15),
-                MouseEventKind::ScrollDown => (true, None, -15),
+                MouseEventKind::ScrollUp => (true, None, WHEEL_STEP),
+                MouseEventKind::ScrollDown => (true, None, -WHEEL_STEP),
                 _ => (false, None, 0),
             };
-            let (x, y) = match units {
-                MouseUnits::Pixels => (f64::from(mouse.column), f64::from(mouse.row)),
-                // Cell mouse coordinates target the center of each cell.
-                MouseUnits::Cells => {
-                    let (cell_width, cell_height) = cell.unwrap_or(FALLBACK_CELL);
-                    let (cell_width, cell_height) = (f64::from(cell_width), f64::from(cell_height));
-                    (
-                        f64::from(mouse.column).mul_add(cell_width, cell_width / 2.0),
-                        f64::from(mouse.row).mul_add(cell_height, cell_height / 2.0),
-                    )
-                }
-            };
+            let (x, y) = (f64::from(mouse.column), f64::from(mouse.row));
             protocol::send(
                 tx,
                 &PaneToServer::Input(Input::Pointer {
@@ -749,7 +708,8 @@ fn key_input(key: KeyEvent) -> Option<(u16, u8)> {
     if let KeyCode::Char(character) = key.code
         && needs_shift(character)
     {
-        // Legacy input can send a shifted character without the Shift modifier.
+        // Printable characters can encode Shift without a separate modifier
+        // bit.
         modifiers.insert(KeyModifiers::SHIFT);
     }
     let code = match key.code {
@@ -946,7 +906,7 @@ fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
 /// Restores the terminal modes enabled by this pane.
 struct TerminalGuard {
     active: bool,
-    mouse: Option<MouseUnits>,
+    mouse: bool,
 }
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
@@ -955,7 +915,7 @@ impl TerminalGuard {
         // them.
         let guard = Self {
             active: true,
-            mouse: None,
+            mouse: false,
         };
         execute!(
             io::stdout(),
@@ -967,14 +927,10 @@ impl TerminalGuard {
         Ok(guard)
     }
 
-    fn enable_mouse(&mut self, units: MouseUnits) -> io::Result<()> {
-        let modes: &[u8] = match units {
-            MouseUnits::Pixels => b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h",
-            MouseUnits::Cells => b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h",
-        };
-        io::stdout().write_all(modes)?;
+    fn enable_mouse(&mut self) -> io::Result<()> {
+        self.mouse = true;
+        io::stdout().write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h")?;
         io::stdout().flush()?;
-        self.mouse = Some(units);
         Ok(())
     }
 
@@ -999,12 +955,9 @@ impl TerminalGuard {
         };
         // Disable raw mode before potentially failing terminal writes.
         note(terminal::disable_raw_mode());
-        if let Some(units) = self.mouse.take() {
-            let off: &[u8] = match units {
-                MouseUnits::Pixels => b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
-                MouseUnits::Cells => b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
-            };
-            note(io::stdout().write_all(off));
+        if self.mouse {
+            self.mouse = false;
+            note(io::stdout().write_all(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l"));
         }
         note(io::stdout().write_all(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\"));
         note(execute!(

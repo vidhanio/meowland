@@ -1,4 +1,9 @@
-use std::{fs::OpenOptions, io, path::PathBuf};
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    os::unix::fs::FileExt as _,
+    path::PathBuf,
+};
 
 use smithay::{
     backend::{
@@ -224,19 +229,36 @@ impl DmabufProtocol {
             client.has_global("zwp_linux_dmabuf_v1"),
             "usable GPU did not expose DMA-BUF"
         );
-        let object = client.bind("zwp_linux_dmabuf_v1", 3);
+        let object = client.bind("zwp_linux_dmabuf_v1");
+        let feedback = client.alloc();
+        client.request(object, 2, &u32s(&[feedback]));
+        let events = client.sync();
+        let table = events
+            .iter()
+            .find(|event| event.object == feedback && event.opcode == 1)
+            .expect("DMA-BUF format table");
+        let mut bytes = vec![0; table.u32_at(0) as usize];
+        File::from(client.fds.remove(0))
+            .read_exact_at(&mut bytes, 0)
+            .unwrap();
+        assert_eq!(bytes.len() % 16, 0, "format table entry size");
         let mut formats = Vec::new();
-        for message in client
-            .sync()
-            .into_iter()
-            .filter(|message| message.object == object && message.opcode == 1)
+        for event in events
+            .iter()
+            .filter(|event| event.object == feedback && event.opcode == 5)
         {
-            let code = Fourcc::try_from(message.u32_at(0)).expect("advertised DRM format");
-            let modifier =
-                Modifier::from((u64::from(message.u32_at(1)) << 32) | u64::from(message.u32_at(2)));
-            formats.push(Format { code, modifier });
+            let len = event.u32_at(0) as usize;
+            for index in event.body[4..4 + len].as_chunks::<2>().0 {
+                let index = usize::from(u16::from_ne_bytes(*index));
+                let entry = &bytes[index * 16..(index + 1) * 16];
+                let code = Fourcc::try_from(u32::from_ne_bytes(entry[..4].try_into().unwrap()))
+                    .expect("advertised DRM format");
+                let modifier = Modifier::from(u64::from_ne_bytes(entry[8..].try_into().unwrap()));
+                formats.push(Format { code, modifier });
+            }
         }
-        assert!(!formats.is_empty(), "DMA-BUF v3 modifier list was empty");
+        client.request(feedback, 0, &[]);
+        assert!(!formats.is_empty(), "DMA-BUF feedback formats were empty");
         Self { object, formats }
     }
 

@@ -124,6 +124,7 @@ pub enum ControlRequest {
     Ping,
     Run(Vec<OsString>),
     List,
+    Kill(Show),
 }
 
 #[derive(Debug, Deserialize, Serialize)]

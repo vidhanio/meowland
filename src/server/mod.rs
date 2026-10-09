@@ -256,6 +256,21 @@ impl Server {
     fn control(&mut self, request: ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::Ping => ControlResponse::Ok,
+            ControlRequest::Kill(show) => {
+                let (reply, result) = mpsc::channel();
+                if self
+                    .commands
+                    .send(CompositorCommand::Kill { show, reply })
+                    .is_err()
+                {
+                    return ControlResponse::Error("compositor unavailable".into());
+                }
+                match result.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Ok(())) => ControlResponse::Ok,
+                    Ok(Err(error)) => ControlResponse::Error(error),
+                    Err(error) => ControlResponse::Error(format!("killing client: {error}")),
+                }
+            }
             ControlRequest::List => {
                 let mut list: Vec<_> = self.windows.values().cloned().collect();
                 list.sort_by_key(|window| window.id);

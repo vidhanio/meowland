@@ -55,11 +55,6 @@
               pkgs.libgbm
             ];
 
-            runtimeInputs = [
-              pkgs.xwayland
-              pkgs.xwayland-satellite
-            ];
-
             commonArgs = {
               inherit
                 src
@@ -85,8 +80,7 @@
 
                 postInstall = ''
                   wrapProgram $out/bin/meowland \
-                    --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]} \
-                    --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
+                    --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libglvnd ]}
 
                   install -Dm644 ${./share/systemd/user/meowland.service} \
                     $out/share/systemd/user/meowland.service
@@ -137,10 +131,7 @@
                 LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libglvnd ];
               };
 
-              packages = [
-                config.treefmt.build.wrapper
-              ]
-              ++ runtimeInputs;
+              packages = [ config.treefmt.build.wrapper ];
 
               inherit buildInputs nativeBuildInputs;
             };

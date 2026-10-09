@@ -56,9 +56,8 @@ pub struct Server {
 }
 
 impl Server {
-    /// Disable Xwayland to avoid depending on `xwayland-satellite`.
     pub fn start() -> Self {
-        Self::start_with_env(&[("MEOWLAND_XWAYLAND", "off")])
+        Self::start_with_env(&[])
     }
 
     pub fn start_with_env(env: &[(&str, &str)]) -> Self {
@@ -202,28 +201,6 @@ impl Drop for Server {
         let _ = self.shutdown();
         let _ = fs::remove_dir_all(&self.runtime);
     }
-}
-
-/// Speak the first X11 setup message and report whether the server accepts
-/// the connection (reply byte 1) or rejects it (0).
-pub fn x11_connection_succeeds(socket: &std::path::Path) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket) else {
-        return false;
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut setup = vec![b'l', 0];
-    setup.extend_from_slice(&11u16.to_le_bytes());
-    setup.extend_from_slice(&0u16.to_le_bytes());
-    setup.extend_from_slice(&0u16.to_le_bytes());
-    setup.extend_from_slice(&0u16.to_le_bytes());
-    setup.extend_from_slice(&[0, 0]);
-    if stream.write_all(&setup).is_err() {
-        return false;
-    }
-    let mut reply = [0u8; 1];
-    matches!(stream.read_exact(&mut reply), Ok(()) if reply[0] == 1)
 }
 
 pub struct Pty {
@@ -422,7 +399,7 @@ pub struct Client {
     buffer: Vec<u8>,
     pub fds: Vec<OwnedFd>,
     next_id: u32,
-    pub globals: HashMap<String, u32>,
+    pub globals: HashMap<String, (u32, u32)>,
     pub compositor: u32,
     pub shm: u32,
     pub xdg: u32,
@@ -467,12 +444,18 @@ impl Client {
                     .position(|byte| *byte == 0)
                     .unwrap_or(len);
                 let interface = String::from_utf8_lossy(&message.body[8..8 + end]).into_owned();
-                client.globals.insert(interface, name);
+                let version_offset = 8 + len.next_multiple_of(4);
+                let version = u32::from_ne_bytes(
+                    message.body[version_offset..version_offset + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                client.globals.insert(interface, (name, version));
             }
         }
-        client.compositor = client.bind("wl_compositor", 4);
-        client.shm = client.bind("wl_shm", 1);
-        client.xdg = client.bind("xdg_wm_base", 1);
+        client.compositor = client.bind("wl_compositor");
+        client.shm = client.bind("wl_shm");
+        client.xdg = client.bind("xdg_wm_base");
         client
     }
 
@@ -509,9 +492,10 @@ impl Client {
         .unwrap();
     }
 
-    pub fn bind(&mut self, interface: &str, version: u32) -> u32 {
+    /// Bind the protocol version advertised by this compositor.
+    pub fn bind(&mut self, interface: &str) -> u32 {
         let id = self.alloc();
-        let name = *self
+        let (name, version) = *self
             .globals
             .get(interface)
             .unwrap_or_else(|| panic!("the compositor did not advertise {interface}"));
@@ -703,7 +687,7 @@ impl Client {
     }
 
     pub fn create_subsurface(&mut self, surface: u32, parent: u32) -> u32 {
-        let subcompositor = self.bind("wl_subcompositor", 1);
+        let subcompositor = self.bind("wl_subcompositor");
         let id = self.alloc();
         self.request(subcompositor, 1, &u32s(&[id, surface, parent]));
         id
@@ -753,7 +737,7 @@ impl Client {
     }
 
     pub fn create_viewport(&mut self, surface: u32) -> u32 {
-        let viewporter = self.bind("wp_viewporter", 1);
+        let viewporter = self.bind("wp_viewporter");
         let id = self.alloc();
         self.request(viewporter, 1, &u32s(&[id, surface]));
         id
@@ -772,7 +756,7 @@ impl Client {
     }
 
     pub fn seat(&mut self) -> u32 {
-        self.bind("wl_seat", 1)
+        self.bind("wl_seat")
     }
 
     pub fn get_keyboard(&mut self, seat: u32) -> u32 {
@@ -916,7 +900,6 @@ impl Pane {
 
 pub const fn hello(width: u32, height: u32, show: Show) -> Hello {
     Hello {
-        version: protocol::VERSION,
         width,
         height,
         show,

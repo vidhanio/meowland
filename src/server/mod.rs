@@ -16,7 +16,7 @@ use std::{
 mod process;
 mod transport;
 
-use process::{Xwayland, launch_client, start_xwayland, terminate_tree, xwayland_program};
+use process::{launch_client, terminate_tree};
 use transport::{Pane, accept_control, accept_panes, bind};
 
 use crate::{
@@ -84,7 +84,6 @@ struct Server {
     incoming: Sender<Incoming>,
     commands: calloop::channel::Sender<CompositorCommand>,
     display: String,
-    xwayland: Option<Xwayland>,
     panes: HashMap<u64, Pane>,
     releasing_panes: Vec<Pane>,
     windows: HashMap<u64, WindowInfo>,
@@ -100,21 +99,18 @@ struct Server {
 /// signal handlers.
 pub fn serve(paths: &Paths) -> Result<()> {
     let interrupted = signals::termination_flag()?;
-    // Binding below still decides; the probe keeps a second server from
-    // starting Xwayland only to be turned away.
+    // Binding below decides ownership; avoid initializing another compositor
+    // when the control socket already has a listener.
     if UnixStream::connect(&paths.control).is_ok() {
         return Err(Error::ServerAlreadyListening(paths.control.clone()));
     }
     let (commands, events, display, compositor_thread) = compositor::spawn()?;
-    // Bind sockets only after Xwayland startup, so connecting clients can be
-    // served immediately.
-    let xwayland = start_xwayland_if_configured(&display);
     let (control, pane) = match bind(&paths.control)
         .and_then(|control| bind(&paths.pane).map(|pane| (control, pane)))
     {
         Ok(sockets) => sockets,
         Err(error) => {
-            abandon(xwayland, commands, compositor_thread);
+            abandon(commands, compositor_thread);
             return Err(error);
         }
     };
@@ -133,7 +129,6 @@ pub fn serve(paths: &Paths) -> Result<()> {
         }
     });
     let mut server = Server {
-        xwayland,
         incoming,
         commands,
         display,
@@ -193,32 +188,12 @@ pub fn serve(paths: &Paths) -> Result<()> {
 
 /// Release resources from a server that failed to start.
 fn abandon(
-    xwayland: Option<Xwayland>,
     commands: calloop::channel::Sender<CompositorCommand>,
     compositor_thread: thread::JoinHandle<()>,
 ) {
-    if let Some(mut xwayland) = xwayland {
-        terminate_tree(&HashSet::from([xwayland.child.id()]));
-        let _ = xwayland.child.wait();
-    }
     // Dropping the last sender is what tells the compositor thread to leave.
     drop(commands);
     let _ = compositor_thread.join();
-}
-
-/// X11 startup is optional; report failure without stopping the server.
-fn start_xwayland_if_configured(wayland: &str) -> Option<Xwayland> {
-    let program = xwayland_program()?;
-    match start_xwayland(&program, wayland) {
-        Ok(xwayland) => {
-            tracing::info!(display = %xwayland.display, program = %program.display(), "xwayland started");
-            Some(xwayland)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "xwayland could not start");
-            None
-        }
-    }
 }
 
 impl Server {
@@ -286,22 +261,14 @@ impl Server {
                 list.sort_by_key(|window| window.id);
                 ControlResponse::Windows(list)
             }
-            ControlRequest::Run(args) => {
-                // `DISPLAY` is only passed on when a satellite is really up,
-                // or an inherited one would send the client elsewhere.
-                let x11 = self
-                    .xwayland
-                    .as_ref()
-                    .map(|xwayland| xwayland.display.as_str());
-                match launch_client(&args, &self.display, x11) {
-                    Ok(child) => {
-                        self.child_groups.insert(child.id());
-                        self.children.push(child);
-                        ControlResponse::Ok
-                    }
-                    Err(error) => ControlResponse::Error(format!("{error:#}")),
+            ControlRequest::Run(args) => match launch_client(&args, &self.display) {
+                Ok(child) => {
+                    self.child_groups.insert(child.id());
+                    self.children.push(child);
+                    ControlResponse::Ok
                 }
-            }
+                Err(error) => ControlResponse::Error(format!("{error:#}")),
+            },
         }
     }
 
@@ -312,17 +279,6 @@ impl Server {
             tracing::warn!("pane: cannot clone socket; dropping connection");
             return;
         };
-        if hello.version != protocol::VERSION {
-            let _ = protocol::send(
-                &mut writer,
-                &ServerToPane::Reject(format!(
-                    "pane protocol version {} is unsupported; server uses {}",
-                    hello.version,
-                    protocol::VERSION
-                )),
-            );
-            return;
-        }
         if FrameSize::new(hello.width, hello.height).is_none() {
             let _ = protocol::send(
                 &mut writer,
@@ -436,14 +392,6 @@ impl Server {
             }
             running
         });
-        if self
-            .xwayland
-            .as_mut()
-            .is_some_and(|running| matches!(running.child.try_wait(), Ok(Some(_))))
-        {
-            tracing::warn!("xwayland server exited");
-            self.xwayland = None;
-        }
     }
 
     /// Listener owners have already stopped accepting before this grace period.
@@ -457,10 +405,6 @@ impl Server {
         // forever. Close both halves and join every established transport.
         self.panes.clear();
         self.releasing_panes.clear();
-        if let Some(mut xwayland) = self.xwayland.take() {
-            terminate_tree(&HashSet::from([xwayland.child.id()]));
-            let _ = xwayland.child.wait();
-        }
         terminate_tree(&self.child_groups);
         let _ = self.commands.send(CompositorCommand::Shutdown);
         let _ = compositor_thread.join();

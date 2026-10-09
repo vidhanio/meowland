@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
@@ -20,10 +20,8 @@ pub enum Error {
     ServerAlreadyListening(PathBuf),
     #[error("run requires a command")]
     RunRequiresCommand,
-    #[error("no X display could be started (last tried {last})")]
-    NoXDisplay { last: String },
-    #[error("X server did not listen on {} within {timeout:?}", socket.display())]
-    XServerTimeout { socket: PathBuf, timeout: Duration },
+    #[error("terminal does not support SGR pixel mouse reporting")]
+    PixelMouseUnsupported,
     #[error("terminal does not support kitty graphics")]
     GraphicsUnsupported,
     #[error("pane handshake timed out")]

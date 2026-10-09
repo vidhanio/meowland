@@ -18,15 +18,12 @@ pub struct Clipboard {
 
 impl Clipboard {
     pub fn bind(client: &mut Client, control: bool) -> Self {
-        let manager = client.bind(
-            if control {
-                "zwlr_data_control_manager_v1"
-            } else {
-                "wl_data_device_manager"
-            },
-            if control { 2 } else { 3 },
-        );
-        let seat = client.bind("wl_seat", 5);
+        let manager = client.bind(if control {
+            "zwlr_data_control_manager_v1"
+        } else {
+            "wl_data_device_manager"
+        });
+        let seat = client.seat();
         let device = client.alloc();
         client.request(manager, 1, &u32s(&[device, seat]));
         client.sync();

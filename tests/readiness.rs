@@ -103,6 +103,16 @@ fn stalled_terminal_keeps_input_responsive_and_defers_ack() {
         );
     }
     eprintln!("keyboard while terminal stalled: {:?}", started.elapsed());
+    for (report, expected) in [(64, 120), (65, -120)] {
+        write!(pty.master, "\x1b[<{report};1;1M").unwrap();
+        let message = reader
+            .recv_timeout(Duration::from_millis(750))
+            .expect("terminal backpressure blocked wheel input");
+        assert!(
+            matches!(message, PaneToServer::Input(Input::Pointer { scroll, .. }) if scroll == expected),
+            "each wheel report must deliver a complete detent: {message:?}"
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let replies = terminal.feed(&pty.read_now());

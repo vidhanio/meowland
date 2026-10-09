@@ -72,10 +72,7 @@ fn assert_shm_frame(server: &Server, title: &str) {
 
 #[test]
 fn gpu_off_keeps_real_shm_pixels_without_advertising_dmabuf() {
-    let server = Server::start_with_env(&[
-        ("MEOWLAND_XWAYLAND", "off"),
-        ("MEOWLAND_RENDER_NODE", "off"),
-    ]);
+    let server = Server::start_with_env(&[("MEOWLAND_RENDER_NODE", "off")]);
     let client = Client::connect(&server);
     assert!(!client.has_global("zwp_linux_dmabuf_v1"));
     assert_shm_frame(&server, "GPU disabled");
@@ -86,10 +83,8 @@ fn gpu_pixels_alpha_orientation_and_released_buffer_reuse_are_owned() {
     let Some(mut producer) = Producer::discover() else {
         return;
     };
-    let server = Server::start_with_env(&[
-        ("MEOWLAND_XWAYLAND", "off"),
-        ("MEOWLAND_RENDER_NODE", producer.node.to_str().unwrap()),
-    ]);
+    let server =
+        Server::start_with_env(&[("MEOWLAND_RENDER_NODE", producer.node.to_str().unwrap())]);
     let mut client = Client::connect(&server);
     assert!(client.has_global("zwp_linux_dmabuf_v1"), "{}", server.log());
     let protocol = DmabufProtocol::bind(&mut client);
@@ -167,10 +162,8 @@ fn unsupported_gpu_import_only_disconnects_the_offending_client() {
     let Some(mut producer) = Producer::discover() else {
         return;
     };
-    let server = Server::start_with_env(&[
-        ("MEOWLAND_XWAYLAND", "off"),
-        ("MEOWLAND_RENDER_NODE", producer.node.to_str().unwrap()),
-    ]);
+    let server =
+        Server::start_with_env(&[("MEOWLAND_RENDER_NODE", producer.node.to_str().unwrap())]);
     let mut client = Client::connect(&server);
     let protocol = DmabufProtocol::bind(&mut client);
     let gpu = producer

@@ -6,9 +6,7 @@ mod support;
 
 use std::{fs, os::unix::net::UnixListener, process::Command, time::Duration};
 
-use support::{
-    BINARY, Client, Server, program_in_path, temp_dir, wait_for, x11_connection_succeeds,
-};
+use support::{BINARY, Client, Server, program_in_path, temp_dir, wait_for};
 
 #[test]
 fn detached_server_accepts_control_requests_and_stops() {
@@ -43,14 +41,17 @@ fn detached_server_accepts_control_requests_and_stops() {
 }
 
 #[test]
-fn clients_run_without_a_display_when_xwayland_is_off() {
+fn clients_use_the_servers_wayland_display() {
     let server = Server::start();
     let probe = server.runtime.join("display");
     let run = server.cli(&[
         "run",
         "sh",
         "-c",
-        &format!("printf %s \"${{DISPLAY-unset}}\" > {}", probe.display()),
+        &format!(
+            "printf '%s\\n%s' \"$WAYLAND_DISPLAY\" \"${{DISPLAY-unset}}\" > {}",
+            probe.display()
+        ),
     ]);
     assert!(run.status.success());
     assert!(
@@ -58,7 +59,12 @@ fn clients_run_without_a_display_when_xwayland_is_off() {
         "client did not run;\nlog:\n{}",
         server.log()
     );
-    assert_eq!(std::fs::read_to_string(&probe).unwrap(), "unset");
+    let socket = server.wayland_socket();
+    let display = socket.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(&probe).unwrap(),
+        format!("{display}\nunset")
+    );
 }
 
 #[test]
@@ -70,7 +76,6 @@ fn failed_startup_preserves_unowned_socket_paths() {
         let result = Command::new(BINARY)
             .arg("server")
             .env("XDG_RUNTIME_DIR", &runtime)
-            .env("MEOWLAND_XWAYLAND", "off")
             .output()
             .unwrap();
         assert!(!result.status.success(), "startup replaced a regular file");
@@ -82,7 +87,6 @@ fn failed_startup_preserves_unowned_socket_paths() {
     let result = Command::new(BINARY)
         .arg("server")
         .env("XDG_RUNTIME_DIR", &runtime)
-        .env("MEOWLAND_XWAYLAND", "off")
         .output()
         .unwrap();
     assert!(!result.status.success());
@@ -131,46 +135,4 @@ fn shutdown_kills_helpers_after_their_parent_exits() {
     });
     let _ = rustix::process::pidfd_send_signal(&process, rustix::process::Signal::KILL);
     assert!(exited, "the orphaned helper survived shutdown escalation");
-}
-
-#[test]
-fn xwayland_gives_clients_a_working_display() {
-    let Some(satellite) = program_in_path("xwayland-satellite") else {
-        eprintln!("skipping: xwayland-satellite is not on PATH");
-        return;
-    };
-    let mut server = Server::start_with_env(&[("MEOWLAND_XWAYLAND", satellite.to_str().unwrap())]);
-    let probe = server.runtime.join("display");
-    let run = server.cli(&[
-        "run",
-        "sh",
-        "-c",
-        &format!("printf %s \"${{DISPLAY-unset}}\" > {}", probe.display()),
-    ]);
-    assert!(run.status.success());
-    assert!(
-        wait_for(Duration::from_secs(20), || probe.exists()),
-        "client did not run;\nlog:\n{}",
-        server.log()
-    );
-    let display = std::fs::read_to_string(&probe).unwrap();
-    let number = display
-        .strip_prefix(':')
-        .unwrap_or_else(|| panic!("DISPLAY was {display:?};\nlog:\n{}", server.log()));
-    assert!(number.parse::<u32>().is_ok(), "DISPLAY was {display:?}");
-    let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-    assert!(
-        wait_for(Duration::from_secs(10), || x11_connection_succeeds(&socket)),
-        "no X server accepting connections at {};\nlog:\n{}",
-        socket.display(),
-        server.log()
-    );
-
-    server.stop();
-    assert!(
-        wait_for(Duration::from_secs(10), || !socket.exists()),
-        "Xwayland left {} behind;\nlog:\n{}",
-        socket.display(),
-        server.log()
-    );
 }

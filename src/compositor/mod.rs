@@ -82,7 +82,7 @@ use frame::PaneState;
 use render::{Renderer, surface_stack};
 use snapshot::Snapshot;
 
-const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
 /// Transfers and implicit DMA-BUF fences still need periodic progress checks.
 const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 

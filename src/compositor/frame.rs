@@ -21,7 +21,6 @@ pub(super) struct PaneState {
     pub(super) window: u64,
     pub(super) size: FrameSize,
     presentation: Presentation,
-    next_frame: Instant,
     shown: Vec<u8>,
     /// None means the retained pixels are not a valid basis for a row diff.
     shown_size: Option<FrameSize>,
@@ -33,7 +32,6 @@ impl PaneState {
             window,
             size,
             presentation: Presentation::Clean,
-            next_frame: Instant::now(),
             shown: Vec::new(),
             shown_size: None,
         }
@@ -60,15 +58,14 @@ impl PaneState {
         };
     }
 
-    fn due(&self, now: Instant) -> bool {
-        self.presentation == Presentation::Dirty && now >= self.next_frame
+    fn due(&self) -> bool {
+        self.presentation == Presentation::Dirty
     }
 
     /// Record exactly the pixels sent, not a newer commit or an unacknowledged
     /// assumption. The allocation crossing threads is only the changed band.
-    fn frame(&mut self, pane: u64, pixels: &[u8], now: Instant) -> Option<Event> {
+    fn frame(&mut self, pane: u64, pixels: &[u8]) -> Option<Event> {
         self.presentation = Presentation::Clean;
-        self.next_frame = now + FRAME_INTERVAL;
         let stride = self.size.rgb_stride();
         let rows = if self.shown_size == Some(self.size) {
             self.changed_rows(pixels, stride)?
@@ -121,15 +118,13 @@ impl State {
         for window in self.windows.values() {
             wait = wait.min(window.callback_due.saturating_duration_since(now));
         }
-        for pane in self.panes.values() {
-            if pane.presentation == Presentation::Dirty {
-                wait = wait.min(pane.next_frame.saturating_duration_since(now));
-            }
+        if self.panes.values().any(PaneState::due) {
+            return Duration::ZERO;
         }
         wait
     }
 
-    /// Run Wayland callbacks at ~60Hz, independently of terminal acks.
+    /// Run Wayland callbacks at ~120Hz, independently of terminal acks.
     pub(super) fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed().as_millis() as u32;
@@ -166,15 +161,14 @@ impl State {
 
     /// Borrow disjoint fields instead of allocating a list of due pane IDs.
     pub(super) fn dispatch_frames(&mut self) {
-        let now = Instant::now();
         for (&pane, entry) in &mut self.panes {
-            if !entry.due(now) {
+            if !entry.due() {
                 continue;
             }
             let pixels =
                 self.renderer
                     .render(&self.windows, &self.snapshots, entry.window, entry.size);
-            if let Some(frame) = entry.frame(pane, pixels, now) {
+            if let Some(frame) = entry.frame(pane, pixels) {
                 let _ = self.events.send(frame);
             }
         }

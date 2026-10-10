@@ -18,6 +18,9 @@ crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", default-fea
 ] }
 flate2 = "1.1.10"
 libloading = "0.9.0"
+mime = "0.3.17"
+vtparse = "0.7.0"
+getrandom = { version = "0.4.3", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11.19"
 signal-hook = "0.4"
@@ -42,7 +45,6 @@ smithay = { git = "https://github.com/Smithay/smithay.git", default-features = f
   "backend_drm",
   "renderer_gl",
 ] }
-wl-clipboard-rs = "0.9.4"
 usage-rs = { version = "7.0.0", default-features = false, features = [
   "completions",
   "diagnostics",

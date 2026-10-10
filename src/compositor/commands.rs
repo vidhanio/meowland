@@ -59,7 +59,22 @@ impl State {
                 self.apply_window_state(window);
             }
             Command::Input { pane, event } => pane_input(self, pane, &event),
-            Command::Paste { pane, text } => clipboard::paste(self, pane, text),
+            Command::Paste { pane, text } => clipboard::paste(self, pane, &text),
+            Command::ClipboardOffer {
+                pane,
+                offer,
+                mimes,
+                paste,
+            } => {
+                clipboard::offer(self, pane, offer, mimes, paste);
+            }
+            Command::ClipboardReply {
+                pane,
+                request,
+                data,
+            } => {
+                clipboard::reply(self, pane, request, data);
+            }
             Command::Ack { pane, drawn } => self.pane_ack(pane, drawn),
             Command::CloseShown { pane } => {
                 if let Some(window) = self

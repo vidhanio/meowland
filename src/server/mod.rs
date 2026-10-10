@@ -199,8 +199,23 @@ impl Server {
             CompositorEvent::Cursor { pane, shape } => {
                 self.to_pane(pane, ServerToPane::Cursor(shape));
             }
-            CompositorEvent::Clipboard { pane, text } => {
-                self.to_pane(pane, ServerToPane::Clipboard(text));
+            CompositorEvent::ClipboardWrite { pane, data } => {
+                self.to_pane(pane, ServerToPane::ClipboardWrite(data));
+            }
+            CompositorEvent::ClipboardRead {
+                pane,
+                request,
+                offer,
+                mime,
+            } => {
+                self.to_pane(
+                    pane,
+                    ServerToPane::ClipboardRead {
+                        request,
+                        offer,
+                        mime,
+                    },
+                );
             }
             CompositorEvent::Focus(id) => {
                 for window in self.windows.values_mut() {
@@ -342,11 +357,35 @@ impl Server {
                         .send(CompositorCommand::Paste { pane: id, text });
                 }
             }
+            PaneToServer::ClipboardOffer {
+                offer,
+                mimes,
+                paste,
+            } => {
+                if self.panes.contains_key(&id) && mimes.len() <= crate::clipboard::MAX_TYPES {
+                    let _ = self.commands.send(CompositorCommand::ClipboardOffer {
+                        pane: id,
+                        offer,
+                        mimes,
+                        paste,
+                    });
+                }
+            }
+            PaneToServer::ClipboardReply { request, data } => {
+                if self.panes.contains_key(&id) {
+                    let _ = self.commands.send(CompositorCommand::ClipboardReply {
+                        pane: id,
+                        request,
+                        data,
+                    });
+                }
+            }
             PaneToServer::Input(event) => match &event {
                 protocol::Input::Key {
                     code: KEY_W,
                     pressed: true,
                     modifiers,
+                    ..
                 } if protocol::modifiers::alt_only(*modifiers) => {
                     self.release_pane(id, "detached".into());
                     let _ = self.commands.send(CompositorCommand::Detach { pane: id });
@@ -355,6 +394,7 @@ impl Server {
                     code: KEY_Q,
                     pressed: true,
                     modifiers,
+                    ..
                 } if protocol::modifiers::alt_only(*modifiers) => {
                     let _ = self
                         .commands

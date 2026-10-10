@@ -69,7 +69,7 @@ pub struct Hello {
     pub show: Show,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Input {
     Key {
         /// Linux input code (`KEY_*`), which is 8 below what XKB uses for an
@@ -79,6 +79,8 @@ pub enum Input {
         pressed: bool,
         /// [`modifiers`] snapshot, including lock state.
         modifiers: u8,
+        /// Client-known held keys immediately before this transition.
+        held: Vec<u16>,
     },
     Pointer {
         x: f64,
@@ -90,8 +92,8 @@ pub enum Input {
     },
     /// Release the pane's keyboard state after terminal focus loss.
     ResetKeyboard,
-    /// An intentional clipboard shortcut, not a physical key transition.
-    KeyTap { code: u16, modifiers: u8 },
+    /// Client-known held keys and modifiers on focus entry.
+    KeyboardEnter { keys: Vec<u16>, modifiers: u8 },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,6 +110,15 @@ pub enum PaneToServer {
         drawn: bool,
     },
     Paste(String),
+    ClipboardOffer {
+        offer: u64,
+        mimes: Vec<String>,
+        paste: bool,
+    },
+    ClipboardReply {
+        request: u64,
+        data: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -126,7 +137,12 @@ pub enum ServerToPane {
     Title(String),
     /// The pointer shape the terminal should show, or `None` for its own.
     Cursor(Option<String>),
-    Clipboard(String),
+    ClipboardWrite(crate::clipboard::ClipboardData),
+    ClipboardRead {
+        request: u64,
+        offer: u64,
+        mime: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

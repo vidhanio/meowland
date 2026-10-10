@@ -4,7 +4,7 @@ use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, InputTime, KeyState, Keycode},
     desktop::{PopupKind, PopupManager},
     input::{
-        keyboard::{FilterResult, KeyboardHandle, KeyboardSource, ModifiersState},
+        keyboard::{KeyboardHandle, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     utils::{Point, SERIAL_COUNTER},
@@ -43,20 +43,29 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
             code,
             pressed,
             modifiers,
+            ref held,
         } => {
-            activate_keyboard(state, pane, window);
-            let source = state.panes[&pane].keyboard_source;
+            if held.len() > 256 || held.iter().any(|code| *code == 0 || *code > 255) {
+                return;
+            }
+            if state.keyboard_pane != Some(pane) || !state.keyboard_known {
+                enter_keyboard(state, pane, window, held, modifiers);
+            } else {
+                activate_keyboard(state, pane, window);
+            }
             if let Some(keyboard) = state.keyboard.take() {
-                inject_key(&keyboard, state, source, code, pressed, modifiers);
+                inject_key(&keyboard, state, code, pressed, modifiers);
                 state.keyboard = Some(keyboard);
             }
         }
-        Input::KeyTap { code, modifiers } => {
-            activate_keyboard(state, pane, window);
-            if let Some(keyboard) = state.keyboard.take() {
-                tap_key(&keyboard, state, code, modifiers);
-                state.keyboard = Some(keyboard);
+        Input::KeyboardEnter {
+            ref keys,
+            modifiers,
+        } => {
+            if keys.len() > 256 || keys.iter().any(|code| *code == 0 || *code > 255) {
+                return;
             }
+            enter_keyboard(state, pane, window, keys, modifiers);
         }
         Input::ResetKeyboard => unreachable!(),
         Input::Pointer {
@@ -184,25 +193,51 @@ fn dismiss_popups(state: &mut State, window: u64) {
     state.touch(window);
 }
 
+fn enter_keyboard(state: &mut State, pane: u64, window: u64, keys: &[u16], bits: u8) {
+    reset_keyboard(state);
+    state.focus_window(window);
+    if let Some(keyboard) = state.keyboard.take() {
+        keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        set_modifiers(&keyboard, state, snapshot(bits));
+        for code in keys {
+            if state.keyboard_keys.insert(*code) {
+                forward(&keyboard, state, *code, true);
+            }
+        }
+        let surface = state.windows[&window].surface.wl_surface().clone();
+        keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+        state.keyboard = Some(keyboard);
+    }
+    state.keyboard_pane = Some(pane);
+    state.keyboard_known = true;
+}
+
 fn activate_keyboard(state: &mut State, pane: u64, window: u64) {
-    if state.keyboard_pane != Some(pane) {
+    let changed = state.keyboard_pane != Some(pane);
+    if changed {
         reset_keyboard(state);
     }
     state.focus_window(window);
+    if changed && let Some(keyboard) = state.keyboard.take() {
+        let surface = state.windows[&window].surface.wl_surface().clone();
+        keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+        state.keyboard = Some(keyboard);
+    }
     state.keyboard_pane = Some(pane);
 }
 
 /// A pane cannot leave keys or snapshot-only modifiers down when it loses
 /// focus, disconnects, or starts showing a different window.
 pub(super) fn reset_keyboard(state: &mut State) {
-    let pane = state.keyboard_pane.take();
+    state.keyboard_pane = None;
+    state.keyboard_known = false;
+    let keys = std::mem::take(&mut state.keyboard_keys);
     if let Some(keyboard) = state.keyboard.take() {
-        if let Some(source) =
-            pane.and_then(|pane| state.panes.get(&pane).map(|p| p.keyboard_source))
-        {
-            keyboard.release_source(state, source);
-        }
         set_modifiers(&keyboard, state, ModifiersState::default());
+        for code in keys {
+            forward(&keyboard, state, code, false);
+        }
+        keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
         state.keyboard = Some(keyboard);
     }
 }
@@ -225,72 +260,65 @@ fn set_modifiers(keyboard: &KeyboardHandle<State>, state: &mut State, modifiers:
     }
 }
 
+/// The terminal is the modifier authority, like a parent Wayland seat. Do not
+/// re-derive its state by feeding logical key identities through XKB again.
 fn inject_key(
     keyboard: &KeyboardHandle<State>,
     state: &mut State,
-    source: KeyboardSource,
     code: u16,
     pressed: bool,
     bits: u8,
 ) {
-    let before = keyboard.modifier_state();
-    let keycode = Keycode::from(u32::from(code) + 8);
-    let serial = SERIAL_COUNTER.next_serial();
-    let time = InputTime::now();
-    let direction = if pressed {
-        KeyState::Pressed
-    } else {
-        KeyState::Released
-    };
-    if keyboard
-        .input_from_source(
-            source,
-            state,
-            keycode,
-            direction,
-            serial,
-            time,
-            |_, _, _| FilterResult::Intercept(()),
-        )
-        .is_none()
-    {
+    if code == 0 || code > 255 {
         return;
     }
-    let mut modifiers = snapshot(bits);
-    let held = |left: u32, right: u32| {
-        let keys = keyboard.pressed_keys();
-        keys.contains(&Keycode::from(left + 8)) || keys.contains(&Keycode::from(right + 8))
+    set_modifiers(keyboard, state, snapshot(bits));
+    let changed = if pressed {
+        state.keyboard_keys.insert(code)
+    } else {
+        state.keyboard_keys.remove(&code)
     };
-    match code {
-        42 | 54 => modifiers.shift = held(42, 54),
-        29 | 97 => modifiers.ctrl = held(29, 97),
-        56 | 100 => modifiers.alt = held(56, 100),
-        125 | 126 => modifiers.logo = held(125, 126),
-        _ => {}
+    if changed {
+        forward(keyboard, state, code, pressed);
     }
-    keyboard.set_modifier_state(modifiers);
-    if before != keyboard.modifier_state() {
-        keyboard.advertise_modifier_state(state);
-    }
-    keyboard.input_forward(state, keycode, direction, serial, time, false);
 }
 
-/// Only clipboard commands are taps. Keep them separate from real input and
-/// restore the held modifier state instead of releasing the user's modifiers.
-fn tap_key(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, bits: u8) {
-    let previous = keyboard.modifier_state();
-    set_modifiers(keyboard, state, snapshot(bits));
-    let source = KeyboardSource::new_auxiliary();
-    for direction in [KeyState::Pressed, KeyState::Released] {
-        keyboard.input_from_source(
-            source,
-            state,
-            Keycode::from(u32::from(code) + 8),
-            direction,
-            SERIAL_COUNTER.next_serial(),
-            InputTime::now(),
-            |_, _, _| FilterResult::<()>::Forward,
-        );
+fn forward(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, pressed: bool) {
+    keyboard.input_forward(
+        state,
+        Keycode::from(u32::from(code) + 8),
+        if pressed {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        },
+        SERIAL_COUNTER.next_serial(),
+        InputTime::now(),
+        false,
+    );
+}
+
+/// A terminal paste action has no physical key event. Its explicit shortcut
+/// leaves the real held-key set and modifier state unchanged.
+pub(super) fn paste_action(state: &mut State, pane: u64) {
+    let Some(window) = state
+        .panes
+        .get(&pane)
+        .map(|pane| pane.window)
+        .filter(|window| *window != 0)
+    else {
+        return;
+    };
+    activate_keyboard(state, pane, window);
+    if state.keyboard_keys.contains(&47) {
+        return;
     }
-    set_modifiers(keyboard, state, previous);
+    if let Some(keyboard) = state.keyboard.take() {
+        let previous = keyboard.modifier_state();
+        set_modifiers(&keyboard, state, snapshot(modifiers::CONTROL));
+        forward(&keyboard, state, 47, true);
+        forward(&keyboard, state, 47, false);
+        set_modifiers(&keyboard, state, previous);
+        state.keyboard = Some(keyboard);
+    }
 }

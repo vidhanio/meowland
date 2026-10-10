@@ -5,8 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smithay::input::keyboard::KeyboardSource;
-
 use super::{Event, FRAME_INTERVAL, State, SurfaceAttributes, TRANSFER_POLL_INTERVAL, with_states};
 use crate::pixels::FrameSize;
 
@@ -22,7 +20,6 @@ enum Presentation {
 pub(super) struct PaneState {
     pub(super) window: u64,
     pub(super) size: FrameSize,
-    pub(super) keyboard_source: KeyboardSource,
     presentation: Presentation,
     next_frame: Instant,
     shown: Vec<u8>,
@@ -35,7 +32,6 @@ impl PaneState {
         Self {
             window,
             size,
-            keyboard_source: KeyboardSource::new_auxiliary(),
             presentation: Presentation::Clean,
             next_frame: Instant::now(),
             shown: Vec::new(),
@@ -114,11 +110,7 @@ impl State {
     /// Sleep until frame work is due; only unfinished transfers require
     /// polling.
     pub(super) fn next_wakeup(&self, now: Instant) -> Duration {
-        let mut wait = if self.pending_imports.is_empty()
-            && self.clipboard_read.is_none()
-            && self.clipboard_request.is_none()
-            && self.clipboard_writes.is_empty()
-        {
+        let mut wait = if self.pending_imports.is_empty() && !self.clipboard.pending() {
             Duration::from_secs(60)
         } else {
             TRANSFER_POLL_INTERVAL

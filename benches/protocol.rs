@@ -82,6 +82,7 @@ fn input(c: &mut Criterion) {
         code: 30,
         pressed: true,
         modifiers: modifiers::ALT,
+        held: vec![56],
     });
     let pointer = PaneToServer::Input(Input::Pointer {
         x: 640.0,

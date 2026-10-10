@@ -1,4 +1,6 @@
-use std::{ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration};
+use std::{
+    collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration,
+};
 
 use meowland::{
     Error, Result,
@@ -79,23 +81,23 @@ fn complete_windows(include_ids: bool) -> Vec<usage_rs::complete::Candidate<'sta
     let Ok(paths) = server::Paths::discover() else {
         return Vec::new();
     };
-    let Ok(windows) = list_with_timeout(&paths, Duration::from_millis(100)) else {
+    let Ok(mut windows) = list_with_timeout(&paths, Duration::from_millis(100)) else {
         return Vec::new();
     };
-    let mut targets = Vec::new();
+    windows.sort_unstable_by_key(|window| std::cmp::Reverse(window.id));
+    let mut targets = BTreeMap::new();
     for window in windows {
+        let title = protocol::sanitize(&window.title);
         if include_ids {
-            targets.push(window.id.to_string());
+            targets.insert(window.id.to_string(), title.clone());
         }
         if !window.app_id.is_empty() {
-            targets.push(window.app_id);
+            targets.entry(window.app_id).or_insert(title);
         }
     }
-    targets.sort_unstable();
-    targets.dedup();
     targets
         .into_iter()
-        .map(usage_rs::complete::Candidate::new)
+        .map(|(value, title)| usage_rs::complete::Candidate::described(value, title))
         .collect()
 }
 

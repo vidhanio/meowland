@@ -124,6 +124,17 @@ pub enum Command {
         pane: u64,
         text: String,
     },
+    ClipboardOffer {
+        pane: u64,
+        offer: u64,
+        mimes: Vec<String>,
+        paste: bool,
+    },
+    ClipboardReply {
+        pane: u64,
+        request: u64,
+        data: Option<Vec<u8>>,
+    },
     CloseAll,
     CloseShown {
         pane: u64,
@@ -146,9 +157,15 @@ pub enum Event {
         shape: Option<String>,
     },
     Focus(u64),
-    Clipboard {
+    ClipboardWrite {
         pane: u64,
-        text: String,
+        data: crate::clipboard::ClipboardData,
+    },
+    ClipboardRead {
+        pane: u64,
+        request: u64,
+        offer: u64,
+        mime: String,
     },
     Frame {
         pane: u64,
@@ -240,9 +257,7 @@ struct State {
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
     data_control: DataControlState,
-    clipboard_request: Option<(u64, String)>,
-    clipboard_read: Option<(u64, crate::clipboard::Transfer)>,
-    clipboard_writes: Vec<clipboard::PendingWrite>,
+    clipboard: clipboard::Bridge,
     _cursor_shape: CursorShapeManagerState,
     popups: PopupManager,
     seats: SeatState<Self>,
@@ -250,6 +265,8 @@ struct State {
     keyboard: Option<KeyboardHandle<Self>>,
     /// One terminal pane owns the seat's held keyboard state at a time.
     keyboard_pane: Option<u64>,
+    keyboard_keys: HashSet<u16>,
+    keyboard_known: bool,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<u64, Window>,
@@ -491,15 +508,15 @@ impl State {
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),
             data_control: DataControlState::new::<Self, _>(&display_handle, None, |_| true),
-            clipboard_request: None,
-            clipboard_read: None,
-            clipboard_writes: Vec::new(),
+            clipboard: clipboard::Bridge::default(),
             _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
             popups: PopupManager::default(),
             seats: seat_state,
             seat,
             keyboard: None,
             keyboard_pane: None,
+            keyboard_keys: HashSet::new(),
+            keyboard_known: false,
             pointer,
             output,
             windows: HashMap::new(),
@@ -646,6 +663,7 @@ impl State {
         }
         let first = self.panes.keys().min() == Some(&pane);
         let window = self.panes.remove(&pane).map(|state| state.window);
+        self.clipboard.detach(pane);
         self.following.remove(&pane);
         if let Some(Show::Activation(token)) = self.pending_shows.remove(&pane) {
             self.forget_activation(&token);
@@ -1068,7 +1086,7 @@ const fn cursor_name(icon: CursorIcon) -> &'static str {
 }
 
 impl SelectionHandler for State {
-    type SelectionUserData = Arc<str>;
+    type SelectionUserData = clipboard::Source;
 
     fn new_selection(
         &mut self,
@@ -1076,37 +1094,8 @@ impl SelectionHandler for State {
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
-        if target != SelectionTarget::Clipboard {
-            return;
-        }
-        self.clipboard_request = None;
-        self.clipboard_read = None;
-        let Some(source) = source else {
-            return;
-        };
-        let types = source.mime_types();
-        let Some(mime) = crate::clipboard::TEXT_MIMES
-            .into_iter()
-            .find(|mime| types.iter().any(|offered| offered == mime))
-        else {
-            return;
-        };
-        let pane = self
-            .cursor_pane
-            .filter(|pane| {
-                self.panes
-                    .get(pane)
-                    .is_some_and(|pane| Some(pane.window) == self.focused)
-            })
-            .or_else(|| {
-                self.panes
-                    .iter()
-                    .filter(|(_, pane)| Some(pane.window) == self.focused)
-                    .map(|(id, _)| *id)
-                    .min()
-            });
-        if let Some(pane) = pane {
-            self.clipboard_request = Some((pane, mime.to_owned()));
+        if target == SelectionTarget::Clipboard {
+            clipboard::selection(self, source);
         }
     }
 
@@ -1116,12 +1105,10 @@ impl SelectionHandler for State {
         mime: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
-        text: &Self::SelectionUserData,
+        source: &Self::SelectionUserData,
     ) {
-        if target == SelectionTarget::Clipboard
-            && crate::clipboard::TEXT_MIMES.contains(&mime.as_str())
-        {
-            clipboard::send(self, fd, text);
+        if target == SelectionTarget::Clipboard {
+            clipboard::send(self, fd, &mime, source);
         }
     }
 }

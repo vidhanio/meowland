@@ -8,27 +8,30 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyboardEnhancementFlags, MouseEventKind, PushKeyboardEnhancementFlags},
+    event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute, terminal,
 };
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     io::Errno,
 };
+use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
 use crate::{
     Error, Result,
-    clipboard::{HostClipboard, MAX_TEXT, Response as ClipboardResponse, write_osc52},
+    clipboard::MAX_TEXT,
     kitty::{Presenter, SharedMemory},
     protocol::{self, Hello, Input, PaneToServer, ServerToPane, Show},
     signals,
 };
 
+mod clipboard;
 mod input;
 mod keyboard;
 mod output;
 
-use input::InputGuard;
+use clipboard::{Action as ClipboardAction, Clipboard};
+use input::Event;
 use keyboard::Keyboard;
 
 const CELL_WIDTH: u16 = 10;
@@ -40,13 +43,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
 const GRAPHICS_ID: u32 = 31;
-/// One complete wheel detent per terminal report, in Wayland value120 units.
-const WHEEL_STEP: i16 = 120;
-
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;AAAA\x1b\\";
 /// Query device attributes last so their reply starts the handshake's quiet
 /// window.
-const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?u\x1b[c";
+const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?5522$p\x1b[?u\x1b[c";
 
 const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -63,6 +63,8 @@ pub struct ProbeInfo {
     pub graphics: bool,
     pub shared_memory: bool,
     pub sgr_pixels: bool,
+    /// OSC 5522 support and the paste-notification mode's previous state.
+    pub clipboard: Option<bool>,
     /// Kitty's active enhancements after pushing the requested flags.
     pub keyboard_flags: Option<KeyboardEnhancementFlags>,
     pub name: Option<String>,
@@ -142,45 +144,26 @@ fn terminal_probe(
 /// Match a complete device-attributes reply, not a DECRQM `CSI ?` reply or
 /// an incidental `c`, before starting the quiet window.
 fn device_attributes_seen(bytes: &[u8]) -> bool {
-    let mut index = 0;
-    while let Some(offset) = find(&bytes[index..], b"\x1b[?") {
-        let start = index + offset;
-        index = start + 3;
-        let Some((body, final_byte, _)) = control_sequence(bytes, start) else {
-            return false;
-        };
-        if final_byte == b'c'
-            && body[1..]
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || *byte == b';')
-        {
-            return true;
-        }
-    }
-    false
+    probe_actions(bytes).into_iter().any(|action| {
+        matches!(action, VTAction::CsiDispatch { params, parameters_truncated: false, byte: b'c' }
+            if params.first() == Some(&CsiParam::P(b'?'))
+                && params[1..].iter().all(|param| matches!(param, CsiParam::Integer(_) | CsiParam::P(b';'))))
+    })
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+fn probe_actions(bytes: &[u8]) -> Vec<VTAction> {
+    let mut actor = CollectingVTActor::default();
+    VTParser::new().parse(bytes, &mut actor);
+    actor.into_vec()
 }
 
 fn parse_probe_bytes(bytes: &[u8]) -> ProbeInfo {
     let mut out = ProbeInfo::default();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != 0x1b {
-            index += 1;
-            continue;
-        }
-        match bytes.get(index + 1) {
-            Some(b'_') => {
-                let rest = &bytes[index + 2..];
-                let Some(end) = find(rest, b"\x1b\\") else {
-                    break;
-                };
-                if let Some(body) = rest[..end].strip_prefix(b"G") {
+    let mut name = None;
+    for action in probe_actions(bytes) {
+        match action {
+            VTAction::ApcDispatch(data) => {
+                if let Some(body) = data.strip_prefix(b"G") {
                     if let Some(ok) = kitty_reply(body, GRAPHICS_ID) {
                         out.graphics = ok;
                     }
@@ -188,101 +171,80 @@ fn parse_probe_bytes(bytes: &[u8]) -> ProbeInfo {
                         out.shared_memory = ok;
                     }
                 }
-                index += 2 + end + 2;
             }
-            Some(b'P') => {
-                let rest = &bytes[index + 2..];
-                let Some(end) = find(rest, b"\x1b\\") else {
-                    break;
-                };
-                if let Some(name) = rest[..end].strip_prefix(b">|") {
-                    let name = String::from_utf8_lossy(name).trim().to_owned();
+            VTAction::DcsHook {
+                byte: b'|',
+                ignored_excess_intermediates: false,
+                ..
+            } => name = Some(Vec::new()),
+            VTAction::DcsPut(byte) => {
+                if let Some(name) = &mut name {
+                    name.push(byte);
+                }
+            }
+            VTAction::DcsUnhook => {
+                if let Some(name) = name.take() {
+                    let name = String::from_utf8_lossy(&name).trim().to_owned();
                     if !name.is_empty() {
                         out.name = Some(name);
                     }
                 }
-                index += 2 + end + 2;
             }
-            Some(b'[') => {
-                let Some((body, final_byte, next)) = control_sequence(bytes, index) else {
-                    break;
-                };
-                match final_byte {
-                    b't' => parse_size_reply(body, &mut out),
-                    b'y' => parse_decrqm_reply(body, &mut out),
-                    b'u' => {
-                        out.keyboard_flags = body
-                            .strip_prefix(b"?")
-                            .and_then(parse_u32)
-                            .and_then(|flags| u8::try_from(flags).ok())
-                            .map(KeyboardEnhancementFlags::from_bits_truncate);
-                    }
-                    _ => {}
-                }
-                index = next;
-            }
-            _ => index += 1,
+            VTAction::CsiDispatch {
+                params,
+                parameters_truncated: false,
+                byte,
+            } => probe_csi(&params, byte, &mut out),
+            _ => {}
         }
     }
     out
 }
 
-fn control_sequence(bytes: &[u8], start: usize) -> Option<(&[u8], u8, usize)> {
-    let body_start = start + 2;
-    let mut index = body_start;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if (0x40..=0x7e).contains(&byte) {
-            return Some((&bytes[body_start..index], byte, index + 1));
-        }
-        index += 1;
-    }
-    None
-}
-
-/// `CSI 4` reports text-area pixels; `CSI 6` reports cell pixels.
-/// A zero dimension means the terminal has no answer.
-fn parse_size_reply(body: &[u8], out: &mut ProbeInfo) {
-    let body = body.strip_prefix(b"?").unwrap_or(body);
-    let mut fields = body.split(|byte| *byte == b';');
-    let (Some(kind), Some(height), Some(width)) = (
-        fields.next().and_then(parse_u32),
-        fields.next().and_then(parse_u32),
-        fields.next().and_then(parse_u32),
-    ) else {
+fn probe_csi(params: &[CsiParam], byte: u8, out: &mut ProbeInfo) {
+    let private = params.strip_prefix(&[CsiParam::P(b'?')]);
+    let params = private.unwrap_or(params);
+    let params = params.strip_suffix(&[CsiParam::P(b'$')]).unwrap_or(params);
+    let mut fields = params
+        .split(|param| *param == CsiParam::P(b';'))
+        .map(input::number);
+    let Some(first) = fields.next().flatten() else {
         return;
     };
-    if height == 0 || width == 0 {
-        return;
-    }
-    match kind {
-        4 => {
-            out.pixel_height = Some(height);
-            out.pixel_width = Some(width);
+    match byte {
+        b't' => {
+            if let (Some(height), Some(width)) = (fields.next().flatten(), fields.next().flatten())
+                && height != 0
+                && width != 0
+            {
+                match first {
+                    4 => {
+                        out.pixel_height = Some(height);
+                        out.pixel_width = Some(width);
+                    }
+                    6 => {
+                        out.cell_height = u16::try_from(height).ok();
+                        out.cell_width = u16::try_from(width).ok();
+                    }
+                    _ => {}
+                }
+            }
         }
-        6 => {
-            out.cell_height = u16::try_from(height).ok();
-            out.cell_width = u16::try_from(width).ok();
+        b'y' if private.is_some() => {
+            if let Some(value) = fields.next().flatten() {
+                match first {
+                    1016 => out.sgr_pixels = matches!(value, 1..=3),
+                    5522 if matches!(value, 1..=3) => out.clipboard = Some(value != 2),
+                    _ => {}
+                }
+            }
+        }
+        b'u' if private.is_some() => {
+            out.keyboard_flags = u8::try_from(first)
+                .ok()
+                .map(KeyboardEnhancementFlags::from_bits_truncate);
         }
         _ => {}
-    }
-}
-
-/// DECRQM `CSI ? mode ; value $ y`: zero means unsupported.
-fn parse_decrqm_reply(body: &[u8], out: &mut ProbeInfo) {
-    let Some(body) = body.strip_prefix(b"?") else {
-        return;
-    };
-    let body = body.strip_suffix(b"$").unwrap_or(body);
-    let mut fields = body.split(|byte| *byte == b';');
-    let (Some(mode), Some(value)) = (
-        fields.next().and_then(parse_u32),
-        fields.next().and_then(parse_u32),
-    ) else {
-        return;
-    };
-    if mode == 1016 {
-        out.sgr_pixels = matches!(value, 1..=3);
     }
 }
 
@@ -337,6 +299,7 @@ impl PaneStats {
             shared_memory = probe.shared_memory,
             sgr_pixels = probe.sgr_pixels,
             keyboard_flags = ?probe.keyboard_flags,
+            clipboard = ?probe.clipboard,
             "pane attached"
         );
     }
@@ -407,7 +370,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     if !probe.graphics {
         return Err(Error::GraphicsUnsupported);
     }
-    let _input = InputGuard::enter()?;
+    let mut input = input::Reader::new()?;
     if !probe.sgr_pixels {
         return Err(Error::PixelMouseUnsupported);
     }
@@ -418,6 +381,9 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         return Err(Error::KeyboardUnsupported);
     }
     mode.enable_mouse()?;
+    if let Some(previous) = probe.clipboard {
+        mode.enable_clipboard(previous)?;
+    }
     let mut cell = probe.cell_width.zip(probe.cell_height);
     let (width, height) = pane_pixels(
         probe.pixel_width.zip(probe.pixel_height),
@@ -433,7 +399,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
 
     let mut tx = stream.try_clone()?;
     protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
-    let clipboard = HostClipboard::new()?;
+    let mut clipboard = Clipboard::new(probe.clipboard.is_some())?;
     let mut keyboard = Keyboard::default();
     let mut presentation = PanePresentation::new(cell, shared);
     PaneStats::capabilities(&probe, width, height);
@@ -441,7 +407,6 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
     let handshake_deadline = Instant::now() + Duration::from_secs(1);
     let mut handshake_done = false;
     let mut reader = protocol::MessageReader::default();
-    let stdin = io::stdin();
     let mut stdout = output::open()?;
     loop {
         if interrupted.interrupted() {
@@ -451,9 +416,14 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
         if !handshake_done && Instant::now() >= handshake_deadline {
             return Err(Error::PaneHandshakeTimeout);
         }
+        if keyboard.deferred_expired() {
+            send_deferred(&mut keyboard, &mut tx)?;
+        }
+        clipboard.poll(&mut presentation.pending);
+        send_clipboard_actions(&mut clipboard, &mut keyboard, &mut tx)?;
         let receiving = !presentation.pending.pending();
         let mut fds = [
-            PollFd::new(&stdin, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
+            PollFd::new(&input.fd, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
             PollFd::new(
                 &stdout,
                 PollFlags::HUP
@@ -465,13 +435,12 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                     },
             ),
             PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
-            PollFd::new(&clipboard.wake, PollFlags::IN),
         ];
         let mut wait = Duration::from_millis(100);
         if !handshake_done {
             wait = wait.min(handshake_deadline.saturating_duration_since(Instant::now()));
         }
-        if event::poll(Duration::ZERO)? {
+        if input.pending() {
             wait = Duration::ZERO;
         }
         let timeout = Timespec {
@@ -497,31 +466,34 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             return Ok(());
         }
         let writable = fds[1].revents().contains(PollFlags::OUT);
-        if receiving
+        let input_ready = fds[0].revents().contains(PollFlags::IN);
+        let server_ready = receiving
             && fds[2]
                 .revents()
-                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
-        {
+                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
+        if server_ready {
             let Ok(message) = reader.try_recv::<ServerToPane>(&stream) else {
                 mode.restore_with_message("server disconnected")?;
                 return Ok(());
             };
             if let Some(message) = message {
                 match message {
-                    ServerToPane::HelloOk => handshake_done = true,
+                    ServerToPane::HelloOk => {
+                        handshake_done = true;
+                        clipboard.refresh(false);
+                    }
                     ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
                         mode.restore_with_message(&reason)?;
                         return Ok(());
                     }
-                    ServerToPane::Clipboard(text) => {
-                        if text.len() <= MAX_TEXT
-                            && let Some(text) = clipboard.copy(text)
-                        {
-                            let mut bytes = Vec::new();
-                            write_osc52(&mut bytes, &text)?;
-                            presentation.pending.append(&bytes);
-                        }
+                    ServerToPane::ClipboardWrite(data) => {
+                        clipboard.copy(data, &mut presentation.pending);
                     }
+                    ServerToPane::ClipboardRead {
+                        request,
+                        offer,
+                        mime,
+                    } => clipboard.read(request, offer, mime),
                     ServerToPane::Title(title) => presentation.pending.append(&title_bytes(&title)),
                     ServerToPane::Cursor(shape) => {
                         presentation.pending.append(&cursor_bytes(shape.as_deref()));
@@ -535,46 +507,28 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 }
             }
         }
-        if receiving {
-            for response in clipboard.drain() {
-                match response {
-                    ClipboardResponse::CopyFallback(text) => {
-                        let mut bytes = Vec::new();
-                        write_osc52(&mut bytes, &text)?;
-                        presentation.pending.append(&bytes);
-                    }
-                    ClipboardResponse::Paste {
-                        code,
-                        modifiers,
-                        text,
-                    } => {
-                        if let Some(text) = text {
-                            send_paste(&mut tx, text)?;
-                        } else {
-                            protocol::send(
-                                &mut tx,
-                                &PaneToServer::Input(Input::KeyTap { code, modifiers }),
-                            )?;
-                        }
-                    }
-                }
-            }
-        }
         if writable {
             presentation.drain(&mut stdout, &mut tx)?;
         }
+        if input_ready {
+            input.read_ready()?;
+        }
         for _ in 0..64 {
-            if interrupted.interrupted() || !event::poll(Duration::ZERO)? {
+            if interrupted.interrupted() {
                 break;
             }
+            let Some(event) = input.next() else {
+                break;
+            };
             send_event(
-                event::read()?,
+                event,
                 &mut tx,
                 &mut presentation.presenter,
                 &mut cell,
-                &clipboard,
+                &mut clipboard,
                 &mut keyboard,
             )?;
+            send_clipboard_actions(&mut clipboard, &mut keyboard, &mut tx)?;
         }
     }
 }
@@ -657,7 +611,7 @@ fn send_event(
     tx: &mut UnixStream,
     presenter: &mut Presenter,
     cell: &mut Option<(u16, u16)>,
-    clipboard: &HostClipboard,
+    clipboard: &mut Clipboard,
     keyboard: &mut Keyboard,
 ) -> Result<()> {
     match event {
@@ -667,24 +621,32 @@ fn send_event(
                     code,
                     pressed,
                     modifiers,
+                    ..
                 },
             ) = keyboard.input(key)
             {
-                if pressed && keyboard::paste(code, modifiers) && clipboard.paste(code, modifiers) {
+                if pressed && keyboard::binding(code, modifiers) {
                     keyboard.intercept(code);
-                } else {
-                    if pressed && keyboard::binding(code, modifiers) {
-                        keyboard.intercept(code);
-                    }
-                    protocol::send(tx, &PaneToServer::Input(input))?;
                 }
+                let defer = keyboard.deferred()
+                    || (pressed
+                        && keyboard::paste(code, modifiers)
+                        && clipboard.enabled()
+                        && clipboard.refresh(true));
+                send_input(input, defer, keyboard, tx)?;
             }
         }
-        Event::FocusLost => {
-            keyboard.reset();
-            protocol::send(tx, &PaneToServer::Input(Input::ResetKeyboard))?;
+        Event::Focus(focused) => {
+            clipboard.focus(focused);
+            if focused {
+                send_input(keyboard.enter(), keyboard.deferred(), keyboard, tx)?;
+            } else {
+                keyboard.reset();
+                protocol::send(tx, &PaneToServer::Input(Input::ResetKeyboard))?;
+            }
         }
-        Event::Resize(cols, rows) => {
+        Event::Resize => {
+            let (cols, rows) = terminal::size().unwrap_or((80, 24));
             let pixels = window_pixels();
             *cell = derived_cell(pixels, (cols, rows)).or(*cell);
             presenter.set_cell_size(*cell);
@@ -692,28 +654,78 @@ fn send_event(
                 pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
             protocol::send(tx, &PaneToServer::Resize { width, height })?;
         }
-        Event::Mouse(mouse) => {
-            let (pressed, button, scroll) = match mouse.kind {
-                MouseEventKind::Down(b) => (true, Some(b as u8), 0),
-                MouseEventKind::Up(b) => (false, Some(b as u8), 0),
-                MouseEventKind::ScrollUp => (true, None, WHEEL_STEP),
-                MouseEventKind::ScrollDown => (true, None, -WHEEL_STEP),
-                _ => (false, None, 0),
-            };
-            let (x, y) = (f64::from(mouse.column), f64::from(mouse.row));
-            protocol::send(
-                tx,
-                &PaneToServer::Input(Input::Pointer {
-                    x,
-                    y,
-                    button,
-                    pressed,
-                    scroll,
-                }),
-            )?;
+        Event::Pointer(input) => send_input(input, keyboard.deferred(), keyboard, tx)?,
+        Event::Paste(text) => {
+            send_deferred(keyboard, tx)?;
+            send_paste(tx, text)?;
         }
-        Event::Paste(text) => send_paste(tx, text)?,
-        Event::FocusGained => {}
+        Event::Clipboard(bytes) => clipboard.packet(&bytes),
+    }
+    Ok(())
+}
+
+fn send_input(
+    input: Input,
+    defer: bool,
+    keyboard: &mut Keyboard,
+    tx: &mut UnixStream,
+) -> Result<()> {
+    if defer {
+        keyboard.defer(input);
+        if keyboard.deferred_len() >= 256 {
+            tracing::warn!("Clipboard refresh deferred too much input; forwarding original events");
+            send_deferred(keyboard, tx)?;
+        }
+    } else {
+        protocol::send(tx, &PaneToServer::Input(input))?;
+    }
+    Ok(())
+}
+
+fn send_clipboard_actions(
+    clipboard: &mut Clipboard,
+    keyboard: &mut Keyboard,
+    tx: &mut UnixStream,
+) -> Result<()> {
+    while let Some(action) = clipboard.next_action() {
+        match action {
+            ClipboardAction::Offer {
+                offer,
+                mimes,
+                paste,
+            } => {
+                if paste && keyboard.deferred() {
+                    protocol::send(
+                        tx,
+                        &PaneToServer::ClipboardOffer {
+                            offer,
+                            mimes: mimes.clone(),
+                            paste: false,
+                        },
+                    )?;
+                    send_deferred(keyboard, tx)?;
+                }
+                protocol::send(
+                    tx,
+                    &PaneToServer::ClipboardOffer {
+                        offer,
+                        mimes,
+                        paste,
+                    },
+                )?;
+            }
+            ClipboardAction::Reply { request, data } => {
+                protocol::send(tx, &PaneToServer::ClipboardReply { request, data })?;
+            }
+            ClipboardAction::Unblock => send_deferred(keyboard, tx)?,
+        }
+    }
+    Ok(())
+}
+
+fn send_deferred(keyboard: &mut Keyboard, tx: &mut UnixStream) -> Result<()> {
+    for input in keyboard.take_deferred() {
+        protocol::send(tx, &PaneToServer::Input(input))?;
     }
     Ok(())
 }
@@ -785,6 +797,7 @@ fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
 struct TerminalGuard {
     active: bool,
     mouse: bool,
+    clipboard: Option<bool>,
 }
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
@@ -792,6 +805,7 @@ impl TerminalGuard {
         let guard = Self {
             active: true,
             mouse: false,
+            clipboard: None,
         };
         execute!(
             io::stdout(),
@@ -810,6 +824,12 @@ impl TerminalGuard {
         io::stdout().write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h")?;
         io::stdout().flush()?;
         Ok(())
+    }
+
+    fn enable_clipboard(&mut self, previous: bool) -> io::Result<()> {
+        self.clipboard = Some(previous);
+        io::stdout().write_all(b"\x1b[?5522h")?;
+        io::stdout().flush()
     }
 
     fn restore_with_message(&mut self, reason: &str) -> io::Result<()> {
@@ -835,6 +855,13 @@ impl TerminalGuard {
         if self.mouse {
             self.mouse = false;
             note(io::stdout().write_all(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l"));
+        }
+        if let Some(previous) = self.clipboard.take() {
+            note(io::stdout().write_all(if previous {
+                b"\x1b[?5522h"
+            } else {
+                b"\x1b[?5522l"
+            }));
         }
         note(io::stdout().write_all(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\"));
         note(execute!(

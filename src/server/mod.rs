@@ -279,12 +279,12 @@ impl Server {
                 list.sort_by_key(|window| window.id);
                 ControlResponse::Windows(list)
             }
-            ControlRequest::Run(args) => {
+            ControlRequest::Run { args, env, cwd } => {
                 let token = match self.activation_token() {
                     Ok(token) => token,
                     Err(error) => return ControlResponse::Error(format!("{error:#}")),
                 };
-                match launch_client(&args, &self.display, &token) {
+                match launch_client(&args, &env, &cwd, &self.display, &token) {
                     Ok(child) => {
                         self.child_groups.insert(child.id());
                         self.children.push(child);

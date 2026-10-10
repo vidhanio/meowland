@@ -32,7 +32,8 @@ pub(super) fn launch_client(
         .envs(env.iter().map(|(key, value)| (key, value)))
         .current_dir(cwd)
         .env("WAYLAND_DISPLAY", wayland)
-        .env("XDG_ACTIVATION_TOKEN", token);
+        .env("XDG_ACTIVATION_TOKEN", token)
+        .env("DESKTOP_STARTUP_ID", token);
     command
         .env_remove("DISPLAY")
         .env_remove("NOTIFY_SOCKET")

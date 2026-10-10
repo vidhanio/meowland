@@ -5,6 +5,7 @@ use std::{
     ffi::OsString,
     io::{self, Read, Write},
     os::unix::net::UnixStream,
+    path::PathBuf,
 };
 
 use rustix::{io::Errno, net::RecvFlags};
@@ -148,7 +149,11 @@ pub enum ServerToPane {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ControlRequest {
     Ping,
-    Run(Vec<OsString>),
+    Run {
+        args: Vec<OsString>,
+        env: Vec<(OsString, OsString)>,
+        cwd: PathBuf,
+    },
     List,
     Kill(Show),
 }

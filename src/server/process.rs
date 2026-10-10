@@ -5,6 +5,7 @@ use std::{
     ffi::OsString,
     fs,
     os::unix::process::CommandExt as _,
+    path::Path,
     process::{Child, Command, Stdio},
     thread,
     time::Duration,
@@ -14,13 +15,22 @@ use rustix::process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, p
 
 use crate::{Error, Result};
 
-pub(super) fn launch_client(args: &[OsString], wayland: &str, token: &str) -> Result<Child> {
+pub(super) fn launch_client(
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+    cwd: &Path,
+    wayland: &str,
+    token: &str,
+) -> Result<Child> {
     let Some(executable) = args.first() else {
         return Err(Error::RunRequiresCommand);
     };
     let mut command = Command::new(executable);
     command
         .args(&args[1..])
+        .env_clear()
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .current_dir(cwd)
         .env("WAYLAND_DISPLAY", wayland)
         .env("XDG_ACTIVATION_TOKEN", token);
     command

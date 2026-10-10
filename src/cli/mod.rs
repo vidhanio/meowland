@@ -159,8 +159,13 @@ pub fn start() -> Result<()> {
             command: client,
         }) => {
             let paths = server::Paths::discover()?;
-            let ControlResponse::Started(token) = request(&paths, &ControlRequest::Run(client))?
-            else {
+            let launch = ControlRequest::Run {
+                args: client,
+                env: std::env::vars_os().collect(),
+                cwd: std::env::current_dir()
+                    .map_err(|error| Error::io("reading launch working directory", error))?,
+            };
+            let ControlResponse::Started(token) = request(&paths, &launch)? else {
                 return Err(Error::UnexpectedRunResponse);
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {

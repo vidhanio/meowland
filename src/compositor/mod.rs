@@ -1156,7 +1156,7 @@ fn run(
         layout: "us",
         ..XkbConfig::default()
     };
-    let Ok(keyboard) = state.seat.add_keyboard(keymap, 25, 600) else {
+    let Ok(keyboard) = state.seat.add_keyboard(keymap, 600, 25) else {
         let _ = ready.send(Err(std::io::Error::other(
             "could not compile the keyboard keymap",
         )));

@@ -74,6 +74,10 @@ impl Keyboard {
         self.deferred.take().unwrap_or_default()
     }
 
+    pub(super) const fn deadline(&self) -> Option<Instant> {
+        self.deferred_deadline
+    }
+
     pub(super) fn deferred_expired(&self) -> bool {
         self.deferred_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)

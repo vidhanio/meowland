@@ -143,6 +143,10 @@ pub enum ServerToPane {
         request: u64,
         offer: u64,
         mime: String,
+        deadline: crate::clipboard::Deadline,
+    },
+    ClipboardCancel {
+        request: u64,
     },
 }
 

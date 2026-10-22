@@ -1,4 +1,6 @@
-use std::{ffi::OsStr, fs::OpenOptions, io};
+//! Native-fence DMA-BUF submission and completion-gated CPU readback.
+
+use std::{ffi::OsStr, fs::OpenOptions, io, os::fd::OwnedFd};
 
 use smithay::{
     backend::{
@@ -9,10 +11,10 @@ use smithay::{
         drm::{DrmNode, NodeType},
         egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError, fence::EGLFence},
         renderer::{
-            Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter,
-            TextureMapping,
-            gles::{Capability, GlesError, GlesRenderbuffer, GlesRenderer},
-            sync::Interrupted,
+            Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter, TextureMapping,
+            gles::{
+                Capability, GlesError, GlesMapping, GlesRenderbuffer, GlesRenderer, GlesTexture,
+            },
         },
     },
     utils::{Rectangle, Transform},
@@ -30,11 +32,10 @@ enum BackendError {
     Egl(#[from] EglError),
     #[error(transparent)]
     Gles(#[from] GlesError),
-    #[error(transparent)]
-    Wait(#[from] Interrupted),
+
     #[error("DRM render node has no path")]
     MissingNodePath,
-    #[error("EGL fence synchronization is unavailable")]
+    #[error("native EGL fence export is unavailable")]
     MissingFenceSync,
     #[error("DMA-BUF readback requires GLES 3 and EGL synchronization")]
     MissingRendererSync,
@@ -73,6 +74,20 @@ impl SnapshotError {
     }
 }
 
+pub(super) struct Submission {
+    pub(super) fd: OwnedFd,
+    pub(super) readback: Readback,
+}
+
+pub(super) struct Readback {
+    mapping: Result<GlesMapping, BackendError>,
+    size: FrameSize,
+    force_opaque: bool,
+    _texture: GlesTexture,
+    _target: GlesRenderbuffer,
+    _fence: EGLFence,
+}
+
 pub(super) struct DmabufBackend {
     renderer: GlesRenderer,
     target: GlesRenderbuffer,
@@ -104,10 +119,9 @@ impl DmabufBackend {
             },
             None => None,
         };
-        #[expect(
-            unsafe_code,
-            reason = "loading the installed graphics library before Smithay's infallible loader"
-        )]
+        // SAFETY: This is the trusted system EGL implementation, loaded before
+        // EGL use on the compositor thread. Its handle stays alive throughout
+        // Smithay's graphics initialization.
         let _egl = match unsafe { libloading::Library::new("libEGL.so.1") } {
             Ok(library) => library,
             Err(error) => {
@@ -132,7 +146,7 @@ impl DmabufBackend {
             }
             match Self::initialize(device, node) {
                 Ok(backend) => {
-                    tracing::info!(node = ?node.dev_path(), formats = backend.formats.len(), "Enabled DMA-BUF import and CPU readback");
+                    tracing::info!(node = ?node.dev_path(), formats = backend.formats.len(), "Enabled asynchronous DMA-BUF readback");
                     return Some(backend);
                 }
                 Err(error) => {
@@ -144,22 +158,23 @@ impl DmabufBackend {
         None
     }
 
-    #[expect(
-        unsafe_code,
-        reason = "Smithay owns the EGL display; the fresh context is never shared or used on another thread"
-    )]
     fn initialize(device: EGLDevice, node: DrmNode) -> Result<Self, BackendError> {
         let path = node.dev_path().ok_or(BackendError::MissingNodePath)?;
         let _access = OpenOptions::new().read(true).write(true).open(path)?;
+        // SAFETY: The enumerated device is valid, and Smithay exclusively
+        // manages this display's EGL initialization and termination.
         let display = unsafe { EGLDisplay::new(device)? };
         if !display
             .extensions()
             .iter()
-            .any(|extension| extension == "EGL_KHR_fence_sync")
+            .any(|extension| extension == "EGL_ANDROID_native_fence_sync")
         {
             return Err(BackendError::MissingFenceSync);
         }
         let context = EGLContext::new(&display)?;
+        // SAFETY: This fresh context has no external GL state or users and
+        // remains exclusively owned by the renderer on the compositor
+        // thread.
         let mut renderer = unsafe { GlesRenderer::new(context)? };
         if !renderer.capabilities().contains(&Capability::Fencing)
             || !renderer.capabilities().contains(&Capability::ExportFence)
@@ -182,34 +197,15 @@ impl DmabufBackend {
         }
         renderer.downscale_filter(TextureFilter::Nearest)?;
         renderer.upscale_filter(TextureFilter::Nearest)?;
-        let mut target: GlesRenderbuffer =
-            renderer.create_buffer(Fourcc::Abgr8888, (1, 1).into())?;
-        {
-            let mut framebuffer = renderer.bind(&mut target)?;
-            let completion = {
-                let mut frame =
-                    renderer.render(&mut framebuffer, (1, 1).into(), Transform::Normal)?;
-                frame.clear(
-                    Color32F::new(0.0, 0.0, 0.0, 0.0),
-                    &[Rectangle::from_size((1, 1).into())],
-                )?;
-                Frame::finish(frame)?
-            };
-            completion.wait()?;
-            let mapping = renderer.copy_framebuffer(
-                &framebuffer,
-                Rectangle::from_size((1, 1).into()),
-                Fourcc::Abgr8888,
-            )?;
-            drop(framebuffer);
-            renderer.map_texture(&mapping)?;
-        }
-        Ok(Self {
+        let target = renderer.create_buffer(Fourcc::Abgr8888, (1, 1).into())?;
+        let mut backend = Self {
             renderer,
             target,
             formats,
             device: node.dev_id(),
-        })
+        };
+        backend.native_fence()?;
+        Ok(backend)
     }
 
     pub(super) const fn device(&self) -> u64 {
@@ -247,25 +243,15 @@ impl DmabufBackend {
         self.dimensions(dmabuf, None).is_ok() && self.renderer.import_dmabuf(dmabuf, None).is_ok()
     }
 
+    /// The later native fence covers both rendering and readback in this
+    /// context.
     fn readback(
         &mut self,
         dmabuf: &Dmabuf,
-    ) -> Result<<GlesRenderer as ExportMem>::TextureMapping, SnapshotError> {
+        texture: &GlesTexture,
+    ) -> Result<GlesMapping, BackendError> {
         let size = dmabuf.size();
-        let texture = self
-            .renderer
-            .import_dmabuf(dmabuf, None)
-            .map_err(SnapshotError::safe)?;
-        if self.target.size() != size {
-            self.target = self
-                .renderer
-                .create_buffer(Fourcc::Abgr8888, size)
-                .map_err(SnapshotError::safe)?;
-        }
-        let mut framebuffer = self
-            .renderer
-            .bind(&mut self.target)
-            .map_err(SnapshotError::safe)?;
+        let mut framebuffer = self.renderer.bind(&mut self.target)?;
         let destination = Rectangle::from_size((size.w, size.h).into());
         let source = Rectangle::new(
             (
@@ -279,59 +265,86 @@ impl DmabufBackend {
                 .into(),
             (f64::from(size.w), f64::from(size.h)).into(),
         );
-        let (drawn, finished) = {
-            let mut frame = self
-                .renderer
-                .render(&mut framebuffer, (size.w, size.h).into(), Transform::Normal)
-                .map_err(SnapshotError::safe)?;
-            let drawn = Frame::render_texture_from_to(
+        {
+            let mut frame = self.renderer.render(
+                &mut framebuffer,
+                (size.w, size.h).into(),
+                Transform::Normal,
+            )?;
+            Frame::render_texture_from_to(
                 &mut frame,
-                &texture,
+                texture,
                 source,
                 destination,
                 &[destination],
                 &[destination],
                 Transform::Normal,
                 1.0,
-            );
-            (drawn, Frame::finish(frame))
-        };
-        let completion = match finished {
-            Ok(sync) => sync.wait().map_err(BackendError::from),
-            Err(error) => Err(BackendError::from(error)),
-        };
-        if let Err(error) = completion {
-            let display = self.renderer.egl_context().display().clone();
-            let drained = self
-                .renderer
-                .with_context(|_| EGLFence::create(&display)?.client_wait(None, true));
-            if !matches!(drained, Ok(Ok(true))) {
-                return Err(SnapshotError {
-                    source: error,
-                    release_safe: false,
-                });
-            }
-            return Err(SnapshotError::safe(error));
+            )?;
+            drop(Frame::finish(frame)?);
         }
-        drawn.map_err(SnapshotError::safe)?;
-        let mapping = self
-            .renderer
-            .copy_framebuffer(&framebuffer, Rectangle::from_size(size), Fourcc::Abgr8888)
-            .map_err(SnapshotError::safe)?;
-        drop(framebuffer);
-        Ok(mapping)
+        Ok(self.renderer.copy_framebuffer(
+            &framebuffer,
+            Rectangle::from_size(size),
+            Fourcc::Abgr8888,
+        )?)
     }
 
-    /// The caller gates implicit writer fences before this synchronous read.
-    /// An unsynchronized error must not be followed by a buffer release.
-    pub(super) fn snapshot(
+    fn native_fence(&mut self) -> Result<(EGLFence, OwnedFd), BackendError> {
+        let display = self.renderer.egl_context().display().clone();
+        Ok(self.renderer.with_context(|gl| {
+            let fence = EGLFence::create(&display)?;
+            // SAFETY: with_context makes this renderer's live EGL context
+            // current; Flush has no pointer arguments and does not
+            // alter tracked GL state.
+            unsafe {
+                gl.Flush();
+            }
+            let fd = fence.export()?;
+            Ok::<_, EglError>((fence, fd))
+        })??)
+    }
+
+    /// Submit rendering and PBO readback in one context, then fence both
+    /// operations.
+    pub(super) fn submit(
         &mut self,
         dmabuf: &Dmabuf,
         bound: Option<(u32, u32)>,
-        pixels: &mut Vec<u8>,
-    ) -> Result<Snapshot, SnapshotError> {
+    ) -> Result<Submission, SnapshotError> {
         let size = self.dimensions(dmabuf, bound)?;
-        let mapping = self.readback(dmabuf)?;
+        let texture = self
+            .renderer
+            .import_dmabuf(dmabuf, None)
+            .map_err(SnapshotError::safe)?;
+        if self.target.size() != dmabuf.size() {
+            self.target = self
+                .renderer
+                .create_buffer(Fourcc::Abgr8888, dmabuf.size())
+                .map_err(SnapshotError::safe)?;
+        }
+        let mapping = self.readback(dmabuf, &texture);
+        let (fence, fd) = self.native_fence().map_err(|source| SnapshotError {
+            source,
+            release_safe: false,
+        })?;
+        Ok(Submission {
+            fd,
+            readback: Readback {
+                mapping,
+                size,
+                force_opaque: matches!(dmabuf.format().code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888),
+                _texture: texture,
+                _target: self.target.clone(),
+                _fence: fence,
+            },
+        })
+    }
+
+    /// Map only after the submission's native fence has reported completion.
+    pub(super) fn complete(&mut self, readback: Readback) -> Result<Snapshot, SnapshotError> {
+        let size = readback.size;
+        let mapping = readback.mapping.map_err(SnapshotError::safe)?;
         let top_down = mapping.flipped();
         let bytes = self
             .renderer
@@ -342,7 +355,7 @@ impl DmabufBackend {
         if bytes.len() != needed {
             return Err(SnapshotError::safe(BackendError::ReadbackLength));
         }
-        Snapshot::resize_pixels(pixels, size);
+        let mut pixels = vec![0; needed];
         if top_down {
             pixels.copy_from_slice(bytes);
         } else {
@@ -353,10 +366,9 @@ impl DmabufBackend {
                 destination.copy_from_slice(source);
             }
         }
-        let force_opaque = matches!(dmabuf.format().code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888);
         let mut opaque = true;
         for pixel in pixels.as_chunks_mut::<4>().0 {
-            if force_opaque {
+            if readback.force_opaque {
                 pixel[3] = 255;
             } else {
                 opaque &= pixel[3] == 255;
@@ -365,7 +377,7 @@ impl DmabufBackend {
         Ok(Snapshot {
             width: size.width(),
             height: size.height(),
-            pixels: std::mem::take(pixels),
+            pixels,
             opaque,
         })
     }

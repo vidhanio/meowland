@@ -9,7 +9,9 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 use super::output::Output;
-use crate::clipboard::{ClipboardData, MAX_BYTES, MAX_TYPES, mime_types};
+use crate::clipboard::{
+    ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, TRANSFER_TIMEOUT, mime_types,
+};
 
 pub(super) enum Action {
     Offer {
@@ -83,8 +85,14 @@ enum Request {
         request: u64,
         offer: u64,
         mime: String,
+        deadline: Deadline,
     },
     Write(ClipboardData),
+}
+
+struct Queued {
+    request: Request,
+    deadline: Instant,
 }
 
 struct Operation {
@@ -100,7 +108,7 @@ pub(super) struct Clipboard {
     focused: bool,
     epoch: u64,
     next: u64,
-    requests: VecDeque<Request>,
+    requests: VecDeque<Queued>,
     active: Option<Operation>,
     notification: Option<Reading>,
     offers: HashMap<u64, Credentials>,
@@ -139,7 +147,7 @@ impl Clipboard {
             self.epoch += 1;
             self.notification = None;
             self.requests
-                .retain(|request| !matches!(request, Request::List { .. }));
+                .retain(|queued| !matches!(queued.request, Request::List { .. }));
         }
     }
 
@@ -154,12 +162,28 @@ impl Clipboard {
         true
     }
 
-    pub(super) fn read(&mut self, request: u64, offer: u64, mime: String) {
+    pub(super) fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
         self.enqueue(Request::Read {
             request,
             offer,
             mime,
+            deadline,
         });
+    }
+
+    pub(super) fn cancel(&mut self, request: u64) {
+        let matches = |candidate: &Request| matches!(candidate, Request::Read { request: number, .. } if *number == request);
+        self.requests.retain(|queued| !matches(&queued.request));
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|operation| matches(&operation.request))
+        {
+            self.active = None;
+        }
+        self.actions.retain(
+            |action| !matches!(action, Action::Reply { request: number, .. } if *number == request),
+        );
     }
 
     pub(super) fn copy(&mut self, data: ClipboardData, output: &mut Output) {
@@ -176,15 +200,27 @@ impl Clipboard {
     }
 
     fn enqueue(&mut self, request: Request) {
+        let timeout = match &request {
+            Request::List { .. } => Duration::from_secs(1),
+            Request::Read { deadline, .. } => deadline.remaining(),
+            Request::Write(_) => TRANSFER_TIMEOUT,
+        };
+        if !self.enabled || timeout.is_zero() {
+            self.failed(&request);
+            return;
+        }
+        if matches!(request, Request::Write(_)) {
+            self.requests
+                .retain(|queued| !matches!(queued.request, Request::Write(_)));
+        }
         if self.requests.len() >= 16 {
             tracing::warn!("Clipboard request queue is full");
             self.failed(&request);
         } else {
-            if matches!(request, Request::Write(_)) {
-                self.requests
-                    .retain(|request| !matches!(request, Request::Write(_)));
-            }
-            self.requests.push_back(request);
+            self.requests.push_back(Queued {
+                request,
+                deadline: Instant::now() + timeout,
+            });
         }
     }
 
@@ -192,20 +228,44 @@ impl Clipboard {
         self.actions.pop_front()
     }
 
-    pub(super) fn poll(&mut self, output: &mut Output) {
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.active
+            .as_ref()
+            .map(|operation| operation.deadline)
+            .into_iter()
+            .chain(self.requests.iter().map(|queued| queued.deadline))
+            .min()
+    }
+
+    fn expire(&mut self) {
+        let now = Instant::now();
         if self
             .active
             .as_ref()
-            .is_some_and(|active| Instant::now() >= active.deadline)
+            .is_some_and(|active| now >= active.deadline)
         {
             let operation = self.active.take().unwrap();
             tracing::warn!(id = operation.id, "Terminal clipboard request timed out");
             self.failed(&operation.request);
         }
+        let mut requests = std::mem::take(&mut self.requests);
+        requests.retain(|queued| {
+            if now < queued.deadline {
+                true
+            } else {
+                self.failed(&queued.request);
+                false
+            }
+        });
+        self.requests = requests;
+    }
+
+    pub(super) fn poll(&mut self, output: &mut Output) {
+        self.expire();
         if self.active.is_some() || output.pending() {
             return;
         }
-        while let Some(request) = self.requests.pop_front() {
+        while let Some(Queued { request, deadline }) = self.requests.pop_front() {
             self.next += 1;
             let id = format!("meowland-{}", self.next);
             let mut metadata = format!(
@@ -219,6 +279,7 @@ impl Clipboard {
                     request: number,
                     offer,
                     mime,
+                    ..
                 } => {
                     let Some(credentials) = self.offers.get_mut(offer) else {
                         self.actions.push_back(Action::Reply {
@@ -258,22 +319,18 @@ impl Clipboard {
                     packet(output, "type=wdata", b"");
                 }
             }
-            let timeout = if matches!(request, Request::List { .. }) {
-                1
-            } else {
-                60
-            };
             self.active = Some(Operation {
                 id,
                 request,
                 reading: Reading::new(),
-                deadline: Instant::now() + Duration::from_secs(timeout),
+                deadline,
             });
             break;
         }
     }
 
     pub(super) fn packet(&mut self, bytes: &[u8]) {
+        self.expire();
         let Some(packet) = Packet::parse(bytes) else {
             return;
         };

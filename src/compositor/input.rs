@@ -11,14 +11,14 @@ use smithay::{
 };
 
 use super::{
-    Input, State,
+    Input, Pane, PaneId, State, WindowId,
     render::{extents, popup_origin, viewport_of, window_geometry},
 };
 use crate::protocol::modifiers;
 
 const SCROLL_FACTOR: f64 = 0.5;
 
-pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
+pub(super) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     if matches!(event, Input::ResetKeyboard) {
         if state.keyboard_pane == Some(pane) {
             reset_keyboard(state);
@@ -28,14 +28,11 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
     if matches!(event, Input::Key { pressed: false, .. }) && state.keyboard_pane != Some(pane) {
         return;
     }
-    let Some(window) = state.panes.get(&pane).map(|pane| pane.window) else {
+    let Some(window) = state.attachments.panes.get(&pane).and_then(Pane::window) else {
         return;
     };
-    if window == 0 {
-        return;
-    }
     state.cursor_pane = Some(pane);
-    if state.deciding.insert(window, pane) != Some(pane) {
+    if state.attachments.decide(window, pane) {
         state.apply_window_state(window);
     }
     match *event {
@@ -85,7 +82,7 @@ pub(super) fn pane_input(state: &mut State, pane: u64, event: &Input) {
 
 fn pointer_input(
     state: &mut State,
-    window: u64,
+    window: WindowId,
     position: (f64, f64),
     button: Option<u8>,
     pressed: bool,
@@ -148,7 +145,7 @@ fn pointer_input(
 }
 
 /// Popup grabs dismiss on a press outside all popup surfaces.
-fn point_in_popups(state: &State, window: u64, x: f64, y: f64) -> bool {
+fn point_in_popups(state: &State, window: WindowId, x: f64, y: f64) -> bool {
     let Some(root) = state
         .windows
         .get(&window)
@@ -170,7 +167,7 @@ fn point_in_popups(state: &State, window: u64, x: f64, y: f64) -> bool {
     })
 }
 
-fn dismiss_popups(state: &mut State, window: u64) {
+fn dismiss_popups(state: &mut State, window: WindowId) {
     let Some(root) = state
         .windows
         .get(&window)
@@ -193,7 +190,7 @@ fn dismiss_popups(state: &mut State, window: u64) {
     state.touch(window);
 }
 
-fn enter_keyboard(state: &mut State, pane: u64, window: u64, keys: &[u16], bits: u8) {
+fn enter_keyboard(state: &mut State, pane: PaneId, window: WindowId, keys: &[u16], bits: u8) {
     reset_keyboard(state);
     state.focus_window(window);
     if let Some(keyboard) = state.keyboard.take() {
@@ -212,7 +209,7 @@ fn enter_keyboard(state: &mut State, pane: u64, window: u64, keys: &[u16], bits:
     state.keyboard_known = true;
 }
 
-fn activate_keyboard(state: &mut State, pane: u64, window: u64) {
+fn activate_keyboard(state: &mut State, pane: PaneId, window: WindowId) {
     let changed = state.keyboard_pane != Some(pane);
     if changed {
         reset_keyboard(state);
@@ -300,13 +297,8 @@ fn forward(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, press
 
 /// A terminal paste action has no physical key event. Its explicit shortcut
 /// leaves the real held-key set and modifier state unchanged.
-pub(super) fn paste_action(state: &mut State, pane: u64) {
-    let Some(window) = state
-        .panes
-        .get(&pane)
-        .map(|pane| pane.window)
-        .filter(|window| *window != 0)
-    else {
+pub(super) fn paste_action(state: &mut State, pane: PaneId) {
+    let Some(window) = state.attachments.panes.get(&pane).and_then(Pane::window) else {
         return;
     };
     activate_keyboard(state, pane, window);

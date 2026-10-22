@@ -18,10 +18,10 @@ use rustix::{
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
 use crate::{
-    Error, Result,
+    Result,
     clipboard::MAX_TEXT,
     kitty::{Presenter, SharedMemory},
-    protocol::{self, Hello, Input, PaneToServer, ServerToPane, Show},
+    protocol::{self, Input, PaneToServer, Show},
     signals,
 };
 
@@ -29,6 +29,7 @@ mod clipboard;
 mod input;
 mod keyboard;
 mod output;
+mod session;
 
 use clipboard::{Action as ClipboardAction, Clipboard};
 use input::Event;
@@ -338,199 +339,18 @@ impl PaneStats {
 /// Attach this terminal to a pane until release or disconnection.
 ///
 /// This invocation exclusively owns terminal input and raw mode. Do not read
-/// stdin concurrently; its descriptor is temporarily replaced for nonblocking
-/// event parsing and restored when attachment ends.
+/// stdin concurrently; a separate nonblocking descriptor reads the same
+/// terminal.
 ///
 /// # Errors
 /// Fails if the terminal cannot be configured or probed, or the pane
 /// connection fails. Server-initiated release restores the terminal and
 /// returns `Ok`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "terminal setup and the readiness-driven pane event loop"
-)]
 pub fn attach(socket: &Path, show: Show) -> Result<()> {
-    let stream = UnixStream::connect(socket).map_err(|error| {
-        Error::io(
-            format!(
-                "could not reach the pane socket {} (is the server running?)",
-                socket.display()
-            ),
-            error,
-        )
-    })?;
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let interrupted = signals::termination_flag()?;
-    let mut mode = TerminalGuard::enter()?;
-    let (probe, shared) = terminal_probe(&interrupted)?;
-    if interrupted.interrupted() {
-        mode.restore()?;
-        return Ok(());
+    if let Some(session) = session::TerminalSession::connect(socket, show)? {
+        session.run()?;
     }
-    if !probe.graphics {
-        return Err(Error::GraphicsUnsupported);
-    }
-    let mut input = input::Reader::new()?;
-    if !probe.sgr_pixels {
-        return Err(Error::PixelMouseUnsupported);
-    }
-    if probe
-        .keyboard_flags
-        .is_none_or(|flags| !flags.contains(KEYBOARD_FLAGS))
-    {
-        return Err(Error::KeyboardUnsupported);
-    }
-    mode.enable_mouse()?;
-    if let Some(previous) = probe.clipboard {
-        mode.enable_clipboard(previous)?;
-    }
-    let mut cell = probe.cell_width.zip(probe.cell_height);
-    let (width, height) = pane_pixels(
-        probe.pixel_width.zip(probe.pixel_height),
-        window_pixels(),
-        (cols, rows),
-        cell.unwrap_or(FALLBACK_CELL),
-    );
-    let hello = Hello {
-        width,
-        height,
-        show,
-    };
-
-    let mut tx = stream.try_clone()?;
-    protocol::send(&mut tx, &PaneToServer::Hello(hello))?;
-    let mut clipboard = Clipboard::new(probe.clipboard.is_some())?;
-    let mut keyboard = Keyboard::default();
-    let mut presentation = PanePresentation::new(cell, shared);
-    PaneStats::capabilities(&probe, width, height);
-
-    let handshake_deadline = Instant::now() + Duration::from_secs(1);
-    let mut handshake_done = false;
-    let mut reader = protocol::MessageReader::default();
-    let mut stdout = output::open()?;
-    loop {
-        if interrupted.interrupted() {
-            mode.restore()?;
-            return Ok(());
-        }
-        if !handshake_done && Instant::now() >= handshake_deadline {
-            return Err(Error::PaneHandshakeTimeout);
-        }
-        if keyboard.deferred_expired() {
-            send_deferred(&mut keyboard, &mut tx)?;
-        }
-        clipboard.poll(&mut presentation.pending);
-        send_clipboard_actions(&mut clipboard, &mut keyboard, &mut tx)?;
-        let receiving = !presentation.pending.pending();
-        let mut fds = [
-            PollFd::new(&input.fd, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
-            PollFd::new(
-                &stdout,
-                PollFlags::HUP
-                    | PollFlags::ERR
-                    | if presentation.pending.pending() {
-                        PollFlags::OUT
-                    } else {
-                        PollFlags::empty()
-                    },
-            ),
-            PollFd::new(&stream, PollFlags::IN | PollFlags::HUP | PollFlags::ERR),
-        ];
-        let mut wait = Duration::from_millis(100);
-        if !handshake_done {
-            wait = wait.min(handshake_deadline.saturating_duration_since(Instant::now()));
-        }
-        if input.pending() {
-            wait = Duration::ZERO;
-        }
-        let timeout = Timespec {
-            tv_sec: wait.as_secs() as i64,
-            tv_nsec: wait.subsec_nanos().into(),
-        };
-        let watched = if receiving {
-            &mut fds[..]
-        } else {
-            &mut fds[..2]
-        };
-        match poll(watched, Some(&timeout)) {
-            Err(Errno::INTR) => continue,
-            Err(error) => return Err(io::Error::from(error).into()),
-            Ok(_) => {}
-        }
-        if interrupted.interrupted() {
-            continue;
-        }
-        if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR)
-            || fds[1].revents().intersects(PollFlags::HUP | PollFlags::ERR)
-        {
-            return Ok(());
-        }
-        let writable = fds[1].revents().contains(PollFlags::OUT);
-        let input_ready = fds[0].revents().contains(PollFlags::IN);
-        let server_ready = receiving
-            && fds[2]
-                .revents()
-                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR);
-        if server_ready {
-            let Ok(message) = reader.try_recv::<ServerToPane>(&stream) else {
-                mode.restore_with_message("server disconnected")?;
-                return Ok(());
-            };
-            if let Some(message) = message {
-                match message {
-                    ServerToPane::HelloOk => {
-                        handshake_done = true;
-                        clipboard.refresh(false);
-                    }
-                    ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
-                        mode.restore_with_message(&reason)?;
-                        return Ok(());
-                    }
-                    ServerToPane::ClipboardWrite(data) => {
-                        clipboard.copy(data, &mut presentation.pending);
-                    }
-                    ServerToPane::ClipboardRead {
-                        request,
-                        offer,
-                        mime,
-                    } => clipboard.read(request, offer, mime),
-                    ServerToPane::Title(title) => presentation.pending.append(&title_bytes(&title)),
-                    ServerToPane::Cursor(shape) => {
-                        presentation.pending.append(&cursor_bytes(shape.as_deref()));
-                    }
-                    ServerToPane::Frame {
-                        width,
-                        height,
-                        y,
-                        rgb,
-                    } => presentation.draw(width, height, y, rgb, &mut tx)?,
-                }
-            }
-        }
-        if writable {
-            presentation.drain(&mut stdout, &mut tx)?;
-        }
-        if input_ready {
-            input.read_ready()?;
-        }
-        for _ in 0..64 {
-            if interrupted.interrupted() {
-                break;
-            }
-            let Some(event) = input.next() else {
-                break;
-            };
-            send_event(
-                event,
-                &mut tx,
-                &mut presentation.presenter,
-                &mut cell,
-                &mut clipboard,
-                &mut keyboard,
-            )?;
-            send_clipboard_actions(&mut clipboard, &mut keyboard, &mut tx)?;
-        }
-    }
+    Ok(())
 }
 
 /// Own terminal-side presentation buffers together with their accounting.

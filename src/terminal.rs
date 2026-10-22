@@ -340,17 +340,16 @@ impl PaneStats {
 ///
 /// This invocation exclusively owns terminal input and raw mode. Do not read
 /// stdin concurrently; a separate nonblocking descriptor reads the same
-/// terminal.
+/// terminal. Terminal modes and capability probing begin only when the server
+/// supplies the selected window's first frame; waiting leaves the normal screen
+/// and terminal signal handling intact.
 ///
 /// # Errors
 /// Fails if the terminal cannot be configured or probed, or the pane
 /// connection fails. Server-initiated release restores the terminal and
 /// returns `Ok`.
 pub fn attach(socket: &Path, show: Show) -> Result<()> {
-    if let Some(session) = session::TerminalSession::connect(socket, show)? {
-        session.run()?;
-    }
-    Ok(())
+    session::TerminalSession::connect(socket, show)?.run()
 }
 
 /// Own terminal-side presentation buffers together with their accounting.
@@ -650,12 +649,6 @@ impl TerminalGuard {
         self.clipboard = Some(previous);
         io::stdout().write_all(b"\x1b[?5522h")?;
         io::stdout().flush()
-    }
-
-    fn restore_with_message(&mut self, reason: &str) -> io::Result<()> {
-        let clean = protocol::sanitize_with_limit(reason, 512);
-        self.restore()?;
-        writeln!(io::stdout(), "meowland: {clean}")
     }
 
     /// Attempt every restoration step even if an earlier one fails; a shell

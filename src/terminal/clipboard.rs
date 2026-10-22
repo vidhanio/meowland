@@ -106,6 +106,7 @@ pub(super) struct Clipboard {
     enabled: bool,
     password: String,
     focused: bool,
+    /// Explicit pastes supersede MIME refreshes issued before them.
     epoch: u64,
     next: u64,
     requests: VecDeque<Queued>,
@@ -342,7 +343,9 @@ impl Clipboard {
                 match reading.accept(&packet, ".", MAX_TYPES * 257) {
                     Some(true) => {
                         let reading = self.notification.take().unwrap();
+                        self.epoch += 1;
                         self.offer(reading, true);
+                        self.actions.push_back(Action::Unblock);
                     }
                     Some(false) => {}
                     None => {

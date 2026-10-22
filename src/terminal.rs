@@ -447,20 +447,22 @@ fn send_event(
                 if pressed && keyboard::binding(code, modifiers) {
                     keyboard.intercept(code);
                 }
-                let defer = keyboard.deferred()
-                    || (pressed
-                        && keyboard::paste(code, modifiers)
-                        && clipboard.enabled()
-                        && clipboard.refresh(true));
+                let defer = keyboard.deadline().or_else(|| {
+                    if pressed && keyboard::paste(code, modifiers) {
+                        clipboard.refresh(true)
+                    } else {
+                        None
+                    }
+                });
                 send_input(input, defer, keyboard, tx)?;
             }
         }
         Event::Focus(focused) => {
-            clipboard.focus(focused);
+            let pending_paste = clipboard.focus(focused);
             if focused {
-                send_input(keyboard.enter(), keyboard.deferred(), keyboard, tx)?;
+                send_input(keyboard.enter(), keyboard.deadline(), keyboard, tx)?;
             } else {
-                keyboard.reset();
+                keyboard.reset(pending_paste);
                 protocol::send(tx, &PaneToServer::Input(Input::ResetKeyboard))?;
             }
         }
@@ -473,24 +475,26 @@ fn send_event(
                 pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
             protocol::send(tx, &PaneToServer::Resize { width, height })?;
         }
-        Event::Pointer(input) => send_input(input, keyboard.deferred(), keyboard, tx)?,
+        Event::Pointer(input) => send_input(input, keyboard.deadline(), keyboard, tx)?,
         Event::Paste(text) => {
+            clipboard.cancel_refresh();
             send_deferred(keyboard, tx)?;
             send_paste(tx, text)?;
         }
         Event::Clipboard(bytes) => clipboard.packet(&bytes),
+        Event::ClipboardText(bytes) => clipboard.text(&bytes),
     }
     Ok(())
 }
 
 fn send_input(
     input: Input,
-    defer: bool,
+    defer: Option<Instant>,
     keyboard: &mut Keyboard,
     tx: &mut UnixStream,
 ) -> Result<()> {
-    if defer {
-        keyboard.defer(input);
+    if let Some(deadline) = defer {
+        keyboard.defer(input, deadline);
         if keyboard.deferred_len() >= 256 {
             tracing::warn!("Clipboard refresh deferred too much input; forwarding original events");
             send_deferred(keyboard, tx)?;

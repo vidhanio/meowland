@@ -19,7 +19,7 @@ use vtparse::{CsiParam, VTActor, VTParser};
 
 use crate::{clipboard::MAX_TEXT, protocol::Input};
 
-const MAX_CONTROL: usize = 64 * 1024;
+const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +43,7 @@ pub(super) enum Event {
     Resize,
     Paste(String),
     Clipboard(Vec<u8>),
+    ClipboardText(Vec<u8>),
 }
 
 pub(super) struct Reader {
@@ -173,6 +174,9 @@ impl VTActor for Decoder {
                 packet.extend_from_slice(payload);
             }
             self.events.push_back(Event::Clipboard(packet));
+        } else if let [b"52", b"c" | b"", payload] = params {
+            self.events
+                .push_back(Event::ClipboardText(payload.to_vec()));
         }
     }
 

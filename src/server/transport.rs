@@ -2,6 +2,7 @@
 //! transport threads only decode/encode messages and report arrivals.
 
 use std::{
+    collections::HashMap,
     fs, io,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -17,9 +18,17 @@ use std::{
     time::Duration,
 };
 
-use super::{Incoming, Paths, Reply};
+use calloop::{
+    EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken, channel,
+    generic::Generic,
+    timer::{TimeoutAction, Timer},
+};
+
+use super::{Incoming, IncomingSender, Paths, Reply};
 use crate::{
     Error, Result,
+    compositor::PaneId,
+    pixels::FrameSize,
     protocol::{self, ControlRequest, PaneToServer, ServerToPane},
 };
 
@@ -178,11 +187,17 @@ pub(super) struct AcceptLoop {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl Drop for AcceptLoop {
-    fn drop(&mut self) {
+impl AcceptLoop {
+    pub(super) fn stop_accepting(&mut self) {
         self.stopping.store(true, Ordering::Relaxed);
         let _ = self.wake.shutdown(std::net::Shutdown::Both);
         self.path.take();
+    }
+}
+
+impl Drop for AcceptLoop {
+    fn drop(&mut self) {
+        self.stop_accepting();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -192,6 +207,9 @@ impl Drop for AcceptLoop {
 #[derive(Debug)]
 struct ConnectionThread {
     socket: UnixStream,
+    /// Cancellation authority, relinquished before handing a pane to the
+    /// server.
+    owned: Arc<AtomicBool>,
     thread: thread::JoinHandle<()>,
 }
 
@@ -207,8 +225,8 @@ fn transient_accept(error: &io::Error) -> bool {
         .any(|candidate| Some(candidate.raw_os_error()) == error.raw_os_error())
 }
 
-pub(super) fn accept_control(socket: BoundSocket, incoming: Sender<Incoming>) -> AcceptLoop {
-    accept_connections(socket, incoming, "control", |mut socket, incoming| {
+pub(super) fn accept_control(socket: BoundSocket, incoming: IncomingSender) -> AcceptLoop {
+    accept_connections(socket, incoming, "control", |mut socket, incoming, _| {
         let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
         if let Ok(request) = protocol::recv::<ControlRequest>(&mut socket) {
@@ -228,14 +246,23 @@ pub(super) fn accept_control(socket: BoundSocket, incoming: Sender<Incoming>) ->
     })
 }
 
-pub(super) fn accept_panes(socket: BoundSocket, incoming: Sender<Incoming>) -> AcceptLoop {
-    accept_connections(socket, incoming, "pane", |mut socket, incoming| {
+pub(super) fn accept_panes(socket: BoundSocket, incoming: IncomingSender) -> AcceptLoop {
+    accept_connections(socket, incoming, "pane", |mut socket, incoming, owned| {
         let _ = socket.set_read_timeout(Some(HELLO_TIMEOUT));
         let _ = socket.set_write_timeout(Some(HANDSHAKE_WRITE_TIMEOUT));
         match protocol::recv::<PaneToServer>(&mut socket) {
             Ok(PaneToServer::Hello(hello)) => {
+                if FrameSize::new(hello.width, hello.height).is_none() {
+                    let _ = protocol::send(
+                        &mut socket,
+                        &ServerToPane::Reject("invalid pane dimensions".into()),
+                    );
+                    return;
+                }
                 let _ = socket.set_read_timeout(None);
-                let _ = incoming.send(Incoming::Pane(hello, socket));
+                if owned.swap(false, Ordering::AcqRel) {
+                    let _ = incoming.send(Incoming::Pane(hello, socket));
+                }
             }
             Ok(other) => {
                 tracing::warn!(?other, "pane: first message was not a hello");
@@ -257,12 +284,12 @@ pub(super) fn accept_panes(socket: BoundSocket, incoming: Sender<Incoming>) -> A
 
 fn accept_connections<F>(
     socket: BoundSocket,
-    incoming: Sender<Incoming>,
+    incoming: IncomingSender,
     label: &'static str,
     handle: F,
 ) -> AcceptLoop
 where
-    F: Fn(UnixStream, Sender<Incoming>) + Copy + Send + 'static,
+    F: Fn(UnixStream, IncomingSender, &AtomicBool) + Copy + Send + 'static,
 {
     let BoundSocket {
         listener,
@@ -272,72 +299,8 @@ where
     let stopping = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&stopping);
     let thread = thread::spawn(move || {
-        let mut workers: Vec<ConnectionThread> = Vec::new();
-        while !stop.load(Ordering::Relaxed) {
-            let mut index = 0;
-            while index < workers.len() {
-                if workers[index].thread.is_finished() {
-                    let worker = workers.swap_remove(index);
-                    let _ = worker.thread.join();
-                } else {
-                    index += 1;
-                }
-            }
-            let mut fds = [
-                rustix::event::PollFd::new(&listener, rustix::event::PollFlags::IN),
-                rustix::event::PollFd::new(&cancel, rustix::event::PollFlags::IN),
-            ];
-            match rustix::event::poll(
-                &mut fds,
-                Some(&rustix::event::Timespec {
-                    tv_sec: 1,
-                    tv_nsec: 0,
-                }),
-            ) {
-                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(%error, label, "accept readiness stopped");
-                    break;
-                }
-            }
-            if stop.load(Ordering::Relaxed) || !fds[1].revents().is_empty() {
-                break;
-            }
-            match listener.accept() {
-                Ok((socket, _)) => {
-                    let cancellation = match socket.try_clone() {
-                        Ok(cancellation) => cancellation,
-                        Err(error) => {
-                            tracing::warn!(%error, label, "cannot own accepted connection");
-                            continue;
-                        }
-                    };
-                    let incoming = incoming.clone();
-                    workers.push(ConnectionThread {
-                        socket: cancellation,
-                        thread: thread::spawn(move || handle(socket, incoming)),
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) if transient_accept(&error) => {
-                    tracing::warn!(%error, label, "accept failed; retrying");
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    tracing::error!(%error, label, "accept stopped");
-                    break;
-                }
-            }
-        }
-        drop(listener);
-        for worker in &workers {
-            if !worker.thread.is_finished() {
-                let _ = worker.socket.shutdown(std::net::Shutdown::Both);
-            }
-        }
-        for worker in workers {
-            let _ = worker.thread.join();
+        if let Err(error) = run_acceptor(listener, cancel, incoming, stop, handle) {
+            tracing::error!(%error, label, "accept readiness stopped");
         }
     });
     AcceptLoop {
@@ -346,6 +309,152 @@ where
         wake,
         thread: Some(thread),
     }
+}
+
+struct Acceptor {
+    incoming: IncomingSender,
+    completed: channel::Sender<u64>,
+    workers: HashMap<u64, ConnectionThread>,
+    next: u64,
+    running: bool,
+    handle: LoopHandle<'static, Self>,
+    listener: Option<RegistrationToken>,
+}
+
+impl Acceptor {
+    fn spawn<F>(&mut self, socket: UnixStream, handle: F) -> io::Result<()>
+    where
+        F: Fn(UnixStream, IncomingSender, &AtomicBool) + Send + 'static,
+    {
+        let cancellation = socket.try_clone()?;
+        let incoming = self.incoming.clone();
+        let completed = self.completed.clone();
+        let id = self.next;
+        self.next += 1;
+        let owned = Arc::new(AtomicBool::new(true));
+        let ownership = Arc::clone(&owned);
+        let thread = thread::Builder::new().spawn(move || {
+            handle(socket, incoming, &ownership);
+            ownership.store(false, Ordering::Release);
+            let _ = completed.send(id);
+        })?;
+        self.workers.insert(
+            id,
+            ConnectionThread {
+                socket: cancellation,
+                owned,
+                thread,
+            },
+        );
+        Ok(())
+    }
+
+    fn retry(&self) -> io::Result<()> {
+        let handle = self.handle.clone();
+        let listener = self.listener;
+        self.handle
+            .insert_source(
+                Timer::from_duration(Duration::from_millis(50)),
+                move |_, (), acceptor| {
+                    if let Some(listener) = listener
+                        && let Err(error) = handle.enable(&listener)
+                    {
+                        tracing::error!(%error, "cannot resume listener");
+                        acceptor.running = false;
+                    }
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    }
+}
+
+impl Drop for Acceptor {
+    fn drop(&mut self) {
+        for worker in self.workers.values() {
+            if worker.owned.swap(false, Ordering::AcqRel) {
+                let _ = worker.socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        for (_, worker) in self.workers.drain() {
+            let _ = worker.thread.join();
+        }
+    }
+}
+
+fn run_acceptor<F>(
+    listener: UnixListener,
+    cancel: UnixStream,
+    incoming: IncomingSender,
+    stop: Arc<AtomicBool>,
+    handle: F,
+) -> io::Result<()>
+where
+    F: Fn(UnixStream, IncomingSender, &AtomicBool) + Copy + Send + 'static,
+{
+    let mut event_loop = EventLoop::<Acceptor>::try_new().map_err(io::Error::other)?;
+    let loop_handle = event_loop.handle();
+    let (completed, completions) = channel::channel();
+    loop_handle
+        .insert_source(completions, |event, (), acceptor| {
+            if let channel::Event::Msg(id) = event
+                && let Some(worker) = acceptor.workers.remove(&id)
+            {
+                let _ = worker.thread.join();
+            }
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    loop_handle
+        .insert_source(
+            Generic::new(cancel, Interest::READ, Mode::Level),
+            |_, _, acceptor| {
+                acceptor.running = false;
+                Ok(PostAction::Remove)
+            },
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let listener = loop_handle
+        .insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            move |_, listener, acceptor| {
+                if stop.load(Ordering::Relaxed) {
+                    acceptor.running = false;
+                    return Ok(PostAction::Remove);
+                }
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        if let Err(error) = acceptor.spawn(socket, handle) {
+                            tracing::warn!(%error, "cannot own accepted connection");
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) if transient_accept(&error) => {
+                        tracing::warn!(%error, "accept failed; retrying");
+                        acceptor.retry()?;
+                        return Ok(PostAction::Disable);
+                    }
+                    Err(error) => return Err(error),
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut acceptor = Acceptor {
+        incoming,
+        completed,
+        workers: HashMap::new(),
+        next: 1,
+        running: true,
+        handle: loop_handle,
+        listener: Some(listener),
+    };
+    while acceptor.running {
+        event_loop
+            .dispatch(None, &mut acceptor)
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
 }
 
 /// Both halves of an established pane remain owned until they have stopped.
@@ -359,14 +468,18 @@ pub(super) struct Pane {
 
 impl Pane {
     pub(super) fn start(
-        id: u64,
+        id: PaneId,
         socket: UnixStream,
         writer: UnixStream,
-        incoming: Sender<Incoming>,
+        incoming: IncomingSender,
     ) -> io::Result<Self> {
         let cancellation = socket.try_clone()?;
         let (sender, receiver) = mpsc::channel();
-        let writer = thread::spawn(move || pane_writer(writer, receiver));
+        let completed = incoming.clone();
+        let writer = thread::spawn(move || {
+            pane_writer(writer, receiver);
+            let _ = completed.send(Incoming::PaneWriterDone(id));
+        });
         let reader = thread::spawn(move || {
             let mut socket = socket;
             while let Ok(message) = protocol::recv::<PaneToServer>(&mut socket) {
@@ -396,12 +509,6 @@ impl Pane {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(ServerToPane::Release(reason));
         }
-    }
-
-    pub(super) fn finished(&self) -> bool {
-        self.writer
-            .as_ref()
-            .is_none_or(thread::JoinHandle::is_finished)
     }
 }
 

@@ -1,27 +1,35 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, io,
+    env,
+    ffi::OsString,
+    io,
     os::unix::net::UnixStream,
     path::PathBuf,
     process::Child,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Sender},
+        mpsc::Sender,
     },
-    thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use calloop::{
+    EventLoop, LoopHandle, PostAction, RegistrationToken, channel,
+    generic::Generic,
+    timer::{TimeoutAction, Timer},
+};
+mod lifecycle;
 mod process;
 mod transport;
 
-use process::{launch_client, terminate_tree};
-use transport::{Pane, accept_control, accept_panes, listeners};
+use lifecycle::Shutdown;
+use process::{Termination, launch_client};
+use transport::{AcceptLoop, Pane, accept_control, accept_panes, listeners};
 
 use crate::{
     Error, Result,
-    compositor::{self, Command as CompositorCommand, Event as CompositorEvent},
+    compositor::{self, Command as CompositorCommand, Event as CompositorEvent, PaneId},
     pixels::FrameSize,
     protocol::{
         self, ControlRequest, ControlResponse, Hello, KEY_Q, KEY_W, PaneToServer, ServerToPane,
@@ -29,6 +37,10 @@ use crate::{
     },
     signals,
 };
+
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+
+type IncomingSender = channel::Sender<Incoming>;
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -58,13 +70,11 @@ impl Paths {
 enum Incoming {
     Control(ControlRequest, Reply),
     Pane(Hello, UnixStream),
-    PaneMessage(u64, PaneToServer),
-    PaneGone(u64),
-    Compositor(CompositorEvent),
-    CompositorGone,
+    PaneMessage(PaneId, PaneToServer),
+    PaneGone(PaneId),
+    PaneWriterDone(PaneId),
 }
 
-/// Timed-out clients must not have their queued requests executed.
 struct Reply {
     sender: Sender<ControlResponse>,
     waiting: Arc<AtomicBool>,
@@ -80,101 +90,156 @@ impl Reply {
     }
 }
 
+struct Launch {
+    args: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
+    cwd: PathBuf,
+}
+
+enum Operation {
+    Launch(Launch),
+    Close,
+}
+
+struct PendingControl {
+    operation: Operation,
+    reply: Reply,
+    deadline: Instant,
+    timer: RegistrationToken,
+}
+
 struct Server {
-    incoming: Sender<Incoming>,
-    commands: calloop::channel::Sender<CompositorCommand>,
+    incoming: IncomingSender,
+    handle: LoopHandle<'static, Self>,
+    commands: channel::Sender<CompositorCommand>,
     display: String,
-    panes: HashMap<u64, Pane>,
-    releasing_panes: Vec<Pane>,
+    panes: HashMap<PaneId, Pane>,
+    releasing_panes: HashMap<PaneId, Pane>,
     windows: HashMap<u64, WindowInfo>,
     children: Vec<Child>,
     child_groups: HashSet<u32>,
+    pending: HashMap<u64, PendingControl>,
+    next_request: u64,
     next_pane: u64,
+    listeners: Option<(AcceptLoop, AcceptLoop)>,
+    shutdown: Shutdown,
+    compositor_alive: bool,
+    compositor_failed: bool,
+    interrupted: signals::TerminationFlag,
 }
 
-/// Run until a stop request or termination signal.
+/// Run the server using readiness sources and explicit operation deadlines.
 ///
 /// # Errors
-/// Fails if startup cannot bind sockets, launch the compositor, or install
-/// signal handlers.
+/// Fails if startup or event dispatch cannot complete, or the compositor exits
+/// unexpectedly.
 pub fn serve(paths: &Paths) -> Result<()> {
     let (control, pane) = listeners(paths)?;
     let interrupted = signals::server_termination_flag()?;
+    let wakeup = signals::Wakeup::new(&[
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGCHLD,
+    ])?;
+    let mut event_loop = EventLoop::<Server>::try_new().map_err(io::Error::other)?;
+    let handle = event_loop.handle();
+    handle
+        .insert_source(
+            Generic::new(wakeup, calloop::Interest::READ, calloop::Mode::Level),
+            |_, source, server| {
+                source.drain();
+                server.reap_children();
+                if server.interrupted.interrupted() {
+                    server.begin_shutdown();
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
     let (commands, events, display, compositor_thread) = compositor::spawn()?;
-    let (incoming, incoming_rx) = mpsc::channel();
-    let control = accept_control(control, incoming.clone());
-    let pane = accept_panes(pane, incoming.clone());
-    let compositor_events = thread::spawn({
-        let incoming = incoming.clone();
-        move || {
-            for event in events {
-                if incoming.send(Incoming::Compositor(event)).is_err() {
-                    return;
-                }
-            }
-            let _ = incoming.send(Incoming::CompositorGone);
-        }
-    });
+    let (incoming, incoming_rx) = channel::channel();
+    let setup = register_channels(&handle, incoming_rx, events);
+    if let Err(error) = setup {
+        let _ = commands.send(CompositorCommand::Shutdown);
+        let _ = compositor_thread.join();
+        return Err(error.into());
+    }
+    let listeners = (
+        accept_control(control, incoming.clone()),
+        accept_panes(pane, incoming.clone()),
+    );
     let mut server = Server {
         incoming,
+        handle,
         commands,
         display,
         panes: HashMap::new(),
-        releasing_panes: Vec::new(),
+        releasing_panes: HashMap::new(),
         windows: HashMap::new(),
         children: Vec::new(),
         child_groups: HashSet::new(),
+        pending: HashMap::new(),
+        next_request: 1,
         next_pane: 1,
+        listeners: Some(listeners),
+        shutdown: Shutdown::Running,
+        compositor_alive: true,
+        compositor_failed: false,
+        interrupted,
     };
-
     notify(&[
         sd_notify::NotifyState::Ready,
         sd_notify::NotifyState::Status("Accepting control and pane connections"),
     ]);
-    let mut compositor_failed = false;
-    while !interrupted.interrupted() {
-        match incoming_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Incoming::Control(request, reply)) => {
-                if reply.waiting() {
-                    let response = server.control(request);
-                    reply.send(response);
-                }
-            }
-            Ok(Incoming::Pane(hello, socket)) => server.attach_pane(hello, socket),
-            Ok(Incoming::PaneMessage(id, message)) => server.pane_message(id, message),
-            Ok(Incoming::PaneGone(id)) => server.pane_gone(id),
-            Ok(Incoming::Compositor(event)) => server.compositor_event(event),
-            Ok(Incoming::CompositorGone) => {
-                compositor_failed = true;
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        if compositor_thread.is_finished() {
-            compositor_failed = true;
-            break;
-        }
-        server.reap_children();
-        server.releasing_panes.retain(|pane| !pane.finished());
+    if server.interrupted.interrupted() {
+        server.begin_shutdown();
     }
-
-    notify(&[
-        sd_notify::NotifyState::Stopping,
-        sd_notify::NotifyState::Status("Shutting down compositor and clients"),
-    ]);
-    drop(incoming_rx);
-    drop(control);
-    drop(pane);
-    server.shutdown(compositor_thread);
-    let _ = compositor_events.join();
-    if compositor_failed {
+    let result = loop {
+        if server.shutdown.stopped() {
+            break Ok(());
+        }
+        if let Err(error) = event_loop.dispatch(None, &mut server) {
+            break Err(io::Error::other(error));
+        }
+    };
+    if result.is_err() {
+        server.begin_shutdown();
+        server.force_shutdown();
+    }
+    server.listeners.take();
+    server.panes.clear();
+    server.releasing_panes.clear();
+    let _ = compositor_thread.join();
+    server.reap_children();
+    result?;
+    if server.compositor_failed {
         return Err(Error::io(
             "compositor thread stopped unexpectedly",
             io::Error::other("display unavailable"),
         ));
     }
+    Ok(())
+}
+
+fn register_channels(
+    handle: &LoopHandle<'static, Server>,
+    incoming: channel::Channel<Incoming>,
+    events: channel::Channel<CompositorEvent>,
+) -> io::Result<()> {
+    handle
+        .insert_source(incoming, |event, (), server| {
+            if let channel::Event::Msg(message) = event {
+                server.incoming(message);
+            }
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    handle
+        .insert_source(events, |event, (), server| match event {
+            channel::Event::Msg(event) => server.compositor_event(event),
+            channel::Event::Closed => server.compositor_gone(),
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
 
@@ -185,13 +250,55 @@ fn notify(state: &[sd_notify::NotifyState<'_>]) {
 }
 
 impl Server {
+    fn incoming(&mut self, message: Incoming) {
+        match message {
+            Incoming::Control(request, reply) => {
+                if !reply.waiting() {
+                    return;
+                }
+                if self.shutdown.running() {
+                    self.control(request, reply);
+                } else {
+                    reply.send(ControlResponse::Error("server stopping".into()));
+                }
+            }
+            Incoming::Pane(hello, socket) => {
+                if self.shutdown.running() {
+                    self.attach_pane(hello, socket);
+                }
+            }
+            Incoming::PaneMessage(id, message) => {
+                if self.panes.contains_key(&id) && self.shutdown.running() {
+                    self.pane_message(id, message);
+                }
+            }
+            Incoming::PaneGone(id) => self.pane_gone(id),
+            Incoming::PaneWriterDone(id) => {
+                self.releasing_panes.remove(&id);
+                if self.panes.remove(&id).is_some() {
+                    let _ = self.commands.send(CompositorCommand::Detach { pane: id });
+                }
+            }
+        }
+    }
+
     fn compositor_event(&mut self, event: CompositorEvent) {
         match event {
+            CompositorEvent::ActivationCreated { request, token } => {
+                self.activation_created(request, token);
+            }
+            CompositorEvent::CloseRequested { request, result } => {
+                if let Some(pending) = self.finish_control(request) {
+                    pending
+                        .reply
+                        .send(result.map_or_else(ControlResponse::Error, |()| ControlResponse::Ok));
+                }
+            }
             CompositorEvent::WindowUp(info) => {
                 self.windows.insert(info.id, info);
             }
             CompositorEvent::WindowDown(id) => {
-                self.windows.remove(&id);
+                self.windows.remove(&id.0);
             }
             CompositorEvent::Title { pane, title } => {
                 self.to_pane(pane, ServerToPane::Title(title));
@@ -207,19 +314,22 @@ impl Server {
                 request,
                 offer,
                 mime,
-            } => {
-                self.to_pane(
-                    pane,
-                    ServerToPane::ClipboardRead {
-                        request,
-                        offer,
-                        mime,
-                    },
-                );
+                deadline,
+            } => self.to_pane(
+                pane,
+                ServerToPane::ClipboardRead {
+                    request,
+                    offer,
+                    mime,
+                    deadline,
+                },
+            ),
+            CompositorEvent::ClipboardCancel { pane, request } => {
+                self.to_pane(pane, ServerToPane::ClipboardCancel { request });
             }
             CompositorEvent::Focus(id) => {
                 for window in self.windows.values_mut() {
-                    window.active = window.id == id;
+                    window.active = Some(window.id) == id.map(|id| id.0);
                 }
             }
             CompositorEvent::Frame {
@@ -228,116 +338,171 @@ impl Server {
                 height,
                 y,
                 rgb,
-            } => {
-                self.hand_over_frame(pane, width, height, y, rgb);
-            }
+            } => self.to_pane(
+                pane,
+                ServerToPane::Frame {
+                    width,
+                    height,
+                    y,
+                    rgb,
+                },
+            ),
             CompositorEvent::Release { pane, reason } => self.release_pane(pane, reason),
         }
     }
 
-    /// The compositor owns presentation backpressure: it sends no new frame
-    /// until the pane has acknowledged its previous one. The server only
-    /// forwards frames; a second independent queue would retain stale pixels.
-    fn hand_over_frame(&self, pane: u64, width: u32, height: u32, y: u32, rgb: Vec<u8>) {
-        self.to_pane(
-            pane,
-            ServerToPane::Frame {
-                width,
-                height,
-                y,
-                rgb,
-            },
-        );
-    }
-
-    fn to_pane(&self, pane: u64, message: ServerToPane) {
+    fn to_pane(&self, pane: PaneId, message: ServerToPane) {
         if let Some(target) = self.panes.get(&pane) {
             target.send(message);
         }
     }
 
-    fn control(&mut self, request: ControlRequest) -> ControlResponse {
-        match request {
-            ControlRequest::Ping => ControlResponse::Ok,
-            ControlRequest::Kill(show) => {
-                let (reply, result) = mpsc::channel();
-                if self
-                    .commands
-                    .send(CompositorCommand::Kill { show, reply })
-                    .is_err()
-                {
-                    return ControlResponse::Error("compositor unavailable".into());
-                }
-                match result.recv_timeout(Duration::from_secs(1)) {
-                    Ok(Ok(())) => ControlResponse::Ok,
-                    Ok(Err(error)) => ControlResponse::Error(error),
-                    Err(error) => ControlResponse::Error(format!("killing client: {error}")),
-                }
+    fn control(&mut self, request: ControlRequest, reply: Reply) {
+        let command = match request {
+            ControlRequest::Ping => {
+                reply.send(ControlResponse::Ok);
+                return;
             }
             ControlRequest::List => {
                 let mut list: Vec<_> = self.windows.values().cloned().collect();
                 list.sort_by_key(|window| window.id);
-                ControlResponse::Windows(list)
+                reply.send(ControlResponse::Windows(list));
+                return;
             }
-            ControlRequest::Run { args, env, cwd } => {
-                let token = match self.activation_token() {
-                    Ok(token) => token,
-                    Err(error) => return ControlResponse::Error(format!("{error:#}")),
+            ControlRequest::Kill(show) => {
+                let waiting = reply.waiting.clone();
+                let Some(request) = self.begin_control(Operation::Close, reply) else {
+                    return;
                 };
-                match launch_client(&args, &env, &cwd, &self.display, &token) {
-                    Ok(child) => {
-                        self.child_groups.insert(child.id());
-                        self.children.push(child);
-                        ControlResponse::Started(token)
-                    }
-                    Err(error) => {
-                        let _ = self
-                            .commands
-                            .send(CompositorCommand::CancelActivation { token });
-                        ControlResponse::Error(format!("{error:#}"))
-                    }
+                CompositorCommand::Kill {
+                    request,
+                    show,
+                    waiting,
+                    deadline: self.pending[&request].deadline,
                 }
             }
+            ControlRequest::Run { args, env, cwd } => {
+                let Some(request) =
+                    self.begin_control(Operation::Launch(Launch { args, env, cwd }), reply)
+                else {
+                    return;
+                };
+                CompositorCommand::CreateActivationToken { request }
+            }
+        };
+        if self.commands.send(command).is_err() {
+            self.compositor_failed = true;
+            self.begin_shutdown();
         }
     }
 
-    /// Register the token before spawning, so even immediate activation is
-    /// safe.
-    fn activation_token(&self) -> io::Result<String> {
-        let (reply, token) = mpsc::channel();
-        self.commands
-            .send(CompositorCommand::CreateActivationToken { reply })
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        token
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|error| io::Error::other(format!("creating activation token: {error}")))
+    fn begin_control(&mut self, operation: Operation, reply: Reply) -> Option<u64> {
+        let request = self.next_request;
+        self.next_request += 1;
+        let deadline = Instant::now() + CONTROL_TIMEOUT;
+        let timer =
+            match self
+                .handle
+                .insert_source(Timer::from_deadline(deadline), move |_, (), server| {
+                    server.timeout_control(request);
+                    TimeoutAction::Drop
+                }) {
+                Ok(timer) => timer,
+                Err(error) => {
+                    reply.send(ControlResponse::Error(format!(
+                        "scheduling control request: {error}"
+                    )));
+                    return None;
+                }
+            };
+        self.pending.insert(
+            request,
+            PendingControl {
+                operation,
+                reply,
+                deadline,
+                timer,
+            },
+        );
+        Some(request)
     }
 
-    /// Reject unusable panes instead of leaving them to time out.
-    fn attach_pane(&mut self, hello: Hello, socket: UnixStream) {
-        let Ok(mut writer) = socket.try_clone() else {
-            tracing::warn!("pane: cannot clone socket; dropping connection");
+    fn finish_control(&mut self, request: u64) -> Option<PendingControl> {
+        let pending = self.pending.remove(&request)?;
+        self.handle.remove(pending.timer);
+        if pending.reply.waiting() && Instant::now() < pending.deadline && self.shutdown.running() {
+            Some(pending)
+        } else {
+            pending.reply.waiting.store(false, Ordering::Relaxed);
+            pending
+                .reply
+                .send(ControlResponse::Error("control request expired".into()));
+            None
+        }
+    }
+
+    fn timeout_control(&mut self, request: u64) {
+        if let Some(pending) = self.pending.remove(&request) {
+            pending.reply.waiting.store(false, Ordering::Relaxed);
+            pending.reply.send(ControlResponse::Error(
+                "compositor request timed out".into(),
+            ));
+        }
+    }
+
+    fn activation_created(&mut self, request: u64, token: String) {
+        let Some(pending) = self.finish_control(request) else {
+            let _ = self
+                .commands
+                .send(CompositorCommand::CancelActivation { token });
             return;
         };
-        if FrameSize::new(hello.width, hello.height).is_none() {
-            let _ = protocol::send(
-                &mut writer,
-                &ServerToPane::Reject("invalid pane dimensions".into()),
-            );
+        let Operation::Launch(launch) = pending.operation else {
+            let _ = self
+                .commands
+                .send(CompositorCommand::CancelActivation { token });
+            pending.reply.send(ControlResponse::Error(
+                "unexpected activation response".into(),
+            ));
             return;
+        };
+        match launch_client(
+            &launch.args,
+            &launch.env,
+            &launch.cwd,
+            &self.display,
+            &token,
+        ) {
+            Ok(child) => {
+                self.child_groups.insert(child.id());
+                self.children.push(child);
+                pending.reply.send(ControlResponse::Started(token));
+            }
+            Err(error) => {
+                let _ = self
+                    .commands
+                    .send(CompositorCommand::CancelActivation { token });
+                pending
+                    .reply
+                    .send(ControlResponse::Error(format!("{error:#}")));
+            }
         }
-        let id = self.next_pane;
+    }
+
+    fn attach_pane(&mut self, hello: Hello, socket: UnixStream) {
+        let Ok(writer) = socket.try_clone() else {
+            return;
+        };
+        let id = PaneId(self.next_pane);
         self.next_pane += 1;
-        if protocol::send(&mut writer, &ServerToPane::HelloOk).is_err() {
-            return;
-        }
         let pane = match Pane::start(id, socket, writer, self.incoming.clone()) {
             Ok(pane) => pane,
             Err(error) => {
-                tracing::warn!(%error, "pane: cannot own connection; dropping pane");
+                tracing::warn!(%error, "pane: cannot own connection");
                 return;
             }
         };
+        pane.send(ServerToPane::HelloOk);
         self.panes.insert(id, pane);
         let _ = self.commands.send(CompositorCommand::Attach {
             pane: id,
@@ -347,39 +512,35 @@ impl Server {
         });
     }
 
-    fn pane_message(&mut self, id: u64, message: PaneToServer) {
-        match message {
-            PaneToServer::Hello(_) => {}
+    fn pane_message(&mut self, id: PaneId, message: PaneToServer) {
+        let command = match message {
+            PaneToServer::Hello(_) => return,
             PaneToServer::Paste(text) => {
-                if self.panes.contains_key(&id) && text.len() <= crate::clipboard::MAX_TEXT {
-                    let _ = self
-                        .commands
-                        .send(CompositorCommand::Paste { pane: id, text });
+                if text.len() > crate::clipboard::MAX_TEXT {
+                    return;
                 }
+                CompositorCommand::Paste { pane: id, text }
             }
             PaneToServer::ClipboardOffer {
                 offer,
                 mimes,
                 paste,
             } => {
-                if self.panes.contains_key(&id) && mimes.len() <= crate::clipboard::MAX_TYPES {
-                    let _ = self.commands.send(CompositorCommand::ClipboardOffer {
-                        pane: id,
-                        offer,
-                        mimes,
-                        paste,
-                    });
+                if mimes.len() > crate::clipboard::MAX_TYPES {
+                    return;
+                }
+                CompositorCommand::ClipboardOffer {
+                    pane: id,
+                    offer,
+                    mimes,
+                    paste,
                 }
             }
-            PaneToServer::ClipboardReply { request, data } => {
-                if self.panes.contains_key(&id) {
-                    let _ = self.commands.send(CompositorCommand::ClipboardReply {
-                        pane: id,
-                        request,
-                        data,
-                    });
-                }
-            }
+            PaneToServer::ClipboardReply { request, data } => CompositorCommand::ClipboardReply {
+                pane: id,
+                request,
+                data,
+            },
             PaneToServer::Input(event) => match &event {
                 protocol::Input::Key {
                     code: KEY_W,
@@ -388,7 +549,7 @@ impl Server {
                     ..
                 } if protocol::modifiers::alt_only(*modifiers) => {
                     self.release_pane(id, "detached".into());
-                    let _ = self.commands.send(CompositorCommand::Detach { pane: id });
+                    CompositorCommand::Detach { pane: id }
                 }
                 protocol::Input::Key {
                     code: KEY_Q,
@@ -396,70 +557,44 @@ impl Server {
                     modifiers,
                     ..
                 } if protocol::modifiers::alt_only(*modifiers) => {
-                    let _ = self
-                        .commands
-                        .send(CompositorCommand::CloseShown { pane: id });
+                    CompositorCommand::CloseShown { pane: id }
                 }
-                _ => {
-                    let _ = self
-                        .commands
-                        .send(CompositorCommand::Input { pane: id, event });
-                }
+                _ => CompositorCommand::Input { pane: id, event },
             },
             PaneToServer::Resize { width, height } => {
-                if FrameSize::new(width, height).is_some() {
-                    let _ = self.commands.send(CompositorCommand::Resize {
-                        pane: id,
-                        width,
-                        height,
-                    });
+                if FrameSize::new(width, height).is_none() {
+                    return;
+                }
+                CompositorCommand::Resize {
+                    pane: id,
+                    width,
+                    height,
                 }
             }
-            PaneToServer::Ack { drawn } => {
-                if self.panes.contains_key(&id) {
-                    let _ = self
-                        .commands
-                        .send(CompositorCommand::Ack { pane: id, drawn });
-                }
-            }
-        }
+            PaneToServer::Ack { drawn } => CompositorCommand::Ack { pane: id, drawn },
+        };
+        let _ = self.commands.send(command);
     }
 
-    /// Keep the connection owned while its writer drains the ordered Release.
-    fn release_pane(&mut self, id: u64, reason: String) {
+    fn release_pane(&mut self, id: PaneId, reason: String) {
         if let Some(mut pane) = self.panes.remove(&id) {
             pane.release(reason);
-            self.releasing_panes.push(pane);
+            self.releasing_panes.insert(id, pane);
         }
     }
 
-    fn pane_gone(&mut self, id: u64) {
+    fn pane_gone(&mut self, id: PaneId) {
         self.panes.remove(&id);
         let _ = self.commands.send(CompositorCommand::Detach { pane: id });
     }
 
     fn reap_children(&mut self) {
-        let child_groups = &mut self.child_groups;
         self.children.retain_mut(|child| {
             let running = matches!(child.try_wait(), Ok(None));
             if !running {
-                child_groups.remove(&child.id());
+                self.child_groups.remove(&child.id());
             }
             running
         });
-    }
-
-    /// Listener owners have already stopped accepting before this grace period.
-    fn shutdown(&mut self, compositor_thread: thread::JoinHandle<()>) {
-        let _ = self.commands.send(CompositorCommand::CloseAll);
-        for pane in self.panes.values_mut() {
-            pane.release("server stopped".into());
-        }
-        thread::sleep(Duration::from_millis(250));
-        self.panes.clear();
-        self.releasing_panes.clear();
-        terminate_tree(&self.child_groups);
-        let _ = self.commands.send(CompositorCommand::Shutdown);
-        let _ = compositor_thread.join();
     }
 }

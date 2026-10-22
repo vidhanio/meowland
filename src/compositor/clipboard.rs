@@ -1,12 +1,17 @@
-//! Wayland selection offers, lazy terminal reads, and bounded copy exports.
+//! Readiness-driven Wayland selection exports and terminal-backed deliveries.
 
 use std::{
     collections::{HashMap, VecDeque},
+    io,
     os::fd::OwnedFd,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
+use calloop::{
+    Interest, Mode, PostAction,
+    generic::Generic,
+    timer::{TimeoutAction, Timer},
+};
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
     io::Errno,
@@ -16,51 +21,53 @@ use smithay::wayland::selection::{
     data_device::{request_data_device_client_selection, set_data_device_selection},
 };
 
-use super::{Event, State, input::paste_action};
-use crate::clipboard::{ClipboardData, Item, MAX_BYTES, Transfer, mime_types};
+use super::{Event, PaneId, State, input::paste_action, sources::Sources};
+use crate::clipboard::{ClipboardData, Deadline, Item, MAX_BYTES, TRANSFER_TIMEOUT, mime_types};
 
 #[derive(Clone, Debug)]
 pub(super) enum Source {
     Local(Arc<ClipboardData>),
-    Terminal { pane: u64, offer: u64 },
+    Terminal { pane: PaneId, offer: u64 },
 }
 
 struct Export {
-    pane: u64,
+    id: u64,
+    pane: PaneId,
     mimes: VecDeque<String>,
-    transfer: Option<(String, Transfer)>,
+    active: Option<Sources>,
     data: ClipboardData,
     bytes: usize,
+    deadline: Deadline,
 }
 
-struct PendingRead {
-    pane: u64,
-    fd: OwnedFd,
-    deadline: Instant,
+enum DeliveryPhase {
+    AwaitingTerminal { pane: PaneId, fd: OwnedFd },
+    Writing,
 }
 
-struct PendingWrite {
-    fd: OwnedFd,
-    data: Arc<[u8]>,
-    sent: usize,
-    deadline: Instant,
+struct Delivery {
+    phase: DeliveryPhase,
+    deadline: Deadline,
+    sources: Sources,
 }
 
 #[derive(Default)]
 pub(super) struct Bridge {
     export: Option<Export>,
-    reads: HashMap<u64, PendingRead>,
-    writes: Vec<PendingWrite>,
+    deliveries: HashMap<u64, Delivery>,
     next: u64,
 }
 
 impl Bridge {
-    pub(super) fn pending(&self) -> bool {
-        self.export.is_some() || !self.reads.is_empty() || !self.writes.is_empty()
+    const fn id(&mut self) -> u64 {
+        self.next += 1;
+        self.next
     }
 
-    pub(super) fn detach(&mut self, pane: u64) {
-        self.reads.retain(|_, read| read.pane != pane);
+    pub(super) fn detach(&mut self, pane: PaneId) {
+        self.deliveries.retain(|_, delivery| {
+            !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
+        });
         if self
             .export
             .as_ref()
@@ -76,16 +83,18 @@ pub(super) fn selection(state: &mut State, source: Option<SelectionSource>) {
     let pane = state
         .cursor_pane
         .filter(|pane| {
-            state
-                .panes
-                .get(pane)
-                .is_some_and(|pane| Some(pane.window) == state.focused)
+            state.attachments.panes.get(pane).is_some_and(|pane| {
+                pane.window().is_some() && pane.window() == state.catalog.focused()
+            })
         })
         .or_else(|| {
             state
+                .attachments
                 .panes
                 .iter()
-                .filter(|(_, pane)| Some(pane.window) == state.focused)
+                .filter(|(_, pane)| {
+                    pane.window().is_some() && pane.window() == state.catalog.focused()
+                })
                 .map(|(id, _)| *id)
                 .min()
         });
@@ -99,82 +108,334 @@ pub(super) fn selection(state: &mut State, source: Option<SelectionSource>) {
         });
         return;
     };
+    let id = state.clipboard.id();
     state.clipboard.export = Some(Export {
+        id,
         pane,
         mimes: mime_types(source.mime_types()).into(),
-        transfer: None,
+        active: None,
         data: ClipboardData::default(),
         bytes: 0,
+        deadline: Deadline::new(TRANSFER_TIMEOUT),
     });
+    schedule_export(state, id);
+}
+
+/// Smithay updates the seat selection after returning from `new_selection`.
+fn schedule_export(state: &mut State, id: u64) {
+    let mut sources = Sources::new(&state.handle);
+    match state
+        .handle
+        .insert_source(Timer::immediate(), move |_, (), state| {
+            if let Some(export) = &mut state.clipboard.export
+                && export.id == id
+            {
+                if let Some(sources) = &mut export.active {
+                    sources.timer = None;
+                }
+                export.active = None;
+                export_next(state);
+            }
+            TimeoutAction::Drop
+        }) {
+        Ok(token) => {
+            sources.timer = Some(token);
+            state.clipboard.export.as_mut().unwrap().active = Some(sources);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Cannot schedule clipboard export");
+            state.clipboard.export = None;
+        }
+    }
+}
+
+fn export_next(state: &mut State) {
+    let Some(mut export) = state.clipboard.export.take() else {
+        return;
+    };
+    if export.deadline.expired() || !state.attachments.panes.contains_key(&export.pane) {
+        return;
+    }
+    while let Some(mime) = export.mimes.pop_front() {
+        let result = export_source(state, &export, mime.clone());
+        match result {
+            Ok(sources) => {
+                export.active = Some(sources);
+                state.clipboard.export = Some(export);
+                return;
+            }
+            Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
+        }
+    }
+    let _ = state.events.send(Event::ClipboardWrite {
+        pane: export.pane,
+        data: export.data,
+    });
+}
+
+fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sources> {
+    let (read, write) = rustix::pipe::pipe()?;
+    nonblocking(&read)?;
+    let mut sources = Sources::new(&state.handle);
+    let id = export.id;
+    let deadline = export.deadline;
+    let limit = MAX_BYTES - export.bytes;
+    let mut bytes = Vec::new();
+    let requested_mime = mime.clone();
+    sources.io = Some(
+        state
+            .handle
+            .insert_source(
+                Generic::new(read, Interest::READ, Mode::Level),
+                move |_, fd, state| {
+                    if state
+                        .clipboard
+                        .export
+                        .as_ref()
+                        .is_none_or(|export| export.id != id)
+                    {
+                        return Ok(PostAction::Remove);
+                    }
+                    if deadline.expired() {
+                        let mut export = state.clipboard.export.take().unwrap();
+                        if let Some(sources) = &mut export.active {
+                            sources.io = None;
+                        }
+                        return Ok(PostAction::Remove);
+                    }
+                    let result = receive(fd, &mut bytes, limit);
+                    if matches!(result, Ok(false)) {
+                        return Ok(PostAction::Continue);
+                    }
+                    let export = state.clipboard.export.as_mut().unwrap();
+                    if let Some(sources) = &mut export.active {
+                        sources.io = None;
+                    }
+                    export.active = None;
+                    match result {
+                        Ok(true) => {
+                            export.bytes += bytes.len();
+                            export.data.items.push(Item {
+                                mime: mime.clone(),
+                                data: std::mem::take(&mut bytes),
+                            });
+                            export_next(state);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
+                            tracing::warn!(%error, "Clipboard export exceeds size limit");
+                            state.clipboard.export = None;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Client clipboard transfer failed");
+                            export_next(state);
+                        }
+                        Ok(false) => unreachable!(),
+                    }
+                    Ok(PostAction::Remove)
+                },
+            )
+            .map_err(io::Error::other)?,
+    );
+    sources.timer = Some(
+        state
+            .handle
+            .insert_source(
+                Timer::from_duration(export.deadline.remaining()),
+                move |_, (), state| {
+                    if state
+                        .clipboard
+                        .export
+                        .as_ref()
+                        .is_some_and(|export| export.id == id)
+                    {
+                        let mut export = state.clipboard.export.take().unwrap();
+                        if let Some(sources) = &mut export.active {
+                            sources.timer = None;
+                        }
+                        tracing::warn!("Client clipboard export timed out");
+                    }
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|error| io::Error::other(error.error))?,
+    );
+    request_data_device_client_selection(&state.seat, requested_mime, write)
+        .map_err(io::Error::other)?;
+    Ok(sources)
+}
+
+fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
+    let mut chunk = [0; 16 * 1024];
+    for _ in 0..4 {
+        match rustix::io::read(fd, &mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                if bytes.len() + read > limit {
+                    return Err(io::ErrorKind::FileTooLarge.into());
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            Err(Errno::AGAIN) => return Ok(false),
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) {
+    if state.clipboard.deliveries.len() >= 16 {
+        return;
+    }
+    let deadline = Deadline::new(TRANSFER_TIMEOUT);
     match source {
         Source::Local(data) => {
             if let Some(item) = data.items.iter().find(|item| item.mime == mime) {
-                write(state, fd, Arc::from(item.data.as_slice()));
+                write(state, fd, Arc::from(item.data.as_slice()), deadline);
             }
         }
         Source::Terminal { pane, offer } => {
-            if !state.panes.contains_key(pane) || state.clipboard.reads.len() >= 16 {
+            if !state.attachments.panes.contains_key(pane) {
                 return;
             }
-            state.clipboard.next += 1;
-            let request = state.clipboard.next;
-            state.clipboard.reads.insert(
+            let request = state.clipboard.id();
+            let Ok(sources) = delivery_timer(state, request, deadline) else {
+                return;
+            };
+            state.clipboard.deliveries.insert(
                 request,
-                PendingRead {
-                    pane: *pane,
-                    fd,
-                    deadline: Instant::now() + Duration::from_secs(65),
+                Delivery {
+                    phase: DeliveryPhase::AwaitingTerminal { pane: *pane, fd },
+                    deadline,
+                    sources,
                 },
             );
-            let _ = state.events.send(Event::ClipboardRead {
-                pane: *pane,
-                request,
-                offer: *offer,
-                mime: mime.to_owned(),
-            });
+            if state
+                .events
+                .send(Event::ClipboardRead {
+                    pane: *pane,
+                    request,
+                    offer: *offer,
+                    mime: mime.to_owned(),
+                    deadline,
+                })
+                .is_err()
+            {
+                state.clipboard.deliveries.remove(&request);
+            }
         }
     }
 }
 
-fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>) {
-    if state.clipboard.writes.len() >= 16 || data.len() > MAX_BYTES {
-        return;
-    }
-    let Ok(flags) = fcntl_getfl(&fd) else {
-        return;
-    };
-    if fcntl_setfl(&fd, flags | OFlags::NONBLOCK).is_err() {
-        return;
-    }
-    state.clipboard.writes.push(PendingWrite {
-        fd,
-        data,
-        sent: 0,
-        deadline: Instant::now() + Duration::from_secs(75),
-    });
+fn delivery_timer(state: &State, request: u64, deadline: Deadline) -> io::Result<Sources> {
+    let mut sources = Sources::new(&state.handle);
+    sources.timer = Some(
+        state
+            .handle
+            .insert_source(
+                Timer::from_duration(deadline.remaining()),
+                move |_, (), state| {
+                    if let Some(mut delivery) = state.clipboard.deliveries.remove(&request) {
+                        delivery.sources.timer = None;
+                        if let DeliveryPhase::AwaitingTerminal { pane, .. } = delivery.phase {
+                            let _ = state.events.send(Event::ClipboardCancel { pane, request });
+                        }
+                    }
+                    TimeoutAction::Drop
+                },
+            )
+            .map_err(|error| io::Error::other(error.error))?,
+    );
+    Ok(sources)
 }
 
-pub(super) fn reply(state: &mut State, pane: u64, request: u64, data: Option<Vec<u8>>) {
-    if state
-        .clipboard
-        .reads
-        .get(&request)
-        .is_none_or(|read| read.pane != pane)
-    {
+fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    fcntl_setfl(fd, fcntl_getfl(fd)? | OFlags::NONBLOCK)?;
+    Ok(())
+}
+
+fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
+    if data.is_empty() || data.len() > MAX_BYTES || deadline.expired() {
         return;
     }
-    if let Some(read) = state.clipboard.reads.remove(&request)
-        && let Some(data) = data.filter(|data| data.len() <= MAX_BYTES)
-    {
-        write(state, read.fd, data.into());
+    let request = state.clipboard.id();
+    let result = (|| -> io::Result<Sources> {
+        nonblocking(&fd)?;
+        let mut sources = delivery_timer(state, request, deadline)?;
+        let mut sent = 0;
+        sources.io = Some(
+            state
+                .handle
+                .insert_source(
+                    Generic::new(fd, Interest::WRITE, Mode::Level),
+                    move |_, fd, state| {
+                        if deadline.expired() {
+                            if let Some(mut delivery) = state.clipboard.deliveries.remove(&request)
+                            {
+                                delivery.sources.io = None;
+                            }
+                            return Ok(PostAction::Remove);
+                        }
+                        let mut budget = 64 * 1024;
+                        while sent < data.len() && budget > 0 {
+                            let end = (sent + budget).min(data.len());
+                            match rustix::io::write(&*fd, &data[sent..end]) {
+                                Ok(0) => break,
+                                Ok(written) => {
+                                    sent += written;
+                                    budget -= written;
+                                }
+                                Err(Errno::AGAIN | Errno::INTR) => return Ok(PostAction::Continue),
+                                Err(_) => break,
+                            }
+                        }
+                        if sent < data.len() && budget == 0 {
+                            return Ok(PostAction::Continue);
+                        }
+                        if let Some(mut delivery) = state.clipboard.deliveries.remove(&request) {
+                            delivery.sources.io = None;
+                        }
+                        Ok(PostAction::Remove)
+                    },
+                )
+                .map_err(io::Error::other)?,
+        );
+        Ok(sources)
+    })();
+    match result {
+        Ok(sources) => {
+            state.clipboard.deliveries.insert(
+                request,
+                Delivery {
+                    phase: DeliveryPhase::Writing,
+                    deadline,
+                    sources,
+                },
+            );
+        }
+        Err(error) => tracing::warn!(%error, "Cannot write client clipboard"),
     }
 }
 
-pub(super) fn offer(state: &mut State, pane: u64, offer: u64, mimes: Vec<String>, paste: bool) {
-    if !state.panes.contains_key(&pane) {
+pub(super) fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<Vec<u8>>) {
+    if state.clipboard.deliveries.get(&request).is_none_or(|delivery| {
+        !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
+    }) {
+        return;
+    }
+    if let Some(delivery) = state.clipboard.deliveries.remove(&request) {
+        let DeliveryPhase::AwaitingTerminal { fd, .. } = delivery.phase else {
+            unreachable!();
+        };
+        drop(delivery.sources);
+        if let Some(data) = data.filter(|data| data.len() <= MAX_BYTES) {
+            write(state, fd, data.into(), delivery.deadline);
+        }
+    }
+}
+
+pub(super) fn offer(state: &mut State, pane: PaneId, offer: u64, mimes: Vec<String>, paste: bool) {
+    if !state.attachments.panes.contains_key(&pane) {
         return;
     }
     let mimes = mime_types(mimes);
@@ -190,9 +451,13 @@ pub(super) fn offer(state: &mut State, pane: u64, offer: u64, mimes: Vec<String>
     }
 }
 
-pub(super) fn paste(state: &mut State, pane: u64, text: &str) {
+pub(super) fn paste(state: &mut State, pane: PaneId, text: &str) {
     if text.len() > crate::clipboard::MAX_TEXT
-        || state.panes.get(&pane).is_none_or(|pane| pane.window == 0)
+        || state
+            .attachments
+            .panes
+            .get(&pane)
+            .is_none_or(|pane| pane.window().is_none())
     {
         return;
     }
@@ -201,78 +466,4 @@ pub(super) fn paste(state: &mut State, pane: u64, text: &str) {
     let mimes = data.items.iter().map(|item| item.mime.clone()).collect();
     set_data_device_selection(&state.display, &state.seat, mimes, Source::Local(data));
     paste_action(state, pane);
-}
-
-pub(super) fn poll(state: &mut State) {
-    if let Some(mut export) = state.clipboard.export.take()
-        && state.panes.contains_key(&export.pane)
-    {
-        if export.transfer.is_none()
-            && let Some(mime) = export.mimes.pop_front()
-        {
-            match rustix::pipe::pipe() {
-                Ok((read, write)) => {
-                    if request_data_device_client_selection(&state.seat, mime.clone(), write)
-                        .is_ok()
-                    {
-                        match Transfer::new(read) {
-                            Ok(transfer) => export.transfer = Some((mime, transfer)),
-                            Err(error) => tracing::warn!(%error, "Cannot read client clipboard"),
-                        }
-                    }
-                }
-                Err(error) => tracing::warn!(%error, "Cannot create clipboard pipe"),
-            }
-        }
-        if let Some((mime, transfer)) = &mut export.transfer {
-            match transfer.receive() {
-                Ok(Some(data)) => {
-                    export.bytes += data.len();
-                    if export.bytes <= MAX_BYTES {
-                        export.data.items.push(Item {
-                            mime: mime.clone(),
-                            data,
-                        });
-                    } else {
-                        tracing::warn!("Clipboard export exceeds size limit");
-                        export.mimes.clear();
-                        export.data.items.clear();
-                    }
-                    export.transfer = None;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "Client clipboard transfer failed");
-                    export.transfer = None;
-                }
-            }
-        }
-        if export.mimes.is_empty() && export.transfer.is_none() {
-            if export.bytes <= MAX_BYTES {
-                let _ = state.events.send(Event::ClipboardWrite {
-                    pane: export.pane,
-                    data: export.data,
-                });
-            }
-        } else {
-            state.clipboard.export = Some(export);
-        }
-    }
-    let now = Instant::now();
-    state.clipboard.reads.retain(|_, read| read.deadline > now);
-    state.clipboard.writes.retain_mut(|write| {
-        if now >= write.deadline {
-            return false;
-        }
-        let end = (write.sent + 64 * 1024).min(write.data.len());
-        match rustix::io::write(&write.fd, &write.data[write.sent..end]) {
-            Ok(0) => false,
-            Ok(sent) => {
-                write.sent += sent;
-                write.sent < write.data.len()
-            }
-            Err(Errno::AGAIN | Errno::INTR) => true,
-            Err(_) => false,
-        }
-    });
 }

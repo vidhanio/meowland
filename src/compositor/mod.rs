@@ -10,11 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use calloop::{EventLoop, Interest, Mode as PollMode, PostAction, channel, generic::Generic};
+use calloop::{
+    EventLoop, Interest, LoopHandle, Mode as PollMode, PostAction, channel, generic::Generic,
+};
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_dispatch2,
-    desktop::{PopupKind, PopupManager, get_popup_toplevel_coords},
+    desktop::{PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
         dnd::DndGrabHandler,
@@ -24,7 +26,7 @@ use smithay::{
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
-        Client, Display, DisplayHandle, ListeningSocket, Resource, Weak,
+        Client, Display, DisplayHandle, ListeningSocket, Resource,
         backend::{ClientData, ClientId, DisconnectReason},
         protocol::{wl_buffer, wl_surface::WlSurface},
     },
@@ -32,9 +34,9 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            Barrier, BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SubsurfaceCachedState, SurfaceAttributes, add_blocker, add_pre_commit_hook,
-            get_children, get_parent, with_states,
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SubsurfaceCachedState, SurfaceAttributes, add_pre_commit_hook, get_children,
+            get_parent, with_states,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{
@@ -53,9 +55,7 @@ use smithay::{
         shell::{
             kde::decoration::KdeDecorationState,
             xdg::{
-                PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
-                XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
-                decoration::XdgDecorationState,
+                SurfaceCachedState, ToplevelSurface, XdgShellState, decoration::XdgDecorationState,
             },
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
@@ -68,107 +68,127 @@ pub use crate::pixels::{MAX_SURFACE_PIXELS, MAX_SURFACE_SIDE};
 use crate::protocol::{Input, Show, WindowInfo};
 
 mod activation;
+mod attachment;
+mod catalog;
 mod clipboard;
 mod commands;
 mod decoration;
 mod dmabuf;
 mod frame;
 mod input;
+mod readback;
 mod render;
+mod shell;
 mod snapshot;
+mod sources;
 
+use attachment::{Attachments, Binding, Pane, Policy, Selection};
+pub use attachment::{PaneId, WindowId};
+use catalog::WindowCatalog;
 use dmabuf::DmabufBackend;
-use frame::PaneState;
 use render::{Renderer, surface_stack};
 use snapshot::Snapshot;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
-/// Transfers and implicit DMA-BUF fences still need periodic progress checks.
-const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Debug)]
 pub enum Command {
     CreateActivationToken {
-        reply: mpsc::Sender<String>,
+        request: u64,
     },
     CancelActivation {
         token: String,
     },
     Kill {
+        request: u64,
         show: Show,
-        reply: mpsc::Sender<Result<(), String>>,
+        waiting: Arc<std::sync::atomic::AtomicBool>,
+        deadline: Instant,
     },
     Attach {
-        pane: u64,
+        pane: PaneId,
         show: Show,
         width: u32,
         height: u32,
     },
     Detach {
-        pane: u64,
+        pane: PaneId,
     },
     Resize {
-        pane: u64,
+        pane: PaneId,
         width: u32,
         height: u32,
     },
     Input {
-        pane: u64,
+        pane: PaneId,
         event: Input,
     },
     Ack {
-        pane: u64,
+        pane: PaneId,
         drawn: bool,
     },
     Paste {
-        pane: u64,
+        pane: PaneId,
         text: String,
     },
     ClipboardOffer {
-        pane: u64,
+        pane: PaneId,
         offer: u64,
         mimes: Vec<String>,
         paste: bool,
     },
     ClipboardReply {
-        pane: u64,
+        pane: PaneId,
         request: u64,
         data: Option<Vec<u8>>,
     },
     CloseAll,
     CloseShown {
-        pane: u64,
+        pane: PaneId,
     },
     Shutdown,
 }
 
 #[derive(Debug)]
 pub enum Event {
+    ActivationCreated {
+        request: u64,
+        token: String,
+    },
+    CloseRequested {
+        request: u64,
+        result: Result<(), String>,
+    },
     /// A window appeared, or its title or app id changed.
     WindowUp(WindowInfo),
-    WindowDown(u64),
+    WindowDown(WindowId),
     Title {
-        pane: u64,
+        pane: PaneId,
         title: String,
     },
     /// The pointer shape a pane should show, or `None` for the terminal's own.
     Cursor {
-        pane: u64,
+        pane: PaneId,
         shape: Option<String>,
     },
-    Focus(u64),
+    Focus(Option<WindowId>),
     ClipboardWrite {
-        pane: u64,
+        pane: PaneId,
         data: crate::clipboard::ClipboardData,
     },
     ClipboardRead {
-        pane: u64,
+        pane: PaneId,
         request: u64,
         offer: u64,
         mime: String,
+        deadline: crate::clipboard::Deadline,
+    },
+    ClipboardCancel {
+        pane: PaneId,
+        request: u64,
     },
     Frame {
-        pane: u64,
+        pane: PaneId,
         width: u32,
         height: u32,
         /// The first row `rgb` covers.
@@ -176,14 +196,14 @@ pub enum Event {
         rgb: Vec<u8>,
     },
     Release {
-        pane: u64,
+        pane: PaneId,
         reason: String,
     },
 }
 
 pub type Handle = (
     channel::Sender<Command>,
-    mpsc::Receiver<Event>,
+    channel::Channel<Event>,
     String,
     thread::JoinHandle<()>,
 );
@@ -195,7 +215,7 @@ pub type Handle = (
 /// if readiness is not reported within two seconds.
 pub fn spawn() -> crate::Result<Handle> {
     let (commands, rx) = channel::channel();
-    let (tx, events) = mpsc::channel();
+    let (tx, events) = channel::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let socket = format!("wayland-meowland-{}", std::process::id());
     let socket_for_thread = socket.clone();
@@ -225,29 +245,20 @@ impl ClientData for ClientState {
 
 struct Window {
     surface: ToplevelSurface,
-    title: String,
-    app_id: String,
-    /// A window without pixels must not capture a follow-the-newest pane.
-    announced: bool,
     fullscreen: bool,
     callback_due: Instant,
 }
 
 type ViewportGeometry = (Option<Rectangle<f64, Logical>>, Option<Size<i32, Logical>>);
 
-struct PendingImport {
-    surface: Weak<WlSurface>,
-    buffer: Dmabuf,
-    barrier: Barrier,
-}
-
 struct State {
     display: DisplayHandle,
+    handle: LoopHandle<'static, Self>,
     compositor: CompositorState,
     shm: ShmState,
     dmabuf: DmabufState,
     gpu: Option<DmabufBackend>,
-    pending_imports: Vec<PendingImport>,
+    readbacks: readback::Readbacks,
     xdg: XdgShellState,
     activation: XdgActivationState,
     launches: HashMap<String, activation::Launch>,
@@ -264,34 +275,26 @@ struct State {
     seat: Seat<Self>,
     keyboard: Option<KeyboardHandle<Self>>,
     /// One terminal pane owns the seat's held keyboard state at a time.
-    keyboard_pane: Option<u64>,
+    keyboard_pane: Option<PaneId>,
     keyboard_keys: HashSet<u16>,
     keyboard_known: bool,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
-    windows: HashMap<u64, Window>,
-    ids: HashMap<WlSurface, u64>,
+    windows: HashMap<WindowId, Window>,
+    ids: HashMap<WlSurface, WindowId>,
     snapshots: HashMap<WlSurface, Snapshot>,
     /// Cached to distinguish viewport changes from frame-only commits.
     viewport_geometry: HashMap<WlSurface, ViewportGeometry>,
-    next_id: u64,
-    newest: Option<u64>,
-    panes: HashMap<u64, PaneState>,
-    following: HashSet<u64>,
-    /// Explicit selections waiting for an app ID or activation and pixels.
-    pending_shows: HashMap<u64, Show>,
-    /// For each window, the pane that last interacted with it.  That pane
-    /// decides the window's configured size while it is attached.
-    deciding: HashMap<u64, u64>,
-    focused: Option<u64>,
+    catalog: WindowCatalog,
+    attachments: Attachments,
     /// Most recent input pane, used for cursor shape events.
-    cursor_pane: Option<u64>,
+    cursor_pane: Option<PaneId>,
     cursor: Option<String>,
     /// The pane `cursor` was last sent to, so a shape that is unchanged but
     /// belongs to another pane is still sent.
-    cursor_shape_pane: Option<u64>,
+    cursor_shape_pane: Option<PaneId>,
     renderer: Renderer,
-    events: mpsc::Sender<Event>,
+    events: channel::Sender<Event>,
     /// Output mode, rewritten as panes attach and leave.
     mode: Size<i32, Logical>,
     started: Instant,
@@ -341,23 +344,26 @@ impl CompositorHandler for State {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, |state, _, surface| {
-            let buffer = with_states(surface, |states| {
+            let assignment = with_states(surface, |states| {
                 let mut attributes = states.cached_state.get::<SurfaceAttributes>();
                 match &attributes.pending().buffer {
-                    Some(BufferAssignment::NewBuffer(buffer)) => get_dmabuf(buffer).ok().cloned(),
-                    _ => None,
+                    Some(BufferAssignment::NewBuffer(buffer)) => {
+                        Some(BufferAssignment::NewBuffer(buffer.clone()))
+                    }
+                    Some(BufferAssignment::Removed) => Some(BufferAssignment::Removed),
+                    None => None,
                 }
             });
-            if let Some(buffer) = buffer
-                && !dmabuf_ready(&buffer)
-            {
-                let barrier = Barrier::new(false);
-                add_blocker(surface, barrier.clone());
-                state.pending_imports.push(PendingImport {
-                    surface: surface.downgrade(),
-                    buffer,
-                    barrier,
-                });
+            match assignment {
+                Some(BufferAssignment::NewBuffer(buffer)) => {
+                    if let Ok(dmabuf) = get_dmabuf(&buffer) {
+                        readback::prepare(state, surface, &buffer, dmabuf.clone());
+                    } else {
+                        readback::clear(surface);
+                    }
+                }
+                Some(BufferAssignment::Removed) => readback::clear(surface),
+                None => {}
             }
         });
     }
@@ -400,18 +406,8 @@ impl CompositorHandler for State {
                 let mut reuse = previous
                     .as_mut()
                     .map_or_else(Vec::new, |old| std::mem::take(&mut old.pixels));
-                let mut release_safe = true;
-                let snapshot = if let Ok(dmabuf) = get_dmabuf(&buffer) {
-                    self.gpu.as_mut().and_then(|gpu| {
-                        match gpu.snapshot(dmabuf, bound, &mut reuse) {
-                            Ok(snapshot) => Some(snapshot),
-                            Err(error) => {
-                                release_safe = error.release_safe();
-                                tracing::warn!(%error, release_safe, "DMA-BUF readback failed");
-                                None
-                            }
-                        }
-                    })
+                let snapshot = if get_dmabuf(&buffer).is_ok() {
+                    readback::snapshot(surface)
                 } else {
                     with_buffer_contents(&buffer, |ptr, len, data| {
                         Snapshot::copy_shm(ptr, len, &data, bound, &mut reuse)
@@ -419,9 +415,7 @@ impl CompositorHandler for State {
                     .ok()
                     .flatten()
                 };
-                if release_safe {
-                    buffer.release();
-                }
+                buffer.release();
                 match snapshot {
                     Some(snapshot) => {
                         self.snapshots.insert(surface.clone(), snapshot);
@@ -450,13 +444,16 @@ impl CompositorHandler for State {
     fn destroyed(&mut self, surface: &WlSurface) {
         self.snapshots.remove(surface);
         self.viewport_geometry.remove(surface);
-        self.pending_imports
-            .retain(|pending| pending.surface != surface.downgrade());
+        readback::destroyed(self, surface);
     }
 }
 
 impl State {
-    fn new(display_handle: DisplayHandle, events: mpsc::Sender<Event>) -> Self {
+    fn new(
+        display_handle: DisplayHandle,
+        handle: LoopHandle<'static, Self>,
+        events: channel::Sender<Event>,
+    ) -> Self {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
         let pointer = Some(seat.add_pointer());
@@ -498,7 +495,8 @@ impl State {
             shm: ShmState::new::<Self>(&display_handle, vec![]),
             dmabuf,
             gpu,
-            pending_imports: Vec::new(),
+            handle,
+            readbacks: readback::Readbacks::default(),
             xdg: XdgShellState::new::<Self>(&display_handle),
             activation: XdgActivationState::new::<Self>(&display_handle),
             launches: HashMap::new(),
@@ -523,13 +521,8 @@ impl State {
             ids: HashMap::new(),
             snapshots: HashMap::new(),
             viewport_geometry: HashMap::new(),
-            next_id: 1,
-            newest: None,
-            panes: HashMap::new(),
-            following: HashSet::new(),
-            pending_shows: HashMap::new(),
-            deciding: HashMap::new(),
-            focused: None,
+            catalog: WindowCatalog::default(),
+            attachments: Attachments::default(),
             cursor_pane: None,
             cursor: None,
             cursor_shape_pane: None,
@@ -547,16 +540,20 @@ impl State {
     /// pane only the global surface limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
         let window = self.window_for_surface(surface)?;
-        self.panes
+        self.attachments
+            .panes
             .values()
-            .filter(|pane| pane.window == window)
+            .filter(|pane| pane.window() == Some(window))
             .fold(None, |bound: Option<(u32, u32)>, pane| {
-                let pane = (pane.size.width() * 2, pane.size.height() * 2);
+                let pane = (
+                    pane.presentation.size.width() * 2,
+                    pane.presentation.size.height() * 2,
+                );
                 Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))))
             })
     }
 
-    fn window_for_surface(&self, surface: &WlSurface) -> Option<u64> {
+    fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
         let mut surface = surface.clone();
         for _ in 0..64 {
             if let Some(id) = self.ids.get(&surface) {
@@ -582,15 +579,9 @@ impl State {
         if !self.snapshots.contains_key(surface) {
             return;
         }
-        let Some(window) = self.windows.get_mut(&id) else {
-            return;
-        };
-        let first = !window.announced;
-        window.announced = true;
-        if !first {
+        if !self.catalog.announce(id) {
             return;
         }
-        self.newest = Some(id);
         self.follow_panes(id);
         self.resolve_pending_panes();
         let info = self.window_info(id);
@@ -600,151 +591,117 @@ impl State {
         self.focus_window(id);
     }
 
-    fn window_info(&self, window: u64) -> WindowInfo {
-        let (app_id, title) = self
-            .windows
-            .get(&window)
-            .map_or_default(|entry| (entry.app_id.clone(), entry.title.clone()));
-        WindowInfo {
-            id: window,
-            app_id,
-            title,
-            active: self.focused == Some(window),
-        }
+    fn window_info(&self, window: WindowId) -> WindowInfo {
+        self.catalog.info(window)
     }
 
     /// The last-used pane decides the window's size; otherwise use the first
     /// attached pane, then the output mode.
-    fn pane_size(&self, window: u64) -> Size<i32, Logical> {
-        let selected = self
-            .deciding
-            .get(&window)
-            .and_then(|pane| self.panes.get(pane))
-            .filter(|pane| pane.window == window)
-            .or_else(|| {
-                self.panes
-                    .iter()
-                    .filter(|(_, pane)| pane.window == window)
-                    .min_by_key(|(id, _)| *id)
-                    .map(|(_, pane)| pane)
-            });
-        selected.map_or(self.mode, |pane| {
-            Size::from((pane.size.width() as i32, pane.size.height() as i32))
+    fn pane_size(&self, window: WindowId) -> Size<i32, Logical> {
+        self.attachments.size(window).map_or(self.mode, |size| {
+            Size::from((size.width() as i32, size.height() as i32))
         })
     }
 
-    fn mark_dirty(&mut self, pane: u64) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.mark_dirty();
-        }
-    }
-
-    fn panes_showing(&self, window: u64) -> Vec<u64> {
-        self.panes
-            .iter()
-            .filter(|(_, pane)| pane.window == window)
-            .map(|(pane, _)| *pane)
-            .collect()
+    fn panes_showing(&self, window: WindowId) -> Vec<PaneId> {
+        self.attachments.showing(window)
     }
 
     /// The lowest-numbered pane sets the output mode seen by clients.
-    fn insert_pane(&mut self, pane: u64, entry: PaneState) {
-        let size = entry.size;
-        self.panes.insert(pane, entry);
-        if self.panes.keys().min() == Some(&pane) {
+    fn insert_pane(&mut self, pane: PaneId, entry: Pane) {
+        let size = entry.presentation.size;
+        self.attachments.panes.insert(pane, entry);
+        if self.attachments.first() == Some(pane) {
             self.configure_output(size);
         }
     }
 
     /// Remove every pane-keyed entry, restoring the remaining output mode.
-    fn remove_pane(&mut self, pane: u64) -> Option<u64> {
+    fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
         if self.keyboard_pane == Some(pane) {
             input::reset_keyboard(self);
         }
-        let first = self.panes.keys().min() == Some(&pane);
-        let window = self.panes.remove(&pane).map(|state| state.window);
+        let first = self.attachments.first() == Some(pane);
+        let removed = self.attachments.remove(pane);
+        let window = removed.as_ref().and_then(Pane::window);
         self.clipboard.detach(pane);
-        self.following.remove(&pane);
-        if let Some(Show::Activation(token)) = self.pending_shows.remove(&pane) {
+        if let Some(Pane {
+            binding: Binding::Waiting(Selection::Activation(token)),
+            ..
+        }) = removed
+        {
             self.forget_activation(&token);
         }
-        self.deciding.retain(|_, deciding| *deciding != pane);
         if self.cursor_pane == Some(pane) {
             self.cursor_pane = None;
         }
         if self.cursor_shape_pane == Some(pane) {
             self.cursor_shape_pane = None;
         }
-        if first && let Some((_, next)) = self.panes.iter().min_by_key(|(pane, _)| **pane) {
-            self.configure_output(next.size);
+        if first && let Some(next) = self.attachments.first() {
+            self.configure_output(self.attachments.panes[&next].presentation.size);
         }
         window
     }
 
     /// Move focus to another attached pane's window when this pane is released.
-    fn release_pane_window(&mut self, pane: u64) {
+    fn release_pane_window(&mut self, pane: PaneId) {
         let Some(window) = self.remove_pane(pane) else {
             return;
         };
         self.leave_output(window);
-        if self.focused == Some(window)
+        if self.catalog.focused() == Some(window)
             && let Some(next) = self
-                .panes
-                .iter()
-                .min_by_key(|(pane, _)| **pane)
-                .map(|(_, pane)| pane.window)
-                .filter(|window| *window != 0)
+                .attachments
+                .first()
+                .and_then(|id| self.attachments.panes[&id].window())
         {
             self.focus_window(next);
         }
     }
 
-    fn follow_panes(&mut self, window: u64) {
+    fn follow_panes(&mut self, window: WindowId) {
+        let following = self.attachments.following();
         if self
             .keyboard_pane
-            .is_some_and(|pane| self.following.contains(&pane))
+            .is_some_and(|pane| following.contains(&pane))
         {
             input::reset_keyboard(self);
         }
-        for &pane in &self.following {
-            if let Some(state) = self.panes.get_mut(&pane) {
-                state.window = window;
-                state.mark_dirty();
+        for pane in following {
+            if let Some(state) = self.attachments.panes.get_mut(&pane) {
+                state.show(window);
             }
             self.send_title(pane, window);
         }
     }
 
-    fn touch(&mut self, window: u64) {
-        for entry in self.panes.values_mut() {
-            if entry.window != window {
-                continue;
+    fn touch(&mut self, window: WindowId) {
+        for entry in self.attachments.panes.values_mut() {
+            if entry.window() == Some(window) {
+                entry.presentation.mark_dirty();
             }
-            entry.mark_dirty();
         }
     }
 
-    fn send_title(&self, pane: u64, window: u64) {
-        let title = self
-            .windows
-            .get(&window)
-            .map_or_default(|entry| crate::protocol::sanitize(&entry.title));
+    fn send_title(&self, pane: PaneId, window: WindowId) {
+        let title = crate::protocol::sanitize(self.catalog.title(window));
         let _ = self.events.send(Event::Title { pane, title });
     }
 
-    fn send_titles(&self, window: u64) {
-        for (&pane, entry) in &self.panes {
-            if entry.window == window {
+    fn send_titles(&self, window: WindowId) {
+        for (&pane, entry) in &self.attachments.panes {
+            if entry.window() == Some(window) {
                 self.send_title(pane, window);
             }
         }
     }
 
-    fn enter_output(&self, window: u64) {
+    fn enter_output(&self, window: WindowId) {
         let Some(root) = self
             .windows
             .get(&window)
-            .filter(|entry| entry.announced)
+            .filter(|_| self.catalog.drawable(window))
             .map(|entry| entry.surface.wl_surface())
         else {
             return;
@@ -754,8 +711,13 @@ impl State {
         }
     }
 
-    fn leave_output(&self, window: u64) {
-        if self.panes.values().any(|pane| pane.window == window) {
+    fn leave_output(&self, window: WindowId) {
+        if self
+            .attachments
+            .panes
+            .values()
+            .any(|pane| pane.window() == Some(window))
+        {
             return;
         }
         let Some(root) = self
@@ -770,12 +732,12 @@ impl State {
         }
     }
 
-    fn focus_window(&mut self, window: u64) {
-        if self.focused == Some(window) {
+    fn focus_window(&mut self, window: WindowId) {
+        if self.catalog.focused() == Some(window) {
             return;
         }
         input::reset_keyboard(self);
-        let previous = self.focused.replace(window);
+        let previous = self.catalog.focus(Some(window));
         let surface = self
             .windows
             .get(&window)
@@ -788,228 +750,8 @@ impl State {
             self.apply_window_state(previous);
         }
         self.apply_window_state(window);
-        let _ = self.events.send(Event::Focus(window));
+        let _ = self.events.send(Event::Focus(Some(window)));
     }
-}
-
-impl XdgShellHandler for State {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg
-    }
-
-    fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let id = self.next_id;
-        self.next_id += 1;
-        let (app_id, title) = metadata(&surface);
-        self.ids.insert(surface.wl_surface().clone(), id);
-        self.windows.insert(
-            id,
-            Window {
-                surface,
-                title,
-                app_id,
-                announced: false,
-                fullscreen: false,
-                callback_due: Instant::now(),
-            },
-        );
-        self.apply_window_state(id);
-    }
-
-    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
-        if self
-            .popups
-            .track_popup(PopupKind::Xdg(surface.clone()))
-            .is_err()
-        {
-            return;
-        }
-        place_popup(self, &surface, positioner);
-        let _ = surface.send_configure();
-    }
-
-    fn reposition_request(
-        &mut self,
-        surface: PopupSurface,
-        positioner: PositionerState,
-        token: u32,
-    ) {
-        place_popup(self, &surface, positioner);
-        surface.send_repositioned(token);
-    }
-
-    fn grab(
-        &mut self,
-        _surface: PopupSurface,
-        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
-        _serial: smithay::utils::Serial,
-    ) {
-    }
-
-    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
-            return;
-        };
-        let stale: Vec<WlSurface> = self
-            .snapshots
-            .keys()
-            .filter(|surface| self.window_for_surface(surface) == Some(id))
-            .cloned()
-            .collect();
-        for surface in stale {
-            self.snapshots.remove(&surface);
-        }
-        self.ids.remove(surface.wl_surface());
-        self.cancel_window_activations(id);
-        if self
-            .keyboard_pane
-            .is_some_and(|pane| self.panes.get(&pane).is_some_and(|p| p.window == id))
-        {
-            input::reset_keyboard(self);
-        }
-        for pane in self.panes_showing(id) {
-            if self.following.contains(&pane) {
-                if let Some(state) = self.panes.get_mut(&pane) {
-                    state.window = 0;
-                }
-                self.mark_dirty(pane);
-                self.send_title(pane, 0);
-            } else {
-                self.remove_pane(pane);
-                let _ = self.events.send(Event::Release {
-                    pane,
-                    reason: "window closed".into(),
-                });
-            }
-        }
-        self.leave_output(id);
-        self.windows.remove(&id);
-        self.deciding.remove(&id);
-        if self.newest == Some(id) {
-            self.newest = self
-                .windows
-                .iter()
-                .filter(|(_, entry)| entry.announced)
-                .map(|(id, _)| *id)
-                .max();
-            if let Some(newest) = self.newest {
-                self.follow_panes(newest);
-            }
-        }
-        self.popups.cleanup();
-        if self.focused == Some(id) {
-            if let Some(next) = self.newest {
-                self.focus_window(next);
-            } else {
-                self.focused = None;
-                let _ = self.events.send(Event::Focus(0));
-            }
-        }
-        let _ = self.events.send(Event::WindowDown(id));
-    }
-
-    fn fullscreen_request(
-        &mut self,
-        surface: ToplevelSurface,
-        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
-    ) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
-            return;
-        };
-        let announced = match self.windows.get_mut(&id) {
-            Some(window) => {
-                window.fullscreen = true;
-                window.announced
-            }
-            None => return,
-        };
-        if announced {
-            self.follow_panes(id);
-        }
-        self.enter_output(id);
-        self.focus_window(id);
-        self.apply_window_state(id);
-    }
-
-    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
-            return;
-        };
-        if let Some(window) = self.windows.get_mut(&id) {
-            window.fullscreen = false;
-        }
-        self.apply_window_state(id);
-    }
-
-    fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(id) = self.ids.get(surface.wl_surface()).copied() {
-            self.apply_window_state(id);
-        }
-    }
-
-    fn title_changed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
-            return;
-        };
-        let (app_id, title) = metadata(&surface);
-        if let Some(window) = self.windows.get_mut(&id) {
-            window.title = title;
-            window.app_id = app_id;
-        }
-        self.resolve_pending_panes();
-        let info = self.window_info(id);
-        let _ = self.events.send(Event::WindowUp(info));
-        self.send_titles(id);
-    }
-
-    fn app_id_changed(&mut self, surface: ToplevelSurface) {
-        self.title_changed(surface);
-    }
-}
-
-fn metadata(surface: &ToplevelSurface) -> (String, String) {
-    with_states(surface.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .map_or_default(|data| {
-                let data = data.lock().unwrap();
-                (
-                    data.app_id.clone().unwrap_or_default(),
-                    data.title.clone().unwrap_or_default(),
-                )
-            })
-    })
-}
-
-/// Where a popup may be placed: the pane showing its window, in the
-/// coordinates popup geometry is expressed in (the parent's window geometry).
-fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> {
-    let window = state.window_for_surface(popup.wl_surface());
-    let geometry = window
-        .and_then(|window| state.windows.get(&window))
-        .map_or_else(
-            || (0, 0).into(),
-            |window| render::window_geometry(window.surface.wl_surface()),
-        );
-    let parent = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
-    let size = window.map_or(state.mode, |window| state.pane_size(window));
-    Rectangle::new(
-        (
-            geometry.x.saturating_add(parent.x).saturating_neg(),
-            geometry.y.saturating_add(parent.y).saturating_neg(),
-        )
-            .into(),
-        size,
-    )
-}
-
-fn place_popup(state: &State, surface: &PopupSurface, positioner: PositionerState) {
-    let target = popup_target(state, surface);
-    surface.with_pending_state(|pending| {
-        pending.geometry = positioner.get_unconstrained_geometry(target);
-        pending.positioner = positioner;
-    });
 }
 
 impl SeatHandler for State {
@@ -1142,7 +884,7 @@ delegate_dispatch2!(State);
 fn run(
     name: String,
     rx: channel::Channel<Command>,
-    events: mpsc::Sender<Event>,
+    events: channel::Sender<Event>,
     ready: mpsc::Sender<std::io::Result<()>>,
 ) {
     let Ok(mut display) = Display::<State>::new() else {
@@ -1151,7 +893,14 @@ fn run(
         )));
         return;
     };
-    let mut state = State::new(display.handle(), events);
+    let mut event_loop = match EventLoop::<State>::try_new() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            let _ = ready.send(Err(std::io::Error::other(error)));
+            return;
+        }
+    };
+    let mut state = State::new(display.handle(), event_loop.handle(), events);
     let keymap = XkbConfig {
         layout: "us",
         ..XkbConfig::default()
@@ -1167,8 +916,7 @@ fn run(
         let _ = ready.send(Err(std::io::Error::other("could not bind Wayland socket")));
         return;
     };
-    let setup = (|| -> std::io::Result<_> {
-        let event_loop = EventLoop::<State>::try_new().map_err(std::io::Error::other)?;
+    let setup = (|| -> std::io::Result<()> {
         let handle = event_loop.handle();
         handle
             .insert_source(rx, |event, (), state| match event {
@@ -1195,15 +943,12 @@ fn run(
                 |_, _, _| Ok(PostAction::Continue),
             )
             .map_err(std::io::Error::other)?;
-        Ok(event_loop)
+        Ok(())
     })();
-    let mut event_loop = match setup {
-        Ok(event_loop) => event_loop,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
+    if let Err(error) = setup {
+        let _ = ready.send(Err(error));
+        return;
+    }
     let _ = ready.send(Ok(()));
     while !state.shutdown {
         if let Err(error) = event_loop.dispatch(state.next_wakeup(Instant::now()), &mut state) {
@@ -1211,59 +956,9 @@ fn run(
             break;
         }
         let _ = display.dispatch_clients(&mut state);
-        poll_imports(&mut state);
-        clipboard::poll(&mut state);
         state.expire_activation_tokens();
         state.frame_callbacks();
         state.dispatch_frames();
         let _ = display.flush_clients();
-    }
-}
-
-fn dmabuf_ready(buffer: &Dmabuf) -> bool {
-    buffer.handles().all(|fd| {
-        let mut descriptors = [rustix::event::PollFd::new(
-            &fd,
-            rustix::event::PollFlags::IN,
-        )];
-        rustix::event::poll(
-            &mut descriptors,
-            Some(&rustix::event::Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            }),
-        )
-        .is_ok_and(|count| {
-            count != 0
-                && descriptors[0].revents().intersects(
-                    rustix::event::PollFlags::IN
-                        | rustix::event::PollFlags::ERR
-                        | rustix::event::PollFlags::HUP,
-                )
-        })
-    })
-}
-
-fn poll_imports(state: &mut State) {
-    let mut index = 0;
-    while index < state.pending_imports.len() {
-        let pending = &state.pending_imports[index];
-        let Ok(surface) = pending.surface.upgrade() else {
-            state.pending_imports.swap_remove(index);
-            continue;
-        };
-        if !dmabuf_ready(&pending.buffer) {
-            index += 1;
-            continue;
-        }
-        state.pending_imports.swap_remove(index).barrier.signal();
-        if let Some(client) = surface.client()
-            && let Some(client_state) = client.get_data::<ClientState>()
-        {
-            let display = state.display.clone();
-            client_state
-                .compositor_state
-                .blocker_cleared(state, &display);
-        }
     }
 }

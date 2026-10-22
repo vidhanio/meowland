@@ -10,13 +10,12 @@ use smithay::{
     },
 };
 
-use super::{Event, State};
-use crate::protocol::Show;
+use super::{Binding, Event, Selection, State, WindowId};
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
 pub(super) struct Launch {
-    pub(super) window: Option<u64>,
+    pub(super) window: Option<WindowId>,
     expires: Instant,
 }
 
@@ -43,10 +42,10 @@ impl State {
     pub(super) fn cancel_activation(&mut self, token: &str, reason: &str) {
         self.forget_activation(token);
         let waiting: Vec<_> = self
-            .pending_shows
+            .attachments.panes
             .iter()
-            .filter_map(|(pane, show)| {
-                matches!(show, Show::Activation(pending) if pending == token).then_some(*pane)
+            .filter_map(|(pane, entry)| {
+                matches!(&entry.binding, Binding::Waiting(Selection::Activation(pending)) if pending == token).then_some(*pane)
             })
             .collect();
         for pane in waiting {
@@ -58,7 +57,7 @@ impl State {
         }
     }
 
-    pub(super) fn cancel_window_activations(&mut self, window: u64) {
+    pub(super) fn cancel_window_activations(&mut self, window: WindowId) {
         let tokens: Vec<_> = self
             .launches
             .iter()
@@ -109,7 +108,8 @@ impl XdgActivationHandler for State {
 
     /// Only the focused Wayland client may delegate activation to another app.
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        self.focused
+        self.catalog
+            .focused()
             .and_then(|window| self.windows.get(&window))
             .and_then(|window| window.surface.wl_surface().client())
             .is_some_and(|client| data.client_id == Some(client.id()))
@@ -133,11 +133,7 @@ impl XdgActivationHandler for State {
             launch.window = Some(window);
         }
         self.resolve_pending_panes();
-        if self
-            .windows
-            .get(&window)
-            .is_some_and(|window| window.announced)
-        {
+        if self.catalog.drawable(window) {
             self.focus_window(window);
         }
     }

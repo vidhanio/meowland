@@ -17,11 +17,6 @@ impl Snapshot {
     /// Copy a committed shm buffer into an owned RGBA snapshot, reusing
     /// `pixels` when possible. On failure, `pixels` remains with the
     /// caller.
-    #[expect(
-        unsafe_code,
-        reason = "the shm pool is only reachable as a raw pointer, so reading it takes one \
-              bounded, documented slice"
-    )]
     pub(super) fn copy_shm(
         ptr: *const u8,
         len: usize,
@@ -48,6 +43,9 @@ impl Snapshot {
         if offset.checked_add(stride.checked_mul(size.height() as usize)?)? > len {
             return None;
         }
+        // SAFETY: Smithay's with_buffer_contents keeps this mapped shm pool
+        // valid for the callback; the dimensions, stride, and offset
+        // were checked above.
         let source = unsafe { std::slice::from_raw_parts(ptr, len) };
         Self::resize_pixels(pixels, size);
         let opaque = if data.format == wl_shm::Format::Xrgb8888 {

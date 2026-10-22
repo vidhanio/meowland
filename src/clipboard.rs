@@ -1,15 +1,8 @@
-//! Bounded, MIME-aware clipboard data and nonblocking Wayland transfers.
+//! Bounded, MIME-aware clipboard data and shared monotonic request deadlines.
 
-use std::{
-    io,
-    os::fd::OwnedFd,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
-use rustix::{
-    fs::{OFlags, fcntl_getfl, fcntl_setfl},
-    io::Errno,
-};
+use rustix::time::{ClockId, clock_gettime};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_TEXT: usize = 1024 * 1024;
@@ -88,41 +81,30 @@ pub fn mime_types(types: impl IntoIterator<Item = String>) -> Vec<String> {
     result
 }
 
-#[derive(Debug)]
-pub struct Transfer {
-    fd: OwnedFd,
-    bytes: Vec<u8>,
-    deadline: Instant,
-}
+/// A boot-scoped `CLOCK_MONOTONIC` deadline shared by local server and pane
+/// processes.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct Deadline(u64);
 
-impl Transfer {
-    pub(crate) fn new(fd: OwnedFd) -> io::Result<Self> {
-        fcntl_setfl(&fd, fcntl_getfl(&fd)? | OFlags::NONBLOCK)?;
-        Ok(Self {
-            fd,
-            bytes: Vec::new(),
-            deadline: Instant::now() + Duration::from_secs(75),
-        })
+impl Deadline {
+    pub fn new(timeout: Duration) -> Self {
+        Self(Self::now().saturating_add(timeout.as_nanos().min(u128::from(u64::MAX)) as u64))
     }
 
-    pub(crate) fn receive(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if Instant::now() >= self.deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        let mut bytes = [0; 16 * 1024];
-        for _ in 0..4 {
-            match rustix::io::read(&self.fd, &mut bytes) {
-                Ok(0) => return Ok(Some(std::mem::take(&mut self.bytes))),
-                Ok(read) => {
-                    if self.bytes.len() + read > MAX_BYTES {
-                        return Err(io::Error::other("clipboard transfer exceeds size limit"));
-                    }
-                    self.bytes.extend_from_slice(&bytes[..read]);
-                }
-                Err(Errno::AGAIN | Errno::INTR) => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(None)
+    pub fn remaining(self) -> Duration {
+        Duration::from_nanos(self.0.saturating_sub(Self::now()))
+    }
+
+    pub fn expired(self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    fn now() -> u64 {
+        let time = clock_gettime(ClockId::Monotonic);
+        (time.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(time.tv_nsec as u64)
     }
 }
+
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);

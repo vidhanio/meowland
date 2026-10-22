@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{Event, FRAME_INTERVAL, State, SurfaceAttributes, TRANSFER_POLL_INTERVAL, with_states};
+use super::{Event, FRAME_INTERVAL, State, SurfaceAttributes, with_states};
 use crate::pixels::FrameSize;
 
 /// Each pane owns its scheduling state. No separate dirty-pane index can drift
@@ -18,7 +18,6 @@ enum Presentation {
 }
 
 pub(super) struct PaneState {
-    pub(super) window: u64,
     pub(super) size: FrameSize,
     presentation: Presentation,
     shown: Vec<u8>,
@@ -27,9 +26,8 @@ pub(super) struct PaneState {
 }
 
 impl PaneState {
-    pub(super) fn new(window: u64, size: FrameSize) -> Self {
+    pub(super) const fn new(size: FrameSize) -> Self {
         Self {
-            window,
             size,
             presentation: Presentation::Clean,
             shown: Vec::new(),
@@ -64,7 +62,7 @@ impl PaneState {
 
     /// Record exactly the pixels sent, not a newer commit or an unacknowledged
     /// assumption. The allocation crossing threads is only the changed band.
-    fn frame(&mut self, pane: u64, pixels: &[u8]) -> Option<Event> {
+    fn frame(&mut self, pane: super::PaneId, pixels: &[u8]) -> Option<Event> {
         self.presentation = Presentation::Clean;
         let stride = self.size.rgb_stride();
         let rows = if self.shown_size == Some(self.size) {
@@ -104,24 +102,26 @@ impl PaneState {
 }
 
 impl State {
-    /// Sleep until frame work is due; only unfinished transfers require
-    /// polling.
-    pub(super) fn next_wakeup(&self, now: Instant) -> Duration {
-        let mut wait = if self.pending_imports.is_empty() && !self.clipboard.pending() {
-            Duration::from_secs(60)
-        } else {
-            TRANSFER_POLL_INTERVAL
-        };
-        if let Some(deadline) = self.next_activation_deadline() {
-            wait = wait.min(deadline.saturating_duration_since(now));
+    /// Wait for frame or activation deadlines; transfers wake through readiness
+    /// sources.
+    pub(super) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
+        if self
+            .attachments
+            .panes
+            .values()
+            .any(|pane| pane.presentation.due())
+        {
+            return Some(Duration::ZERO);
         }
-        for window in self.windows.values() {
-            wait = wait.min(window.callback_due.saturating_duration_since(now));
-        }
-        if self.panes.values().any(PaneState::due) {
-            return Duration::ZERO;
-        }
-        wait
+        self.next_activation_deadline()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .into_iter()
+            .chain(
+                self.windows
+                    .values()
+                    .map(|window| window.callback_due.saturating_duration_since(now)),
+            )
+            .min()
     }
 
     /// Run Wayland callbacks at ~120Hz, independently of terminal acks.
@@ -153,22 +153,25 @@ impl State {
         }
     }
 
-    pub(super) fn pane_ack(&mut self, pane: u64, drawn: bool) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.ack(drawn);
+    pub(super) fn pane_ack(&mut self, pane: super::PaneId, drawn: bool) {
+        if let Some(entry) = self.attachments.panes.get_mut(&pane) {
+            entry.presentation.ack(drawn);
         }
     }
 
     /// Borrow disjoint fields instead of allocating a list of due pane IDs.
     pub(super) fn dispatch_frames(&mut self) {
-        for (&pane, entry) in &mut self.panes {
-            if !entry.due() {
+        for (&pane, entry) in &mut self.attachments.panes {
+            if !entry.presentation.due() {
                 continue;
             }
-            let pixels =
-                self.renderer
-                    .render(&self.windows, &self.snapshots, entry.window, entry.size);
-            if let Some(frame) = entry.frame(pane, pixels) {
+            let pixels = self.renderer.render(
+                &self.windows,
+                &self.snapshots,
+                entry.window(),
+                entry.presentation.size,
+            );
+            if let Some(frame) = entry.presentation.frame(pane, pixels) {
                 let _ = self.events.send(frame);
             }
         }

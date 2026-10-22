@@ -1,11 +1,59 @@
 //! Shared signal handling for the server and terminal pane.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use signal_hook::SigId;
+
+/// Signal registrations that wake a readiness loop without masking child
+/// signals.
+#[derive(Debug)]
+pub(crate) struct Wakeup {
+    socket: UnixStream,
+    handlers: Vec<SigId>,
+}
+
+impl Wakeup {
+    pub(crate) fn new(signals: &[i32]) -> std::io::Result<Self> {
+        let (socket, writer) = UnixStream::pair()?;
+        socket.set_nonblocking(true)?;
+        let mut wakeup = Self {
+            socket,
+            handlers: Vec::new(),
+        };
+        for &signal in signals {
+            wakeup.handlers.push(signal_hook::low_level::pipe::register(
+                signal,
+                writer.try_clone()?,
+            )?);
+        }
+        Ok(wakeup)
+    }
+
+    pub(crate) fn drain(&self) {
+        let mut bytes = [0; 256];
+        while rustix::io::read(&self.socket, &mut bytes).is_ok_and(|read| read > 0) {}
+    }
+}
+
+impl std::os::fd::AsFd for Wakeup {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+}
+
+impl Drop for Wakeup {
+    fn drop(&mut self) {
+        for handler in &self.handlers {
+            signal_hook::low_level::unregister(*handler);
+        }
+    }
+}
 
 /// Termination handlers owned by one server or pane invocation.
 #[derive(Debug)]

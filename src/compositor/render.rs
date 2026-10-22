@@ -9,7 +9,8 @@ use smithay::{
 
 use super::{
     Logical, PopupKind, PopupManager, Rectangle, Size, Snapshot, State, SubsurfaceCachedState,
-    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, Window, WlSurface, with_states,
+    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, Window, WindowId, WlSurface,
+    with_states,
 };
 use crate::pixels::FrameSize;
 
@@ -24,12 +25,12 @@ impl Renderer {
     /// Compose one pane while borrowing scene state only for this draw.
     pub(super) fn render(
         &mut self,
-        windows: &HashMap<u64, Window>,
+        windows: &HashMap<WindowId, Window>,
         snapshots: &HashMap<WlSurface, Snapshot>,
-        window: u64,
+        window: Option<WindowId>,
         size: FrameSize,
     ) -> &[u8] {
-        if let Some(window) = windows.get(&window) {
+        if let Some(window) = window.and_then(|id| windows.get(&id)) {
             self.stack.rebuild(window.surface.wl_surface());
         } else {
             self.stack.clear();
@@ -344,7 +345,7 @@ impl State {
     /// focus.
     pub(super) fn hit_test(
         &mut self,
-        window: u64,
+        window: WindowId,
         x: f64,
         y: f64,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {

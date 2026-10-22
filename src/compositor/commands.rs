@@ -1,27 +1,45 @@
-//! Pane attachment and compositor commands; all mutations stay on the display
-//! thread.
+//! Commands entering the display thread and their Wayland side effects.
 
 use smithay::{
     output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel, utils::Size,
 };
 
-use super::{Command, Event, State, clipboard, frame::PaneState, input::pane_input};
+use super::{
+    Binding, Command, Event, Pane, PaneId, Selection, State, WindowId, clipboard, input::pane_input,
+};
 use crate::{pixels::FrameSize, protocol::Show};
 
 impl State {
     pub(super) fn handle_command(&mut self, command: Command) {
         match command {
-            Command::CreateActivationToken { reply } => {
+            Command::CreateActivationToken { request } => {
                 let token = self.create_activation_token();
-                if reply.send(token.clone()).is_err() {
+                if self
+                    .events
+                    .send(Event::ActivationCreated {
+                        request,
+                        token: token.clone(),
+                    })
+                    .is_err()
+                {
                     self.cancel_activation(&token, "launch cancelled");
                 }
             }
             Command::CancelActivation { token } => {
                 self.cancel_activation(&token, "launch cancelled");
             }
-            Command::Kill { show, reply } => {
-                let _ = reply.send(self.close_window(&show));
+            Command::Kill {
+                request,
+                show,
+                waiting,
+                deadline,
+            } => {
+                if waiting.load(std::sync::atomic::Ordering::Relaxed)
+                    && std::time::Instant::now() < deadline
+                {
+                    let result = self.close_window(&show);
+                    let _ = self.events.send(Event::CloseRequested { request, result });
+                }
             }
             Command::Attach {
                 pane,
@@ -44,19 +62,9 @@ impl State {
                 width,
                 height,
             } => {
-                let Some(size) = FrameSize::new(width, height) else {
-                    return;
-                };
-                let Some(entry) = self.panes.get_mut(&pane) else {
-                    return;
-                };
-                entry.size = size;
-                entry.mark_dirty();
-                let window = entry.window;
-                if self.panes.keys().min() == Some(&pane) {
-                    self.configure_output(size);
+                if let Some(size) = FrameSize::new(width, height) {
+                    self.resize_pane(pane, size);
                 }
-                self.apply_window_state(window);
             }
             Command::Input { pane, event } => pane_input(self, pane, &event),
             Command::Paste { pane, text } => clipboard::paste(self, pane, &text),
@@ -65,22 +73,20 @@ impl State {
                 offer,
                 mimes,
                 paste,
-            } => {
-                clipboard::offer(self, pane, offer, mimes, paste);
-            }
+            } => clipboard::offer(self, pane, offer, mimes, paste),
             Command::ClipboardReply {
                 pane,
                 request,
                 data,
-            } => {
-                clipboard::reply(self, pane, request, data);
-            }
+            } => clipboard::reply(self, pane, request, data),
             Command::Ack { pane, drawn } => self.pane_ack(pane, drawn),
             Command::CloseShown { pane } => {
                 if let Some(window) = self
+                    .attachments
                     .panes
                     .get(&pane)
-                    .and_then(|pane| self.windows.get(&pane.window))
+                    .and_then(Pane::window)
+                    .and_then(|id| self.windows.get(&id))
                 {
                     window.surface.send_close();
                 } else {
@@ -99,9 +105,22 @@ impl State {
         }
     }
 
-    /// Explicit app IDs and launch tokens wait for their window, never the
-    /// newest.
-    fn attach_pane(&mut self, pane: u64, show: Show, size: FrameSize) {
+    fn resize_pane(&mut self, pane: PaneId, size: FrameSize) {
+        let Some(entry) = self.attachments.panes.get_mut(&pane) else {
+            return;
+        };
+        entry.presentation.size = size;
+        entry.presentation.mark_dirty();
+        let window = entry.window();
+        if self.attachments.first() == Some(pane) {
+            self.configure_output(size);
+        }
+        if let Some(window) = window {
+            self.apply_window_state(window);
+        }
+    }
+
+    fn attach_pane(&mut self, pane: PaneId, show: Show, size: FrameSize) {
         if matches!(&show, Show::Activation(token) if !self.launches.contains_key(token)) {
             let _ = self.events.send(Event::Release {
                 pane,
@@ -109,66 +128,52 @@ impl State {
             });
             return;
         }
-        if matches!(show, Show::Newest) {
-            self.following.insert(pane);
-        }
-        if let Some(window) = self.selected_window(&show) {
-            self.insert_pane(pane, PaneState::new(window, size));
-            self.show_pane_window(pane, window);
-            if let Show::Activation(token) = show {
-                self.forget_activation(&token);
-            }
-        } else if matches!(show, Show::Id(_)) {
+        let window = self.selected_window(&show);
+        if window.is_none() && matches!(show, Show::Id(_)) {
             let _ = self.events.send(Event::Release {
                 pane,
                 reason: "no such window".into(),
             });
-        } else {
-            self.insert_pane(pane, PaneState::new(0, size));
-            match show {
-                Show::AppId(_) | Show::Activation(_) => {
-                    self.pending_shows.insert(pane, show);
-                }
-                Show::Newest | Show::Focused => {
-                    self.following.insert(pane);
-                }
-                Show::Id(_) => unreachable!(),
-            }
+            return;
+        }
+        let token = match &show {
+            Show::Activation(token) if window.is_some() => Some(token.clone()),
+            _ => None,
+        };
+        self.insert_pane(pane, Pane::new(show, window, size));
+        if let Some(window) = window {
+            self.show_pane_window(pane, window);
+        }
+        if let Some(token) = token {
+            self.forget_activation(&token);
         }
     }
 
     fn close_window(&self, show: &Show) -> Result<(), String> {
         let window = self
             .selected_window(show)
-            .and_then(|window| self.windows.get(&window))
+            .and_then(|id| self.windows.get(&id))
             .ok_or_else(|| "no such window".to_owned())?;
         window.surface.send_close();
         Ok(())
     }
 
-    fn selected_window(&self, show: &Show) -> Option<u64> {
-        let window = match show {
-            Show::Id(id) => Some(*id),
-            Show::Newest => self.newest,
-            Show::Focused => self.focused,
-            Show::AppId(app_id) => self
-                .windows
-                .iter()
-                .filter(|(_, window)| window.announced && window.app_id == *app_id)
-                .map(|(id, _)| *id)
-                .max(),
+    fn selected_window(&self, show: &Show) -> Option<WindowId> {
+        let activation = match show {
             Show::Activation(token) => self.launches.get(token).and_then(|launch| launch.window),
-        }?;
-        self.windows
-            .get(&window)
-            .filter(|window| window.announced)
-            .map(|_| window)
+            _ => None,
+        };
+        self.catalog.select(show, activation)
     }
 
-    fn show_pane_window(&mut self, pane: u64, window: u64) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.window = window;
-            entry.mark_dirty();
+    fn show_pane_window(&mut self, pane: PaneId, window: WindowId) {
+        let token = self
+            .attachments
+            .panes
+            .get_mut(&pane)
+            .and_then(|entry| entry.show(window));
+        if let Some(token) = token {
+            self.forget_activation(&token);
         }
         self.enter_output(window);
         self.send_title(pane, window);
@@ -176,27 +181,32 @@ impl State {
         self.focus_window(window);
     }
 
-    /// Called on mapping, metadata changes and activation, not on a timer.
     pub(super) fn resolve_pending_panes(&mut self) {
         let ready: Vec<_> = self
-            .pending_shows
+            .attachments
+            .panes
             .iter()
-            .filter_map(|(pane, show)| self.selected_window(show).map(|window| (*pane, window)))
+            .filter_map(|(pane, entry)| {
+                let show = match &entry.binding {
+                    Binding::Waiting(Selection::AppId(id)) => Show::AppId(id.clone()),
+                    Binding::Waiting(Selection::Activation(token)) => {
+                        Show::Activation(token.clone())
+                    }
+                    Binding::Empty | Binding::Showing(_) => return None,
+                };
+                self.selected_window(&show).map(|window| (*pane, window))
+            })
             .collect();
         for (pane, window) in ready {
-            let show = self.pending_shows.remove(&pane);
             self.show_pane_window(pane, window);
-            if let Some(Show::Activation(token)) = show {
-                self.forget_activation(&token);
-            }
         }
     }
 
-    pub(super) fn apply_window_state(&self, window: u64) {
+    pub(super) fn apply_window_state(&self, window: WindowId) {
         let Some(entry) = self.windows.get(&window) else {
             return;
         };
-        let activated = self.focused == Some(window);
+        let activated = self.catalog.focused() == Some(window);
         let size = self.pane_size(window);
         entry.surface.with_pending_state(|pending| {
             pending.size = Some(size);

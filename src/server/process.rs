@@ -7,8 +7,6 @@ use std::{
     os::unix::process::CommandExt as _,
     path::Path,
     process::{Child, Command, Stdio},
-    thread,
-    time::Duration,
 };
 
 use rustix::process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, pidfd_send_signal};
@@ -57,14 +55,25 @@ pub(super) fn launch_client(
 
 /// Retain process handles across escalation so orphaned helpers remain
 /// reachable without signaling a reused PID.
-pub(super) fn terminate_tree(roots: &HashSet<u32>) {
-    if roots.is_empty() {
-        return;
+pub(super) struct Termination {
+    roots: HashSet<u32>,
+    processes: HashMap<u32, std::os::fd::OwnedFd>,
+}
+
+impl Termination {
+    pub(super) fn new(roots: HashSet<u32>) -> Self {
+        Self {
+            roots,
+            processes: HashMap::new(),
+        }
     }
-    let mut processes = HashMap::new();
-    for signal in [Signal::HUP, Signal::TERM, Signal::KILL] {
-        for raw in descendants(roots).into_iter().chain(roots.iter().copied()) {
-            if let std::collections::hash_map::Entry::Vacant(entry) = processes.entry(raw)
+
+    pub(super) fn signal(&mut self, signal: Signal) {
+        for raw in descendants(&self.roots)
+            .into_iter()
+            .chain(self.roots.iter().copied())
+        {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.processes.entry(raw)
                 && let Some(pid) = process_id(raw)
             {
                 match pidfd_open(pid, PidfdFlags::empty()) {
@@ -78,15 +87,14 @@ pub(super) fn terminate_tree(roots: &HashSet<u32>) {
                 }
             }
         }
-        for process in processes.values() {
+        for process in self.processes.values() {
             let _ = pidfd_send_signal(process, signal);
         }
-        for raw in roots {
+        for raw in &self.roots {
             if let Some(group) = process_id(*raw) {
                 let _ = kill_process_group(group, signal);
             }
         }
-        thread::sleep(Duration::from_millis(250));
     }
 }
 

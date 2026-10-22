@@ -363,7 +363,7 @@ impl TerminalSession {
         );
         self.presentation = PanePresentation::new(self.cell, shared);
         self.clipboard = Clipboard::new(probe.clipboard.is_some())?;
-        self.clipboard.refresh(false);
+        let _ = self.clipboard.refresh(false);
         protocol::send(&mut self.tx, &PaneToServer::Resize { width, height })?;
         PaneStats::capabilities(&probe, width, height);
         self.lifecycle = Lifecycle::Active(mode);

@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use super::input::{Key, Kind};
@@ -63,9 +63,8 @@ impl Keyboard {
         self.deferred.is_some()
     }
 
-    pub(super) fn defer(&mut self, input: Input) {
-        self.deferred_deadline
-            .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+    pub(super) fn defer(&mut self, input: Input, deadline: Instant) {
+        self.deferred_deadline.get_or_insert(deadline);
         self.deferred.get_or_insert_with(Vec::new).push(input);
     }
 
@@ -87,12 +86,20 @@ impl Keyboard {
         self.deferred.as_ref().map_or(0, Vec::len)
     }
 
-    pub(super) fn reset(&mut self) {
+    pub(super) fn reset(&mut self, preserve_deferred: bool) {
         self.intercepted.clear();
         self.held.clear();
         self.modifiers = 0;
-        self.deferred = None;
-        self.deferred_deadline = None;
+        if preserve_deferred {
+            if let Some(inputs) = &mut self.deferred
+                && !matches!(inputs.last(), Some(Input::ResetKeyboard))
+            {
+                inputs.push(Input::ResetKeyboard);
+            }
+        } else {
+            self.deferred = None;
+            self.deferred_deadline = None;
+        }
     }
 }
 

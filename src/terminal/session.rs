@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io,
+    io::{self, Write},
     os::unix::net::UnixStream,
     path::Path,
     time::{Duration, Instant},
@@ -15,8 +15,8 @@ use rustix::{
 
 use super::{
     Clipboard, FALLBACK_CELL, KEYBOARD_FLAGS, Keyboard, PanePresentation, PaneStats, TerminalGuard,
-    cursor_bytes, input, output, pane_pixels, send_clipboard_actions, send_deferred, send_event,
-    terminal_probe, title_bytes, window_pixels,
+    cursor_bytes, derived_cell, input, output, pane_pixels, send_clipboard_actions, send_deferred,
+    send_event, terminal_probe, title_bytes, window_pixels,
 };
 use crate::{
     Error, Result,
@@ -24,11 +24,18 @@ use crate::{
     signals,
 };
 
-#[derive(Clone, Copy)]
 enum Lifecycle {
     Handshaking { deadline: Instant },
-    Active,
+    Waiting,
+    Active(TerminalGuard),
     Closed,
+}
+
+#[derive(Default)]
+struct PendingWindow {
+    title: Option<String>,
+    cursor: Option<String>,
+    clipboard: Option<crate::clipboard::ClipboardData>,
 }
 
 enum Ready {
@@ -53,11 +60,11 @@ pub(super) struct TerminalSession {
     lifecycle: Lifecycle,
     wakeup: signals::Wakeup,
     interrupted: signals::TerminationFlag,
-    mode: TerminalGuard,
+    window: PendingWindow,
 }
 
 impl TerminalSession {
-    pub(super) fn connect(socket: &Path, show: Show) -> Result<Option<Self>> {
+    pub(super) fn connect(socket: &Path, show: Show) -> Result<Self> {
         let stream = UnixStream::connect(socket).map_err(|error| {
             Error::io(
                 format!(
@@ -69,24 +76,6 @@ impl TerminalSession {
         })?;
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let interrupted = signals::termination_flag()?;
-        let mut mode = TerminalGuard::enter()?;
-        let (probe, shared) = terminal_probe(&interrupted)?;
-        if interrupted.interrupted() {
-            mode.restore()?;
-            return Ok(None);
-        }
-        if !probe.graphics {
-            return Err(Error::GraphicsUnsupported);
-        }
-        if !probe.sgr_pixels {
-            return Err(Error::PixelMouseUnsupported);
-        }
-        if probe
-            .keyboard_flags
-            .is_none_or(|flags| !flags.contains(KEYBOARD_FLAGS))
-        {
-            return Err(Error::KeyboardUnsupported);
-        }
         let input = input::Reader::new()?;
         let wakeup = signals::Wakeup::new(&[
             signal_hook::consts::SIGINT,
@@ -94,17 +83,10 @@ impl TerminalSession {
             signal_hook::consts::SIGHUP,
             signal_hook::consts::SIGWINCH,
         ])?;
-        mode.enable_mouse()?;
-        if let Some(previous) = probe.clipboard {
-            mode.enable_clipboard(previous)?;
-        }
-        let cell = probe.cell_width.zip(probe.cell_height);
-        let (width, height) = pane_pixels(
-            probe.pixel_width.zip(probe.pixel_height),
-            window_pixels(),
-            (cols, rows),
-            cell.unwrap_or(FALLBACK_CELL),
-        );
+        let pixels = window_pixels();
+        let cell = derived_cell(pixels, (cols, rows));
+        let (width, height) =
+            pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
         let mut tx = stream.try_clone()?;
         protocol::send(
             &mut tx,
@@ -114,24 +96,23 @@ impl TerminalSession {
                 show,
             }),
         )?;
-        PaneStats::capabilities(&probe, width, height);
-        Ok(Some(Self {
+        Ok(Self {
             stream,
             tx,
             reader: protocol::MessageReader::default(),
             input,
             stdout: output::open()?,
             keyboard: Keyboard::default(),
-            clipboard: Clipboard::new(probe.clipboard.is_some())?,
-            presentation: PanePresentation::new(cell, shared),
+            clipboard: Clipboard::new(false)?,
+            presentation: PanePresentation::new(cell, None),
             cell,
             lifecycle: Lifecycle::Handshaking {
                 deadline: Instant::now() + Duration::from_secs(1),
             },
             wakeup,
             interrupted,
-            mode,
-        }))
+            window: PendingWindow::default(),
+        })
     }
 
     pub(super) fn run(mut self) -> Result<()> {
@@ -188,7 +169,7 @@ impl TerminalSession {
     fn next_deadline(&self) -> Option<Instant> {
         let handshake = match self.lifecycle {
             Lifecycle::Handshaking { deadline } => Some(deadline),
-            Lifecycle::Active | Lifecycle::Closed => None,
+            Lifecycle::Waiting | Lifecycle::Active(_) | Lifecycle::Closed => None,
         };
         handshake
             .into_iter()
@@ -198,12 +179,19 @@ impl TerminalSession {
     }
 
     fn wait_ready(&self) -> io::Result<Ready> {
-        let pending_output = self.presentation.pending.pending();
+        let active = matches!(self.lifecycle, Lifecycle::Active(_));
+        let pending_output = active && self.presentation.pending.pending();
         let mut fds = [
             PollFd::new(&self.wakeup, PollFlags::IN),
             PollFd::new(
                 &self.input.fd,
-                PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
+                PollFlags::HUP
+                    | PollFlags::ERR
+                    | if active {
+                        PollFlags::IN
+                    } else {
+                        PollFlags::empty()
+                    },
             ),
             PollFd::new(
                 &self.stdout,
@@ -271,15 +259,22 @@ impl TerminalSession {
         match message {
             ServerToPane::HelloOk => {
                 if matches!(self.lifecycle, Lifecycle::Handshaking { .. }) {
-                    self.lifecycle = Lifecycle::Active;
-                    self.clipboard.refresh(false);
+                    self.lifecycle = Lifecycle::Waiting;
+                    writeln!(
+                        io::stderr(),
+                        "meowland: waiting for a window (Ctrl+C to cancel)"
+                    )?;
                 }
             }
             ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
                 return self.close(Some(&reason));
             }
             ServerToPane::ClipboardWrite(data) => {
-                self.clipboard.copy(data, &mut self.presentation.pending);
+                if matches!(self.lifecycle, Lifecycle::Active(_)) {
+                    self.clipboard.copy(data, &mut self.presentation.pending);
+                } else {
+                    self.window.clipboard = Some(data);
+                }
             }
             ServerToPane::ClipboardRead {
                 request,
@@ -288,20 +283,90 @@ impl TerminalSession {
                 deadline,
             } => self.clipboard.read(request, offer, mime, deadline),
             ServerToPane::ClipboardCancel { request } => self.clipboard.cancel(request),
-            ServerToPane::Title(title) => self.presentation.pending.append(&title_bytes(&title)),
-            ServerToPane::Cursor(shape) => self
-                .presentation
-                .pending
-                .append(&cursor_bytes(shape.as_deref())),
+            ServerToPane::Title(title) => {
+                if matches!(self.lifecycle, Lifecycle::Active(_)) {
+                    self.presentation.pending.append(&title_bytes(&title));
+                } else {
+                    self.window.title = Some(title);
+                }
+            }
+            ServerToPane::Cursor(shape) => {
+                if matches!(self.lifecycle, Lifecycle::Active(_)) {
+                    self.presentation
+                        .pending
+                        .append(&cursor_bytes(shape.as_deref()));
+                } else {
+                    self.window.cursor = shape;
+                }
+            }
             ServerToPane::Frame {
                 width,
                 height,
                 y,
                 rgb,
-            } => self
-                .presentation
-                .draw(width, height, y, rgb, &mut self.tx)?,
+            } => {
+                let starting = !matches!(self.lifecycle, Lifecycle::Active(_));
+                if starting {
+                    self.start_presentation()?;
+                    if matches!(self.lifecycle, Lifecycle::Closed) {
+                        return Ok(());
+                    }
+                }
+                self.presentation
+                    .draw(width, height, y, rgb, &mut self.tx)?;
+                if starting {
+                    let window = std::mem::take(&mut self.window);
+                    if let Some(title) = window.title {
+                        self.presentation.pending.append(&title_bytes(&title));
+                    }
+                    self.presentation
+                        .pending
+                        .append(&cursor_bytes(window.cursor.as_deref()));
+                    if let Some(data) = window.clipboard {
+                        self.clipboard.copy(data, &mut self.presentation.pending);
+                    }
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn start_presentation(&mut self) -> Result<()> {
+        let mut mode = TerminalGuard::enter()?;
+        let (probe, shared) = terminal_probe(&self.interrupted)?;
+        if self.interrupted.interrupted() {
+            mode.restore()?;
+            return self.close(None);
+        }
+        if !probe.graphics {
+            return Err(Error::GraphicsUnsupported);
+        }
+        if !probe.sgr_pixels {
+            return Err(Error::PixelMouseUnsupported);
+        }
+        if probe
+            .keyboard_flags
+            .is_none_or(|flags| !flags.contains(KEYBOARD_FLAGS))
+        {
+            return Err(Error::KeyboardUnsupported);
+        }
+        mode.enable_mouse()?;
+        if let Some(previous) = probe.clipboard {
+            mode.enable_clipboard(previous)?;
+        }
+        self.cell = probe.cell_width.zip(probe.cell_height).or(self.cell);
+        let (width, height) = pane_pixels(
+            probe.pixel_width.zip(probe.pixel_height),
+            window_pixels(),
+            crossterm::terminal::size().unwrap_or((80, 24)),
+            self.cell.unwrap_or(FALLBACK_CELL),
+        );
+        self.presentation = PanePresentation::new(self.cell, shared);
+        self.clipboard = Clipboard::new(probe.clipboard.is_some())?;
+        self.clipboard.refresh(false);
+        protocol::send(&mut self.tx, &PaneToServer::Resize { width, height })?;
+        PaneStats::capabilities(&probe, width, height);
+        self.lifecycle = Lifecycle::Active(mode);
         Ok(())
     }
 
@@ -313,6 +378,11 @@ impl TerminalSession {
             let Some(event) = self.input.next() else {
                 break;
             };
+            if !matches!(self.lifecycle, Lifecycle::Active(_))
+                && !matches!(event, input::Event::Resize)
+            {
+                continue;
+            }
             send_event(
                 event,
                 &mut self.tx,
@@ -327,11 +397,14 @@ impl TerminalSession {
     }
 
     fn close(&mut self, reason: Option<&str>) -> Result<()> {
-        self.lifecycle = Lifecycle::Closed;
+        if let Lifecycle::Active(mut mode) =
+            std::mem::replace(&mut self.lifecycle, Lifecycle::Closed)
+        {
+            mode.restore()?;
+        }
         if let Some(reason) = reason {
-            self.mode.restore_with_message(reason)?;
-        } else {
-            self.mode.restore()?;
+            let clean = protocol::sanitize_with_limit(reason, 512);
+            writeln!(io::stdout(), "meowland: {clean}")?;
         }
         Ok(())
     }

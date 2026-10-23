@@ -1,0 +1,25 @@
+[package]
+name = "meowland-compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+meowland-core = { workspace = true }
+meowland-protocol = { workspace = true }
+calloop = { workspace = true }
+getrandom = { workspace = true, features = ["std"] }
+libloading = { workspace = true }
+rustix = { workspace = true, features = ["event", "fs", "pipe"] }
+smithay = { workspace = true, features = [
+  "wayland_frontend",
+  "desktop",
+  "backend_drm",
+  "renderer_gl",
+] }
+tracing = { workspace = true }

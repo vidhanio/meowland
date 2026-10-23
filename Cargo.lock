@@ -641,27 +641,92 @@ dependencies = [
 name = "meowland"
 version = "0.1.0"
 dependencies = [
- "base64",
- "calloop",
- "criterion",
- "crossterm",
- "flate2",
- "getrandom",
- "libloading 0.9.0",
- "listenfd",
- "mime",
- "postcard",
- "rustix 1.1.5",
- "sd-notify",
- "serde",
- "serde_bytes",
- "signal-hook",
- "smithay",
- "thiserror",
- "tracing",
+ "meowland-core",
+ "meowland-protocol",
+ "meowland-server",
+ "meowland-terminal",
  "tracing-journald",
  "tracing-subscriber",
  "usage-rs",
+]
+
+[[package]]
+name = "meowland-compositor"
+version = "0.1.0"
+dependencies = [
+ "calloop",
+ "getrandom",
+ "libloading 0.9.0",
+ "meowland-core",
+ "meowland-protocol",
+ "rustix 1.1.5",
+ "smithay",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "meowland-core"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.5",
+ "signal-hook",
+ "thiserror",
+]
+
+[[package]]
+name = "meowland-kitty"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "criterion",
+ "flate2",
+ "meowland-core",
+ "rustix 1.1.5",
+ "tracing",
+]
+
+[[package]]
+name = "meowland-protocol"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "meowland-core",
+ "mime",
+ "postcard",
+ "rustix 1.1.5",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
+name = "meowland-server"
+version = "0.1.0"
+dependencies = [
+ "calloop",
+ "listenfd",
+ "meowland-compositor",
+ "meowland-core",
+ "meowland-protocol",
+ "rustix 1.1.5",
+ "sd-notify",
+ "signal-hook",
+ "tracing",
+]
+
+[[package]]
+name = "meowland-terminal"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "crossterm",
+ "getrandom",
+ "meowland-core",
+ "meowland-kitty",
+ "meowland-protocol",
+ "rustix 1.1.5",
+ "signal-hook",
+ "tracing",
  "vtparse",
 ]
 

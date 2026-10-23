@@ -104,7 +104,11 @@
               src = ./.;
               filter =
                 path: type:
-                craneLib.filterCargoSources path type || pkgs.lib.baseNameOf (toString path) == "rustfmt.toml";
+                craneLib.filterCargoSources path type
+                || builtins.elem (pkgs.lib.baseNameOf (toString path)) [
+                  "rustfmt.toml"
+                  "clippy.toml"
+                ];
             };
 
             nativeBuildInputs = [ pkgs.pkg-config ];
@@ -116,13 +120,15 @@
             ];
 
             commonArgs = {
+              pname = "meowland";
+              version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
               inherit
                 src
                 buildInputs
                 nativeBuildInputs
                 ;
               strictDeps = true;
-              cargoExtraArgs = "--locked";
+              cargoExtraArgs = "--locked --workspace --all-features";
               LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libglvnd ];
             };
 
@@ -172,7 +178,7 @@
                 commonArgs
                 // {
                   inherit cargoArtifacts;
-                  cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
+                  cargoClippyExtraArgs = "--all-targets -- -D warnings";
                 }
               );
 

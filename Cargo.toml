@@ -1,81 +1,57 @@
-[package]
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.metadata.crane]
 name = "meowland"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
 license = "MIT"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
+meowland-core = { path = "crates/meowland-core" }
+meowland-protocol = { path = "crates/meowland-protocol" }
+meowland-kitty = { path = "crates/meowland-kitty" }
+meowland-terminal = { path = "crates/meowland-terminal" }
+meowland-compositor = { path = "crates/meowland-compositor" }
+meowland-server = { path = "crates/meowland-server" }
 base64 = "0.23.1"
 calloop = "0.14.5"
-postcard = { version = "1.1.3", default-features = false, features = [
-  "use-std",
-] }
-crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", default-features = false, features = [
-  "bracketed-paste",
-  "events",
-] }
+postcard = { version = "1.1.3", default-features = false }
+crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", default-features = false }
 flate2 = "1.1.10"
 libloading = "0.9.0"
 mime = "0.3.17"
 vtparse = "0.7.0"
-getrandom = { version = "0.4.3", features = ["std"] }
-serde = { version = "1.0.229", features = ["derive"] }
+getrandom = { version = "0.4.3", default-features = false }
+serde = "1.0.229"
 serde_bytes = "0.11.19"
 signal-hook = "0.4.5"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-journald = "0.3.2"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-rustix = { version = "1.1.5", features = [
-  "event",
-  "fs",
-  "net",
-  "pipe",
-  "process",
-  "runtime",
-  "shm",
-  "stdio",
-  "termios",
-  "time",
-] }
-smithay = { git = "https://github.com/Smithay/smithay.git", default-features = false, features = [
-  "wayland_frontend",
-  "desktop",
-  "backend_drm",
-  "renderer_gl",
-] }
-usage-rs = { version = "7.1.0", default-features = false, features = [
-  "completions",
-  "diagnostics",
-  "help",
-] }
+tracing-subscriber = "0.3.23"
+rustix = "1.1.5"
+smithay = { git = "https://github.com/Smithay/smithay.git", default-features = false }
+usage-rs = { version = "7.1.0", default-features = false }
 sd-notify = "0.5.0"
 listenfd = "1.0.2"
+criterion = { version = "0.8.2", default-features = false }
 
-[dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = [
-  "cargo_bench_support",
-] }
-[[bench]]
-name = "kitty"
-harness = false
+[workspace.lints.cargo]
+unused_dependencies = "allow"
 
-[[bench]]
-name = "protocol"
-harness = false
-
-[lints]
-[lints.rust]
+[workspace.lints.rust]
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 cast_possible_wrap = "allow"
 cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
-
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

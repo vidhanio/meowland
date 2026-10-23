@@ -1,0 +1,24 @@
+[package]
+name = "meowland-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+meowland-core = { workspace = true }
+postcard = { workspace = true, features = ["use-std"] }
+rustix = { workspace = true, features = ["net", "time"] }
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
+mime = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "protocol"
+harness = false

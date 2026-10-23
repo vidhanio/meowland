@@ -1,0 +1,23 @@
+[package]
+name = "meowland-kitty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+meowland-core = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+rustix = { workspace = true, features = ["fs", "shm"] }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "kitty"
+harness = false

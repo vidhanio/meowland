@@ -64,6 +64,7 @@ use smithay::{
 
 mod activation;
 mod attachment;
+mod bell;
 mod catalog;
 mod clipboard;
 mod commands;
@@ -73,13 +74,14 @@ mod input;
 mod readback;
 mod shell;
 mod sources;
+mod toplevels;
 
 use attachment::{Attachments, Binding, Pane, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot, surface_stack};
 
-const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
+const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -162,6 +164,9 @@ pub enum Event {
         shape: Option<String>,
     },
     Focus(Option<WindowId>),
+    Bell {
+        pane: PaneId,
+    },
     ClipboardWrite {
         pane: PaneId,
         data: meowland_protocol::clipboard::ClipboardData,
@@ -237,6 +242,7 @@ struct Window {
     surface: ToplevelSurface,
     fullscreen: bool,
     callback_due: Instant,
+    callback_pending: bool,
 }
 
 type ViewportGeometry = (Option<Rectangle<f64, Logical>>, Option<Size<i32, Logical>>);
@@ -260,6 +266,7 @@ struct State {
     data_control: DataControlState,
     clipboard: clipboard::Bridge,
     _cursor_shape: CursorShapeManagerState,
+    bell: bell::Bell,
     popups: PopupManager,
     seats: SeatState<Self>,
     seat: Seat<Self>,
@@ -276,6 +283,7 @@ struct State {
     /// Cached to distinguish viewport changes from frame-only commits.
     viewport_geometry: HashMap<WlSurface, ViewportGeometry>,
     catalog: WindowCatalog,
+    toplevels: toplevels::Toplevels,
     attachments: Attachments,
     /// Most recent input pane, used for cursor shape events.
     cursor_pane: Option<PaneId>,
@@ -364,18 +372,29 @@ impl CompositorHandler for State {
     )]
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
-        let (assignment, damaged, viewport) = with_states(surface, |states| {
-            let (assignment, damaged) = {
+        let (assignment, damaged, viewport, callbacks) = with_states(surface, |states| {
+            let (assignment, damaged, callbacks) = {
                 let mut cached = states.cached_state.get::<SurfaceAttributes>();
                 let current = cached.current();
                 let damaged = !current.damage.is_empty();
                 current.damage.clear();
-                (current.buffer.take(), damaged)
+                (
+                    current.buffer.take(),
+                    damaged,
+                    !current.frame_callbacks.is_empty(),
+                )
             };
             let mut viewport = states.cached_state.get::<ViewportCachedState>();
             let current = viewport.current();
-            (assignment, damaged, (current.src, current.dst))
+            (assignment, damaged, (current.src, current.dst), callbacks)
         });
+        if callbacks
+            && let Some(window) = self
+                .window_for_surface(surface)
+                .and_then(|id| self.windows.get_mut(&id))
+        {
+            window.callback_pending = true;
+        }
         let viewport_changed = if viewport.0.is_some() || viewport.1.is_some() {
             self.viewport_geometry.insert(surface.clone(), viewport) != Some(viewport)
         } else {
@@ -489,6 +508,7 @@ impl State {
             data_control: DataControlState::new::<Self, _>(&display_handle, None, |_| true),
             clipboard: clipboard::Bridge::default(),
             _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
+            bell: bell::Bell::new(&display_handle),
             popups: PopupManager::default(),
             seats: seat_state,
             seat,
@@ -503,6 +523,7 @@ impl State {
             snapshots: HashMap::new(),
             viewport_geometry: HashMap::new(),
             catalog: WindowCatalog::default(),
+            toplevels: toplevels::Toplevels::new(&display_handle),
             attachments: Attachments::default(),
             cursor_pane: None,
             cursor: None,
@@ -566,6 +587,7 @@ impl State {
         self.follow_panes(id);
         self.resolve_pending_panes();
         let info = self.window_info(id);
+        self.toplevels.announce(id, &info.title, &info.app_id);
         let _ = self.events.send(Event::WindowUp(info));
         self.apply_window_state(id);
         self.enter_output(id);
@@ -660,6 +682,7 @@ impl State {
             self.send_title(pane, window);
             self.send_pane_cursor(pane);
         }
+        self.resume_callbacks(window);
     }
 
     fn touch(&mut self, window: WindowId) {

@@ -176,6 +176,7 @@ impl State {
         if let Some(token) = token {
             self.forget_activation(&token);
         }
+        self.resume_callbacks(window);
         self.enter_output(window);
         self.send_title(pane, window);
         self.send_pane_cursor(pane);

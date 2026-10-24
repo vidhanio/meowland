@@ -151,6 +151,7 @@ pub enum ServerToPane {
     ClipboardCancel {
         request: u64,
     },
+    Bell,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

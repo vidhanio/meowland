@@ -11,7 +11,11 @@ use std::{
 };
 
 use meowland_core::asynchronous::Descriptor;
-use meowland_protocol::{Input, clipboard::MAX_TEXT};
+use meowland_protocol::{
+    Input,
+    clipboard::MAX_TEXT,
+    modifiers::{ALT, CONTROL, HYPER, META, SUPER},
+};
 use rustix::fs::{Mode, OFlags, open};
 use signal_hook::SigId;
 use tokio::io::AsyncReadExt;
@@ -39,6 +43,7 @@ pub struct Key {
 #[derive(Debug)]
 pub enum Event {
     Key(Key),
+    Text(String),
     Pointer(Input),
     Focus(bool),
     Resize,
@@ -275,7 +280,11 @@ impl VTActor for Decoder {
         }
     }
 
-    fn print(&mut self, _character: char) {}
+    fn print(&mut self, character: char) {
+        if !character.is_control() && crate::keyboard::key_code(u32::from(character)).is_none() {
+            self.events.push_back(Event::Text(character.to_string()));
+        }
+    }
 
     fn execute_c0_or_c1(&mut self, _control: u8) {}
 
@@ -339,6 +348,11 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         3 => Kind::Release,
         _ => return None,
     };
+    let text = if final_byte == b'u' {
+        fields.next().and_then(committed_text)
+    } else {
+        None
+    };
     let code = match final_byte {
         b'u' => number(key)?,
         b'A' => 57352,
@@ -367,11 +381,31 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         },
         _ => return None,
     };
+    let shortcut = modifiers & (CONTROL | ALT | SUPER | HYPER | META) != 0;
+    if let Some(text) = text
+        && matches!(kind, Kind::Press | Kind::Repeat)
+        && !shortcut
+        && crate::keyboard::key_code(code).is_none()
+    {
+        return Some(Event::Text(text));
+    }
     Some(Event::Key(Key {
         code,
         modifiers,
         kind,
     }))
+}
+
+fn committed_text(params: &[CsiParam]) -> Option<String> {
+    let mut text = String::new();
+    for param in params.split(|param| *param == CsiParam::P(b':')) {
+        let character = char::from_u32(number(param)?)?;
+        if character.is_control() {
+            return None;
+        }
+        text.push(character);
+    }
+    (!text.is_empty() && text.len() <= MAX_TEXT).then_some(text)
 }
 
 fn mouse(report: &[u8]) -> Option<Event> {

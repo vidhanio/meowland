@@ -46,6 +46,9 @@ const KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         .union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
         .union(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+const ASSOCIATED_TEXT: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::from_bits_retain(1 << 4);
+const REQUESTED_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KEYBOARD_FLAGS.union(ASSOCIATED_TEXT);
 
 /// Terminal capabilities discovered during the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -212,7 +215,7 @@ fn probe_csi(params: &[CsiParam], byte: u8, out: &mut ProbeInfo) {
         b'u' if private.is_some() => {
             out.keyboard_flags = u8::try_from(first)
                 .ok()
-                .map(KeyboardEnhancementFlags::from_bits_truncate);
+                .map(KeyboardEnhancementFlags::from_bits_retain);
         }
         _ => {}
     }
@@ -438,6 +441,11 @@ fn send_event(
                 send_input(input, defer, keyboard, tx)?;
             }
         }
+        Event::Text(text) => {
+            if text.len() <= MAX_TEXT {
+                tx.send(&PaneToServer::Input(Input::Text(text)))?;
+            }
+        }
         Event::Focus(focused) => {
             let pending_paste = clipboard.focus(focused);
             if focused {
@@ -612,7 +620,7 @@ impl TerminalGuard {
             io::stdout(),
             terminal::EnterAlternateScreen,
             crossterm::cursor::Hide,
-            PushKeyboardEnhancementFlags(KEYBOARD_FLAGS),
+            PushKeyboardEnhancementFlags(REQUESTED_KEYBOARD_FLAGS),
             event::EnableFocusChange
         )?;
         io::stdout().write_all(b"\x1b[?7l\x1b[?25l\x1b[?2004h")?;

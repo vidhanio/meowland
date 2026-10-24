@@ -100,6 +100,11 @@ impl XdgShellHandler for State {
         if let Some(pointer) = pointer {
             pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
         }
+        self.popup_grab = Some(grab);
+    }
+
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.refresh_popup_grab();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {

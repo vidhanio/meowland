@@ -11,12 +11,13 @@ use smithay::{
     utils::{Point, SERIAL_COUNTER, Serial},
 };
 
-use super::{Input, Pane, PaneId, State, WindowId, WlSurface};
+use super::{Input, Pane, PaneId, State, WindowId, WlSurface, text};
 
 const SCROLL_FACTOR: f64 = 0.5;
 const SERIAL_HISTORY: usize = 32;
 
 pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
+    state.refresh_popup_grab();
     if matches!(event, Input::ResetKeyboard) {
         if state.keyboard_pane == Some(pane) {
             reset_keyboard(state);
@@ -63,6 +64,10 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             enter_keyboard(state, pane, window, keys, modifiers);
         }
         Input::ResetKeyboard => unreachable!(),
+        Input::Text(ref text) => {
+            activate_keyboard(state, pane, window);
+            text::commit(state, text);
+        }
         Input::Pointer {
             x,
             y,
@@ -214,10 +219,24 @@ fn event_serial(state: &mut State, focus: Option<WlSurface>) -> Serial {
 
 pub fn valid_serial(state: &State, serial: Serial, surface: &WlSurface) -> bool {
     surface.client().is_some_and(|client| {
-        state
-            .recent_serials
-            .iter()
-            .any(|(recent, recipient)| *recent == serial && *recipient == client.id())
+        let keyboard = state
+            .keyboard
+            .as_ref()
+            .and_then(KeyboardHandle::current_focus);
+        let pointer = state
+            .pointer
+            .as_ref()
+            .and_then(PointerHandle::current_focus);
+        let focused = keyboard.into_iter().chain(pointer).any(|focus| {
+            focus
+                .client()
+                .is_some_and(|focused| focused.id() == client.id())
+        });
+        focused
+            && state
+                .recent_serials
+                .iter()
+                .any(|(recent, recipient)| *recent == serial && *recipient == client.id())
     })
 }
 

@@ -31,6 +31,7 @@ impl XdgShellHandler for State {
                 surface,
                 fullscreen: false,
                 callback_due: Instant::now(),
+                callback_pending: false,
             },
         );
         self.apply_window_state(id);
@@ -108,6 +109,7 @@ impl XdgShellHandler for State {
         }
         self.leave_output(id);
         self.windows.remove(&id);
+        self.toplevels.remove(id);
         self.attachments.forget_window(id);
         let was_newest = self.catalog.newest() == Some(id);
         self.catalog.remove(id);
@@ -170,6 +172,7 @@ impl XdgShellHandler for State {
         self.catalog.update(id, app_id, title);
         self.resolve_pending_panes();
         let info = self.window_info(id);
+        self.toplevels.update(id, &info.title, &info.app_id);
         let _ = self.events.send(Event::WindowUp(info));
         self.send_titles(id);
     }

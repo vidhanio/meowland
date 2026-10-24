@@ -113,19 +113,34 @@ impl Attachments {
         self.deciding.insert(window, pane) != Some(pane)
     }
 
-    pub fn size(&self, window: WindowId) -> Option<FrameSize> {
+    pub fn owner(&self, window: WindowId) -> Option<PaneId> {
         self.deciding
             .get(&window)
-            .and_then(|id| self.panes.get(id))
-            .filter(|pane| pane.window() == Some(window))
+            .copied()
+            .filter(|id| {
+                self.panes
+                    .get(id)
+                    .is_some_and(|pane| pane.window() == Some(window))
+            })
             .or_else(|| {
                 self.panes
                     .iter()
                     .filter(|(_, pane)| pane.window() == Some(window))
                     .min_by_key(|(id, _)| *id)
-                    .map(|(_, pane)| pane)
+                    .map(|(id, _)| *id)
             })
+    }
+
+    pub fn size(&self, window: WindowId) -> Option<FrameSize> {
+        self.owner(window)
+            .and_then(|id| self.panes.get(&id))
             .map(|pane| pane.presentation.size)
+    }
+
+    pub fn visible(&self, window: WindowId) -> bool {
+        self.panes
+            .values()
+            .any(|pane| pane.window() == Some(window))
     }
 
     pub fn remove(&mut self, pane: PaneId) -> Option<Pane> {

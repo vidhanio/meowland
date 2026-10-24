@@ -120,22 +120,28 @@ impl State {
             .chain(
                 self.windows
                     .values()
+                    .filter(|window| window.callback_pending)
                     .map(|window| window.callback_due.saturating_duration_since(now)),
             )
             .min()
     }
 
-    /// Run Wayland callbacks at ~120Hz, independently of terminal acks.
+    /// Pace visible clients at the output refresh rate and hidden clients at
+    /// one Hz, independently of terminal acknowledgements.
     pub fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed().as_millis() as u32;
-        for window in self.windows.values_mut() {
-            if now < window.callback_due {
+        for (&id, window) in &mut self.windows {
+            if !window.callback_pending || now < window.callback_due {
                 continue;
             }
-            let late = now.duration_since(window.callback_due).as_nanos();
-            let ticks = late / FRAME_INTERVAL.as_nanos() + 1;
-            window.callback_due += FRAME_INTERVAL * u32::try_from(ticks).unwrap_or(u32::MAX);
+            let interval = if self.attachments.visible(id) {
+                FRAME_INTERVAL
+            } else {
+                Duration::from_secs(1)
+            };
+            window.callback_due = now + interval;
+            window.callback_pending = false;
             self.renderer
                 .for_each_surface(window.surface.wl_surface(), |surface| {
                     with_states(surface, |states| {
@@ -150,6 +156,14 @@ impl State {
                         }
                     });
                 });
+        }
+    }
+
+    pub fn resume_callbacks(&mut self, window: super::WindowId) {
+        if self.attachments.visible(window)
+            && let Some(window) = self.windows.get_mut(&window)
+        {
+            window.callback_due = window.callback_due.min(Instant::now() + FRAME_INTERVAL);
         }
     }
 

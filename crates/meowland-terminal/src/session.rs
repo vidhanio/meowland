@@ -214,6 +214,11 @@ impl TerminalSession {
             ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
                 return self.close(Some(&reason));
             }
+            ServerToPane::Bell => {
+                if matches!(self.lifecycle, Lifecycle::Active(_)) {
+                    self.presentation.pending.append(b"\x07");
+                }
+            }
             ServerToPane::ClipboardWrite(data) => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
                     self.clipboard

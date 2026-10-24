@@ -162,6 +162,9 @@ impl Server {
             CompositorEvent::Cursor { pane, shape } => {
                 self.send_to_pane(pane, ServerToPane::Cursor(shape));
             }
+            CompositorEvent::Bell { pane } => {
+                self.send_to_pane(pane, ServerToPane::Bell);
+            }
             CompositorEvent::ClipboardWrite { pane, data } => {
                 self.send_to_pane(pane, ServerToPane::ClipboardWrite(data));
             }

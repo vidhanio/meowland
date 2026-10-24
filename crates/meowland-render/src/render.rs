@@ -13,7 +13,6 @@ use smithay::{
             with_surface_tree_upward,
         },
         shell::xdg::SurfaceCachedState,
-        viewporter::ViewportCachedState,
     },
 };
 
@@ -156,7 +155,7 @@ pub fn popup_origin(
     ))
 }
 
-pub fn collect_surface(
+fn collect_surface(
     surface: &WlSurface,
     origin: Point<i32, Logical>,
     stack: &mut Vec<(WlSurface, Point<i32, Logical>)>,
@@ -322,7 +321,7 @@ fn blit_scaled<const OPAQUE: bool>(
 }
 
 /// Unscaled pixels map directly to snapshot offsets from the surface origin.
-pub fn blit_unscaled(
+fn blit_unscaled(
     snapshot: &Snapshot,
     left: i32,
     top: i32,
@@ -411,29 +410,6 @@ fn opaque_cover(
         && dst.top <= 0
         && dst.left.saturating_add(dst.width) >= width as i32
         && dst.top.saturating_add(dst.height) >= height as i32
-}
-
-#[must_use]
-pub fn extents(
-    snapshot: &Snapshot,
-    viewport: ViewportCachedState,
-) -> (Rectangle<f64, Logical>, Size<i32, Logical>) {
-    let full = Rectangle::new(
-        (0.0, 0.0).into(),
-        (f64::from(snapshot.width), f64::from(snapshot.height)).into(),
-    );
-    let src = viewport.src.unwrap_or(full);
-    let dst = viewport
-        .dst
-        .unwrap_or_else(|| Size::from((src.size.w.round() as i32, src.size.h.round() as i32)));
-    (src, dst)
-}
-
-#[must_use]
-pub fn viewport_of(surface: &WlSurface) -> ViewportCachedState {
-    with_states(surface, |states| {
-        *states.cached_state.get::<ViewportCachedState>().current()
-    })
 }
 
 impl Renderer {

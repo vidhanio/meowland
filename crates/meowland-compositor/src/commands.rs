@@ -69,10 +69,11 @@ impl State {
             Command::Paste { pane, text } => clipboard::paste(self, pane, &text),
             Command::ClipboardOffer {
                 pane,
+                selection,
                 offer,
                 mimes,
                 paste,
-            } => clipboard::offer(self, pane, offer, mimes, paste),
+            } => clipboard::offer(self, pane, selection, offer, mimes, paste),
             Command::ClipboardReply {
                 pane,
                 request,

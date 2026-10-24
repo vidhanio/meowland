@@ -16,7 +16,7 @@ use meowland_kitty::{Presenter, SharedMemory};
 use meowland_protocol::{
     self as protocol, Input, PaneToServer, Show,
     asynchronous::{Outgoing, Reader},
-    clipboard::MAX_TEXT,
+    clipboard::{MAX_TEXT, Selection},
 };
 use meowland_terminal_clipboard as clipboard;
 use tokio::io::{AsyncReadExt, AsyncWrite};
@@ -430,7 +430,7 @@ fn send_event(
                 }
                 let defer = keyboard.deadline().or_else(|| {
                     if pressed && keyboard::paste(code, modifiers) {
-                        clipboard.refresh(true)
+                        clipboard.refresh(Selection::Clipboard, true)
                     } else {
                         None
                     }
@@ -494,12 +494,14 @@ fn send_clipboard_actions(
     while let Some(action) = clipboard.next_action() {
         match action {
             ClipboardAction::Offer {
+                selection,
                 offer,
                 mimes,
                 paste,
             } => {
                 if paste && keyboard.deferred() {
                     tx.send(&PaneToServer::ClipboardOffer {
+                        selection,
                         offer,
                         mimes: mimes.clone(),
                         paste: false,
@@ -507,6 +509,7 @@ fn send_clipboard_actions(
                     send_deferred(keyboard, tx)?;
                 }
                 tx.send(&PaneToServer::ClipboardOffer {
+                    selection,
                     offer,
                     mimes,
                     paste,

@@ -112,6 +112,7 @@ pub enum PaneToServer {
     },
     Paste(String),
     ClipboardOffer {
+        selection: crate::clipboard::Selection,
         offer: u64,
         mimes: Vec<String>,
         paste: bool,
@@ -141,7 +142,10 @@ pub enum ServerToPane {
     Title(String),
     /// The pointer shape the terminal should show, or `None` for its own.
     Cursor(Option<String>),
-    ClipboardWrite(crate::clipboard::ClipboardData),
+    ClipboardWrite {
+        selection: crate::clipboard::Selection,
+        data: crate::clipboard::ClipboardData,
+    },
     ClipboardRead {
         request: u64,
         offer: u64,

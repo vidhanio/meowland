@@ -14,7 +14,7 @@ use calloop::{
     EventLoop, Interest, LoopHandle, Mode as PollMode, PostAction, channel, generic::Generic,
 };
 use meowland_core::scale::UiScale;
-use meowland_protocol::{Input, Show, WindowInfo};
+use meowland_protocol::{Input, Show, WindowInfo, clipboard::Selection as ClipboardSelection};
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_dispatch2,
@@ -52,7 +52,17 @@ use smithay::{
             data_device::{
                 DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
             },
-            wlr_data_control::{DataControlHandler, DataControlState},
+            ext_data_control::{
+                DataControlHandler as ExtDataControlHandler,
+                DataControlState as ExtDataControlState,
+            },
+            primary_selection::{
+                PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+            },
+            wlr_data_control::{
+                DataControlHandler as WlrDataControlHandler,
+                DataControlState as WlrDataControlState,
+            },
         },
         shell::{
             kde::decoration::KdeDecorationState,
@@ -128,6 +138,7 @@ pub enum Command {
     },
     ClipboardOffer {
         pane: PaneId,
+        selection: ClipboardSelection,
         offer: u64,
         mimes: Vec<String>,
         paste: bool,
@@ -172,6 +183,7 @@ pub enum Event {
     },
     ClipboardWrite {
         pane: PaneId,
+        selection: ClipboardSelection,
         data: meowland_protocol::clipboard::ClipboardData,
     },
     ClipboardRead {
@@ -276,7 +288,9 @@ struct State {
     scale: UiScale,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
-    data_control: DataControlState,
+    data_control: WlrDataControlState,
+    ext_data_control: ExtDataControlState,
+    primary_selection: PrimarySelectionState,
     clipboard: clipboard::Bridge,
     _cursor_shape: CursorShapeManagerState,
     bell: bell::Bell,
@@ -495,6 +509,15 @@ impl State {
             Some((0, 0).into()),
         );
         output.set_preferred(mode);
+        let primary_selection = PrimarySelectionState::new::<Self>(&display_handle);
+        let data_control =
+            WlrDataControlState::new::<Self, _>(&display_handle, Some(&primary_selection), |_| {
+                true
+            });
+        let ext_data_control =
+            ExtDataControlState::new::<Self, _>(&display_handle, Some(&primary_selection), |_| {
+                true
+            });
         let gpu = DmabufBackend::discover();
         let mut dmabuf = DmabufState::new();
         if let Some(gpu) = &gpu {
@@ -522,7 +545,9 @@ impl State {
             scale,
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),
-            data_control: DataControlState::new::<Self, _>(&display_handle, None, |_| true),
+            data_control,
+            ext_data_control,
+            primary_selection,
             clipboard: clipboard::Bridge::default(),
             _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
             bell: bell::Bell::new(&display_handle),
@@ -826,7 +851,8 @@ impl SeatHandler for State {
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let client = focused.and_then(Resource::client);
-        set_data_device_focus(&self.display, seat, client);
+        set_data_device_focus(&self.display, seat, client.clone());
+        set_primary_focus(&self.display, seat, client);
     }
 
     /// During pointer motion, delivery waits until the caller restores the
@@ -895,28 +921,36 @@ impl SelectionHandler for State {
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
-        if target == SelectionTarget::Clipboard {
-            clipboard::selection(self, source);
-        }
+        clipboard::selection(self, target, source);
     }
 
     fn send_selection(
         &mut self,
-        target: SelectionTarget,
+        _target: SelectionTarget,
         mime: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
         source: &Self::SelectionUserData,
     ) {
-        if target == SelectionTarget::Clipboard {
-            clipboard::send(self, fd, &mime, source);
-        }
+        clipboard::send(self, fd, &mime, source);
     }
 }
 
-impl DataControlHandler for State {
-    fn data_control_state(&mut self) -> &mut DataControlState {
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection
+    }
+}
+
+impl WlrDataControlHandler for State {
+    fn data_control_state(&mut self) -> &mut WlrDataControlState {
         &mut self.data_control
+    }
+}
+
+impl ExtDataControlHandler for State {
+    fn data_control_state(&mut self) -> &mut ExtDataControlState {
+        &mut self.ext_data_control
     }
 }
 

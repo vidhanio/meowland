@@ -7,7 +7,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use meowland_protocol::clipboard::{ClipboardData, Deadline, MAX_TEXT, TEXT_MIMES};
+use meowland_protocol::clipboard::{ClipboardData, Deadline, MAX_TEXT, Selection, TEXT_MIMES};
 
 use super::Action;
 
@@ -44,8 +44,8 @@ impl Clipboard {
         };
     }
 
-    pub fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
-        if !shortcut || !matches!(self.state, State::Idle) {
+    pub fn refresh(&mut self, selection: Selection, shortcut: bool) -> Option<Instant> {
+        if selection == Selection::Primary || !shortcut || !matches!(self.state, State::Idle) {
             return None;
         }
         let deadline = Instant::now() + READ_TIMEOUT;
@@ -67,8 +67,8 @@ impl Clipboard {
         );
     }
 
-    pub fn copy(data: &ClipboardData, output: &mut Vec<u8>) {
-        if !data.valid() {
+    pub fn copy(selection: Selection, data: &ClipboardData, output: &mut Vec<u8>) {
+        if selection == Selection::Primary || !data.valid() {
             return;
         }
         if let Some(text) = data.utf8_text() {
@@ -136,6 +136,7 @@ impl Clipboard {
             self.next += 1;
             self.snapshot = Some((self.next, bytes));
             self.actions.push_back(Action::Offer {
+                selection: Selection::Clipboard,
                 offer: self.next,
                 mimes: TEXT_MIMES.into_iter().map(str::to_owned).collect(),
                 paste: false,

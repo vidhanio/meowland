@@ -8,7 +8,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use meowland_protocol::clipboard::{
-    ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, TRANSFER_TIMEOUT, mime_types,
+    ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, Selection, TRANSFER_TIMEOUT, mime_types,
 };
 
 use super::Action;
@@ -65,6 +65,7 @@ impl Reading {
 
 enum Request {
     List {
+        selection: Selection,
         shortcut: bool,
         epoch: u64,
     },
@@ -74,7 +75,10 @@ enum Request {
         mime: String,
         deadline: Deadline,
     },
-    Write(ClipboardData),
+    Write {
+        selection: Selection,
+        data: ClipboardData,
+    },
 }
 
 struct Queued {
@@ -122,7 +126,8 @@ impl Clipboard {
     pub fn focus(&mut self, focused: bool) {
         self.focused = focused;
         if focused {
-            let _ = self.refresh(false);
+            let _ = self.refresh(Selection::Clipboard, false);
+            let _ = self.refresh(Selection::Primary, false);
         } else {
             self.cancel_refresh();
         }
@@ -142,11 +147,12 @@ impl Clipboard {
         }
     }
 
-    pub fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
+    pub fn refresh(&mut self, selection: Selection, shortcut: bool) -> Option<Instant> {
         if shortcut && (self.active.is_some() || !self.requests.is_empty()) {
             return None;
         }
         self.enqueue(Request::List {
+            selection,
             shortcut,
             epoch: self.epoch,
         });
@@ -177,26 +183,26 @@ impl Clipboard {
         );
     }
 
-    pub fn copy(&mut self, data: ClipboardData) {
+    pub fn copy(&mut self, selection: Selection, data: ClipboardData) {
         if !data.valid() {
             return;
         }
-        self.enqueue(Request::Write(data));
+        self.enqueue(Request::Write { selection, data });
     }
 
     fn enqueue(&mut self, request: Request) {
         let timeout = match &request {
             Request::List { .. } => Duration::from_secs(1),
             Request::Read { deadline, .. } => deadline.remaining(),
-            Request::Write(_) => TRANSFER_TIMEOUT,
+            Request::Write { .. } => TRANSFER_TIMEOUT,
         };
         if timeout.is_zero() {
             self.failed(&request);
             return;
         }
-        if matches!(request, Request::Write(_)) {
+        if matches!(request, Request::Write { .. }) {
             self.requests
-                .retain(|queued| !matches!(queued.request, Request::Write(_)));
+                .retain(|queued| !matches!(queued.request, Request::Write { .. }));
         }
         if self.requests.len() >= 16 {
             tracing::warn!("Clipboard request queue is full");
@@ -259,7 +265,12 @@ impl Clipboard {
                 STANDARD.encode(&self.password)
             );
             match &request {
-                Request::List { .. } => packet(output, &format!("type=read:{metadata}"), b"."),
+                Request::List { selection, .. } => {
+                    if *selection == Selection::Primary {
+                        metadata.push_str(":loc=primary");
+                    }
+                    packet(output, &format!("type=read:{metadata}"), b".");
+                }
                 Request::Read {
                     request: number,
                     offer,
@@ -290,7 +301,10 @@ impl Clipboard {
                     }
                     packet(output, &format!("type=read:{metadata}"), mime.as_bytes());
                 }
-                Request::Write(data) => {
+                Request::Write { selection, data } => {
+                    if *selection == Selection::Primary {
+                        metadata.push_str(":loc=primary");
+                    }
                     packet(output, &format!("type=write:{metadata}"), b"");
                     for item in &data.items {
                         let metadata = format!("type=wdata:mime={}", STANDARD.encode(&item.mime));
@@ -327,8 +341,13 @@ impl Clipboard {
                 match reading.accept(&packet, ".", MAX_TYPES * 257) {
                     Some(true) => {
                         let reading = self.notification.take().unwrap();
+                        let selection = if reading.credentials.primary {
+                            Selection::Primary
+                        } else {
+                            Selection::Clipboard
+                        };
                         self.epoch += 1;
-                        self.offer(reading, true);
+                        self.offer(reading, selection, true);
                         self.actions.push_back(Action::Unblock);
                     }
                     Some(false) => {}
@@ -346,7 +365,7 @@ impl Clipboard {
             return;
         }
         let done = match &operation.request {
-            Request::Write(_) if packet.kind == "write" => match packet.status {
+            Request::Write { .. } if packet.kind == "write" => match packet.status {
                 "DONE" => Some(true),
                 _ => None,
             },
@@ -372,8 +391,12 @@ impl Clipboard {
             return;
         }
         match operation.request {
-            Request::List { shortcut, epoch } if epoch == self.epoch => {
-                self.offer(operation.reading, false);
+            Request::List {
+                selection,
+                shortcut,
+                epoch,
+            } if epoch == self.epoch => {
+                self.offer(operation.reading, selection, false);
                 if shortcut {
                     self.actions.push_back(Action::Unblock);
                 }
@@ -382,11 +405,11 @@ impl Clipboard {
                 request,
                 data: Some(operation.reading.bytes),
             }),
-            Request::List { .. } | Request::Write(_) => {}
+            Request::List { .. } | Request::Write { .. } => {}
         }
     }
 
-    fn offer(&mut self, reading: Reading, paste: bool) {
+    fn offer(&mut self, reading: Reading, selection: Selection, paste: bool) {
         let Ok(types) = String::from_utf8(reading.bytes) else {
             return;
         };
@@ -398,8 +421,11 @@ impl Clipboard {
         {
             self.offers.remove(&oldest);
         }
-        self.offers.insert(offer, reading.credentials);
+        let mut credentials = reading.credentials;
+        credentials.primary = selection == Selection::Primary;
+        self.offers.insert(offer, credentials);
         self.actions.push_back(Action::Offer {
+            selection,
             offer,
             mimes,
             paste,
@@ -411,6 +437,7 @@ impl Clipboard {
             Request::List {
                 shortcut: true,
                 epoch,
+                ..
             } if *epoch == self.epoch => self.actions.push_back(Action::Unblock),
             Request::Read { request, .. } => self.actions.push_back(Action::Reply {
                 request: *request,

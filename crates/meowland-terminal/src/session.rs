@@ -9,6 +9,7 @@ use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
 use meowland_protocol::{
     self as protocol, Hello, PaneToServer, ServerToPane, Show,
     asynchronous::{Outgoing, Reader},
+    clipboard::Selection,
 };
 use tokio::{
     io::AsyncReadExt,
@@ -33,6 +34,7 @@ struct PendingWindow {
     title: Option<String>,
     cursor: Option<String>,
     clipboard: Option<meowland_protocol::clipboard::ClipboardData>,
+    primary: Option<meowland_protocol::clipboard::ClipboardData>,
 }
 
 enum Ready {
@@ -219,10 +221,12 @@ impl TerminalSession {
                     self.presentation.pending.append(b"\x07");
                 }
             }
-            ServerToPane::ClipboardWrite(data) => {
+            ServerToPane::ClipboardWrite { selection, data } => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
                     self.clipboard
-                        .copy(data, self.presentation.pending.buffer());
+                        .copy(selection, data, self.presentation.pending.buffer());
+                } else if selection == Selection::Primary {
+                    self.window.primary = Some(data);
                 } else {
                     self.window.clipboard = Some(data);
                 }
@@ -266,16 +270,29 @@ impl TerminalSession {
                 self.presentation
                     .draw(width, height, y, rgb, &mut self.tx)?;
                 if starting {
-                    let window = std::mem::take(&mut self.window);
-                    if let Some(title) = window.title {
+                    let PendingWindow {
+                        title,
+                        cursor,
+                        clipboard,
+                        primary,
+                    } = std::mem::take(&mut self.window);
+                    if let Some(title) = title {
                         self.presentation.pending.append(&title_bytes(&title));
                     }
                     self.presentation
                         .pending
-                        .append(&cursor_bytes(window.cursor.as_deref()));
-                    if let Some(data) = window.clipboard {
-                        self.clipboard
-                            .copy(data, self.presentation.pending.buffer());
+                        .append(&cursor_bytes(cursor.as_deref()));
+                    for (selection, data) in [
+                        (Selection::Clipboard, clipboard),
+                        (Selection::Primary, primary),
+                    ] {
+                        if let Some(data) = data {
+                            self.clipboard.copy(
+                                selection,
+                                data,
+                                self.presentation.pending.buffer(),
+                            );
+                        }
                     }
                 }
             }
@@ -325,7 +342,8 @@ impl TerminalSession {
         } else {
             ClipboardProtocol::Osc52
         })?;
-        let _ = self.clipboard.refresh(false);
+        let _ = self.clipboard.refresh(Selection::Clipboard, false);
+        let _ = self.clipboard.refresh(Selection::Primary, false);
         self.tx.send(&PaneToServer::Resize { width, height })?;
         PaneStats::capabilities(&probe, width, height);
         self.lifecycle = Lifecycle::Active(mode);

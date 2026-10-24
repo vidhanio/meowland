@@ -174,8 +174,12 @@ impl Server {
             CompositorEvent::Bell { pane } => {
                 self.send_to_pane(pane, ServerToPane::Bell);
             }
-            CompositorEvent::ClipboardWrite { pane, data } => {
-                self.send_to_pane(pane, ServerToPane::ClipboardWrite(data));
+            CompositorEvent::ClipboardWrite {
+                pane,
+                selection,
+                data,
+            } => {
+                self.send_to_pane(pane, ServerToPane::ClipboardWrite { selection, data });
             }
             CompositorEvent::ClipboardRead {
                 pane,
@@ -360,6 +364,7 @@ impl Server {
                 CompositorCommand::Paste { pane: id, text }
             }
             PaneToServer::ClipboardOffer {
+                selection,
                 offer,
                 mimes,
                 paste,
@@ -369,6 +374,7 @@ impl Server {
                 }
                 CompositorCommand::ClipboardOffer {
                     pane: id,
+                    selection,
                     offer,
                     mimes,
                     paste,

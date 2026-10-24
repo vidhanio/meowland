@@ -19,10 +19,3 @@ rustix = { workspace = true, features = ["time"] }
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = { workspace = true }
 mime = { workspace = true }
-
-[dev-dependencies]
-criterion = { workspace = true, features = ["cargo_bench_support"] }
-
-[[bench]]
-name = "protocol"
-harness = false

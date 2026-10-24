@@ -14,10 +14,3 @@ meowland-core = { workspace = true }
 base64 = { workspace = true }
 flate2 = { workspace = true }
 rustix = { workspace = true, features = ["fs", "shm"] }
-
-[dev-dependencies]
-criterion = { workspace = true, features = ["cargo_bench_support"] }
-
-[[bench]]
-name = "kitty"
-harness = false

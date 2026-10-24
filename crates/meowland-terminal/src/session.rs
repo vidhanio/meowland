@@ -8,9 +8,12 @@ use std::{
 use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
 use meowland_protocol::{
     self as protocol, Hello, PaneToServer, ServerToPane, Show,
-    asynchronous::{Outgoing, Receiver},
+    asynchronous::{Outgoing, Reader},
 };
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::{
+    io::AsyncReadExt,
+    net::unix::{OwnedReadHalf, OwnedWriteHalf},
+};
 
 use super::{
     Clipboard, ClipboardProtocol, FALLBACK_CELL, KEYBOARD_FLAGS, Keyboard, PanePresentation,
@@ -42,9 +45,9 @@ enum Ready {
     BufferedInput,
 }
 
-pub struct TerminalSession<R, W> {
-    receiver: R,
-    writer: W,
+pub struct TerminalSession {
+    receiver: Reader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
     tx: Outgoing,
     input: input::Reader,
     stdout: Descriptor,
@@ -59,8 +62,12 @@ pub struct TerminalSession<R, W> {
     window: PendingWindow,
 }
 
-impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
-    pub(super) fn new(receiver: R, writer: W, show: Show) -> Result<Self> {
+impl TerminalSession {
+    pub fn new(
+        receiver: Reader<OwnedReadHalf>,
+        writer: OwnedWriteHalf,
+        show: Show,
+    ) -> Result<Self> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let interrupted = signals::termination_flag()?;
         let input = input::Reader::new()?;
@@ -76,14 +83,11 @@ impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
         let (width, height) =
             pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
         let mut tx = Outgoing::default();
-        protocol::send(
-            &mut tx,
-            &PaneToServer::Hello(Hello {
-                width,
-                height,
-                show,
-            }),
-        )?;
+        tx.send(&PaneToServer::Hello(Hello {
+            width,
+            height,
+            show,
+        }))?;
         Ok(Self {
             receiver,
             writer,
@@ -104,7 +108,7 @@ impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
         })
     }
 
-    pub(super) async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             if self.interrupted.interrupted() {
                 return self.close(None);
@@ -119,7 +123,7 @@ impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
                 result = self.wakeup.read(&mut signal) => Ready::Signal(result),
                 () = wait_deadline(deadline) => Ready::Deadline,
                 result = self.presentation.drain(&mut self.stdout), if pending_output => Ready::Output(result),
-                result = self.receiver.receive(), if !pending_output && !self.tx.pending() => Ready::Server(result),
+                result = self.receiver.read(), if !pending_output && !self.tx.pending() => Ready::Server(result),
                 result = self.tx.write_ready(&mut self.writer), if self.tx.pending() => Ready::Transmit(result),
                 result = self.input.read_ready(), if active && !pending_input && !self.tx.pending() => Ready::Input(result),
                 () = tokio::task::yield_now(), if pending_input && !self.tx.pending() => Ready::BufferedInput,
@@ -163,7 +167,7 @@ impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline.into()) => return Err(error.into()),
                 result = self.wakeup.read(&mut signal) => { result?; }
-                result = self.receiver.receive() => match result {
+                result = self.receiver.read() => match result {
                     Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)),
                     Err(_) => return Err(error.into()),
                     Ok(_) => {}
@@ -317,7 +321,7 @@ impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
             ClipboardProtocol::Osc52
         })?;
         let _ = self.clipboard.refresh(false);
-        protocol::send(&mut self.tx, &PaneToServer::Resize { width, height })?;
+        self.tx.send(&PaneToServer::Resize { width, height })?;
         PaneStats::capabilities(&probe, width, height);
         self.lifecycle = Lifecycle::Active(mode);
         Ok(())

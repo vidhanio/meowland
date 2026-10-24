@@ -9,24 +9,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-meowland-core = { workspace = true, features = ["async"] }
-meowland-protocol = { workspace = true, features = ["async"] }
+meowland-core = { workspace = true }
+meowland-protocol = { workspace = true }
 meowland-server = { workspace = true }
 meowland-terminal = { workspace = true }
-flate2 = { workspace = true }
-russh = { workspace = true, features = ["ring", "rsa"] }
-russh-config = { workspace = true }
-rustix = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_bytes = { workspace = true }
-tokio = { workspace = true, features = [
-  "io-util",
-  "macros",
-  "net",
-  "rt",
-  "sync",
-  "time",
-] }
+tokio = { workspace = true, features = ["rt", "time"] }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 usage-rs = { workspace = true, features = [

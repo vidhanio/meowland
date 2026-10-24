@@ -29,15 +29,15 @@ pub enum Shutdown {
 }
 
 impl Shutdown {
-    pub(super) const fn running(&self) -> bool {
+    pub const fn running(&self) -> bool {
         matches!(self, Self::Running)
     }
 
-    pub(super) const fn stopped(&self) -> bool {
+    pub const fn stopped(&self) -> bool {
         matches!(self, Self::Stopped)
     }
 
-    pub(super) const fn deadline(&self) -> Option<Instant> {
+    pub const fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Closing { deadline } | Self::Escalating { deadline, .. } => Some(*deadline),
             _ => None,
@@ -46,7 +46,7 @@ impl Shutdown {
 }
 
 impl Server {
-    pub(super) fn compositor_gone(&mut self) {
+    pub fn compositor_gone(&mut self) {
         self.compositor_alive = false;
         match self.shutdown {
             Shutdown::Running => {
@@ -58,7 +58,7 @@ impl Server {
         }
     }
 
-    pub(super) fn begin_shutdown(&mut self) {
+    pub fn begin_shutdown(&mut self) {
         if !self.shutdown.running() {
             return;
         }
@@ -84,7 +84,7 @@ impl Server {
         }
     }
 
-    pub(super) fn force_shutdown(&mut self) {
+    pub fn force_shutdown(&mut self) {
         let mut tree = match std::mem::replace(&mut self.shutdown, Shutdown::Stopped) {
             Shutdown::Escalating { tree, .. } => tree,
             _ => Termination::new(std::mem::take(&mut self.child_groups)),
@@ -99,7 +99,7 @@ impl Server {
         let _ = self.commands.send(CompositorCommand::Shutdown);
     }
 
-    pub(super) fn advance_shutdown(&mut self) {
+    pub fn advance_shutdown(&mut self) {
         let deadline = Instant::now() + GRACE;
         self.shutdown = match std::mem::replace(&mut self.shutdown, Shutdown::Waiting) {
             Shutdown::Closing { .. } => {

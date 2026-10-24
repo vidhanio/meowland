@@ -19,7 +19,7 @@ enum Presentation {
 }
 
 pub struct PaneState {
-    pub(super) size: FrameSize,
+    pub size: FrameSize,
     presentation: Presentation,
     shown: Vec<u8>,
     /// None means the retained pixels are not a valid basis for a row diff.
@@ -27,7 +27,7 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    pub(super) const fn new(size: FrameSize) -> Self {
+    pub const fn new(size: FrameSize) -> Self {
         Self {
             size,
             presentation: Presentation::Clean,
@@ -36,7 +36,7 @@ impl PaneState {
         }
     }
 
-    pub(super) const fn mark_dirty(&mut self) {
+    pub const fn mark_dirty(&mut self) {
         self.presentation = match self.presentation {
             Presentation::InFlight { .. } => Presentation::InFlight { dirty: true },
             Presentation::Clean | Presentation::Dirty => Presentation::Dirty,
@@ -105,7 +105,7 @@ impl PaneState {
 impl State {
     /// Wait for frame or activation deadlines; transfers wake through readiness
     /// sources.
-    pub(super) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
+    pub fn next_wakeup(&self, now: Instant) -> Option<Duration> {
         if self
             .attachments
             .panes
@@ -126,7 +126,7 @@ impl State {
     }
 
     /// Run Wayland callbacks at ~120Hz, independently of terminal acks.
-    pub(super) fn frame_callbacks(&mut self) {
+    pub fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed().as_millis() as u32;
         for window in self.windows.values_mut() {
@@ -153,14 +153,14 @@ impl State {
         }
     }
 
-    pub(super) fn pane_ack(&mut self, pane: super::PaneId, drawn: bool) {
+    pub fn pane_ack(&mut self, pane: super::PaneId, drawn: bool) {
         if let Some(entry) = self.attachments.panes.get_mut(&pane) {
             entry.presentation.ack(drawn);
         }
     }
 
     /// Borrow disjoint fields instead of allocating a list of due pane IDs.
-    pub(super) fn dispatch_frames(&mut self) {
+    pub fn dispatch_frames(&mut self) {
         for (&pane, entry) in &mut self.attachments.panes {
             if !entry.presentation.due() {
                 continue;

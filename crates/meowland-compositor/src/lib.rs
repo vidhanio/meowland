@@ -280,9 +280,8 @@ struct State {
     /// Most recent input pane, used for cursor shape events.
     cursor_pane: Option<PaneId>,
     cursor: Option<String>,
-    /// The pane `cursor` was last sent to, so a shape that is unchanged but
-    /// belongs to another pane is still sent.
-    cursor_shape_pane: Option<PaneId>,
+    /// Last delivered cursor, including its destination pane.
+    sent_cursor: Option<(PaneId, Option<String>)>,
     renderer: Renderer,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     /// Output mode, rewritten as panes attach and leave.
@@ -507,7 +506,7 @@ impl State {
             attachments: Attachments::default(),
             cursor_pane: None,
             cursor: None,
-            cursor_shape_pane: None,
+            sent_cursor: None,
             renderer: Renderer::default(),
             events,
             mode: Size::from((mode.size.w, mode.size.h)),
@@ -617,8 +616,12 @@ impl State {
         if self.cursor_pane == Some(pane) {
             self.cursor_pane = None;
         }
-        if self.cursor_shape_pane == Some(pane) {
-            self.cursor_shape_pane = None;
+        if self
+            .sent_cursor
+            .as_ref()
+            .is_some_and(|(sent, _)| *sent == pane)
+        {
+            self.sent_cursor = None;
         }
         if first && let Some(next) = self.attachments.first() {
             self.configure_output(self.attachments.panes[&next].presentation.size);
@@ -655,6 +658,7 @@ impl State {
                 state.show(window);
             }
             self.send_title(pane, window);
+            self.send_pane_cursor(pane);
         }
     }
 
@@ -664,6 +668,33 @@ impl State {
                 entry.presentation.mark_dirty();
             }
         }
+    }
+
+    fn send_pane_cursor(&mut self, pane: PaneId) {
+        let window = self.attachments.panes.get(&pane).and_then(Pane::window);
+        let focused = self
+            .pointer
+            .as_ref()
+            .and_then(PointerHandle::current_focus)
+            .and_then(|surface| self.window_for_surface(&surface));
+        let shape = if window.is_some() && window == focused {
+            self.cursor.clone()
+        } else {
+            None
+        };
+        self.send_cursor(pane, shape);
+    }
+
+    fn send_cursor(&mut self, pane: PaneId, shape: Option<String>) {
+        let cursor = (pane, shape);
+        if self.sent_cursor.as_ref() == Some(&cursor) {
+            return;
+        }
+        let _ = self.events.send(Event::Cursor {
+            pane,
+            shape: cursor.1.clone(),
+        });
+        self.sent_cursor = Some(cursor);
     }
 
     fn send_title(&self, pane: PaneId, window: WindowId) {
@@ -750,21 +781,19 @@ impl SeatHandler for State {
         set_data_device_focus(&self.display, seat, client);
     }
 
+    /// During pointer motion, delivery waits until the caller restores the
+    /// pointer handle so the destination can be checked against its focus.
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         let shape = match image {
             CursorImageStatus::Named(icon) => Some(cursor_name(icon).to_owned()),
             CursorImageStatus::Hidden | CursorImageStatus::Surface(_) => None,
         };
-        let pane = self.cursor_pane;
-        if shape == self.cursor && pane == self.cursor_shape_pane {
-            return;
+        self.cursor = shape;
+        if self.pointer.is_some()
+            && let Some(pane) = self.cursor_pane
+        {
+            self.send_pane_cursor(pane);
         }
-        self.cursor.clone_from(&shape);
-        self.cursor_shape_pane = pane;
-        let Some(pane) = pane else {
-            return;
-        };
-        let _ = self.events.send(Event::Cursor { pane, shape });
     }
 }
 

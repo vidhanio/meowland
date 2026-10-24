@@ -22,7 +22,7 @@ pub struct WindowCatalog {
 }
 
 impl WindowCatalog {
-    pub(super) fn insert(&mut self, app_id: String, title: String) -> WindowId {
+    pub fn insert(&mut self, app_id: String, title: String) -> WindowId {
         self.next += 1;
         let id = WindowId(self.next);
         self.windows.insert(
@@ -36,14 +36,14 @@ impl WindowCatalog {
         id
     }
 
-    pub(super) fn update(&mut self, id: WindowId, app_id: String, title: String) {
+    pub fn update(&mut self, id: WindowId, app_id: String, title: String) {
         if let Some(window) = self.windows.get_mut(&id) {
             window.app_id = app_id;
             window.title = title;
         }
     }
 
-    pub(super) fn announce(&mut self, id: WindowId) -> bool {
+    pub fn announce(&mut self, id: WindowId) -> bool {
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
@@ -54,23 +54,23 @@ impl WindowCatalog {
         true
     }
 
-    pub(super) fn drawable(&self, id: WindowId) -> bool {
+    pub fn drawable(&self, id: WindowId) -> bool {
         self.windows.get(&id).is_some_and(|window| window.drawable)
     }
 
-    pub(super) const fn newest(&self) -> Option<WindowId> {
+    pub const fn newest(&self) -> Option<WindowId> {
         self.newest
     }
 
-    pub(super) const fn focused(&self) -> Option<WindowId> {
+    pub const fn focused(&self) -> Option<WindowId> {
         self.focused
     }
 
-    pub(super) const fn focus(&mut self, window: Option<WindowId>) -> Option<WindowId> {
+    pub const fn focus(&mut self, window: Option<WindowId>) -> Option<WindowId> {
         std::mem::replace(&mut self.focused, window)
     }
 
-    pub(super) fn info(&self, id: WindowId) -> WindowInfo {
+    pub fn info(&self, id: WindowId) -> WindowInfo {
         let (app_id, title) = self
             .windows
             .get(&id)
@@ -83,13 +83,13 @@ impl WindowCatalog {
         }
     }
 
-    pub(super) fn title(&self, id: WindowId) -> &str {
+    pub fn title(&self, id: WindowId) -> &str {
         self.windows
             .get(&id)
             .map_or("", |window| window.title.as_str())
     }
 
-    pub(super) fn select(&self, show: &Show, activation: Option<WindowId>) -> Option<WindowId> {
+    pub fn select(&self, show: &Show, activation: Option<WindowId>) -> Option<WindowId> {
         let window = match show {
             Show::Id(id) => Some(WindowId(*id)),
             Show::Newest => self.newest,
@@ -105,7 +105,7 @@ impl WindowCatalog {
         self.drawable(window).then_some(window)
     }
 
-    pub(super) fn remove(&mut self, window: WindowId) {
+    pub fn remove(&mut self, window: WindowId) {
         self.windows.remove(&window);
         if self.newest == Some(window) {
             self.newest = self

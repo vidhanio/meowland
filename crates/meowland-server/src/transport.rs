@@ -255,7 +255,7 @@ enum Output {
 }
 
 impl Pane {
-    pub(super) fn start(
+    pub fn start(
         id: PaneId,
         socket: UnixStream,
         incoming: IncomingSender,
@@ -289,15 +289,15 @@ impl Pane {
         }
     }
 
-    pub(super) const fn active(&self) -> bool {
+    pub const fn active(&self) -> bool {
         matches!(self.output, Output::Open { .. })
     }
 
-    pub(super) fn task_id(&self) -> tokio::task::Id {
+    pub fn task_id(&self) -> tokio::task::Id {
         self.task.id()
     }
 
-    pub(super) fn send(&self, message: ServerToPane) -> bool {
+    pub fn send(&self, message: ServerToPane) -> bool {
         match &self.output {
             Output::Open { sender, .. } => sender.try_send(message).is_ok(),
             Output::Draining => false,
@@ -305,7 +305,7 @@ impl Pane {
     }
 
     /// Drain queued messages before Release; never interrupt an active frame.
-    pub(super) fn release(&mut self, reason: String) {
+    pub fn release(&mut self, reason: String) {
         if let Output::Open { release, .. } = std::mem::replace(&mut self.output, Output::Draining)
         {
             let _ = release.send(reason);
@@ -326,8 +326,7 @@ async fn pane_writer(
 ) -> io::Result<()> {
     let mut outgoing = Outgoing::default();
     while let Some(message) = messages.recv().await {
-        protocol::send(&mut outgoing, &message)?;
-        drop(message);
+        outgoing.send_pane(message)?;
         outgoing.flush_to(writer).await?;
     }
     if let Ok(reason) = reason.await {
@@ -341,7 +340,7 @@ async fn send<T: serde::Serialize>(
     message: &T,
 ) -> io::Result<()> {
     let mut outgoing = Outgoing::default();
-    protocol::send(&mut outgoing, message)?;
+    outgoing.send(message)?;
     outgoing.flush_to(writer).await
 }
 

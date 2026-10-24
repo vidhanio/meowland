@@ -5,10 +5,10 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 
 #[derive(Debug)]
 pub struct Snapshot {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) pixels: Vec<u8>,
-    pub(crate) opaque: bool,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub opaque: bool,
 }
 
 impl Snapshot {
@@ -79,16 +79,23 @@ impl Snapshot {
         for (y, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
             for (x, out_pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 // SAFETY: The caller checked every pixel against the live
-                // mapping. Byte reads require no alignment and create no
-                // references to externally writable memory.
+                // mapping. Word reads require the checked alignment; byte
+                // reads handle unaligned pixels. Neither creates references
+                // to externally writable memory.
                 let pixel = unsafe {
                     let pixel = source.add(y * stride + x * 4);
-                    [
-                        pixel.read_volatile(),
-                        pixel.add(1).read_volatile(),
-                        pixel.add(2).read_volatile(),
-                        pixel.add(3).read_volatile(),
-                    ]
+                    #[expect(clippy::cast_ptr_alignment)]
+                    let word = pixel.cast::<u32>();
+                    if word.is_aligned() {
+                        word.read_volatile().to_ne_bytes()
+                    } else {
+                        [
+                            pixel.read_volatile(),
+                            pixel.add(1).read_volatile(),
+                            pixel.add(2).read_volatile(),
+                            pixel.add(3).read_volatile(),
+                        ]
+                    }
                 };
                 let alpha = if XRGB { 255 } else { pixel[3] };
                 *out_pixel = [pixel[2], pixel[1], pixel[0], alpha];

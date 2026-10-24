@@ -24,7 +24,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub(super) fn prepare(&mut self, pixels: &[u8]) -> Encoding {
+    pub fn prepare(&mut self, pixels: &[u8]) -> Encoding {
         if self.compress(pixels) && self.compressed.len() * 4 <= pixels.len() * 3 {
             Encoding::Zlib
         } else {
@@ -32,7 +32,7 @@ impl Encoder {
         }
     }
 
-    pub(super) fn capacity(&self, pixels: &[u8], encoding: Encoding) -> usize {
+    pub fn capacity(&self, pixels: &[u8], encoding: Encoding) -> usize {
         encoded_capacity(self.payload(pixels, encoding).len())
     }
 
@@ -43,7 +43,7 @@ impl Encoder {
         }
     }
 
-    pub(super) fn image(
+    pub fn image(
         &mut self,
         out: &mut Vec<u8>,
         id: u32,
@@ -56,7 +56,7 @@ impl Encoder {
     }
 
     /// Write the most recently prepared image without repeating compression.
-    pub(super) fn write(
+    pub fn write(
         &self,
         out: &mut Vec<u8>,
         id: u32,

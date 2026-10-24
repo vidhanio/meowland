@@ -118,6 +118,7 @@ pub enum PaneToServer {
     },
     ClipboardReply {
         request: u64,
+        #[serde(with = "serde_bytes")]
         data: Option<Vec<u8>>,
     },
 }
@@ -127,6 +128,8 @@ pub enum ServerToPane {
     HelloOk,
     Reject(String),
     /// RGB rows of a frame, starting at `y`.
+    /// The RGB byte string stays last so writers can transmit its storage
+    /// directly.
     Frame {
         width: u32,
         height: u32,

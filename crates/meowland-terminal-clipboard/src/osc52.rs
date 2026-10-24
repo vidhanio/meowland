@@ -32,11 +32,11 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub(super) const fn pending(&self) -> bool {
+    pub const fn pending(&self) -> bool {
         matches!(self.state, State::Queued(_) | State::Reading(_))
     }
 
-    pub(super) const fn cancel_refresh(&mut self) {
+    pub const fn cancel_refresh(&mut self) {
         self.state = match self.state {
             State::Queued(_) => State::Idle,
             State::Reading(_) => State::Draining,
@@ -44,7 +44,7 @@ impl Clipboard {
         };
     }
 
-    pub(super) fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
+    pub fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
         if !shortcut || !matches!(self.state, State::Idle) {
             return None;
         }
@@ -53,7 +53,7 @@ impl Clipboard {
         Some(deadline)
     }
 
-    pub(super) fn read(&mut self, request: u64, offer: u64, mime: &str, deadline: Deadline) {
+    pub fn read(&mut self, request: u64, offer: u64, mime: &str, deadline: Deadline) {
         let data = self.snapshot.as_ref().and_then(|(id, bytes)| {
             (*id == offer && TEXT_MIMES.contains(&mime) && !deadline.expired())
                 .then(|| bytes.clone())
@@ -61,13 +61,13 @@ impl Clipboard {
         self.actions.push_back(Action::Reply { request, data });
     }
 
-    pub(super) fn cancel(&mut self, request: u64) {
+    pub fn cancel(&mut self, request: u64) {
         self.actions.retain(
             |action| !matches!(action, Action::Reply { request: number, .. } if *number == request),
         );
     }
 
-    pub(super) fn copy(data: &ClipboardData, output: &mut Vec<u8>) {
+    pub fn copy(data: &ClipboardData, output: &mut Vec<u8>) {
         if !data.valid() {
             return;
         }
@@ -79,11 +79,11 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn next_action(&mut self) -> Option<Action> {
+    pub fn next_action(&mut self) -> Option<Action> {
         self.actions.pop_front()
     }
 
-    pub(super) const fn deadline(&self) -> Option<Instant> {
+    pub const fn deadline(&self) -> Option<Instant> {
         match self.state {
             State::Queued(deadline) | State::Reading(deadline) => Some(deadline),
             State::Idle | State::Draining => None,
@@ -108,7 +108,7 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn poll(&mut self, output: &mut Vec<u8>) {
+    pub fn poll(&mut self, output: &mut Vec<u8>) {
         self.expire();
         if let State::Queued(deadline) = self.state
             && output.is_empty()
@@ -118,7 +118,7 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn text(&mut self, payload: &[u8]) {
+    pub fn text(&mut self, payload: &[u8]) {
         self.expire();
         match self.state {
             State::Draining => {

@@ -78,6 +78,7 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             pointer_input(state, window, (x, y), button, pressed, scroll);
         }
     }
+    state.send_pane_cursor(pane);
 }
 
 fn pointer_input(

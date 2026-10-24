@@ -103,7 +103,7 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub(super) fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         let mut password = [0; 32];
         getrandom::fill(&mut password).map_err(io::Error::other)?;
         Ok(Self {
@@ -119,7 +119,7 @@ impl Clipboard {
         })
     }
 
-    pub(super) fn focus(&mut self, focused: bool) {
+    pub fn focus(&mut self, focused: bool) {
         self.focused = focused;
         if focused {
             let _ = self.refresh(false);
@@ -128,7 +128,7 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn cancel_refresh(&mut self) {
+    pub fn cancel_refresh(&mut self) {
         self.epoch += 1;
         self.notification = None;
         self.requests
@@ -142,7 +142,7 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
+    pub fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
         if shortcut && (self.active.is_some() || !self.requests.is_empty()) {
             return None;
         }
@@ -153,7 +153,7 @@ impl Clipboard {
         self.deadline()
     }
 
-    pub(super) fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
+    pub fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
         self.enqueue(Request::Read {
             request,
             offer,
@@ -162,7 +162,7 @@ impl Clipboard {
         });
     }
 
-    pub(super) fn cancel(&mut self, request: u64) {
+    pub fn cancel(&mut self, request: u64) {
         let matches = |candidate: &Request| matches!(candidate, Request::Read { request: number, .. } if *number == request);
         self.requests.retain(|queued| !matches(&queued.request));
         if self
@@ -177,7 +177,7 @@ impl Clipboard {
         );
     }
 
-    pub(super) fn copy(&mut self, data: ClipboardData) {
+    pub fn copy(&mut self, data: ClipboardData) {
         if !data.valid() {
             return;
         }
@@ -209,11 +209,11 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn next_action(&mut self) -> Option<Action> {
+    pub fn next_action(&mut self) -> Option<Action> {
         self.actions.pop_front()
     }
 
-    pub(super) fn deadline(&self) -> Option<Instant> {
+    pub fn deadline(&self) -> Option<Instant> {
         self.active
             .as_ref()
             .map(|operation| operation.deadline)
@@ -245,7 +245,7 @@ impl Clipboard {
         self.requests = requests;
     }
 
-    pub(super) fn poll(&mut self, output: &mut Vec<u8>) {
+    pub fn poll(&mut self, output: &mut Vec<u8>) {
         self.expire();
         if self.active.is_some() || !output.is_empty() {
             return;
@@ -314,7 +314,7 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn packet(&mut self, bytes: &[u8]) {
+    pub fn packet(&mut self, bytes: &[u8]) {
         self.expire();
         let Some(packet) = Packet::parse(bytes) else {
             return;

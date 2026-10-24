@@ -73,7 +73,7 @@ use catalog::WindowCatalog;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot, surface_stack};
 use runtime::ClientState;
 
-const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
 
 #[derive(Clone, Debug)]
 pub enum Command {

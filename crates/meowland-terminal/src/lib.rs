@@ -2,7 +2,6 @@
 
 use std::{
     io::{self, Write},
-    os::unix::net::UnixStream,
     path::Path,
     time::{Duration, Instant},
 };
@@ -11,22 +10,21 @@ use crossterm::{
     event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute, terminal,
 };
-use meowland_core::{Result, signals};
+use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
+use meowland_input::{self as input, keyboard};
 use meowland_kitty::{Presenter, SharedMemory};
-use meowland_protocol::{self as protocol, Input, PaneToServer, Show, clipboard::MAX_TEXT};
-use rustix::{
-    event::{PollFd, PollFlags, Timespec, poll},
-    io::Errno,
+use meowland_protocol::{
+    self as protocol, Input, PaneToServer, Show,
+    asynchronous::{Outgoing, Reader, Receiver},
+    clipboard::MAX_TEXT,
 };
+use meowland_terminal_clipboard as clipboard;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
-
-mod clipboard;
-mod input;
-mod keyboard;
 mod output;
 mod session;
 
-use clipboard::{Action as ClipboardAction, Clipboard};
+use clipboard::{Action as ClipboardAction, Clipboard, Protocol as ClipboardProtocol};
 use input::Event;
 use keyboard::Keyboard;
 
@@ -66,64 +64,40 @@ pub struct ProbeInfo {
     pub name: Option<String>,
 }
 
-/// Probe using unbuffered reads: buffered input could hide bytes from `poll`.
-fn terminal_probe(
+/// Probe through the same async descriptors used for presentation and input.
+async fn terminal_probe(
+    input: &mut input::Reader,
+    output: &mut Descriptor,
+    wakeup: &mut Descriptor,
     interrupted: &signals::TerminationFlag,
 ) -> io::Result<(ProbeInfo, Option<SharedMemory>)> {
     let slot = SharedMemory::new();
     let shared_probe = slot.probe();
-    let mut out = io::stdout();
-    out.write_all(PROBE_QUERY)?;
+    let mut pending = output::Output::default();
+    pending.append(PROBE_QUERY);
     if let Some(command) = &shared_probe {
-        out.write_all(command)?;
+        pending.append(command);
     }
-    out.write_all(PROBE_QUERY_TAIL)?;
-    out.flush()?;
-    let stdin = io::stdin();
+    pending.append(PROBE_QUERY_TAIL);
     let mut bytes = Vec::new();
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut quiet_deadline = None;
     while !interrupted.interrupted() {
-        let now = Instant::now();
-        let stop_at = quiet_deadline.unwrap_or(deadline);
-        if now >= stop_at {
-            break;
-        }
-        let wait = stop_at - now;
-        let mut fds = [PollFd::new(
-            &stdin,
-            PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
-        )];
-        let timeout = Timespec {
-            tv_sec: wait.as_secs() as i64,
-            tv_nsec: wait.subsec_nanos().into(),
-        };
-        match poll(&mut fds, Some(&timeout)) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(Errno::INTR) => continue,
-            Err(error) => return Err(io::Error::from(error)),
-        }
-        if interrupted.interrupted() {
-            break;
-        }
-        if fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR) {
-            break;
-        }
-        let mut buffer = [0u8; 1024];
-        match rustix::io::read(&stdin, &mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
+        let mut buffer = [0; 1024];
+        let mut signal = [0; 256];
+        tokio::select! {
+            () = tokio::time::sleep_until(quiet_deadline.unwrap_or(deadline).into()) => break,
+            result = pending.drain(output), if pending.pending() => result?,
+            result = wakeup.read(&mut signal) => { if result? == 0 { break; } },
+            result = input.read_raw(&mut buffer), if !pending.pending() => {
+                let read = result?;
+                if read == 0 { break; }
                 bytes.extend_from_slice(&buffer[..read]);
                 if quiet_deadline.is_none() && device_attributes_seen(&bytes) {
                     quiet_deadline = Some(Instant::now() + PROBE_QUIET);
                 }
-                if bytes.len() >= PROBE_MAXIMUM {
-                    break;
-                }
+                if bytes.len() >= PROBE_MAXIMUM { break; }
             }
-            Err(Errno::INTR) => {}
-            Err(error) => return Err(io::Error::from(error)),
         }
     }
     let mut probe = parse_probe_bytes(&bytes);
@@ -343,8 +317,34 @@ impl PaneStats {
 /// Fails if the terminal cannot be configured or probed, or the pane
 /// connection fails. Server-initiated release restores the terminal and
 /// returns `Ok`.
-pub fn attach(socket: &Path, show: Show) -> Result<()> {
-    session::TerminalSession::connect(socket, show)?.run()
+pub async fn attach(socket: &Path, show: Show) -> Result<()> {
+    let stream = tokio::net::UnixStream::connect(socket)
+        .await
+        .map_err(|error| {
+            Error::io(
+                format!(
+                    "could not reach the pane socket {} (is the server running?)",
+                    socket.display()
+                ),
+                error,
+            )
+        })?;
+    let (reader, writer) = stream.into_split();
+    attach_connection(Reader::new(reader), writer, show).await
+}
+
+/// Present a pane over a cancellation-safe receiver and an async writer.
+///
+/// # Errors
+/// Returns an error if terminal setup, presentation, or the connection fails.
+pub async fn attach_connection(
+    reader: impl Receiver,
+    writer: impl AsyncWrite + Unpin,
+    show: Show,
+) -> Result<()> {
+    session::TerminalSession::new(reader, writer, show)?
+        .run()
+        .await
 }
 
 /// Own terminal-side presentation buffers together with their accounting.
@@ -378,8 +378,9 @@ impl PanePresentation {
         height: u32,
         y: u32,
         rgb: Vec<u8>,
-        tx: &mut UnixStream,
+        tx: &mut Outgoing,
     ) -> Result<()> {
+        assert!(!self.pending.pending());
         let started = Instant::now();
         self.presenter
             .present_into(width, height, y, rgb, self.pending.buffer());
@@ -392,12 +393,12 @@ impl PanePresentation {
         self.finish(tx)
     }
 
-    fn drain(&mut self, stdout: &mut impl Write, tx: &mut UnixStream) -> Result<()> {
-        self.pending.drain(stdout)?;
-        self.finish(tx)
+    async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        self.pending.drain(stdout).await?;
+        Ok(())
     }
 
-    fn finish(&mut self, tx: &mut UnixStream) -> Result<()> {
+    fn finish(&mut self, tx: &mut Outgoing) -> Result<()> {
         if self.pending.pending() {
             return Ok(());
         }
@@ -422,7 +423,7 @@ impl PanePresentation {
 
 fn send_event(
     event: Event,
-    tx: &mut UnixStream,
+    tx: &mut Outgoing,
     presenter: &mut Presenter,
     cell: &mut Option<(u16, u16)>,
     clipboard: &mut Clipboard,
@@ -486,7 +487,7 @@ fn send_input(
     input: Input,
     defer: Option<Instant>,
     keyboard: &mut Keyboard,
-    tx: &mut UnixStream,
+    tx: &mut Outgoing,
 ) -> Result<()> {
     if let Some(deadline) = defer {
         keyboard.defer(input, deadline);
@@ -503,7 +504,7 @@ fn send_input(
 fn send_clipboard_actions(
     clipboard: &mut Clipboard,
     keyboard: &mut Keyboard,
-    tx: &mut UnixStream,
+    tx: &mut Outgoing,
 ) -> Result<()> {
     while let Some(action) = clipboard.next_action() {
         match action {
@@ -541,14 +542,14 @@ fn send_clipboard_actions(
     Ok(())
 }
 
-fn send_deferred(keyboard: &mut Keyboard, tx: &mut UnixStream) -> Result<()> {
+fn send_deferred(keyboard: &mut Keyboard, tx: &mut Outgoing) -> Result<()> {
     for input in keyboard.take_deferred() {
         protocol::send(tx, &PaneToServer::Input(input))?;
     }
     Ok(())
 }
 
-fn send_paste(tx: &mut UnixStream, text: String) -> Result<()> {
+fn send_paste(tx: &mut Outgoing, text: String) -> Result<()> {
     if text.len() <= MAX_TEXT {
         protocol::send(tx, &PaneToServer::Paste(text))?;
     } else {

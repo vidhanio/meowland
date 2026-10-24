@@ -5,11 +5,10 @@ use std::{io, time::Instant};
 
 use meowland_protocol::clipboard::{ClipboardData, Deadline};
 
-use super::output::Output;
-
 mod kitty;
 mod osc52;
 
+#[derive(Debug)]
 pub enum Action {
     Offer {
         offer: u64,
@@ -23,6 +22,12 @@ pub enum Action {
     Unblock,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum Protocol {
+    Kitty,
+    Osc52,
+}
+
 enum Transport {
     Kitty(Box<kitty::Clipboard>),
     Text(osc52::Clipboard),
@@ -32,18 +37,33 @@ pub struct Clipboard {
     transport: Transport,
 }
 
+impl std::fmt::Debug for Clipboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let protocol = match &self.transport {
+            Transport::Kitty(_) => Protocol::Kitty,
+            Transport::Text(_) => Protocol::Osc52,
+        };
+        f.debug_struct("Clipboard")
+            .field("protocol", &protocol)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Clipboard {
-    pub(super) fn new(kitty: bool) -> io::Result<Self> {
-        let transport = if kitty {
-            Transport::Kitty(Box::new(kitty::Clipboard::new()?))
-        } else {
-            Transport::Text(osc52::Clipboard::default())
+    /// Select the clipboard protocol advertised by the terminal.
+    ///
+    /// # Errors
+    /// Returns an error if secure request credentials cannot be generated.
+    pub fn new(protocol: Protocol) -> io::Result<Self> {
+        let transport = match protocol {
+            Protocol::Kitty => Transport::Kitty(Box::new(kitty::Clipboard::new()?)),
+            Protocol::Osc52 => Transport::Text(osc52::Clipboard::default()),
         };
         Ok(Self { transport })
     }
 
     /// Preserve an explicit text read across the terminal's permission dialog.
-    pub(super) fn focus(&mut self, focused: bool) -> bool {
+    pub fn focus(&mut self, focused: bool) -> bool {
         match &mut self.transport {
             Transport::Kitty(clipboard) => {
                 clipboard.focus(focused);
@@ -53,69 +73,70 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
+    pub fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.refresh(shortcut),
             Transport::Text(clipboard) => clipboard.refresh(shortcut),
         }
     }
 
-    pub(super) fn cancel_refresh(&mut self) {
+    pub fn cancel_refresh(&mut self) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.cancel_refresh(),
             Transport::Text(clipboard) => clipboard.cancel_refresh(),
         }
     }
 
-    pub(super) fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
+    pub fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.read(request, offer, mime, deadline),
             Transport::Text(clipboard) => clipboard.read(request, offer, &mime, deadline),
         }
     }
 
-    pub(super) fn cancel(&mut self, request: u64) {
+    pub fn cancel(&mut self, request: u64) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.cancel(request),
             Transport::Text(clipboard) => clipboard.cancel(request),
         }
     }
 
-    pub(super) fn copy(&mut self, data: ClipboardData, output: &mut Output) {
+    pub fn copy(&mut self, data: ClipboardData, output: &mut Vec<u8>) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.copy(data),
             Transport::Text(_) => osc52::Clipboard::copy(&data, output),
         }
     }
 
-    pub(super) fn next_action(&mut self) -> Option<Action> {
+    pub fn next_action(&mut self) -> Option<Action> {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.next_action(),
             Transport::Text(clipboard) => clipboard.next_action(),
         }
     }
 
-    pub(super) fn deadline(&self) -> Option<Instant> {
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
         match &self.transport {
             Transport::Kitty(clipboard) => clipboard.deadline(),
             Transport::Text(clipboard) => clipboard.deadline(),
         }
     }
 
-    pub(super) fn poll(&mut self, output: &mut Output) {
+    pub fn advance(&mut self, output: &mut Vec<u8>) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.poll(output),
             Transport::Text(clipboard) => clipboard.poll(output),
         }
     }
 
-    pub(super) fn packet(&mut self, bytes: &[u8]) {
+    pub fn packet(&mut self, bytes: &[u8]) {
         if let Transport::Kitty(clipboard) = &mut self.transport {
             clipboard.packet(bytes);
         }
     }
 
-    pub(super) fn text(&mut self, bytes: &[u8]) {
+    pub fn text(&mut self, bytes: &[u8]) {
         if let Transport::Text(clipboard) = &mut self.transport {
             clipboard.text(bytes);
         }

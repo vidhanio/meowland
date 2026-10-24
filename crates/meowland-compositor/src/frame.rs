@@ -136,21 +136,20 @@ impl State {
             let late = now.duration_since(window.callback_due).as_nanos();
             let ticks = late / FRAME_INTERVAL.as_nanos() + 1;
             window.callback_due += FRAME_INTERVAL * u32::try_from(ticks).unwrap_or(u32::MAX);
-            self.renderer.stack.rebuild(window.surface.wl_surface());
-            for (surface, _) in &self.renderer.stack.surfaces {
-                with_states(surface, |states| {
-                    for callback in states
-                        .cached_state
-                        .get::<SurfaceAttributes>()
-                        .current()
-                        .frame_callbacks
-                        .drain(..)
-                    {
-                        callback.done(time);
-                    }
+            self.renderer
+                .for_each_surface(window.surface.wl_surface(), |surface| {
+                    with_states(surface, |states| {
+                        for callback in states
+                            .cached_state
+                            .get::<SurfaceAttributes>()
+                            .current()
+                            .frame_callbacks
+                            .drain(..)
+                        {
+                            callback.done(time);
+                        }
+                    });
                 });
-            }
-            self.renderer.stack.clear();
         }
     }
 
@@ -166,12 +165,13 @@ impl State {
             if !entry.presentation.due() {
                 continue;
             }
-            let pixels = self.renderer.render(
-                &self.windows,
-                &self.snapshots,
-                entry.window(),
-                entry.presentation.size,
-            );
+            let root = entry
+                .window()
+                .and_then(|id| self.windows.get(&id))
+                .map(|window| window.surface.wl_surface());
+            let pixels = self
+                .renderer
+                .render(root, &self.snapshots, entry.presentation.size);
             if let Some(frame) = entry.presentation.frame(pane, pixels) {
                 let _ = self.events.send(frame);
             }

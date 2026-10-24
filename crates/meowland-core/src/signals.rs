@@ -38,11 +38,6 @@ impl Wakeup {
         }
         Ok(wakeup)
     }
-
-    pub fn drain(&self) {
-        let mut bytes = [0; 256];
-        while rustix::io::read(&self.socket, &mut bytes).is_ok_and(|read| read > 0) {}
-    }
 }
 
 impl std::os::fd::AsFd for Wakeup {

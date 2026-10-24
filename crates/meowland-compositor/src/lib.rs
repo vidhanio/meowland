@@ -36,8 +36,7 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SubsurfaceCachedState, SurfaceAttributes, add_pre_commit_hook, get_children,
-            get_parent, with_states,
+            SurfaceAttributes, add_pre_commit_hook, get_children, get_parent, with_states,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{
@@ -55,9 +54,7 @@ use smithay::{
         },
         shell::{
             kde::decoration::KdeDecorationState,
-            xdg::{
-                SurfaceCachedState, ToplevelSurface, XdgShellState, decoration::XdgDecorationState,
-            },
+            xdg::{ToplevelSurface, XdgShellState, decoration::XdgDecorationState},
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
         viewporter::{ViewportCachedState, ViewporterState},
@@ -71,21 +68,16 @@ mod catalog;
 mod clipboard;
 mod commands;
 mod decoration;
-mod dmabuf;
 mod frame;
 mod input;
 mod readback;
-mod render;
 mod shell;
-mod snapshot;
 mod sources;
 
 use attachment::{Attachments, Binding, Pane, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
-use dmabuf::DmabufBackend;
-use render::{Renderer, surface_stack};
-use snapshot::Snapshot;
+use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot, surface_stack};
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
 
@@ -201,7 +193,7 @@ pub enum Event {
 
 pub type Handle = (
     channel::Sender<Command>,
-    channel::Channel<Event>,
+    tokio::sync::mpsc::UnboundedReceiver<Event>,
     String,
     thread::JoinHandle<()>,
 );
@@ -213,7 +205,7 @@ pub type Handle = (
 /// if readiness is not reported within two seconds.
 pub fn spawn() -> meowland_core::Result<Handle> {
     let (commands, rx) = channel::channel();
-    let (tx, events) = channel::channel();
+    let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let socket = format!("wayland-meowland-{}", std::process::id());
     let socket_for_thread = socket.clone();
@@ -292,7 +284,7 @@ struct State {
     /// belongs to another pane is still sent.
     cursor_shape_pane: Option<PaneId>,
     renderer: Renderer,
-    events: channel::Sender<Event>,
+    events: tokio::sync::mpsc::UnboundedSender<Event>,
     /// Output mode, rewritten as panes attach and leave.
     mode: Size<i32, Logical>,
     started: Instant,
@@ -401,29 +393,21 @@ impl CompositorHandler for State {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = self.pane_bound(surface);
                 let mut previous = self.snapshots.remove(surface);
-                let mut reuse = previous
-                    .as_mut()
-                    .map_or_else(Vec::new, |old| std::mem::take(&mut old.pixels));
                 let snapshot = if get_dmabuf(&buffer).is_ok() {
                     readback::snapshot(surface)
                 } else {
                     with_buffer_contents(&buffer, |ptr, len, data| {
-                        Snapshot::copy_shm(ptr, len, &data, bound, &mut reuse)
+                        // SAFETY: Smithay keeps the mapped pool readable for
+                        // this callback and supplies
+                        // its pointer and length together.
+                        unsafe { Snapshot::copy_shm(ptr, len, &data, bound, &mut previous) }
                     })
                     .ok()
                     .flatten()
                 };
                 buffer.release();
-                match snapshot {
-                    Some(snapshot) => {
-                        self.snapshots.insert(surface.clone(), snapshot);
-                    }
-                    None => {
-                        if let Some(mut previous) = previous {
-                            previous.pixels = reuse;
-                            self.snapshots.insert(surface.clone(), previous);
-                        }
-                    }
+                if let Some(snapshot) = snapshot.or(previous) {
+                    self.snapshots.insert(surface.clone(), snapshot);
                 }
             }
             Some(BufferAssignment::Removed) => {
@@ -450,7 +434,7 @@ impl State {
     fn new(
         display_handle: DisplayHandle,
         handle: LoopHandle<'static, Self>,
-        events: channel::Sender<Event>,
+        events: tokio::sync::mpsc::UnboundedSender<Event>,
     ) -> Self {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
@@ -882,7 +866,7 @@ delegate_dispatch2!(State);
 fn run(
     name: String,
     rx: channel::Channel<Command>,
-    events: channel::Sender<Event>,
+    events: tokio::sync::mpsc::UnboundedSender<Event>,
     ready: mpsc::Sender<std::io::Result<()>>,
 ) {
     let Ok(mut display) = Display::<State>::new() else {

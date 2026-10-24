@@ -10,6 +10,7 @@ use std::{
 
 use calloop::{Interest, Mode, PostAction, generic::Generic};
 use meowland_core::pixels::FrameSize;
+use meowland_render::{Readback, Submission};
 use smithay::{
     backend::allocator::{
         Buffer,
@@ -21,11 +22,7 @@ use smithay::{
     wayland::compositor::{Blocker, BlockerState, Cacheable, add_blocker, with_states},
 };
 
-use super::{
-    ClientState, Snapshot, State, WlSurface,
-    dmabuf::{Readback, Submission},
-    sources::Sources,
-};
+use super::{ClientState, Snapshot, State, WlSurface, sources::Sources};
 
 const MAX_PENDING: usize = 32;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;

@@ -21,13 +21,16 @@ enum Commands {
     /// Start a client and show its window in this terminal.
     Run(RunArgs),
     /// Show a window in this terminal.
-    Attach(WindowArgs),
+    Attach(AttachArgs),
     /// Ask a window to close.
     Kill(WindowArgs),
     /// List windows.
     List,
     /// Start the compositor server in the foreground.
     Server,
+    /// Bridge a pane connection over standard input and output.
+    #[usage(hide)]
+    Relay,
     /// Generate a shell completion script.
     Completions(CompletionArgs),
 }
@@ -47,6 +50,17 @@ struct RunArgs {
 }
 
 #[derive(Args)]
+struct AttachArgs {
+    /// SSH destination ([user@]host[:port] or a config alias); presentation
+    /// stays local.
+    #[usage(long)]
+    remote: Option<String>,
+    /// The integer window ID or app ID; omit it to select the focused window.
+    #[usage(complete = attach_targets)]
+    window: Option<String>,
+}
+
+#[derive(Args)]
 struct WindowArgs {
     /// The integer window ID or app ID; omit it to select the focused window.
     #[usage(complete = window_targets)]
@@ -60,6 +74,17 @@ impl WindowArgs {
                 .parse()
                 .map_or_else(|_| Show::AppId(window), Show::Id)
         })
+    }
+}
+
+fn attach_targets(
+    partial: &<AttachArgs as usage_rs::spec::CommandArgs>::Partial,
+    _context: &usage_rs::complete::CompleteCtx<'_>,
+) -> Vec<usage_rs::complete::Candidate<'static>> {
+    if partial.remote.is_some() {
+        Vec::new()
+    } else {
+        complete_windows(true)
     }
 }
 
@@ -140,7 +165,8 @@ impl From<CompletionShell> for usage_rs::complete::Shell {
 pub fn start() -> Result<()> {
     let cli = Meowland::parse();
     match cli.command {
-        Commands::Server => meowland_server::serve(&Paths::discover()?),
+        Commands::Server => run_async(meowland_server::serve(&Paths::discover()?)),
+        Commands::Relay => run_async(crate::remote::relay()),
         Commands::List => {
             let paths = Paths::discover()?;
             for window in list(&paths)? {
@@ -170,14 +196,19 @@ pub fn start() -> Result<()> {
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 let show = app_id.map_or(Show::Activation(token), Show::AppId);
-                terminal::attach(&paths.pane, show)
+                run_async(terminal::attach(&paths.pane, show))
             } else {
                 Ok(())
             }
         }
-        Commands::Attach(args) => {
-            let paths = Paths::discover()?;
-            terminal::attach(&paths.pane, args.show())
+        Commands::Attach(AttachArgs { remote, window }) => {
+            let show = WindowArgs { window }.show();
+            if let Some(host) = remote {
+                run_async(crate::remote::attach(&host, show))
+            } else {
+                let paths = Paths::discover()?;
+                run_async(terminal::attach(&paths.pane, show))
+            }
         }
         Commands::Kill(args) => {
             let paths = Paths::discover()?;
@@ -189,6 +220,13 @@ pub fn start() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_async(operation: impl Future<Output = Result<()>>) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(operation)
 }
 
 fn list(paths: &Paths) -> Result<Vec<WindowInfo>> {

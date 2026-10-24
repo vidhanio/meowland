@@ -69,14 +69,16 @@ impl SnapshotError {
         }
     }
 
-    pub(super) const fn release_safe(&self) -> bool {
+    #[must_use]
+    pub const fn release_safe(&self) -> bool {
         self.release_safe
     }
 }
 
+#[derive(Debug)]
 pub struct Submission {
-    pub(super) fd: OwnedFd,
-    pub(super) readback: Readback,
+    pub fd: OwnedFd,
+    pub readback: Readback,
 }
 
 pub struct Readback {
@@ -95,8 +97,26 @@ pub struct DmabufBackend {
     device: u64,
 }
 
+impl std::fmt::Debug for DmabufBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmabufBackend")
+            .field("device", &self.device)
+            .field("formats", &self.formats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Readback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Readback")
+            .field("size", &self.size)
+            .field("force_opaque", &self.force_opaque)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DmabufBackend {
-    pub(super) fn discover() -> Option<Self> {
+    pub fn discover() -> Option<Self> {
         let selection = std::env::var_os("MEOWLAND_RENDER_NODE");
         if selection.as_deref() == Some(OsStr::new("off")) {
             return None;
@@ -208,11 +228,13 @@ impl DmabufBackend {
         Ok(backend)
     }
 
-    pub(super) const fn device(&self) -> u64 {
+    #[must_use]
+    pub const fn device(&self) -> u64 {
         self.device
     }
 
-    pub(super) fn formats(&self) -> &[Format] {
+    #[must_use]
+    pub fn formats(&self) -> &[Format] {
         &self.formats
     }
 
@@ -239,7 +261,7 @@ impl DmabufBackend {
         Ok(size)
     }
 
-    pub(super) fn validate(&mut self, dmabuf: &Dmabuf) -> bool {
+    pub fn validate(&mut self, dmabuf: &Dmabuf) -> bool {
         self.dimensions(dmabuf, None).is_ok() && self.renderer.import_dmabuf(dmabuf, None).is_ok()
     }
 
@@ -307,7 +329,12 @@ impl DmabufBackend {
 
     /// Submit rendering and PBO readback in one context, then fence both
     /// operations.
-    pub(super) fn submit(
+    /// Submit readback work and export a fence covering rendering and the copy.
+    ///
+    /// # Errors
+    /// Returns a snapshot error; check `release_safe` before releasing the
+    /// client buffer.
+    pub fn submit(
         &mut self,
         dmabuf: &Dmabuf,
         bound: Option<(u32, u32)>,
@@ -342,7 +369,11 @@ impl DmabufBackend {
     }
 
     /// Map only after the submission's native fence has reported completion.
-    pub(super) fn complete(&mut self, readback: Readback) -> Result<Snapshot, SnapshotError> {
+    /// Complete a submitted readback after its fence becomes readable.
+    ///
+    /// # Errors
+    /// Returns an error if mapping or pixel conversion fails.
+    pub fn complete(&mut self, readback: Readback) -> Result<Snapshot, SnapshotError> {
         let size = readback.size;
         let mapping = readback.mapping.map_err(SnapshotError::safe)?;
         let top_down = mapping.flipped();

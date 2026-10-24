@@ -14,17 +14,22 @@ use super::input::{Key, Kind};
 
 /// Releases of intercepted shortcuts must stay intercepted even if their
 /// modifiers have changed by the time the key comes up.
-#[derive(Default)]
+#[derive(Debug)]
+struct Deferred {
+    inputs: Vec<Input>,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default)]
 pub struct Keyboard {
     intercepted: HashSet<u16>,
     held: BTreeSet<u16>,
     modifiers: u8,
-    deferred: Option<Vec<Input>>,
-    deferred_deadline: Option<Instant>,
+    deferred: Option<Deferred>,
 }
 
 impl Keyboard {
-    pub(super) fn input(&mut self, key: Key) -> Option<Input> {
+    pub fn input(&mut self, key: Key) -> Option<Input> {
         self.modifiers = key.modifiers;
         if key.kind == Kind::Repeat {
             return None;
@@ -48,66 +53,83 @@ impl Keyboard {
         })
     }
 
-    pub(super) fn intercept(&mut self, code: u16) {
+    pub fn intercept(&mut self, code: u16) {
         self.held.remove(&code);
         self.intercepted.insert(code);
     }
 
-    pub(super) fn enter(&self) -> Input {
+    #[must_use]
+    pub fn enter(&self) -> Input {
         Input::KeyboardEnter {
             keys: self.held.iter().copied().collect(),
             modifiers: self.modifiers,
         }
     }
 
-    pub(super) const fn deferred(&self) -> bool {
+    #[must_use]
+    pub const fn deferred(&self) -> bool {
         self.deferred.is_some()
     }
 
-    pub(super) fn defer(&mut self, input: Input, deadline: Instant) {
-        self.deferred_deadline.get_or_insert(deadline);
-        self.deferred.get_or_insert_with(Vec::new).push(input);
+    pub fn defer(&mut self, input: Input, deadline: Instant) {
+        self.deferred
+            .get_or_insert_with(|| Deferred {
+                inputs: Vec::new(),
+                deadline,
+            })
+            .inputs
+            .push(input);
     }
 
-    pub(super) fn take_deferred(&mut self) -> Vec<Input> {
-        self.deferred_deadline = None;
-        self.deferred.take().unwrap_or_default()
+    pub fn take_deferred(&mut self) -> Vec<Input> {
+        self.deferred
+            .take()
+            .map_or_else(Vec::new, |deferred| deferred.inputs)
     }
 
-    pub(super) const fn deadline(&self) -> Option<Instant> {
-        self.deferred_deadline
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Instant> {
+        match &self.deferred {
+            Some(deferred) => Some(deferred.deadline),
+            None => None,
+        }
     }
 
-    pub(super) fn deferred_expired(&self) -> bool {
-        self.deferred_deadline
+    #[must_use]
+    pub fn deferred_expired(&self) -> bool {
+        self.deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    pub(super) fn deferred_len(&self) -> usize {
-        self.deferred.as_ref().map_or(0, Vec::len)
+    #[must_use]
+    pub fn deferred_len(&self) -> usize {
+        self.deferred
+            .as_ref()
+            .map_or(0, |deferred| deferred.inputs.len())
     }
 
-    pub(super) fn reset(&mut self, preserve_deferred: bool) {
+    pub fn reset(&mut self, preserve_deferred: bool) {
         self.intercepted.clear();
         self.held.clear();
         self.modifiers = 0;
         if preserve_deferred {
-            if let Some(inputs) = &mut self.deferred
-                && !matches!(inputs.last(), Some(Input::ResetKeyboard))
+            if let Some(deferred) = &mut self.deferred
+                && !matches!(deferred.inputs.last(), Some(Input::ResetKeyboard))
             {
-                inputs.push(Input::ResetKeyboard);
+                deferred.inputs.push(Input::ResetKeyboard);
             }
         } else {
             self.deferred = None;
-            self.deferred_deadline = None;
         }
     }
 }
 
+#[must_use]
 pub const fn binding(code: u16, bits: u8) -> bool {
     modifiers::alt_only(bits) && matches!(code, KEY_Q | KEY_W)
 }
 
+#[must_use]
 pub const fn paste(code: u16, bits: u8) -> bool {
     let bits = bits & !(modifiers::CAPS_LOCK | modifiers::NUM_LOCK);
     (code == 47 && bits == modifiers::CONTROL) || (code == 110 && bits == modifiers::SHIFT)

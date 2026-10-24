@@ -9,19 +9,21 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-meowland-core = { workspace = true }
-meowland-protocol = { workspace = true }
+meowland-core = { workspace = true, features = ["async"] }
+meowland-protocol = { workspace = true, features = ["async"] }
 meowland-compositor = { workspace = true }
 calloop = { workspace = true }
 listenfd = { workspace = true }
-rustix = { workspace = true, features = [
-  "event",
-  "fs",
-  "net",
-  "process",
-  "runtime",
-  "time",
-] }
+rustix = { workspace = true, features = ["net", "process"] }
 sd-notify = { workspace = true }
 signal-hook = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "sync",
+  "time",
+] }
 tracing = { workspace = true }

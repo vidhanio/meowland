@@ -4,11 +4,9 @@ use std::{
     cell::RefCell,
     ffi::OsString,
     io::{self, Read, Write},
-    os::unix::net::UnixStream,
     path::PathBuf,
 };
 
-use rustix::{io::Errno, net::RecvFlags};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
@@ -237,7 +235,17 @@ fn message_size(header: [u8; HEADER]) -> io::Result<usize> {
     Ok(size)
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
+/// Decode one packet body without its length prefix.
+///
+/// # Errors
+/// Returns an error for oversized, malformed, or trailing message bytes.
+pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
+    if bytes.len() > MAX_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
+    }
     let (value, remaining) = postcard::take_from_bytes(bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !remaining.is_empty() {
@@ -247,68 +255,6 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
         ));
     }
     Ok(value)
-}
-
-/// One bounded, incremental message buffer for a readiness-driven socket.
-///
-/// The socket remains blocking for writes, including through cloned handles.
-#[derive(Debug, Default)]
-pub struct MessageReader {
-    header: [u8; HEADER],
-    header_read: usize,
-    body: Vec<u8>,
-    body_size: usize,
-    body_read: usize,
-}
-
-impl MessageReader {
-    /// Receive at most one message without waiting for missing bytes.
-    ///
-    /// `None` retains a partial packet for the next readable wakeup. Each call
-    /// reads at most a header and 64 KiB of body, so larger packets yield to
-    /// the event loop. EOF, oversized packets and decode errors match
-    /// [`recv`].
-    ///
-    /// # Errors
-    /// Returns an error on EOF, invalid messages, or socket read failures.
-    pub fn try_recv<T: for<'de> Deserialize<'de>>(
-        &mut self,
-        socket: &UnixStream,
-    ) -> io::Result<Option<T>> {
-        if self.header_read < HEADER {
-            self.header_read += receive_available(socket, &mut self.header[self.header_read..])?;
-            if self.header_read < HEADER {
-                return Ok(None);
-            }
-            self.body_size = message_size(self.header)?;
-            if self.body.len() < self.body_size {
-                self.body.resize(self.body_size, 0);
-            }
-        }
-        if self.body_read < self.body_size {
-            let end = (self.body_read + 64 * 1024).min(self.body_size);
-            self.body_read += receive_available(socket, &mut self.body[self.body_read..end])?;
-            if self.body_read < self.body_size {
-                return Ok(None);
-            }
-        }
-        self.header_read = 0;
-        self.body_read = 0;
-        decode(&self.body[..self.body_size]).map(Some)
-    }
-}
-
-/// Return currently available bytes, or zero on would-block/interruption.
-fn receive_available(socket: &UnixStream, bytes: &mut [u8]) -> io::Result<usize> {
-    match rustix::net::recv(socket, bytes, RecvFlags::DONTWAIT) {
-        Ok((0, _)) => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "failed to fill whole buffer",
-        )),
-        Ok((read, _)) => Ok(read),
-        Err(Errno::AGAIN | Errno::INTR) => Ok(0),
-        Err(error) => Err(io::Error::from(error)),
-    }
 }
 
 /// Strip the control characters that would let a window title drive the

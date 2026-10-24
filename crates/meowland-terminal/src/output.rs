@@ -1,9 +1,11 @@
 //! Ordered, resumable terminal writes with a bounded per-turn budget.
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io,
     os::unix::fs::OpenOptionsExt,
 };
+
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// A separate open file description leaves stdout's blocking flags untouched,
 /// including the descriptor used to restore terminal modes on exit.
@@ -28,9 +30,7 @@ impl Output {
         self.bytes.extend_from_slice(bytes);
     }
 
-    /// Encoding is permitted only after the previous update has drained.
-    pub(super) fn buffer(&mut self) -> &mut Vec<u8> {
-        assert!(!self.pending());
+    pub(super) const fn buffer(&mut self) -> &mut Vec<u8> {
         &mut self.bytes
     }
 
@@ -39,16 +39,14 @@ impl Output {
     }
 
     /// Never monopolize the input loop, even when the terminal is writable.
-    pub(super) fn drain(&mut self, writer: &mut impl Write) -> io::Result<()> {
+    pub(super) async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         let end = self.bytes.len().min(self.offset + 64 * 1024);
-        while self.offset < end {
-            match writer.write(&self.bytes[self.offset..end]) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => self.offset += n,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+        if self.offset < end {
+            let written = writer.write(&self.bytes[self.offset..end]).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
             }
+            self.offset += written;
         }
         if !self.pending() {
             self.bytes.clear();

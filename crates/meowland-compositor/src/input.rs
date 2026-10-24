@@ -95,7 +95,11 @@ fn pointer_input(
     if pressed && button.is_some() && !point_in_popups(state, window, x, y) {
         dismiss_popups(state, window);
     }
-    let hit = state.hit_test(window, x, y);
+    let root = state
+        .windows
+        .get(&window)
+        .map(|window| window.surface.wl_surface());
+    let hit = root.and_then(|root| state.renderer.hit_test(root, &state.snapshots, x, y));
     let location = Point::from((x, y));
     if let Some(pointer) = state.pointer.take() {
         let time = InputTime::now();

@@ -1,8 +1,7 @@
 //! Deadline-driven server shutdown and process-tree escalation.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use calloop::timer::{TimeoutAction, Timer};
 use rustix::process::Signal;
 
 use super::{CompositorCommand, ControlResponse, Ordering, Server, Termination, notify};
@@ -17,10 +16,13 @@ pub enum Escalation {
 
 pub enum Shutdown {
     Running,
-    Closing,
+    Closing {
+        deadline: Instant,
+    },
     Escalating {
         stage: Escalation,
         tree: Termination,
+        deadline: Instant,
     },
     Waiting,
     Stopped,
@@ -33,6 +35,13 @@ impl Shutdown {
 
     pub(super) const fn stopped(&self) -> bool {
         matches!(self, Self::Stopped)
+    }
+
+    pub(super) const fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Closing { deadline } | Self::Escalating { deadline, .. } => Some(*deadline),
+            _ => None,
+        }
     }
 }
 
@@ -53,17 +62,16 @@ impl Server {
         if !self.shutdown.running() {
             return;
         }
-        self.shutdown = Shutdown::Closing;
+        self.shutdown = Shutdown::Closing {
+            deadline: Instant::now() + GRACE,
+        };
         notify(&[
             sd_notify::NotifyState::Stopping,
             sd_notify::NotifyState::Status("Shutting down compositor and clients"),
         ]);
-        if let Some((control, pane)) = &mut self.listeners {
-            control.stop_accepting();
-            pane.stop_accepting();
-        }
+        self.listeners.take();
+        self.handshakes.abort_all();
         for (_, pending) in self.pending.drain() {
-            self.handle.remove(pending.timer);
             pending.reply.waiting.store(false, Ordering::Relaxed);
             pending
                 .reply
@@ -74,15 +82,6 @@ impl Server {
         for id in ids {
             self.release_pane(id, "server stopped".into());
         }
-        if let Err(error) = self
-            .handle
-            .insert_source(Timer::from_duration(GRACE), |_, (), server| {
-                server.advance_shutdown()
-            })
-        {
-            tracing::error!(%error, "cannot schedule shutdown");
-            self.force_shutdown();
-        }
     }
 
     pub(super) fn force_shutdown(&mut self) {
@@ -91,39 +90,52 @@ impl Server {
             _ => Termination::new(std::mem::take(&mut self.child_groups)),
         };
         tree.signal(Signal::KILL);
+        for (_, pending) in self.pending.drain() {
+            pending.reply.waiting.store(false, Ordering::Relaxed);
+        }
+        self.controls.abort_all();
+        self.handshakes.abort_all();
+        self.connections.abort_all();
         let _ = self.commands.send(CompositorCommand::Shutdown);
     }
 
-    fn advance_shutdown(&mut self) -> TimeoutAction {
+    pub(super) fn advance_shutdown(&mut self) {
+        let deadline = Instant::now() + GRACE;
         self.shutdown = match std::mem::replace(&mut self.shutdown, Shutdown::Waiting) {
-            Shutdown::Closing => {
+            Shutdown::Closing { .. } => {
+                self.controls.abort_all();
                 self.panes.clear();
-                self.releasing_panes.clear();
+                self.connections.abort_all();
                 let mut tree = Termination::new(std::mem::take(&mut self.child_groups));
                 tree.signal(Signal::HUP);
                 Shutdown::Escalating {
                     stage: Escalation::Hangup,
                     tree,
+                    deadline,
                 }
             }
             Shutdown::Escalating {
                 stage: Escalation::Hangup,
                 mut tree,
+                ..
             } => {
                 tree.signal(Signal::TERM);
                 Shutdown::Escalating {
                     stage: Escalation::Terminate,
                     tree,
+                    deadline,
                 }
             }
             Shutdown::Escalating {
                 stage: Escalation::Terminate,
                 mut tree,
+                ..
             } => {
                 tree.signal(Signal::KILL);
                 Shutdown::Escalating {
                     stage: Escalation::Kill,
                     tree,
+                    deadline,
                 }
             }
             Shutdown::Escalating {
@@ -139,10 +151,5 @@ impl Server {
             }
             other => other,
         };
-        if matches!(self.shutdown, Shutdown::Escalating { .. }) {
-            TimeoutAction::ToDuration(GRACE)
-        } else {
-            TimeoutAction::Drop
-        }
     }
 }

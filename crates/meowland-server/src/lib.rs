@@ -2,22 +2,22 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     io,
-    os::unix::net::UnixStream,
     path::PathBuf,
     process::Child,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
     },
     time::{Duration, Instant},
 };
 
-use calloop::{
-    EventLoop, LoopHandle, PostAction, RegistrationToken, channel,
-    generic::Generic,
-    timer::{TimeoutAction, Timer},
+use calloop::channel;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
 };
+
+mod actor;
 mod lifecycle;
 mod process;
 mod transport;
@@ -26,34 +26,34 @@ use lifecycle::Shutdown;
 use meowland_compositor::{
     self as compositor, Command as CompositorCommand, Event as CompositorEvent, PaneId,
 };
-use meowland_core::{Error, Result, pixels::FrameSize, signals};
+use meowland_core::{Result, pixels::FrameSize, signals};
 use meowland_protocol::{
-    self as protocol, ControlRequest, ControlResponse, Hello, KEY_Q, KEY_W, PaneToServer, Paths,
+    self as protocol, ControlRequest, ControlResponse, KEY_Q, KEY_W, PaneToServer, Paths,
     ServerToPane, WindowInfo,
 };
 use process::{Termination, launch_client};
-use transport::{AcceptLoop, Pane, accept_control, accept_panes, listeners};
+use transport::{Listeners, Pane, ReadyPane};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
-type IncomingSender = channel::Sender<Incoming>;
+type IncomingSender = mpsc::Sender<Incoming>;
 
 enum Incoming {
     Control(ControlRequest, Reply),
-    Pane(Hello, UnixStream),
     PaneMessage(PaneId, PaneToServer),
-    PaneGone(PaneId),
-    PaneWriterDone(PaneId),
 }
 
 struct Reply {
-    sender: Sender<ControlResponse>,
+    sender: oneshot::Sender<ControlResponse>,
     waiting: Arc<AtomicBool>,
+    deadline: Instant,
 }
 
 impl Reply {
     fn waiting(&self) -> bool {
         self.waiting.load(Ordering::Relaxed)
+            && !self.sender.is_closed()
+            && Instant::now() < self.deadline
     }
 
     fn send(self, response: ControlResponse) {
@@ -75,143 +75,40 @@ enum Operation {
 struct PendingControl {
     operation: Operation,
     reply: Reply,
-    deadline: Instant,
-    timer: RegistrationToken,
 }
 
 struct Server {
     incoming: IncomingSender,
-    handle: LoopHandle<'static, Self>,
+    messages: mpsc::Receiver<Incoming>,
+    events: mpsc::UnboundedReceiver<CompositorEvent>,
     commands: channel::Sender<CompositorCommand>,
     display: String,
     panes: HashMap<PaneId, Pane>,
-    releasing_panes: HashMap<PaneId, Pane>,
     windows: HashMap<u64, WindowInfo>,
     children: Vec<Child>,
     child_groups: HashSet<u32>,
     pending: HashMap<u64, PendingControl>,
     next_request: u64,
     next_pane: u64,
-    listeners: Option<(AcceptLoop, AcceptLoop)>,
+    listeners: Option<Listeners>,
+    controls: JoinSet<io::Result<()>>,
+    handshakes: JoinSet<io::Result<ReadyPane>>,
+    connections: JoinSet<PaneId>,
+    accept_retry: Option<Instant>,
     shutdown: Shutdown,
     compositor_alive: bool,
     compositor_failed: bool,
     interrupted: signals::TerminationFlag,
 }
 
-/// Run the server using readiness sources and explicit operation deadlines.
+/// Run the single-owner server actor on Tokio, with a dedicated compositor
+/// thread.
 ///
 /// # Errors
-/// Fails if startup or event dispatch cannot complete, or the compositor exits
+/// Fails if startup or socket I/O cannot complete, or the compositor exits
 /// unexpectedly.
-pub fn serve(paths: &Paths) -> Result<()> {
-    let (control, pane) = listeners(paths)?;
-    let interrupted = signals::server_termination_flag()?;
-    let wakeup = signals::Wakeup::new(&[
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGCHLD,
-    ])?;
-    let mut event_loop = EventLoop::<Server>::try_new().map_err(io::Error::other)?;
-    let handle = event_loop.handle();
-    handle
-        .insert_source(
-            Generic::new(wakeup, calloop::Interest::READ, calloop::Mode::Level),
-            |_, source, server| {
-                source.drain();
-                server.reap_children();
-                if server.interrupted.interrupted() {
-                    server.begin_shutdown();
-                }
-                Ok(PostAction::Continue)
-            },
-        )
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
-    let (commands, events, display, compositor_thread) = compositor::spawn()?;
-    let (incoming, incoming_rx) = channel::channel();
-    let setup = register_channels(&handle, incoming_rx, events);
-    if let Err(error) = setup {
-        let _ = commands.send(CompositorCommand::Shutdown);
-        let _ = compositor_thread.join();
-        return Err(error.into());
-    }
-    let listeners = (
-        accept_control(control, incoming.clone()),
-        accept_panes(pane, incoming.clone()),
-    );
-    let mut server = Server {
-        incoming,
-        handle,
-        commands,
-        display,
-        panes: HashMap::new(),
-        releasing_panes: HashMap::new(),
-        windows: HashMap::new(),
-        children: Vec::new(),
-        child_groups: HashSet::new(),
-        pending: HashMap::new(),
-        next_request: 1,
-        next_pane: 1,
-        listeners: Some(listeners),
-        shutdown: Shutdown::Running,
-        compositor_alive: true,
-        compositor_failed: false,
-        interrupted,
-    };
-    notify(&[
-        sd_notify::NotifyState::Ready,
-        sd_notify::NotifyState::Status("Accepting control and pane connections"),
-    ]);
-    if server.interrupted.interrupted() {
-        server.begin_shutdown();
-    }
-    let result = loop {
-        if server.shutdown.stopped() {
-            break Ok(());
-        }
-        if let Err(error) = event_loop.dispatch(None, &mut server) {
-            break Err(io::Error::other(error));
-        }
-    };
-    if result.is_err() {
-        server.begin_shutdown();
-        server.force_shutdown();
-    }
-    server.listeners.take();
-    server.panes.clear();
-    server.releasing_panes.clear();
-    let _ = compositor_thread.join();
-    server.reap_children();
-    result?;
-    if server.compositor_failed {
-        return Err(Error::io(
-            "compositor thread stopped unexpectedly",
-            io::Error::other("display unavailable"),
-        ));
-    }
-    Ok(())
-}
-
-fn register_channels(
-    handle: &LoopHandle<'static, Server>,
-    incoming: channel::Channel<Incoming>,
-    events: channel::Channel<CompositorEvent>,
-) -> io::Result<()> {
-    handle
-        .insert_source(incoming, |event, (), server| {
-            if let channel::Event::Msg(message) = event {
-                server.incoming(message);
-            }
-        })
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    handle
-        .insert_source(events, |event, (), server| match event {
-            channel::Event::Msg(event) => server.compositor_event(event),
-            channel::Event::Closed => server.compositor_gone(),
-        })
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(())
+pub async fn serve(paths: &Paths) -> Result<()> {
+    actor::serve(paths).await
 }
 
 fn notify(state: &[sd_notify::NotifyState<'_>]) {
@@ -233,21 +130,9 @@ impl Server {
                     reply.send(ControlResponse::Error("server stopping".into()));
                 }
             }
-            Incoming::Pane(hello, socket) => {
-                if self.shutdown.running() {
-                    self.attach_pane(hello, socket);
-                }
-            }
             Incoming::PaneMessage(id, message) => {
-                if self.panes.contains_key(&id) && self.shutdown.running() {
+                if self.panes.get(&id).is_some_and(Pane::active) && self.shutdown.running() {
                     self.pane_message(id, message);
-                }
-            }
-            Incoming::PaneGone(id) => self.pane_gone(id),
-            Incoming::PaneWriterDone(id) => {
-                self.releasing_panes.remove(&id);
-                if self.panes.remove(&id).is_some() {
-                    let _ = self.commands.send(CompositorCommand::Detach { pane: id });
                 }
             }
         }
@@ -272,13 +157,13 @@ impl Server {
                 self.windows.remove(&id.0);
             }
             CompositorEvent::Title { pane, title } => {
-                self.to_pane(pane, ServerToPane::Title(title));
+                self.send_to_pane(pane, ServerToPane::Title(title));
             }
             CompositorEvent::Cursor { pane, shape } => {
-                self.to_pane(pane, ServerToPane::Cursor(shape));
+                self.send_to_pane(pane, ServerToPane::Cursor(shape));
             }
             CompositorEvent::ClipboardWrite { pane, data } => {
-                self.to_pane(pane, ServerToPane::ClipboardWrite(data));
+                self.send_to_pane(pane, ServerToPane::ClipboardWrite(data));
             }
             CompositorEvent::ClipboardRead {
                 pane,
@@ -286,7 +171,7 @@ impl Server {
                 offer,
                 mime,
                 deadline,
-            } => self.to_pane(
+            } => self.send_to_pane(
                 pane,
                 ServerToPane::ClipboardRead {
                     request,
@@ -296,7 +181,7 @@ impl Server {
                 },
             ),
             CompositorEvent::ClipboardCancel { pane, request } => {
-                self.to_pane(pane, ServerToPane::ClipboardCancel { request });
+                self.send_to_pane(pane, ServerToPane::ClipboardCancel { request });
             }
             CompositorEvent::Focus(id) => {
                 for window in self.windows.values_mut() {
@@ -309,7 +194,7 @@ impl Server {
                 height,
                 y,
                 rgb,
-            } => self.to_pane(
+            } => self.send_to_pane(
                 pane,
                 ServerToPane::Frame {
                     width,
@@ -322,9 +207,17 @@ impl Server {
         }
     }
 
-    fn to_pane(&self, pane: PaneId, message: ServerToPane) {
-        if let Some(target) = self.panes.get(&pane) {
-            target.send(message);
+    fn send_to_pane(&mut self, pane: PaneId, message: ServerToPane) {
+        if self
+            .panes
+            .get(&pane)
+            .is_some_and(|target| target.active() && !target.send(message))
+        {
+            tracing::warn!(
+                ?pane,
+                "pane output stalled or disconnected; closing connection"
+            );
+            self.pane_gone(pane);
         }
     }
 
@@ -342,22 +235,17 @@ impl Server {
             }
             ControlRequest::Kill(show) => {
                 let waiting = reply.waiting.clone();
-                let Some(request) = self.begin_control(Operation::Close, reply) else {
-                    return;
-                };
+                let request = self.begin_control(Operation::Close, reply);
                 CompositorCommand::Kill {
                     request,
                     show,
                     waiting,
-                    deadline: self.pending[&request].deadline,
+                    deadline: self.pending[&request].reply.deadline,
                 }
             }
             ControlRequest::Run { args, env, cwd } => {
-                let Some(request) =
-                    self.begin_control(Operation::Launch(Launch { args, env, cwd }), reply)
-                else {
-                    return;
-                };
+                let request =
+                    self.begin_control(Operation::Launch(Launch { args, env, cwd }), reply);
                 CompositorCommand::CreateActivationToken { request }
             }
         };
@@ -367,41 +255,17 @@ impl Server {
         }
     }
 
-    fn begin_control(&mut self, operation: Operation, reply: Reply) -> Option<u64> {
+    fn begin_control(&mut self, operation: Operation, reply: Reply) -> u64 {
         let request = self.next_request;
         self.next_request += 1;
-        let deadline = Instant::now() + CONTROL_TIMEOUT;
-        let timer =
-            match self
-                .handle
-                .insert_source(Timer::from_deadline(deadline), move |_, (), server| {
-                    server.timeout_control(request);
-                    TimeoutAction::Drop
-                }) {
-                Ok(timer) => timer,
-                Err(error) => {
-                    reply.send(ControlResponse::Error(format!(
-                        "scheduling control request: {error}"
-                    )));
-                    return None;
-                }
-            };
-        self.pending.insert(
-            request,
-            PendingControl {
-                operation,
-                reply,
-                deadline,
-                timer,
-            },
-        );
-        Some(request)
+        self.pending
+            .insert(request, PendingControl { operation, reply });
+        request
     }
 
     fn finish_control(&mut self, request: u64) -> Option<PendingControl> {
         let pending = self.pending.remove(&request)?;
-        self.handle.remove(pending.timer);
-        if pending.reply.waiting() && Instant::now() < pending.deadline && self.shutdown.running() {
+        if pending.reply.waiting() && self.shutdown.running() {
             Some(pending)
         } else {
             pending.reply.waiting.store(false, Ordering::Relaxed);
@@ -460,21 +324,12 @@ impl Server {
         }
     }
 
-    fn attach_pane(&mut self, hello: Hello, socket: UnixStream) {
-        let Ok(writer) = socket.try_clone() else {
-            return;
-        };
+    fn attach_pane(&mut self, ReadyPane { hello, socket }: ReadyPane) {
         let id = PaneId(self.next_pane);
         self.next_pane += 1;
-        let pane = match Pane::start(id, socket, writer, self.incoming.clone()) {
-            Ok(pane) => pane,
-            Err(error) => {
-                tracing::warn!(%error, "pane: cannot own connection");
-                return;
-            }
-        };
-        pane.send(ServerToPane::HelloOk);
+        let pane = Pane::start(id, socket, self.incoming.clone(), &mut self.connections);
         self.panes.insert(id, pane);
+        self.send_to_pane(id, ServerToPane::HelloOk);
         let _ = self.commands.send(CompositorCommand::Attach {
             pane: id,
             show: hello.show,
@@ -548,15 +403,15 @@ impl Server {
     }
 
     fn release_pane(&mut self, id: PaneId, reason: String) {
-        if let Some(mut pane) = self.panes.remove(&id) {
+        if let Some(pane) = self.panes.get_mut(&id) {
             pane.release(reason);
-            self.releasing_panes.insert(id, pane);
         }
     }
 
     fn pane_gone(&mut self, id: PaneId) {
-        self.panes.remove(&id);
-        let _ = self.commands.send(CompositorCommand::Detach { pane: id });
+        if self.panes.remove(&id).is_some() {
+            let _ = self.commands.send(CompositorCommand::Detach { pane: id });
+        }
     }
 
     fn reap_children(&mut self) {

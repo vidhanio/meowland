@@ -212,6 +212,7 @@ impl State {
         let size = self.pane_size(window);
         entry.surface.with_pending_state(|pending| {
             pending.size = Some(size);
+            pending.bounds = Some(size);
             pending.states.set(xdg_toplevel::State::Maximized);
             if activated {
                 pending.states.set(xdg_toplevel::State::Activated);
@@ -233,8 +234,13 @@ impl State {
             refresh: 60_000,
         };
         self.mode = Size::from((mode.size.w, mode.size.h));
+        for previous in self.output.modes() {
+            if previous != mode {
+                self.output.delete_mode(previous);
+            }
+        }
+        self.output.set_preferred(mode);
         self.output
             .change_current_state(Some(mode), None, None, None);
-        self.output.set_preferred(mode);
     }
 }

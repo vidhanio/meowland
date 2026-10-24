@@ -10,6 +10,14 @@ pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TYPES: usize = 64;
 pub const TEXT_MIMES: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
 
+/// The selection a clipboard transfer belongs to.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Selection {
+    #[default]
+    Clipboard,
+    Primary,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Item {
     pub mime: String,

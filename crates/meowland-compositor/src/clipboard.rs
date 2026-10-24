@@ -13,15 +13,17 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 use meowland_protocol::clipboard::{
-    ClipboardData, Deadline, Item, MAX_BYTES, TRANSFER_TIMEOUT, mime_types,
+    ClipboardData, Deadline, Item, MAX_BYTES, Selection as ClipboardSelection, TRANSFER_TIMEOUT,
+    mime_types,
 };
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
     io::Errno,
 };
 use smithay::wayland::selection::{
-    SelectionSource,
+    SelectionSource, SelectionTarget,
     data_device::{request_data_device_client_selection, set_data_device_selection},
+    primary_selection::{request_primary_client_selection, set_primary_selection},
 };
 
 use super::{Event, PaneId, State, input::paste_action, sources::Sources};
@@ -34,6 +36,7 @@ pub enum Source {
 
 struct Export {
     id: u64,
+    target: SelectionTarget,
     pane: PaneId,
     mimes: VecDeque<String>,
     active: Option<Sources>,
@@ -53,9 +56,30 @@ struct Delivery {
     sources: Sources,
 }
 
+const fn target_index(target: SelectionTarget) -> usize {
+    match target {
+        SelectionTarget::Clipboard => 0,
+        SelectionTarget::Primary => 1,
+    }
+}
+
+const fn wire_selection(target: SelectionTarget) -> ClipboardSelection {
+    match target {
+        SelectionTarget::Clipboard => ClipboardSelection::Clipboard,
+        SelectionTarget::Primary => ClipboardSelection::Primary,
+    }
+}
+
+const fn wayland_selection(selection: ClipboardSelection) -> SelectionTarget {
+    match selection {
+        ClipboardSelection::Clipboard => SelectionTarget::Clipboard,
+        ClipboardSelection::Primary => SelectionTarget::Primary,
+    }
+}
+
 #[derive(Default)]
 pub struct Bridge {
-    export: Option<Export>,
+    exports: [Option<Export>; 2],
     deliveries: HashMap<u64, Delivery>,
     next: u64,
 }
@@ -66,22 +90,36 @@ impl Bridge {
         self.next
     }
 
+    const fn export(&self, target: SelectionTarget) -> Option<&Export> {
+        self.exports[target_index(target)].as_ref()
+    }
+
+    const fn export_mut(&mut self, target: SelectionTarget) -> Option<&mut Export> {
+        self.exports[target_index(target)].as_mut()
+    }
+
+    const fn take_export(&mut self, target: SelectionTarget) -> Option<Export> {
+        self.exports[target_index(target)].take()
+    }
+
+    fn set_export(&mut self, target: SelectionTarget, export: Option<Export>) {
+        self.exports[target_index(target)] = export;
+    }
+
     pub fn detach(&mut self, pane: PaneId) {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
-        if self
-            .export
-            .as_ref()
-            .is_some_and(|export| export.pane == pane)
-        {
-            self.export = None;
+        for export in &mut self.exports {
+            if export.as_ref().is_some_and(|export| export.pane == pane) {
+                *export = None;
+            }
         }
     }
 }
 
-pub fn selection(state: &mut State, source: Option<SelectionSource>) {
-    state.clipboard.export = None;
+pub fn selection(state: &mut State, target: SelectionTarget, source: Option<SelectionSource>) {
+    state.clipboard.set_export(target, None);
     let pane = state
         .cursor_pane
         .filter(|pane| {
@@ -106,53 +144,60 @@ pub fn selection(state: &mut State, source: Option<SelectionSource>) {
     let Some(source) = source else {
         let _ = state.events.send(Event::ClipboardWrite {
             pane,
+            selection: wire_selection(target),
             data: ClipboardData::default(),
         });
         return;
     };
     let id = state.clipboard.id();
-    state.clipboard.export = Some(Export {
-        id,
-        pane,
-        mimes: mime_types(source.mime_types()).into(),
-        active: None,
-        data: ClipboardData::default(),
-        bytes: 0,
-        deadline: Deadline::new(TRANSFER_TIMEOUT),
-    });
-    schedule_export(state, id);
+    state.clipboard.set_export(
+        target,
+        Some(Export {
+            id,
+            target,
+            pane,
+            mimes: mime_types(source.mime_types()).into(),
+            active: None,
+            data: ClipboardData::default(),
+            bytes: 0,
+            deadline: Deadline::new(TRANSFER_TIMEOUT),
+        }),
+    );
+    schedule_export(state, target, id);
 }
 
 /// Smithay updates the seat selection after returning from `new_selection`.
-fn schedule_export(state: &mut State, id: u64) {
+fn schedule_export(state: &mut State, target: SelectionTarget, id: u64) {
     let mut sources = Sources::new(&state.handle);
     match state
         .handle
         .insert_source(Timer::immediate(), move |_, (), state| {
-            if let Some(export) = &mut state.clipboard.export
+            if let Some(export) = state.clipboard.export_mut(target)
                 && export.id == id
             {
                 if let Some(sources) = &mut export.active {
                     sources.timer = None;
                 }
                 export.active = None;
-                export_next(state);
+                export_next(state, target);
             }
             TimeoutAction::Drop
         }) {
         Ok(token) => {
             sources.timer = Some(token);
-            state.clipboard.export.as_mut().unwrap().active = Some(sources);
+            if let Some(export) = state.clipboard.export_mut(target) {
+                export.active = Some(sources);
+            }
         }
         Err(error) => {
             tracing::warn!(%error, "Cannot schedule clipboard export");
-            state.clipboard.export = None;
+            state.clipboard.set_export(target, None);
         }
     }
 }
 
-fn export_next(state: &mut State) {
-    let Some(mut export) = state.clipboard.export.take() else {
+fn export_next(state: &mut State, target: SelectionTarget) {
+    let Some(mut export) = state.clipboard.take_export(target) else {
         return;
     };
     if export.deadline.expired() || !state.attachments.panes.contains_key(&export.pane) {
@@ -163,7 +208,7 @@ fn export_next(state: &mut State) {
         match result {
             Ok(sources) => {
                 export.active = Some(sources);
-                state.clipboard.export = Some(export);
+                state.clipboard.set_export(target, Some(export));
                 return;
             }
             Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
@@ -171,6 +216,7 @@ fn export_next(state: &mut State) {
     }
     let _ = state.events.send(Event::ClipboardWrite {
         pane: export.pane,
+        selection: wire_selection(target),
         data: export.data,
     });
 }
@@ -180,6 +226,7 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
     nonblocking(&read)?;
     let mut sources = Sources::new(&state.handle);
     let id = export.id;
+    let target = export.target;
     let deadline = export.deadline;
     let limit = MAX_BYTES - export.bytes;
     let mut bytes = Vec::new();
@@ -192,14 +239,13 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                 move |_, fd, state| {
                     if state
                         .clipboard
-                        .export
-                        .as_ref()
+                        .export(target)
                         .is_none_or(|export| export.id != id)
                     {
                         return Ok(PostAction::Remove);
                     }
                     if deadline.expired() {
-                        let mut export = state.clipboard.export.take().unwrap();
+                        let mut export = state.clipboard.take_export(target).unwrap();
                         if let Some(sources) = &mut export.active {
                             sources.io = None;
                         }
@@ -209,7 +255,7 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                     if matches!(result, Ok(false)) {
                         return Ok(PostAction::Continue);
                     }
-                    let export = state.clipboard.export.as_mut().unwrap();
+                    let export = state.clipboard.export_mut(target).unwrap();
                     if let Some(sources) = &mut export.active {
                         sources.io = None;
                     }
@@ -221,15 +267,15 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                                 mime: mime.clone(),
                                 data: std::mem::take(&mut bytes),
                             });
-                            export_next(state);
+                            export_next(state, target);
                         }
                         Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
                             tracing::warn!(%error, "Clipboard export exceeds size limit");
-                            state.clipboard.export = None;
+                            state.clipboard.set_export(target, None);
                         }
                         Err(error) => {
                             tracing::warn!(%error, "Client clipboard transfer failed");
-                            export_next(state);
+                            export_next(state, target);
                         }
                         Ok(false) => unreachable!(),
                     }
@@ -246,11 +292,10 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                 move |_, (), state| {
                     if state
                         .clipboard
-                        .export
-                        .as_ref()
+                        .export(target)
                         .is_some_and(|export| export.id == id)
                     {
-                        let mut export = state.clipboard.export.take().unwrap();
+                        let mut export = state.clipboard.take_export(target).unwrap();
                         if let Some(sources) = &mut export.active {
                             sources.timer = None;
                         }
@@ -261,8 +306,16 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
             )
             .map_err(|error| io::Error::other(error.error))?,
     );
-    request_data_device_client_selection(&state.seat, requested_mime, write)
-        .map_err(io::Error::other)?;
+    match target {
+        SelectionTarget::Clipboard => {
+            request_data_device_client_selection(&state.seat, requested_mime, write)
+                .map_err(io::Error::other)?;
+        }
+        SelectionTarget::Primary => {
+            request_primary_client_selection(&state.seat, requested_mime, write)
+                .map_err(io::Error::other)?;
+        }
+    }
     Ok(sources)
 }
 
@@ -436,19 +489,35 @@ pub fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<Vec<u8>
     }
 }
 
-pub fn offer(state: &mut State, pane: PaneId, offer: u64, mimes: Vec<String>, paste: bool) {
+pub fn offer(
+    state: &mut State,
+    pane: PaneId,
+    selection: ClipboardSelection,
+    offer: u64,
+    mimes: Vec<String>,
+    paste: bool,
+) {
     if !state.attachments.panes.contains_key(&pane) {
         return;
     }
+    let target = wayland_selection(selection);
     let mimes = mime_types(mimes);
-    state.clipboard.export = None;
-    set_data_device_selection(
-        &state.display,
-        &state.seat,
-        mimes,
-        Source::Terminal { pane, offer },
-    );
-    if paste {
+    state.clipboard.set_export(target, None);
+    match target {
+        SelectionTarget::Clipboard => set_data_device_selection(
+            &state.display,
+            &state.seat,
+            mimes,
+            Source::Terminal { pane, offer },
+        ),
+        SelectionTarget::Primary => set_primary_selection(
+            &state.display,
+            &state.seat,
+            mimes,
+            Source::Terminal { pane, offer },
+        ),
+    }
+    if paste && target == SelectionTarget::Clipboard {
         paste_action(state, pane);
     }
 }
@@ -463,7 +532,7 @@ pub fn paste(state: &mut State, pane: PaneId, text: &str) {
     {
         return;
     }
-    state.clipboard.export = None;
+    state.clipboard.set_export(SelectionTarget::Clipboard, None);
     let data = Arc::new(ClipboardData::text(text));
     let mimes = data.items.iter().map(|item| item.mime.clone()).collect();
     set_data_device_selection(&state.display, &state.seat, mimes, Source::Local(data));

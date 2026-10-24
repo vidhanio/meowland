@@ -3,7 +3,7 @@
 
 use std::{io, time::Instant};
 
-use meowland_protocol::clipboard::{ClipboardData, Deadline};
+use meowland_protocol::clipboard::{ClipboardData, Deadline, Selection};
 
 mod kitty;
 mod osc52;
@@ -11,6 +11,7 @@ mod osc52;
 #[derive(Debug)]
 pub enum Action {
     Offer {
+        selection: Selection,
         offer: u64,
         mimes: Vec<String>,
         paste: bool,
@@ -73,10 +74,10 @@ impl Clipboard {
         }
     }
 
-    pub fn refresh(&mut self, shortcut: bool) -> Option<Instant> {
+    pub fn refresh(&mut self, selection: Selection, shortcut: bool) -> Option<Instant> {
         match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.refresh(shortcut),
-            Transport::Text(clipboard) => clipboard.refresh(shortcut),
+            Transport::Kitty(clipboard) => clipboard.refresh(selection, shortcut),
+            Transport::Text(clipboard) => clipboard.refresh(selection, shortcut),
         }
     }
 
@@ -101,10 +102,10 @@ impl Clipboard {
         }
     }
 
-    pub fn copy(&mut self, data: ClipboardData, output: &mut Vec<u8>) {
+    pub fn copy(&mut self, selection: Selection, data: ClipboardData, output: &mut Vec<u8>) {
         match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.copy(data),
-            Transport::Text(_) => osc52::Clipboard::copy(&data, output),
+            Transport::Kitty(clipboard) => clipboard.copy(selection, data),
+            Transport::Text(_) => osc52::Clipboard::copy(selection, &data, output),
         }
     }
 

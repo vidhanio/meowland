@@ -24,6 +24,10 @@ impl Toplevels {
         }
     }
 
+    pub fn contains(&self, id: WindowId) -> bool {
+        self.handles.contains_key(&id)
+    }
+
     pub fn announce(&mut self, id: WindowId, title: &str, app_id: &str) {
         let handle = self.protocol.new_toplevel::<State>(title, app_id);
         if let Some(previous) = self.handles.insert(id, handle) {

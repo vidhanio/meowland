@@ -600,7 +600,12 @@ impl State {
             return;
         };
         if !self.snapshots.contains_key(surface) {
+            self.toplevels.remove(id);
             return;
+        }
+        if !self.toplevels.contains(id) {
+            let info = self.window_info(id);
+            self.toplevels.announce(id, &info.title, &info.app_id);
         }
         if !self.catalog.announce(id) {
             return;
@@ -608,7 +613,6 @@ impl State {
         self.follow_panes(id);
         self.resolve_pending_panes();
         let info = self.window_info(id);
-        self.toplevels.announce(id, &info.title, &info.app_id);
         let _ = self.events.send(Event::WindowUp(info));
         self.apply_window_state(id);
         self.enter_output(id);

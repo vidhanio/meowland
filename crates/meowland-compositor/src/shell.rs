@@ -3,8 +3,13 @@
 use std::time::Instant;
 
 use smithay::{
-    desktop::{PopupKind, get_popup_toplevel_coords},
-    utils::{Logical, Rectangle},
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
+        find_popup_root_surface, get_popup_toplevel_coords,
+    },
+    input::{Seat, pointer::Focus},
+    reexports::wayland_server::protocol::wl_seat::WlSeat,
+    utils::{Logical, Rectangle, Serial},
     wayland::{
         compositor::with_states,
         shell::xdg::{
@@ -59,12 +64,42 @@ impl XdgShellHandler for State {
         surface.send_repositioned(token);
     }
 
-    fn grab(
-        &mut self,
-        _surface: PopupSurface,
-        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
-        _serial: smithay::utils::Serial,
-    ) {
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let Some(seat) = Seat::from_resource(&seat) else {
+            dismiss_popup(self, &root, &kind);
+            return;
+        };
+        if seat != self.seat || !input::valid_serial(self, serial) {
+            dismiss_popup(self, &root, &kind);
+            return;
+        }
+        let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else {
+            return;
+        };
+        let previous = grab.previous_serial().unwrap_or(serial);
+        let keyboard = seat.get_keyboard();
+        let pointer = seat.get_pointer();
+        let keyboard_allowed = keyboard.as_ref().is_none_or(|keyboard| {
+            !keyboard.is_grabbed() || keyboard.has_grab(serial) || keyboard.has_grab(previous)
+        });
+        let pointer_allowed = pointer.as_ref().is_none_or(|pointer| {
+            !pointer.is_grabbed() || pointer.has_grab(serial) || pointer.has_grab(previous)
+        });
+        if !keyboard_allowed || !pointer_allowed {
+            grab.ungrab(PopupUngrabStrategy::All);
+            return;
+        }
+        if let Some(keyboard) = keyboard {
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = pointer {
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -180,6 +215,13 @@ impl XdgShellHandler for State {
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         self.title_changed(surface);
     }
+}
+
+fn dismiss_popup(state: &mut State, root: &WlSurface, popup: &PopupKind) {
+    if let Some(window) = state.window_for_surface(popup.wl_surface()) {
+        state.touch(window);
+    }
+    let _ = PopupManager::dismiss_popup(root, popup);
 }
 
 fn metadata(surface: &ToplevelSurface) -> (String, String) {

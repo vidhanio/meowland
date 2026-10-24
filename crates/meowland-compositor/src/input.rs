@@ -3,20 +3,17 @@
 use meowland_protocol::modifiers;
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, InputTime, KeyState, Keycode},
-    desktop::{PopupKind, PopupManager},
     input::{
         keyboard::{KeyboardHandle, ModifiersState},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
     },
-    utils::{Point, SERIAL_COUNTER},
+    utils::{Point, SERIAL_COUNTER, Serial},
 };
 
-use super::{
-    Input, Pane, PaneId, State, WindowId,
-    render::{extents, popup_origin, viewport_of, window_geometry},
-};
+use super::{Input, Pane, PaneId, State, WindowId};
 
 const SCROLL_FACTOR: f64 = 0.5;
+const SERIAL_HISTORY: usize = 32;
 
 pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     if matches!(event, Input::ResetKeyboard) {
@@ -72,7 +69,11 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             pressed,
             scroll,
         } => {
-            if pressed && button.is_some() && x.is_finite() && y.is_finite() {
+            let grabbed = state
+                .pointer
+                .as_ref()
+                .is_some_and(PointerHandle::is_grabbed);
+            if pressed && button.is_some() && x.is_finite() && y.is_finite() && !grabbed {
                 activate_keyboard(state, pane, window);
             }
             let scale = state.scale.factor();
@@ -101,9 +102,6 @@ fn pointer_input(
     if !x.is_finite() || !y.is_finite() {
         return;
     }
-    if pressed && button.is_some() && !point_in_popups(state, window, x, y) {
-        dismiss_popups(state, window);
-    }
     let root = state
         .windows
         .get(&window)
@@ -122,6 +120,7 @@ fn pointer_input(
             },
         );
         if let Some(button) = button {
+            let serial = event_serial(state);
             pointer.button(
                 state,
                 &ButtonEvent {
@@ -136,7 +135,7 @@ fn pointer_input(
                     } else {
                         ButtonState::Released
                     },
-                    serial: SERIAL_COUNTER.next_serial(),
+                    serial,
                     time,
                 },
             );
@@ -157,55 +156,11 @@ fn pointer_input(
     }
 }
 
-/// Popup grabs dismiss on a press outside all popup surfaces.
-fn point_in_popups(state: &State, window: WindowId, x: f64, y: f64) -> bool {
-    let Some(root) = state
-        .windows
-        .get(&window)
-        .map(|entry| entry.surface.wl_surface())
-    else {
-        return false;
-    };
-    let geometry = window_geometry(root);
-    PopupManager::popups_for_surface(root).any(|(popup, location)| {
-        let surface = popup.wl_surface();
-        let Some(snapshot) = state.snapshots.get(surface) else {
-            return false;
-        };
-        let (_, dst) = extents(snapshot, viewport_of(surface));
-        let origin = popup_origin(geometry, location, &popup);
-        let left = f64::from(origin.x);
-        let top = f64::from(origin.y);
-        x >= left && y >= top && x < left + f64::from(dst.w) && y < top + f64::from(dst.h)
-    })
-}
-
-fn dismiss_popups(state: &mut State, window: WindowId) {
-    let Some(root) = state
-        .windows
-        .get(&window)
-        .map(|entry| entry.surface.wl_surface().clone())
-    else {
-        return;
-    };
-    let popups: Vec<PopupKind> = PopupManager::popups_for_surface(&root)
-        .map(|(popup, _)| popup)
-        .collect();
-    if popups.is_empty() {
-        return;
-    }
-    for popup in popups.into_iter().rev() {
-        if let PopupKind::Xdg(popup) = &popup {
-            popup.send_popup_done();
-        }
-        let _ = PopupManager::dismiss_popup(&root, &popup);
-    }
-    state.touch(window);
-}
-
 fn enter_keyboard(state: &mut State, pane: PaneId, window: WindowId, keys: &[u16], bits: u8) {
     reset_keyboard(state);
-    state.focus_window(window);
+    if !keyboard_grabbed(state) {
+        state.focus_window(window);
+    }
     if let Some(keyboard) = state.keyboard.take() {
         keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
         set_modifiers(&keyboard, state, snapshot(bits));
@@ -227,13 +182,35 @@ fn activate_keyboard(state: &mut State, pane: PaneId, window: WindowId) {
     if changed {
         reset_keyboard(state);
     }
-    state.focus_window(window);
-    if changed && let Some(keyboard) = state.keyboard.take() {
-        let surface = state.windows[&window].surface.wl_surface().clone();
-        keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
-        state.keyboard = Some(keyboard);
+    if !keyboard_grabbed(state) {
+        state.focus_window(window);
+        if changed && let Some(keyboard) = state.keyboard.take() {
+            let surface = state.windows[&window].surface.wl_surface().clone();
+            keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+            state.keyboard = Some(keyboard);
+        }
     }
     state.keyboard_pane = Some(pane);
+}
+
+fn keyboard_grabbed(state: &State) -> bool {
+    state
+        .keyboard
+        .as_ref()
+        .is_some_and(KeyboardHandle::is_grabbed)
+}
+
+fn event_serial(state: &mut State) -> Serial {
+    let serial = SERIAL_COUNTER.next_serial();
+    state.recent_serials.push_back(serial);
+    if state.recent_serials.len() > SERIAL_HISTORY {
+        state.recent_serials.pop_front();
+    }
+    serial
+}
+
+pub fn valid_serial(state: &State, serial: Serial) -> bool {
+    state.recent_serials.contains(&serial)
 }
 
 /// A pane cannot leave keys or snapshot-only modifiers down when it loses
@@ -294,6 +271,7 @@ fn inject_key(
 }
 
 fn forward(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, pressed: bool) {
+    let serial = event_serial(state);
     keyboard.input_forward(
         state,
         Keycode::from(u32::from(code) + 8),
@@ -302,7 +280,7 @@ fn forward(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, press
         } else {
             KeyState::Released
         },
-        SERIAL_COUNTER.next_serial(),
+        serial,
         InputTime::now(),
         false,
     );

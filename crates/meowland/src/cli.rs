@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration,
+    collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, path::PathBuf,
+    time::Duration,
 };
 
 use meowland_core::{Error, Result, scale::UiScale};
@@ -12,6 +13,9 @@ use usage_rs::{Args, Cli, Subcommands, ValueEnum};
 #[derive(Cli)]
 #[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
 struct Meowland {
+    /// Runtime directory containing the control and pane sockets.
+    #[usage(long, global, value_hint = usage_rs::ValueHint::DirPath)]
+    runtime_dir: Option<PathBuf>,
     #[usage(subcommand)]
     command: Commands,
 }
@@ -161,14 +165,22 @@ impl From<CompletionShell> for usage_rs::complete::Shell {
 /// # Errors
 /// Returns an error when the selected command cannot be completed.
 pub fn start() -> Result<()> {
-    let cli = Meowland::parse();
-    match cli.command {
-        Commands::Server(args) => run_async(meowland_server::serve_scaled(
-            &Paths::discover()?,
-            args.scale,
-        )),
+    let Meowland {
+        runtime_dir,
+        command,
+    } = Meowland::parse();
+    let paths = || {
+        runtime_dir
+            .clone()
+            .map_or_else(Paths::discover, Paths::in_runtime_dir)
+    };
+    match command {
+        Commands::Server(args) => {
+            let paths = paths()?;
+            run_async(meowland_server::serve_scaled(&paths, args.scale))
+        }
         Commands::List => {
-            let paths = Paths::discover()?;
+            let paths = paths()?;
             for window in list(&paths)? {
                 println!(
                     "{}\t{}\t{}\t{}",
@@ -184,7 +196,7 @@ pub fn start() -> Result<()> {
             app_id,
             command: client,
         }) => {
-            let paths = Paths::discover()?;
+            let paths = paths()?;
             let launch = ControlRequest::Run {
                 args: client,
                 env: std::env::vars_os().collect(),
@@ -202,11 +214,11 @@ pub fn start() -> Result<()> {
             }
         }
         Commands::Attach(AttachArgs { window }) => {
-            let paths = Paths::discover()?;
+            let paths = paths()?;
             run_async(terminal::attach(&paths.pane, window_target(window)))
         }
         Commands::Kill(args) => {
-            let paths = Paths::discover()?;
+            let paths = paths()?;
             request(&paths, &ControlRequest::Kill(args.show()))?;
             Ok(())
         }

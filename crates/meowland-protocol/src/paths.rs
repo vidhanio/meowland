@@ -18,6 +18,15 @@ impl Paths {
         let runtime = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .ok_or(Error::RuntimeDirectoryUnset)?;
+        Self::in_runtime_dir(runtime)
+    }
+
+    /// The sockets inside a specific runtime directory.
+    ///
+    /// # Errors
+    /// Returns an error when the directory does not exist.
+    pub fn in_runtime_dir(runtime: impl Into<PathBuf>) -> Result<Self> {
+        let runtime = runtime.into();
         if !runtime.is_dir() {
             return Err(Error::RuntimeDirectoryInvalid(runtime));
         }

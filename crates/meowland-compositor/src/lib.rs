@@ -13,6 +13,7 @@ use std::{
 use calloop::{
     EventLoop, Interest, LoopHandle, Mode as PollMode, PostAction, channel, generic::Generic,
 };
+use meowland_core::scale::UiScale;
 use meowland_protocol::{Input, Show, WindowInfo};
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
@@ -43,6 +44,7 @@ use smithay::{
             DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
             get_dmabuf,
         },
+        fractional_scale::FractionalScaleManagerState,
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::PointerConstraintsHandler,
         selection::{
@@ -72,6 +74,7 @@ mod decoration;
 mod frame;
 mod input;
 mod readback;
+mod scaling;
 mod shell;
 mod sources;
 mod toplevels;
@@ -209,6 +212,14 @@ pub type Handle = (
 /// Returns an error if the thread, display, keymap or socket cannot start, or
 /// if readiness is not reported within two seconds.
 pub fn spawn() -> meowland_core::Result<Handle> {
+    spawn_scaled(UiScale::default())
+}
+
+/// Start the compositor with the same UI scale on every terminal pane.
+///
+/// # Errors
+/// Returns an error if the thread, display, keymap or socket cannot start.
+pub fn spawn_scaled(scale: UiScale) -> meowland_core::Result<Handle> {
     let (commands, rx) = channel::channel();
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -216,7 +227,7 @@ pub fn spawn() -> meowland_core::Result<Handle> {
     let socket_for_thread = socket.clone();
     let handle = thread::Builder::new()
         .name("meowland-wayland".into())
-        .spawn(move || run(socket_for_thread, rx, tx, ready_tx))?;
+        .spawn(move || run(socket_for_thread, rx, tx, ready_tx, scale))?;
     ready_rx
         .recv_timeout(Duration::from_secs(2))
         .map_err(|_| {
@@ -261,6 +272,8 @@ struct State {
     _decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
     _viewporter: ViewporterState,
+    _fractional_scale: FractionalScaleManagerState,
+    scale: UiScale,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
     data_control: DataControlState,
@@ -453,6 +466,7 @@ impl State {
         display_handle: DisplayHandle,
         handle: LoopHandle<'static, Self>,
         events: tokio::sync::mpsc::UnboundedSender<Event>,
+        scale: UiScale,
     ) -> Self {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
@@ -476,7 +490,7 @@ impl State {
         output.change_current_state(
             Some(mode),
             None,
-            Some(Scale::Integer(1)),
+            Some(Scale::Fractional(scale.factor())),
             Some((0, 0).into()),
         );
         output.set_preferred(mode);
@@ -503,6 +517,8 @@ impl State {
             _decoration: XdgDecorationState::new::<Self>(&display_handle),
             kde_decoration: decoration::kde(&display_handle),
             _viewporter: ViewporterState::new::<Self>(&display_handle),
+            _fractional_scale: FractionalScaleManagerState::new::<Self>(&display_handle),
+            scale,
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),
             data_control: DataControlState::new::<Self, _>(&display_handle, None, |_| true),
@@ -530,7 +546,10 @@ impl State {
             sent_cursor: None,
             renderer: Renderer::default(),
             events,
-            mode: Size::from((mode.size.w, mode.size.h)),
+            mode: Size::from((
+                scale.logical(mode.size.w as u32),
+                scale.logical(mode.size.h as u32),
+            )),
             started: Instant::now(),
             shutdown: false,
             display: display_handle,
@@ -602,7 +621,7 @@ impl State {
     /// attached pane, then the output mode.
     fn pane_size(&self, window: WindowId) -> Size<i32, Logical> {
         self.attachments.size(window).map_or(self.mode, |size| {
-            Size::from((size.width() as i32, size.height() as i32))
+            self.logical_size(size.width(), size.height())
         })
     }
 
@@ -920,6 +939,7 @@ fn run(
     rx: channel::Channel<Command>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     ready: mpsc::Sender<std::io::Result<()>>,
+    scale: UiScale,
 ) {
     let Ok(mut display) = Display::<State>::new() else {
         let _ = ready.send(Err(std::io::Error::other(
@@ -934,7 +954,7 @@ fn run(
             return;
         }
     };
-    let mut state = State::new(display.handle(), event_loop.handle(), events);
+    let mut state = State::new(display.handle(), event_loop.handle(), events, scale);
     let keymap = XkbConfig {
         layout: "us",
         ..XkbConfig::default()

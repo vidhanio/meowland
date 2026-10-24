@@ -5,6 +5,7 @@ pub mod asynchronous;
 
 mod error;
 pub mod pixels;
+pub mod scale;
 pub mod signals;
 
 pub use error::{Error, Result};

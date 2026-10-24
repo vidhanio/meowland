@@ -75,7 +75,15 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             if pressed && button.is_some() && x.is_finite() && y.is_finite() {
                 activate_keyboard(state, pane, window);
             }
-            pointer_input(state, window, (x, y), button, pressed, scroll);
+            let scale = state.scale.factor();
+            pointer_input(
+                state,
+                window,
+                (x / scale, y / scale),
+                button,
+                pressed,
+                scroll,
+            );
         }
     }
     state.send_pane_cursor(pane);

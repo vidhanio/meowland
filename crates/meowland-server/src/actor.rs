@@ -24,7 +24,7 @@ enum ConnectionKind {
     Pane,
 }
 
-pub async fn serve(paths: &Paths) -> Result<()> {
+pub async fn serve(paths: &Paths, scale: meowland_core::scale::UiScale) -> Result<()> {
     let listeners = transport::listeners(paths)?;
     let interrupted = signals::server_termination_flag()?;
     let wakeup = signals::Wakeup::new(&[
@@ -35,7 +35,7 @@ pub async fn serve(paths: &Paths) -> Result<()> {
     let descriptor = Descriptor::new(rustix::io::dup(&wakeup).map_err(io::Error::from)?)?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
     let (commands, events, display, compositor_thread) =
-        tokio::task::spawn_blocking(compositor::spawn)
+        tokio::task::spawn_blocking(move || compositor::spawn_scaled(scale))
             .await
             .map_err(io::Error::other)??;
     let (incoming, messages) = mpsc::channel(INCOMING_QUEUE);

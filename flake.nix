@@ -40,6 +40,12 @@
                 default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
                 description = "Package to install for Meowland.";
               };
+
+              scale = lib.mkOption {
+                type = lib.types.numbers.between 0.5 4.0;
+                default = 1.0;
+                description = "UI scale shared by all Meowland terminal panes.";
+              };
             };
 
             config = lib.mkIf cfg.enable {
@@ -55,7 +61,7 @@
                 Service = {
                   Type = "notify";
                   NotifyAccess = "main";
-                  ExecStart = "${lib.getExe cfg.package} server";
+                  ExecStart = "${lib.getExe cfg.package} server --scale ${toString cfg.scale}";
                   Restart = "on-failure";
                   RestartSec = "1s";
                   UMask = "0077";

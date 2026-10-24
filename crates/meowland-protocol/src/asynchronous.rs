@@ -143,8 +143,12 @@ impl Outgoing {
 
     fn message_size<T: Serialize>(&self, message: &T) -> io::Result<usize> {
         let size = postcard::experimental::serialized_size(message).map_err(invalid)?;
-        if size > MAX_MESSAGE || size + HEADER > MAX_MESSAGE + HEADER - self.queued {
-            return Err(invalid("outgoing pane queue exceeded its byte limit"));
+        if self
+            .queued
+            .checked_add(size)
+            .is_none_or(|queued| queued > MAX_MESSAGE)
+        {
+            return Err(invalid("outgoing message queue exceeded its byte limit"));
         }
         Ok(size)
     }

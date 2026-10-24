@@ -109,6 +109,7 @@ pub fn run(
             break;
         }
         let _ = display.dispatch_clients(&mut state);
+        state.refresh_popup_grab();
         state.expire_activation_tokens();
         state.frame_callbacks();
         state.dispatch_frames();

@@ -135,7 +135,7 @@ pub const fn paste(code: u16, bits: u8) -> bool {
     (code == 47 && bits == modifiers::CONTROL) || (code == 110 && bits == modifiers::SHIFT)
 }
 
-fn key_code(code: u32) -> Option<u16> {
+pub(crate) fn key_code(code: u32) -> Option<u16> {
     Some(match code {
         27 | 57344 => 1,
         13 | 57345 => 28,

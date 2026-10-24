@@ -95,6 +95,8 @@ pub enum Input {
     ResetKeyboard,
     /// Client-known held keys and modifiers on focus entry.
     KeyboardEnter { keys: Vec<u16>, modifiers: u8 },
+    /// Committed Unicode text that has no usable Linux key code.
+    Text(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

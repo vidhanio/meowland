@@ -16,7 +16,7 @@ use meowland_protocol::{Input, Show, WindowInfo, clipboard::Selection as Clipboa
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_dispatch2,
-    desktop::{PopupKind, PopupManager},
+    desktop::{PopupGrab, PopupKind, PopupManager},
     input::{
         Seat, SeatHandler, SeatState,
         dnd::DndGrabHandler,
@@ -24,7 +24,7 @@ use smithay::{
         pointer::{CursorIcon, CursorImageStatus, PointerHandle},
         tablet::TabletSeatHandler,
     },
-    output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
+    output::Output,
     reexports::wayland_server::{
         Client, DisplayHandle, Resource,
         backend::ClientId,
@@ -68,6 +68,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
         single_pixel_buffer::{SinglePixelBufferState, get_single_pixel_buffer},
+        text_input::TextInputManagerState,
         viewporter::{ViewportCachedState, ViewporterState},
         xdg_activation::XdgActivationState,
     },
@@ -82,11 +83,13 @@ mod commands;
 mod decoration;
 mod frame;
 mod input;
+mod popup;
 mod readback;
 mod runtime;
 mod scaling;
 mod shell;
 mod sources;
+mod text;
 mod toplevels;
 
 use attachment::{Attachments, Binding, Pane, Policy, Selection};
@@ -291,7 +294,9 @@ struct State {
     clipboard: clipboard::Bridge,
     _cursor_shape: CursorShapeManagerState,
     bell: bell::Bell,
+    _text_input: TextInputManagerState,
     popups: PopupManager,
+    popup_grab: Option<PopupGrab<Self>>,
     seats: SeatState<Self>,
     seat: Seat<Self>,
     keyboard: Option<KeyboardHandle<Self>>,
@@ -508,29 +513,8 @@ impl State {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
         let pointer = Some(seat.add_pointer());
-        let mode = Mode {
-            size: (1920, 1080).into(),
-            refresh: 60_000,
-        };
-        let output_manager = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
-        let output = Output::new(
-            "meowland".into(),
-            PhysicalProperties {
-                size: (300, 200).into(),
-                subpixel: Subpixel::Unknown,
-                make: "meowland".into(),
-                model: "terminal".into(),
-                serial_number: String::new(),
-            },
-        );
-        output.create_global::<Self>(&display_handle);
-        output.change_current_state(
-            Some(mode),
-            None,
-            Some(Scale::Fractional(scale.factor())),
-            Some((0, 0).into()),
-        );
-        output.set_preferred(mode);
+        let text_input = text::manager(&display_handle, &seat);
+        let (output_manager, output, mode) = scaling::output(&display_handle, scale);
         let primary_selection = PrimarySelectionState::new::<Self>(&display_handle);
         let data_control =
             WlrDataControlState::new::<Self, _>(&display_handle, Some(&primary_selection), |_| {
@@ -574,7 +558,9 @@ impl State {
             clipboard: clipboard::Bridge::default(),
             _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
             bell: bell::Bell::new(&display_handle),
+            _text_input: text_input,
             popups: PopupManager::default(),
+            popup_grab: None,
             seats: seat_state,
             seat,
             keyboard: None,
@@ -842,10 +828,12 @@ impl State {
     }
 
     fn focus_window(&mut self, window: WindowId) {
-        if self.catalog.focused() == Some(window) {
+        self.refresh_popup_grab();
+        if self.popup_grab.is_some() || self.catalog.focused() == Some(window) {
             return;
         }
         input::reset_keyboard(self);
+        self.recent_serials.clear();
         let previous = self.catalog.focus(Some(window));
         let surface = self
             .windows

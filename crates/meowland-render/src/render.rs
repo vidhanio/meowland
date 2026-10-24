@@ -17,7 +17,10 @@ use smithay::{
     },
 };
 
-use super::Snapshot;
+use super::{
+    Snapshot,
+    geometry::{SurfaceGeometry, surface_geometry},
+};
 
 /// Scratch allocations owned by the compositor, not by any client or pane.
 #[derive(Default)]
@@ -36,13 +39,30 @@ impl std::fmt::Debug for Renderer {
 }
 
 impl Renderer {
-    /// Compose one pane while borrowing scene state only for this draw.
+    /// Compose one pane at unit UI scale while borrowing scene state only for
+    /// this draw.
     pub fn render(
         &mut self,
         root: Option<&WlSurface>,
         snapshots: &HashMap<WlSurface, Snapshot>,
         size: FrameSize,
     ) -> &[u8] {
+        self.render_scaled(root, snapshots, size, 1.0)
+    }
+
+    /// Compose logical surface geometry into a physical pane at `scale`.
+    pub fn render_scaled(
+        &mut self,
+        root: Option<&WlSurface>,
+        snapshots: &HashMap<WlSurface, Snapshot>,
+        size: FrameSize,
+        scale: f64,
+    ) -> &[u8] {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
         if let Some(root) = root {
             self.stack.rebuild(root);
         } else {
@@ -50,14 +70,22 @@ impl Renderer {
         }
         let (width, height) = (size.width(), size.height());
         self.pixels.resize(size.rgb_len(), 0);
-        let first = if opaque_cover(snapshots, &self.stack.surfaces, width, height) {
+        let first = if opaque_cover(snapshots, &self.stack.surfaces, width, height, scale) {
             self.stack.surfaces.len() - 1
         } else {
             self.pixels.fill(0);
             0
         };
         for (surface, origin) in &self.stack.surfaces[first..] {
-            blit(snapshots, surface, *origin, &mut self.pixels, width, height);
+            blit(
+                snapshots,
+                surface,
+                *origin,
+                &mut self.pixels,
+                width,
+                height,
+                scale,
+            );
         }
         self.stack.clear();
         &self.pixels
@@ -174,22 +202,19 @@ fn blit(
     out: &mut [u8],
     width: u32,
     height: u32,
+    scale: f64,
 ) {
     let Some(snapshot) = snapshots.get(surface) else {
         return;
     };
-    let viewport = viewport_of(surface);
-    let unscaled = viewport.src.is_none() && viewport.dst.is_none();
-    let (src, dst) = extents(snapshot, viewport);
-    if dst.w <= 0 || dst.h <= 0 {
+    let geometry = surface_geometry(surface, snapshot);
+    let Some(dst) = placement(origin, geometry.dst, scale) else {
         return;
-    }
-    let left = origin.x;
-    let top = origin.y;
-    let clip_left = left.max(0);
-    let clip_top = top.max(0);
-    let clip_right = left.saturating_add(dst.w).min(width as i32);
-    let clip_bottom = top.saturating_add(dst.h).min(height as i32);
+    };
+    let clip_left = dst.left.max(0);
+    let clip_top = dst.top.max(0);
+    let clip_right = dst.left.saturating_add(dst.width).min(width as i32);
+    let clip_bottom = dst.top.saturating_add(dst.height).min(height as i32);
     if clip_right <= clip_left || clip_bottom <= clip_top {
         return;
     }
@@ -197,22 +222,57 @@ fn blit(
         (clip_left, clip_top).into(),
         (clip_right - clip_left, clip_bottom - clip_top).into(),
     );
-    if unscaled {
-        blit_unscaled(snapshot, left, top, clip, out, width);
+    if geometry.direct() && (scale - 1.0).abs() <= f64::EPSILON {
+        blit_unscaled(snapshot, dst.left, dst.top, clip, out, width);
         return;
     }
     if snapshot.opaque {
-        blit_scaled::<true>(snapshot, origin, src, dst, clip, out, width);
+        blit_scaled::<true>(snapshot, &geometry, dst, clip, out, width);
     } else {
-        blit_scaled::<false>(snapshot, origin, src, dst, clip, out, width);
+        blit_scaled::<false>(snapshot, &geometry, dst, clip, out, width);
     }
+}
+
+#[derive(Clone, Copy)]
+struct Placement {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
+fn placement(
+    origin: Point<i32, Logical>,
+    dst: Size<i32, Logical>,
+    scale: f64,
+) -> Option<Placement> {
+    if dst.w <= 0 || dst.h <= 0 {
+        return None;
+    }
+    let left = scaled_edge(i64::from(origin.x), scale);
+    let top = scaled_edge(i64::from(origin.y), scale);
+    let right = scaled_edge(i64::from(origin.x) + i64::from(dst.w), scale);
+    let bottom = scaled_edge(i64::from(origin.y) + i64::from(dst.h), scale);
+    let width = right.saturating_sub(left);
+    let height = bottom.saturating_sub(top);
+    (width > 0 && height > 0).then_some(Placement {
+        left,
+        top,
+        width,
+        height,
+    })
+}
+
+fn scaled_edge(value: i64, scale: f64) -> i32 {
+    (value as f64 * scale)
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 fn blit_scaled<const OPAQUE: bool>(
     snapshot: &Snapshot,
-    origin: Point<i32, Logical>,
-    src: Rectangle<f64, Logical>,
-    dst: Size<i32, Logical>,
+    geometry: &SurfaceGeometry,
+    dst: Placement,
     clip: Rectangle<i32, Logical>,
     out: &mut [u8],
     width: u32,
@@ -222,24 +282,35 @@ fn blit_scaled<const OPAQUE: bool>(
     let stride = snapshot.width as usize;
     let pixels = snapshot.pixels.as_chunks::<4>().0;
     let columns = clip.size.w as usize;
+    let swapped = geometry.swapped();
     let mut source_columns = [0; 256];
     for start in (0..columns).step_by(source_columns.len()) {
         let count = (columns - start).min(source_columns.len());
         let source_columns = &mut source_columns[..count];
         for (column, source_column) in source_columns.iter_mut().enumerate() {
             let x = clip.loc.x + (start + column) as i32;
-            let sample =
-                src.loc.x + (f64::from(x - origin.x) + 0.5) * src.size.w / f64::from(dst.w);
-            *source_column = (sample.floor().max(0.0) as usize).min(last_x);
+            let sample = geometry.src.loc.x
+                + (f64::from(x) + 0.5 - f64::from(dst.left)) * geometry.src.size.w
+                    / f64::from(dst.width);
+            *source_column = if swapped {
+                pixel_index(geometry.raw_y_from_x(sample), last_y)
+            } else {
+                pixel_index(geometry.raw_x(sample), last_x)
+            };
         }
         for y in clip.loc.y..clip.loc.y + clip.size.h {
-            let sample =
-                src.loc.y + (f64::from(y - origin.y) + 0.5) * src.size.h / f64::from(dst.h);
-            let row = (sample.floor().max(0.0) as usize).min(last_y) * stride;
+            let sample = geometry.src.loc.y
+                + (f64::from(y) + 0.5 - f64::from(dst.top)) * geometry.src.size.h
+                    / f64::from(dst.height);
+            let (base, advance) = if swapped {
+                (pixel_index(geometry.raw_x_from_y(sample), last_x), stride)
+            } else {
+                (pixel_index(geometry.raw_y(sample), last_y) * stride, 1)
+            };
             let to = (y as usize * width as usize + clip.loc.x as usize + start) * 3;
             let rgb_row = out[to..to + count * 3].as_chunks_mut::<3>().0;
             for (&column, rgb) in source_columns.iter().zip(rgb_row) {
-                let pixel = pixels[row + column];
+                let pixel = pixels[base + column * advance];
                 if OPAQUE {
                     rgb.copy_from_slice(&pixel[..3]);
                 } else {
@@ -295,6 +366,11 @@ fn blit_unscaled_inner<const OPAQUE: bool>(
     }
 }
 
+#[inline]
+fn pixel_index(value: f64, last: usize) -> usize {
+    (value.floor().max(0.0) as usize).min(last)
+}
+
 /// The snapshot is premultiplied; preserve the same rounding in both the
 /// direct-copy and viewport-sampling paths.
 #[inline]
@@ -318,6 +394,7 @@ fn opaque_cover(
     stack: &[(WlSurface, Point<i32, Logical>)],
     width: u32,
     height: u32,
+    scale: f64,
 ) -> bool {
     let Some((surface, origin)) = stack.last() else {
         return false;
@@ -325,14 +402,15 @@ fn opaque_cover(
     let Some(snapshot) = snapshots.get(surface) else {
         return false;
     };
-    let viewport = viewport_of(surface);
+    let geometry = surface_geometry(surface, snapshot);
+    let Some(dst) = placement(*origin, geometry.dst, scale) else {
+        return false;
+    };
     snapshot.opaque
-        && viewport.src.is_none()
-        && viewport.dst.is_none()
-        && origin.x <= 0
-        && origin.y <= 0
-        && origin.x.saturating_add(snapshot.width as i32) >= width as i32
-        && origin.y.saturating_add(snapshot.height as i32) >= height as i32
+        && dst.left <= 0
+        && dst.top <= 0
+        && dst.left.saturating_add(dst.width) >= width as i32
+        && dst.top.saturating_add(dst.height) >= height as i32
 }
 
 #[must_use]
@@ -385,7 +463,7 @@ impl Renderer {
             .rev()
             .find_map(|(surface, origin)| {
                 let snapshot = snapshots.get(surface)?;
-                let (_, dst) = extents(snapshot, viewport_of(surface));
+                let dst = surface_geometry(surface, snapshot).dst;
                 let local =
                     Point::<f64, Logical>::from((x - f64::from(origin.x), y - f64::from(origin.y)));
                 if local.x < 0.0

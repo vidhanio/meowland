@@ -183,9 +183,12 @@ impl State {
                 .window()
                 .and_then(|id| self.windows.get(&id))
                 .map(|window| window.surface.wl_surface());
-            let pixels = self
-                .renderer
-                .render(root, &self.snapshots, entry.presentation.size);
+            let pixels = self.renderer.render_scaled(
+                root,
+                &self.snapshots,
+                entry.presentation.size,
+                self.scale.factor(),
+            );
             if let Some(frame) = entry.presentation.frame(pane, pixels) {
                 let _ = self.events.send(frame);
             }

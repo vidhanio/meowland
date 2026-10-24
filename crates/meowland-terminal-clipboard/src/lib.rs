@@ -88,6 +88,17 @@ impl Clipboard {
         }
     }
 
+    pub fn cancel_refresh_selection(&mut self, selection: Selection) {
+        match &mut self.transport {
+            Transport::Kitty(clipboard) => clipboard.cancel_refresh_selection(selection),
+            Transport::Text(clipboard) => {
+                if selection == Selection::Clipboard {
+                    clipboard.cancel_refresh();
+                }
+            }
+        }
+    }
+
     pub fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.read(request, offer, mime, deadline),

@@ -466,7 +466,7 @@ fn send_event(
         }
         Event::Pointer(input) => send_input(input, keyboard.deadline(), keyboard, tx)?,
         Event::Paste(text) => {
-            clipboard.cancel_refresh();
+            clipboard.cancel_refresh_selection(Selection::Clipboard);
             send_deferred(keyboard, tx)?;
             send_paste(tx, text)?;
         }

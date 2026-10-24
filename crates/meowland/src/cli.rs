@@ -28,9 +28,6 @@ enum Commands {
     List,
     /// Start the compositor server in the foreground.
     Server,
-    /// Bridge a pane connection over standard input and output.
-    #[usage(hide)]
-    Relay,
     /// Generate a shell completion script.
     Completions(CompletionArgs),
 }
@@ -51,13 +48,9 @@ struct RunArgs {
 
 #[derive(Args)]
 struct AttachArgs {
-    /// SSH destination ([user@]host[:port] or a config alias); presentation
-    /// stays local.
-    #[usage(long)]
-    remote: Option<String>,
-    /// The integer window ID or app ID; omit it to select the focused window.
+    /// The integer window ID or app ID to show.
     #[usage(complete = attach_targets)]
-    window: Option<String>,
+    window: String,
 }
 
 #[derive(Args)]
@@ -69,23 +62,21 @@ struct WindowArgs {
 
 impl WindowArgs {
     fn show(self) -> Show {
-        self.window.map_or(Show::Focused, |window| {
-            window
-                .parse()
-                .map_or_else(|_| Show::AppId(window), Show::Id)
-        })
+        self.window.map_or(Show::Focused, window_target)
     }
 }
 
+fn window_target(window: String) -> Show {
+    window
+        .parse()
+        .map_or_else(|_| Show::AppId(window), Show::Id)
+}
+
 fn attach_targets(
-    partial: &<AttachArgs as usage_rs::spec::CommandArgs>::Partial,
+    _partial: &<AttachArgs as usage_rs::spec::CommandArgs>::Partial,
     _context: &usage_rs::complete::CompleteCtx<'_>,
 ) -> Vec<usage_rs::complete::Candidate<'static>> {
-    if partial.remote.is_some() {
-        Vec::new()
-    } else {
-        complete_windows(true)
-    }
+    complete_windows(true)
 }
 
 fn window_targets(
@@ -166,7 +157,6 @@ pub fn start() -> Result<()> {
     let cli = Meowland::parse();
     match cli.command {
         Commands::Server => run_async(meowland_server::serve(&Paths::discover()?)),
-        Commands::Relay => run_async(crate::remote::relay()),
         Commands::List => {
             let paths = Paths::discover()?;
             for window in list(&paths)? {
@@ -201,14 +191,9 @@ pub fn start() -> Result<()> {
                 Ok(())
             }
         }
-        Commands::Attach(AttachArgs { remote, window }) => {
-            let show = WindowArgs { window }.show();
-            if let Some(host) = remote {
-                run_async(crate::remote::attach(&host, show))
-            } else {
-                let paths = Paths::discover()?;
-                run_async(terminal::attach(&paths.pane, show))
-            }
+        Commands::Attach(AttachArgs { window }) => {
+            let paths = Paths::discover()?;
+            run_async(terminal::attach(&paths.pane, window_target(window)))
         }
         Commands::Kill(args) => {
             let paths = Paths::discover()?;

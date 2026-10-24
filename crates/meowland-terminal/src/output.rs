@@ -22,24 +22,24 @@ pub struct Output {
     offset: usize,
 }
 impl Output {
-    pub(super) const fn pending(&self) -> bool {
+    pub const fn pending(&self) -> bool {
         self.offset < self.bytes.len()
     }
 
-    pub(super) fn append(&mut self, bytes: &[u8]) {
+    pub fn append(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
 
-    pub(super) const fn buffer(&mut self) -> &mut Vec<u8> {
+    pub const fn buffer(&mut self) -> &mut Vec<u8> {
         &mut self.bytes
     }
 
-    pub(super) const fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.bytes.len()
     }
 
     /// Never monopolize the input loop, even when the terminal is writable.
-    pub(super) async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
+    pub async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         let end = self.bytes.len().min(self.offset + 64 * 1024);
         if self.offset < end {
             let written = writer.write(&self.bytes[self.offset..end]).await?;

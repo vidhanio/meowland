@@ -1,6 +1,6 @@
 //! Native-fence DMA-BUF submission and completion-gated CPU readback.
 
-use std::{ffi::OsStr, fs::OpenOptions, io, os::fd::OwnedFd};
+use std::{ffi::OsStr, fs::OpenOptions, io, os::fd::OwnedFd, time::Duration};
 
 use meowland_core::pixels::FrameSize;
 use smithay::{
@@ -312,16 +312,13 @@ impl DmabufBackend {
         )?)
     }
 
+    /// Flush the current context through a zero-timeout EGL poll before export.
+    /// A pending fence is expected; this does not wait for GPU completion.
     fn native_fence(&mut self) -> Result<(EGLFence, OwnedFd), BackendError> {
         let display = self.renderer.egl_context().display().clone();
-        Ok(self.renderer.with_context(|gl| {
+        Ok(self.renderer.with_context(|_| {
             let fence = EGLFence::create(&display)?;
-            // SAFETY: with_context makes this renderer's live EGL context
-            // current; Flush has no pointer arguments and does not
-            // alter tracked GL state.
-            unsafe {
-                gl.Flush();
-            }
+            fence.client_wait(Some(Duration::ZERO), true)?;
             let fd = fence.export()?;
             Ok::<_, EglError>((fence, fd))
         })??)

@@ -15,12 +15,12 @@ use super::{Binding, Event, Selection, State, WindowId};
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
 pub struct Launch {
-    pub(super) window: Option<WindowId>,
+    pub window: Option<WindowId>,
     expires: Instant,
 }
 
 impl State {
-    pub(super) fn create_activation_token(&mut self) -> String {
+    pub fn create_activation_token(&mut self) -> String {
         let (token, data) = self.activation.create_external_token(None);
         let token = token.as_str().to_owned();
         let expires = data.timestamp + TOKEN_LIFETIME;
@@ -34,12 +34,12 @@ impl State {
         token
     }
 
-    pub(super) fn forget_activation(&mut self, token: &str) {
+    pub fn forget_activation(&mut self, token: &str) {
         self.launches.remove(token);
         self.activation.remove_token(&token.to_owned().into());
     }
 
-    pub(super) fn cancel_activation(&mut self, token: &str, reason: &str) {
+    pub fn cancel_activation(&mut self, token: &str, reason: &str) {
         self.forget_activation(token);
         let waiting: Vec<_> = self
             .attachments.panes
@@ -57,7 +57,7 @@ impl State {
         }
     }
 
-    pub(super) fn cancel_window_activations(&mut self, window: WindowId) {
+    pub fn cancel_window_activations(&mut self, window: WindowId) {
         let tokens: Vec<_> = self
             .launches
             .iter()
@@ -69,7 +69,7 @@ impl State {
         }
     }
 
-    pub(super) fn next_activation_deadline(&self) -> Option<Instant> {
+    pub fn next_activation_deadline(&self) -> Option<Instant> {
         self.launches
             .values()
             .map(|launch| launch.expires)
@@ -82,7 +82,7 @@ impl State {
     }
 
     /// Expiry is scheduled by the readiness loop, not window-detection polling.
-    pub(super) fn expire_activation_tokens(&mut self) {
+    pub fn expire_activation_tokens(&mut self) {
         let now = Instant::now();
         let expired: Vec<_> = self
             .launches

@@ -1,23 +1,17 @@
 //! Cancellation-safe framing and bounded outgoing bytes for async transports.
 
-use std::io::{self, Write};
+use std::{
+    collections::VecDeque,
+    io::{self, Write},
+};
 
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{MAX_MESSAGE, ServerToPane, protocol::decode};
 
 const HEADER: usize = 4;
 const IO_BUDGET: usize = 64 * 1024;
-
-/// A pane receiver whose partial message survives cancellation of its future.
-pub trait Receiver {
-    /// Read the next message without losing partial packets on cancellation.
-    ///
-    /// # Errors
-    /// Returns an error on disconnection, malformed data, or transport failure.
-    fn receive(&mut self) -> impl Future<Output = io::Result<ServerToPane>>;
-}
 
 /// A bounded packet reader retaining progress between readiness turns.
 #[derive(Debug)]
@@ -71,16 +65,14 @@ impl<R: AsyncRead + Unpin> Reader<R> {
             }
             self.body_size = u32::from_le_bytes(self.header) as usize;
             if self.body_size > MAX_MESSAGE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "message too large",
-                ));
+                return Err(invalid("message too large"));
             }
-            self.body.clear();
         }
         if self.body_read < self.body_size {
             let end = (self.body_read + IO_BUDGET).min(self.body_size);
-            self.body.resize(end, 0);
+            if self.body.len() < end {
+                self.body.resize(end, 0);
+            }
             let read = self
                 .stream
                 .read(&mut self.body[self.body_read..end])
@@ -95,30 +87,73 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         }
         self.header_read = 0;
         self.body_read = 0;
-        decode(&self.body).map(Some)
-    }
-}
-
-impl<R: AsyncRead + Unpin> Receiver for Reader<R> {
-    async fn receive(&mut self) -> io::Result<ServerToPane> {
-        self.read().await
+        decode(&self.body[..self.body_size]).map(Some)
     }
 }
 
 /// At most one maximum-sized packet's worth of queued bytes.
 ///
-/// Synchronous serialization appends complete packets; async writes retain
-/// their offsets, even when another event cancels the current write future.
+/// Frames retain their owned RGB payload separately from their small header.
+/// Partial writes retain their offsets across cancellation.
 #[derive(Debug, Default)]
 pub struct Outgoing {
-    bytes: Vec<u8>,
+    chunks: VecDeque<Vec<u8>>,
     offset: usize,
+    queued: usize,
 }
 
 impl Outgoing {
     #[must_use]
     pub const fn pending(&self) -> bool {
-        self.offset < self.bytes.len()
+        self.queued != 0
+    }
+
+    /// Append a complete packet without a thread-local staging buffer.
+    /// Serialization errors leave previously queued packets intact.
+    ///
+    /// # Errors
+    /// Returns an error on serialization failure or if the byte limit is
+    /// exceeded.
+    pub fn send<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
+        let size = self.message_size(message)?;
+        let packet = encode_prefix(message, size, size)?;
+        self.push(packet);
+        Ok(())
+    }
+
+    /// Append a pane message, transferring RGB storage without copying it.
+    /// Frame RGB bytes are the final field in the serialized message.
+    ///
+    /// # Errors
+    /// Returns an error on serialization failure or if the byte limit is
+    /// exceeded.
+    pub fn send_pane(&mut self, message: ServerToPane) -> io::Result<()> {
+        let size = self.message_size(&message)?;
+        let prefix = match &message {
+            ServerToPane::Frame { rgb, .. } => size - rgb.len(),
+            _ => size,
+        };
+        let header = encode_prefix(&message, size, prefix)?;
+        self.push(header);
+        if let ServerToPane::Frame { rgb, .. } = message {
+            self.push(rgb);
+        }
+        Ok(())
+    }
+
+    fn message_size<T: Serialize>(&self, message: &T) -> io::Result<usize> {
+        let size = postcard::experimental::serialized_size(message).map_err(invalid)?;
+        if size > MAX_MESSAGE || size + HEADER > MAX_MESSAGE + HEADER - self.queued {
+            return Err(invalid("outgoing pane queue exceeded its byte limit"));
+        }
+        Ok(size)
+    }
+
+    fn push(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.queued += bytes.len();
+            self.chunks.push_back(bytes);
+        }
     }
 
     /// Write at most 64 KiB, retaining the unsent tail on cancellation.
@@ -126,16 +161,18 @@ impl Outgoing {
     /// # Errors
     /// Returns an error if the transport fails or accepts a zero-byte write.
     pub async fn write_ready(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
-        let end = (self.offset + IO_BUDGET).min(self.bytes.len());
-        if self.offset < end {
-            let written = writer.write(&self.bytes[self.offset..end]).await?;
-            if written == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-            self.offset += written;
+        let Some(bytes) = self.chunks.front() else {
+            return Ok(());
+        };
+        let end = (self.offset + IO_BUDGET).min(bytes.len());
+        let written = writer.write(&bytes[self.offset..end]).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
         }
-        if !self.pending() {
-            self.bytes.clear();
+        self.offset += written;
+        self.queued -= written;
+        if self.offset == bytes.len() {
+            self.chunks.pop_front();
             self.offset = 0;
         }
         Ok(())
@@ -153,22 +190,43 @@ impl Outgoing {
     }
 }
 
-impl Write for Outgoing {
+fn encode_prefix<T: Serialize>(message: &T, size: usize, prefix: usize) -> io::Result<Vec<u8>> {
+    let mut output = Prefix {
+        bytes: Vec::with_capacity(HEADER + prefix),
+        remaining: size,
+        limit: HEADER + prefix,
+    };
+    output.bytes.extend_from_slice(&(size as u32).to_le_bytes());
+    postcard::to_io(message, &mut output).map_err(invalid)?;
+    if output.remaining != 0 {
+        return Err(invalid("serialized message size changed"));
+    }
+    Ok(output.bytes)
+}
+
+/// Retains the prefix while counting, but not copying, the serialized tail.
+struct Prefix {
+    bytes: Vec<u8>,
+    remaining: usize,
+    limit: usize,
+}
+
+impl Write for Prefix {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > (MAX_MESSAGE + HEADER).saturating_sub(self.bytes.len() - self.offset) {
-            return Err(io::Error::other(
-                "outgoing pane queue exceeded its byte limit",
-            ));
+        if bytes.len() > self.remaining {
+            return Err(invalid("serialized message size changed"));
         }
-        if self.offset != 0 {
-            self.bytes.drain(..self.offset);
-            self.offset = 0;
-        }
-        self.bytes.extend_from_slice(bytes);
+        let keep = (self.limit - self.bytes.len()).min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.remaining -= bytes.len();
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+fn invalid(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }

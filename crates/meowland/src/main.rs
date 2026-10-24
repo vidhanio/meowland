@@ -1,5 +1,4 @@
 mod cli;
-mod remote;
 
 use tracing_subscriber::{EnvFilter, prelude::*};
 

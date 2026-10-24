@@ -33,13 +33,13 @@ pub enum Policy {
 }
 
 pub struct Pane {
-    pub(super) binding: Binding,
-    pub(super) policy: Policy,
-    pub(super) presentation: PaneState,
+    pub binding: Binding,
+    pub policy: Policy,
+    pub presentation: PaneState,
 }
 
 impl Pane {
-    pub(super) fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
+    pub fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
         let policy = if matches!(show, Show::Newest)
             || (window.is_none() && matches!(show, Show::Focused))
         {
@@ -62,14 +62,14 @@ impl Pane {
         }
     }
 
-    pub(super) const fn window(&self) -> Option<WindowId> {
+    pub const fn window(&self) -> Option<WindowId> {
         match self.binding {
             Binding::Showing(window) => Some(window),
             Binding::Waiting(_) | Binding::Empty => None,
         }
     }
 
-    pub(super) fn show(&mut self, window: WindowId) -> Option<String> {
+    pub fn show(&mut self, window: WindowId) -> Option<String> {
         let previous = std::mem::replace(&mut self.binding, Binding::Showing(window));
         self.presentation.mark_dirty();
         match previous {
@@ -78,7 +78,7 @@ impl Pane {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.binding = Binding::Empty;
         self.presentation.mark_dirty();
     }
@@ -86,34 +86,34 @@ impl Pane {
 
 #[derive(Default)]
 pub struct Attachments {
-    pub(super) panes: HashMap<PaneId, Pane>,
+    pub panes: HashMap<PaneId, Pane>,
     deciding: HashMap<WindowId, PaneId>,
 }
 
 impl Attachments {
-    pub(super) fn first(&self) -> Option<PaneId> {
+    pub fn first(&self) -> Option<PaneId> {
         self.panes.keys().copied().min()
     }
 
-    pub(super) fn showing(&self, window: WindowId) -> Vec<PaneId> {
+    pub fn showing(&self, window: WindowId) -> Vec<PaneId> {
         self.panes
             .iter()
             .filter_map(|(id, pane)| (pane.window() == Some(window)).then_some(*id))
             .collect()
     }
 
-    pub(super) fn following(&self) -> Vec<PaneId> {
+    pub fn following(&self) -> Vec<PaneId> {
         self.panes
             .iter()
             .filter_map(|(id, pane)| (pane.policy == Policy::FollowNewest).then_some(*id))
             .collect()
     }
 
-    pub(super) fn decide(&mut self, window: WindowId, pane: PaneId) -> bool {
+    pub fn decide(&mut self, window: WindowId, pane: PaneId) -> bool {
         self.deciding.insert(window, pane) != Some(pane)
     }
 
-    pub(super) fn size(&self, window: WindowId) -> Option<FrameSize> {
+    pub fn size(&self, window: WindowId) -> Option<FrameSize> {
         self.deciding
             .get(&window)
             .and_then(|id| self.panes.get(id))
@@ -128,12 +128,12 @@ impl Attachments {
             .map(|pane| pane.presentation.size)
     }
 
-    pub(super) fn remove(&mut self, pane: PaneId) -> Option<Pane> {
+    pub fn remove(&mut self, pane: PaneId) -> Option<Pane> {
         self.deciding.retain(|_, owner| *owner != pane);
         self.panes.remove(&pane)
     }
 
-    pub(super) fn forget_window(&mut self, window: WindowId) {
+    pub fn forget_window(&mut self, window: WindowId) {
         self.deciding.remove(&window);
     }
 }

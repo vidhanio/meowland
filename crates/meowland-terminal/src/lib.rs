@@ -15,7 +15,7 @@ use meowland_input::{self as input, keyboard};
 use meowland_kitty::{Presenter, SharedMemory};
 use meowland_protocol::{
     self as protocol, Input, PaneToServer, Show,
-    asynchronous::{Outgoing, Reader, Receiver},
+    asynchronous::{Outgoing, Reader},
     clipboard::MAX_TEXT,
 };
 use meowland_terminal_clipboard as clipboard;
@@ -330,19 +330,7 @@ pub async fn attach(socket: &Path, show: Show) -> Result<()> {
             )
         })?;
     let (reader, writer) = stream.into_split();
-    attach_connection(Reader::new(reader), writer, show).await
-}
-
-/// Present a pane over a cancellation-safe receiver and an async writer.
-///
-/// # Errors
-/// Returns an error if terminal setup, presentation, or the connection fails.
-pub async fn attach_connection(
-    reader: impl Receiver,
-    writer: impl AsyncWrite + Unpin,
-    show: Show,
-) -> Result<()> {
-    session::TerminalSession::new(reader, writer, show)?
+    session::TerminalSession::new(Reader::new(reader), writer, show)?
         .run()
         .await
 }
@@ -411,12 +399,9 @@ impl PanePresentation {
             frame.encoded,
             frame.started.elapsed(),
         );
-        protocol::send(
-            tx,
-            &PaneToServer::Ack {
-                drawn: !frame.dropped,
-            },
-        )?;
+        tx.send(&PaneToServer::Ack {
+            drawn: !frame.dropped,
+        })?;
         Ok(())
     }
 }
@@ -459,7 +444,7 @@ fn send_event(
                 send_input(keyboard.enter(), keyboard.deadline(), keyboard, tx)?;
             } else {
                 keyboard.reset(pending_paste);
-                protocol::send(tx, &PaneToServer::Input(Input::ResetKeyboard))?;
+                tx.send(&PaneToServer::Input(Input::ResetKeyboard))?;
             }
         }
         Event::Resize => {
@@ -469,7 +454,7 @@ fn send_event(
             presenter.set_cell_size(*cell);
             let (width, height) =
                 pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
-            protocol::send(tx, &PaneToServer::Resize { width, height })?;
+            tx.send(&PaneToServer::Resize { width, height })?;
         }
         Event::Pointer(input) => send_input(input, keyboard.deadline(), keyboard, tx)?,
         Event::Paste(text) => {
@@ -496,7 +481,7 @@ fn send_input(
             send_deferred(keyboard, tx)?;
         }
     } else {
-        protocol::send(tx, &PaneToServer::Input(input))?;
+        tx.send(&PaneToServer::Input(input))?;
     }
     Ok(())
 }
@@ -514,27 +499,21 @@ fn send_clipboard_actions(
                 paste,
             } => {
                 if paste && keyboard.deferred() {
-                    protocol::send(
-                        tx,
-                        &PaneToServer::ClipboardOffer {
-                            offer,
-                            mimes: mimes.clone(),
-                            paste: false,
-                        },
-                    )?;
+                    tx.send(&PaneToServer::ClipboardOffer {
+                        offer,
+                        mimes: mimes.clone(),
+                        paste: false,
+                    })?;
                     send_deferred(keyboard, tx)?;
                 }
-                protocol::send(
-                    tx,
-                    &PaneToServer::ClipboardOffer {
-                        offer,
-                        mimes,
-                        paste,
-                    },
-                )?;
+                tx.send(&PaneToServer::ClipboardOffer {
+                    offer,
+                    mimes,
+                    paste,
+                })?;
             }
             ClipboardAction::Reply { request, data } => {
-                protocol::send(tx, &PaneToServer::ClipboardReply { request, data })?;
+                tx.send(&PaneToServer::ClipboardReply { request, data })?;
             }
             ClipboardAction::Unblock => send_deferred(keyboard, tx)?,
         }
@@ -544,14 +523,14 @@ fn send_clipboard_actions(
 
 fn send_deferred(keyboard: &mut Keyboard, tx: &mut Outgoing) -> Result<()> {
     for input in keyboard.take_deferred() {
-        protocol::send(tx, &PaneToServer::Input(input))?;
+        tx.send(&PaneToServer::Input(input))?;
     }
     Ok(())
 }
 
 fn send_paste(tx: &mut Outgoing, text: String) -> Result<()> {
     if text.len() <= MAX_TEXT {
-        protocol::send(tx, &PaneToServer::Paste(text))?;
+        tx.send(&PaneToServer::Paste(text))?;
     } else {
         tracing::warn!("Ignoring pasted text larger than {MAX_TEXT} bytes");
     }
@@ -651,8 +630,8 @@ impl TerminalGuard {
         io::stdout().flush()
     }
 
-    /// Attempt every restoration step even if an earlier one fails; a shell
-    /// must not inherit terminal modes after a partial cleanup.
+    /// Cancel interrupted control strings and end synchronized updates before
+    /// restoring modes. Attempt every step even if an earlier one fails.
     fn restore(&mut self) -> io::Result<()> {
         if !self.active {
             return Ok(());
@@ -665,6 +644,8 @@ impl TerminalGuard {
             }
         };
         note(terminal::disable_raw_mode());
+        note(io::stdout().write_all(b"\x18\x1b\\"));
+        note(execute!(io::stdout(), terminal::EndSynchronizedUpdate));
         if self.mouse {
             self.mouse = false;
             note(io::stdout().write_all(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l"));

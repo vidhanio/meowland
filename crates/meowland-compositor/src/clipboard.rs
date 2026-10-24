@@ -66,7 +66,7 @@ impl Bridge {
         self.next
     }
 
-    pub(super) fn detach(&mut self, pane: PaneId) {
+    pub fn detach(&mut self, pane: PaneId) {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });

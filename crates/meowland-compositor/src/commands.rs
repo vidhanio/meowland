@@ -11,7 +11,7 @@ use super::{
 };
 
 impl State {
-    pub(super) fn handle_command(&mut self, command: Command) {
+    pub fn handle_command(&mut self, command: Command) {
         match command {
             Command::CreateActivationToken { request } => {
                 let token = self.create_activation_token();
@@ -178,11 +178,12 @@ impl State {
         }
         self.enter_output(window);
         self.send_title(pane, window);
+        self.send_pane_cursor(pane);
         self.apply_window_state(window);
         self.focus_window(window);
     }
 
-    pub(super) fn resolve_pending_panes(&mut self) {
+    pub fn resolve_pending_panes(&mut self) {
         let ready: Vec<_> = self
             .attachments
             .panes
@@ -203,7 +204,7 @@ impl State {
         }
     }
 
-    pub(super) fn apply_window_state(&self, window: WindowId) {
+    pub fn apply_window_state(&self, window: WindowId) {
         let Some(entry) = self.windows.get(&window) else {
             return;
         };
@@ -226,7 +227,7 @@ impl State {
         entry.surface.send_configure();
     }
 
-    pub(super) fn configure_output(&mut self, size: FrameSize) {
+    pub fn configure_output(&mut self, size: FrameSize) {
         let mode = Mode {
             size: (size.width() as i32, size.height() as i32).into(),
             refresh: 60_000,

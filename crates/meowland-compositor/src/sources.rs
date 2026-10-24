@@ -6,12 +6,12 @@ use super::State;
 
 pub struct Sources {
     handle: LoopHandle<'static, State>,
-    pub(super) io: Option<RegistrationToken>,
-    pub(super) timer: Option<RegistrationToken>,
+    pub io: Option<RegistrationToken>,
+    pub timer: Option<RegistrationToken>,
 }
 
 impl Sources {
-    pub(super) fn new(handle: &LoopHandle<'static, State>) -> Self {
+    pub fn new(handle: &LoopHandle<'static, State>) -> Self {
         Self {
             handle: handle.clone(),
             io: None,

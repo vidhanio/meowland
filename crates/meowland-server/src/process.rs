@@ -60,14 +60,14 @@ pub struct Termination {
 }
 
 impl Termination {
-    pub(super) fn new(roots: HashSet<u32>) -> Self {
+    pub fn new(roots: HashSet<u32>) -> Self {
         Self {
             roots,
             processes: HashMap::new(),
         }
     }
 
-    pub(super) fn signal(&mut self, signal: Signal) {
+    pub fn signal(&mut self, signal: Signal) {
         for raw in descendants(&self.roots)
             .into_iter()
             .chain(self.roots.iter().copied())

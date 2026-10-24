@@ -17,6 +17,15 @@ const SCROLL_FACTOR: f64 = 0.5;
 const SERIAL_HISTORY: usize = 32;
 
 pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
+    let valid = match event {
+        Input::Key { code, held, .. } => valid_key(*code) && valid_keys(held),
+        Input::KeyboardEnter { keys, .. } => valid_keys(keys),
+        Input::Pointer { x, y, .. } => x.is_finite() && y.is_finite(),
+        Input::Text(_) | Input::ResetKeyboard => true,
+    };
+    if !valid {
+        return;
+    }
     state.refresh_popup_grab();
     if matches!(event, Input::ResetKeyboard) {
         if state.keyboard_pane == Some(pane) {
@@ -41,9 +50,6 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             modifiers,
             ref held,
         } => {
-            if held.len() > 256 || held.iter().any(|code| *code == 0 || *code > 255) {
-                return;
-            }
             if state.keyboard_pane != Some(pane) || !state.keyboard_known {
                 enter_keyboard(state, pane, window, held, modifiers);
             } else {
@@ -58,9 +64,6 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             ref keys,
             modifiers,
         } => {
-            if keys.len() > 256 || keys.iter().any(|code| *code == 0 || *code > 255) {
-                return;
-            }
             enter_keyboard(state, pane, window, keys, modifiers);
         }
         Input::ResetKeyboard => unreachable!(),
@@ -79,7 +82,7 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
                 .pointer
                 .as_ref()
                 .is_some_and(PointerHandle::is_grabbed);
-            if pressed && button.is_some() && x.is_finite() && y.is_finite() && !grabbed {
+            if pressed && button.is_some() && !grabbed {
                 activate_keyboard(state, pane, window);
             }
             let scale = state.scale.factor();
@@ -96,6 +99,14 @@ pub fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     state.send_pane_cursor(pane);
 }
 
+const fn valid_key(code: u16) -> bool {
+    code > 0 && code <= 255
+}
+
+fn valid_keys(keys: &[u16]) -> bool {
+    keys.len() <= 256 && keys.iter().all(|code| valid_key(*code))
+}
+
 fn pointer_input(
     state: &mut State,
     window: WindowId,
@@ -105,9 +116,6 @@ fn pointer_input(
     scroll: i16,
 ) {
     let (x, y) = position;
-    if !x.is_finite() || !y.is_finite() {
-        return;
-    }
     let root = state
         .windows
         .get(&window)
@@ -283,9 +291,6 @@ fn inject_key(
     pressed: bool,
     bits: u8,
 ) {
-    if code == 0 || code > 255 {
-        return;
-    }
     set_modifiers(keyboard, state, snapshot(bits));
     let changed = if pressed {
         state.keyboard_keys.insert(code)

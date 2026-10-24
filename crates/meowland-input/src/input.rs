@@ -227,27 +227,45 @@ impl Parser {
 #[derive(Default)]
 struct Decoder {
     events: VecDeque<Event>,
-    paste: Option<Vec<u8>>,
-    oversized_paste: bool,
+    paste: Option<Paste>,
+}
+
+#[derive(Default)]
+struct Paste {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl Paste {
+    fn push(&mut self, byte: u8) -> bool {
+        self.bytes.push(byte);
+        if self.bytes.ends_with(PASTE_END) {
+            self.bytes.truncate(self.bytes.len() - PASTE_END.len());
+            return true;
+        }
+        if self.oversized || self.bytes.len() > MAX_TEXT + PASTE_END.len() {
+            self.oversized = true;
+            self.bytes
+                .drain(..self.bytes.len().saturating_sub(PASTE_END.len() - 1));
+        }
+        false
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.oversized || self.bytes.len() > MAX_TEXT {
+            return None;
+        }
+        String::from_utf8(self.bytes).ok()
+    }
 }
 
 impl Decoder {
     fn paste_byte(&mut self, byte: u8) {
-        let paste = self.paste.as_mut().unwrap();
-        paste.push(byte);
-        if paste.ends_with(PASTE_END) {
-            paste.truncate(paste.len() - PASTE_END.len());
-            let paste = self.paste.take().unwrap();
-            if !self.oversized_paste
-                && paste.len() <= MAX_TEXT
-                && let Ok(text) = String::from_utf8(paste)
-            {
-                self.events.push_back(Event::Paste(text));
-            }
-            self.oversized_paste = false;
-        } else if self.oversized_paste || paste.len() > MAX_TEXT + PASTE_END.len() {
-            self.oversized_paste = true;
-            paste.drain(..paste.len().saturating_sub(PASTE_END.len() - 1));
+        if let Some(paste) = &mut self.paste
+            && paste.push(byte)
+            && let Some(text) = self.paste.take().and_then(Paste::finish)
+        {
+            self.events.push_back(Event::Paste(text));
         }
     }
 }
@@ -258,7 +276,7 @@ impl VTActor for Decoder {
             return;
         }
         if params == [CsiParam::Integer(200)] && byte == b'~' {
-            self.paste = Some(Vec::new());
+            self.paste = Some(Paste::default());
         } else if let Some(event) = csi(params, byte) {
             self.events.push_back(event);
         }

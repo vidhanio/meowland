@@ -95,6 +95,14 @@ impl Attachments {
         self.panes.keys().copied().min()
     }
 
+    pub fn first_window(&self) -> Option<WindowId> {
+        self.panes
+            .iter()
+            .filter_map(|(id, pane)| pane.window().map(|window| (*id, window)))
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, window)| window)
+    }
+
     pub fn showing(&self, window: WindowId) -> Vec<PaneId> {
         self.panes
             .iter()

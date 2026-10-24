@@ -10,6 +10,8 @@ pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TYPES: usize = 64;
 pub const TEXT_MIMES: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
 
+const MAX_MIME_LENGTH: usize = 256;
+
 /// The selection a clipboard transfer belongs to.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Selection {
@@ -47,8 +49,12 @@ impl ClipboardData {
     #[must_use]
     pub fn valid(&self) -> bool {
         self.items.len() <= MAX_TYPES
+            && self
+                .items
+                .iter()
+                .try_fold(0usize, |total, item| total.checked_add(item.data.len()))
+                .is_some_and(|total| total <= MAX_BYTES)
             && self.items.iter().all(|item| valid_mime(&item.mime))
-            && self.items.iter().map(|item| item.data.len()).sum::<usize>() <= MAX_BYTES
     }
 
     /// UTF-8 plain text for legacy OSC 52, including Wayland's opaque alias.
@@ -57,25 +63,30 @@ impl ClipboardData {
         self.items
             .iter()
             .find(|item| {
-                let text = item.mime == "UTF8_STRING"
-                    || item.mime.parse::<mime::Mime>().is_ok_and(|media| {
-                        media.type_() == mime::TEXT
-                            && media.subtype() == mime::PLAIN
-                            && media
-                                .get_param(mime::CHARSET)
-                                .is_none_or(|charset| charset == mime::UTF_8)
-                    });
-                text && item.data.len() <= MAX_TEXT && std::str::from_utf8(&item.data).is_ok()
+                is_utf8_text_mime(&item.mime)
+                    && item.data.len() <= MAX_TEXT
+                    && std::str::from_utf8(&item.data).is_ok()
             })
             .map(|item| item.data.as_slice())
     }
+}
+
+fn is_utf8_text_mime(mime: &str) -> bool {
+    mime == "UTF8_STRING"
+        || mime.parse::<mime::Mime>().is_ok_and(|media| {
+            media.type_() == mime::TEXT
+                && media.subtype() == mime::PLAIN
+                && media
+                    .get_param(mime::CHARSET)
+                    .is_none_or(|charset| charset == mime::UTF_8)
+        })
 }
 
 #[must_use]
 pub fn valid_mime(mime: &str) -> bool {
     !mime.is_empty()
         && mime != "."
-        && mime.len() <= 256
+        && mime.len() <= MAX_MIME_LENGTH
         && mime.bytes().all(|byte| byte.is_ascii_graphic())
         && (!mime.contains('/') || mime.parse::<mime::Mime>().is_ok())
 }

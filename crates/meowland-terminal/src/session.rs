@@ -1,24 +1,21 @@
-//! Readiness scheduling and lifecycle for one terminal attachment.
+//! Async scheduling and explicit lifecycle for one terminal attachment.
 
 use std::{
-    fs::File,
     io::{self, Write},
-    os::unix::net::UnixStream,
-    path::Path,
     time::{Duration, Instant},
 };
 
-use meowland_core::{Error, Result, signals};
-use meowland_protocol::{self as protocol, Hello, PaneToServer, ServerToPane, Show};
-use rustix::{
-    event::{PollFd, PollFlags, Timespec, poll},
-    io::Errno,
+use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
+use meowland_protocol::{
+    self as protocol, Hello, PaneToServer, ServerToPane, Show,
+    asynchronous::{Outgoing, Receiver},
 };
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
 use super::{
-    Clipboard, FALLBACK_CELL, KEYBOARD_FLAGS, Keyboard, PanePresentation, PaneStats, TerminalGuard,
-    cursor_bytes, derived_cell, input, output, pane_pixels, send_clipboard_actions, send_deferred,
-    send_event, terminal_probe, title_bytes, window_pixels,
+    Clipboard, ClipboardProtocol, FALLBACK_CELL, KEYBOARD_FLAGS, Keyboard, PanePresentation,
+    PaneStats, TerminalGuard, cursor_bytes, derived_cell, input, output, pane_pixels,
+    send_clipboard_actions, send_deferred, send_event, terminal_probe, title_bytes, window_pixels,
 };
 
 enum Lifecycle {
@@ -36,55 +33,49 @@ struct PendingWindow {
 }
 
 enum Ready {
-    Disconnected,
-    Io {
-        input: bool,
-        output: bool,
-        server: bool,
-    },
+    Signal(io::Result<usize>),
+    Deadline,
+    Server(io::Result<ServerToPane>),
+    Output(Result<()>),
+    Transmit(io::Result<()>),
+    Input(io::Result<()>),
+    BufferedInput,
 }
 
-pub struct TerminalSession {
-    stream: UnixStream,
-    tx: UnixStream,
-    reader: protocol::MessageReader,
+pub struct TerminalSession<R, W> {
+    receiver: R,
+    writer: W,
+    tx: Outgoing,
     input: input::Reader,
-    stdout: File,
+    stdout: Descriptor,
     keyboard: Keyboard,
     clipboard: Clipboard,
     presentation: PanePresentation,
     cell: Option<(u16, u16)>,
     lifecycle: Lifecycle,
-    wakeup: signals::Wakeup,
+    wakeup: Descriptor,
+    _signals: signals::Wakeup,
     interrupted: signals::TerminationFlag,
     window: PendingWindow,
 }
 
-impl TerminalSession {
-    pub(super) fn connect(socket: &Path, show: Show) -> Result<Self> {
-        let stream = UnixStream::connect(socket).map_err(|error| {
-            Error::io(
-                format!(
-                    "could not reach the pane socket {} (is the server running?)",
-                    socket.display()
-                ),
-                error,
-            )
-        })?;
+impl<R: Receiver, W: AsyncWrite + Unpin> TerminalSession<R, W> {
+    pub(super) fn new(receiver: R, writer: W, show: Show) -> Result<Self> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let interrupted = signals::termination_flag()?;
         let input = input::Reader::new()?;
-        let wakeup = signals::Wakeup::new(&[
+        let signals = signals::Wakeup::new(&[
             signal_hook::consts::SIGINT,
             signal_hook::consts::SIGTERM,
             signal_hook::consts::SIGHUP,
             signal_hook::consts::SIGWINCH,
         ])?;
+        let wakeup = Descriptor::new(rustix::io::dup(&signals).map_err(io::Error::from)?)?;
         let pixels = window_pixels();
         let cell = derived_cell(pixels, (cols, rows));
         let (width, height) =
             pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
-        let mut tx = stream.try_clone()?;
+        let mut tx = Outgoing::default();
         protocol::send(
             &mut tx,
             &PaneToServer::Hello(Hello {
@@ -94,61 +85,91 @@ impl TerminalSession {
             }),
         )?;
         Ok(Self {
-            stream,
+            receiver,
+            writer,
             tx,
-            reader: protocol::MessageReader::default(),
             input,
-            stdout: output::open()?,
+            stdout: Descriptor::new(output::open()?.into())?,
             keyboard: Keyboard::default(),
-            clipboard: Clipboard::new(false)?,
+            clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
             presentation: PanePresentation::new(cell, None),
             cell,
             lifecycle: Lifecycle::Handshaking {
                 deadline: Instant::now() + Duration::from_secs(1),
             },
             wakeup,
+            _signals: signals,
             interrupted,
             window: PendingWindow::default(),
         })
     }
 
-    pub(super) fn run(mut self) -> Result<()> {
+    pub(super) async fn run(mut self) -> Result<()> {
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             if self.interrupted.interrupted() {
                 return self.close(None);
             }
             self.prepare_pending_work()?;
-            let ready = match self.wait_ready() {
-                Ok(ready) => ready,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error.into()),
+            let active = matches!(self.lifecycle, Lifecycle::Active(_));
+            let pending_output = active && self.presentation.pending.pending();
+            let pending_input = self.input.pending();
+            let deadline = self.next_deadline();
+            let mut signal = [0; 256];
+            let ready = tokio::select! {
+                result = self.wakeup.read(&mut signal) => Ready::Signal(result),
+                () = wait_deadline(deadline) => Ready::Deadline,
+                result = self.presentation.drain(&mut self.stdout), if pending_output => Ready::Output(result),
+                result = self.receiver.receive(), if !pending_output && !self.tx.pending() => Ready::Server(result),
+                result = self.tx.write_ready(&mut self.writer), if self.tx.pending() => Ready::Transmit(result),
+                result = self.input.read_ready(), if active && !pending_input && !self.tx.pending() => Ready::Input(result),
+                () = tokio::task::yield_now(), if pending_input && !self.tx.pending() => Ready::BufferedInput,
             };
             if self.interrupted.interrupted() {
                 continue;
             }
-            let Ready::Io {
-                input,
-                output,
-                server,
-            } = ready
-            else {
-                return self.close(None);
-            };
-            if server {
-                self.receive_server_message()?;
+            match ready {
+                Ready::Signal(result) => {
+                    if result? == 0 {
+                        return self.close(None);
+                    }
+                }
+                Ready::Server(result) => self.handle_server_message(result?).await?,
+                Ready::Output(result) => {
+                    result?;
+                    self.presentation.finish(&mut self.tx)?;
+                }
+                Ready::Transmit(Err(error)) => return self.finish_after_write_error(error).await,
+                Ready::Input(result) => {
+                    if result.is_err() {
+                        return self.close(None);
+                    }
+                }
+                Ready::Transmit(Ok(())) | Ready::Deadline | Ready::BufferedInput => {}
             }
-            if matches!(self.lifecycle, Lifecycle::Closed) {
-                break;
+            if !matches!(self.lifecycle, Lifecycle::Closed) && !self.tx.pending() {
+                self.handle_terminal_events()?;
             }
-            if output {
-                self.presentation.drain(&mut self.stdout, &mut self.tx)?;
-            }
-            if input {
-                self.input.read_ready()?;
-            }
-            self.handle_terminal_events()?;
         }
         Ok(())
+    }
+
+    async fn finish_after_write_error(&mut self, error: io::Error) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if self.interrupted.interrupted() {
+                return self.close(None);
+            }
+            let mut signal = [0; 256];
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline.into()) => return Err(error.into()),
+                result = self.wakeup.read(&mut signal) => { result?; }
+                result = self.receiver.receive() => match result {
+                    Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)),
+                    Err(_) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+            }
+        }
     }
 
     fn prepare_pending_work(&mut self) -> Result<()> {
@@ -159,7 +180,7 @@ impl TerminalSession {
         if self.keyboard.deferred_expired() {
             send_deferred(&mut self.keyboard, &mut self.tx)?;
         }
-        self.clipboard.poll(&mut self.presentation.pending);
+        self.clipboard.advance(self.presentation.pending.buffer());
         send_clipboard_actions(&mut self.clipboard, &mut self.keyboard, &mut self.tx)
     }
 
@@ -175,84 +196,7 @@ impl TerminalSession {
             .min()
     }
 
-    fn wait_ready(&self) -> io::Result<Ready> {
-        let active = matches!(self.lifecycle, Lifecycle::Active(_));
-        let pending_output = active && self.presentation.pending.pending();
-        let mut fds = [
-            PollFd::new(&self.wakeup, PollFlags::IN),
-            PollFd::new(
-                &self.input.fd,
-                PollFlags::HUP
-                    | PollFlags::ERR
-                    | if active {
-                        PollFlags::IN
-                    } else {
-                        PollFlags::empty()
-                    },
-            ),
-            PollFd::new(
-                &self.stdout,
-                PollFlags::HUP
-                    | PollFlags::ERR
-                    | if pending_output {
-                        PollFlags::OUT
-                    } else {
-                        PollFlags::empty()
-                    },
-            ),
-            PollFd::new(
-                &self.stream,
-                PollFlags::IN | PollFlags::HUP | PollFlags::ERR,
-            ),
-        ];
-        let timeout = if self.input.pending() {
-            Some(Duration::ZERO)
-        } else {
-            self.next_deadline()
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-        }
-        .map(|wait| Timespec {
-            tv_sec: wait.as_secs() as i64,
-            tv_nsec: wait.subsec_nanos().into(),
-        });
-        let watched = if pending_output {
-            &mut fds[..3]
-        } else {
-            &mut fds[..]
-        };
-        poll(watched, timeout.as_ref()).map_err(|error| {
-            if error == Errno::INTR {
-                io::ErrorKind::Interrupted.into()
-            } else {
-                io::Error::from(error)
-            }
-        })?;
-        if fds[0].revents().contains(PollFlags::IN) {
-            self.wakeup.drain();
-        }
-        if [1, 2].into_iter().any(|index| {
-            fds[index]
-                .revents()
-                .intersects(PollFlags::HUP | PollFlags::ERR)
-        }) {
-            return Ok(Ready::Disconnected);
-        }
-        Ok(Ready::Io {
-            input: fds[1].revents().contains(PollFlags::IN),
-            output: fds[2].revents().contains(PollFlags::OUT),
-            server: !pending_output && !fds[3].revents().is_empty(),
-        })
-    }
-
-    fn receive_server_message(&mut self) -> Result<()> {
-        match self.reader.try_recv::<ServerToPane>(&self.stream) {
-            Ok(Some(message)) => self.handle_server_message(message),
-            Ok(None) => Ok(()),
-            Err(_) => self.close(Some("server disconnected")),
-        }
-    }
-
-    fn handle_server_message(&mut self, message: ServerToPane) -> Result<()> {
+    async fn handle_server_message(&mut self, message: ServerToPane) -> Result<()> {
         match message {
             ServerToPane::HelloOk => {
                 if matches!(self.lifecycle, Lifecycle::Handshaking { .. }) {
@@ -268,7 +212,8 @@ impl TerminalSession {
             }
             ServerToPane::ClipboardWrite(data) => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.clipboard.copy(data, &mut self.presentation.pending);
+                    self.clipboard
+                        .copy(data, self.presentation.pending.buffer());
                 } else {
                     self.window.clipboard = Some(data);
                 }
@@ -304,7 +249,7 @@ impl TerminalSession {
             } => {
                 let starting = !matches!(self.lifecycle, Lifecycle::Active(_));
                 if starting {
-                    self.start_presentation()?;
+                    self.start_presentation().await?;
                     if matches!(self.lifecycle, Lifecycle::Closed) {
                         return Ok(());
                     }
@@ -320,7 +265,8 @@ impl TerminalSession {
                         .pending
                         .append(&cursor_bytes(window.cursor.as_deref()));
                     if let Some(data) = window.clipboard {
-                        self.clipboard.copy(data, &mut self.presentation.pending);
+                        self.clipboard
+                            .copy(data, self.presentation.pending.buffer());
                     }
                 }
             }
@@ -328,9 +274,15 @@ impl TerminalSession {
         Ok(())
     }
 
-    fn start_presentation(&mut self) -> Result<()> {
+    async fn start_presentation(&mut self) -> Result<()> {
         let mut mode = TerminalGuard::enter()?;
-        let (probe, shared) = terminal_probe(&self.interrupted)?;
+        let (probe, shared) = terminal_probe(
+            &mut self.input,
+            &mut self.stdout,
+            &mut self.wakeup,
+            &self.interrupted,
+        )
+        .await?;
         if self.interrupted.interrupted() {
             mode.restore()?;
             return self.close(None);
@@ -359,7 +311,11 @@ impl TerminalSession {
             self.cell.unwrap_or(FALLBACK_CELL),
         );
         self.presentation = PanePresentation::new(self.cell, shared);
-        self.clipboard = Clipboard::new(probe.clipboard.is_some())?;
+        self.clipboard = Clipboard::new(if probe.clipboard.is_some() {
+            ClipboardProtocol::Kitty
+        } else {
+            ClipboardProtocol::Osc52
+        })?;
         let _ = self.clipboard.refresh(false);
         protocol::send(&mut self.tx, &PaneToServer::Resize { width, height })?;
         PaneStats::capabilities(&probe, width, height);
@@ -372,7 +328,7 @@ impl TerminalSession {
             if self.interrupted.interrupted() {
                 break;
             }
-            let Some(event) = self.input.next() else {
+            let Some(event) = self.input.next_event() else {
                 break;
             };
             if !matches!(self.lifecycle, Lifecycle::Active(_))
@@ -404,5 +360,13 @@ impl TerminalSession {
             writeln!(io::stdout(), "meowland: {clean}")?;
         }
         Ok(())
+    }
+}
+
+async fn wait_deadline(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline.into()).await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }

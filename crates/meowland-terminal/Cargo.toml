@@ -10,12 +10,19 @@ workspace = true
 
 [dependencies]
 signal-hook = { workspace = true }
-getrandom = { workspace = true, features = ["std"] }
-meowland-core = { workspace = true }
-meowland-protocol = { workspace = true }
+meowland-input = { workspace = true }
+meowland-terminal-clipboard = { workspace = true }
+meowland-core = { workspace = true, features = ["async"] }
+meowland-protocol = { workspace = true, features = ["async"] }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "time",
+] }
 meowland-kitty = { workspace = true }
-base64 = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
-rustix = { workspace = true, features = ["event", "fs", "stdio", "termios"] }
+rustix = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 vtparse = { workspace = true }

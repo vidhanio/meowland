@@ -10,7 +10,6 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use meowland_protocol::clipboard::{ClipboardData, Deadline, MAX_TEXT, TEXT_MIMES};
 
 use super::Action;
-use crate::output::Output;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -25,7 +24,7 @@ enum State {
 }
 
 #[derive(Default)]
-pub(super) struct Clipboard {
+pub struct Clipboard {
     state: State,
     next: u64,
     snapshot: Option<(u64, Vec<u8>)>,
@@ -68,14 +67,15 @@ impl Clipboard {
         );
     }
 
-    pub(super) fn copy(data: &ClipboardData, output: &mut Output) {
+    pub(super) fn copy(data: &ClipboardData, output: &mut Vec<u8>) {
         if !data.valid() {
             return;
         }
         if let Some(text) = data.utf8_text() {
-            output.append(format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(text)).as_bytes());
+            output
+                .extend_from_slice(format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(text)).as_bytes());
         } else if data.items.is_empty() {
-            output.append(b"\x1b]52;c;\x1b\\");
+            output.extend_from_slice(b"\x1b]52;c;\x1b\\");
         }
     }
 
@@ -108,12 +108,12 @@ impl Clipboard {
         }
     }
 
-    pub(super) fn poll(&mut self, output: &mut Output) {
+    pub(super) fn poll(&mut self, output: &mut Vec<u8>) {
         self.expire();
         if let State::Queued(deadline) = self.state
-            && !output.pending()
+            && output.is_empty()
         {
-            output.append(b"\x1b]52;c;?\x1b\\");
+            output.extend_from_slice(b"\x1b]52;c;?\x1b\\");
             self.state = State::Reading(deadline);
         }
     }

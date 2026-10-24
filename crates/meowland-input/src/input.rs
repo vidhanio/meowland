@@ -4,19 +4,17 @@
 use std::{
     collections::VecDeque,
     io,
-    os::fd::OwnedFd,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
 
+use meowland_core::asynchronous::Descriptor;
 use meowland_protocol::{Input, clipboard::MAX_TEXT};
-use rustix::{
-    fs::{Mode, OFlags, open},
-    io::Errno,
-};
+use rustix::fs::{Mode, OFlags, open};
 use signal_hook::SigId;
+use tokio::io::AsyncReadExt;
 use vtparse::{CsiParam, VTActor, VTParser};
 
 const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
@@ -33,11 +31,12 @@ pub enum Kind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Key {
-    pub(super) code: u32,
-    pub(super) modifiers: u8,
-    pub(super) kind: Kind,
+    pub code: u32,
+    pub modifiers: u8,
+    pub kind: Kind,
 }
 
+#[derive(Debug)]
 pub enum Event {
     Key(Key),
     Pointer(Input),
@@ -49,56 +48,82 @@ pub enum Event {
 }
 
 pub struct Reader {
-    pub(super) fd: OwnedFd,
+    fd: Descriptor,
     parser: Parser,
+    bytes: Box<[u8]>,
     resized: Arc<AtomicBool>,
     handler: SigId,
 }
 
 impl Reader {
-    pub(super) fn new() -> io::Result<Self> {
+    /// Open terminal input without changing stdin's blocking flags.
+    ///
+    /// # Errors
+    /// Returns an error if opening, registering, or watching input fails.
+    pub fn new() -> io::Result<Self> {
         let fd = open(
             "/proc/self/fd/0",
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
             Mode::empty(),
         )?;
+        let fd = Descriptor::new(fd)?;
         let resized = Arc::new(AtomicBool::new(false));
         let handler =
             signal_hook::flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&resized))?;
         Ok(Self {
             fd,
             parser: Parser::new(),
+            bytes: vec![0; 16 * 1024].into_boxed_slice(),
             resized,
             handler,
         })
     }
 
-    pub(super) fn pending(&self) -> bool {
+    #[must_use]
+    pub fn pending(&self) -> bool {
         !self.parser.decoder.events.is_empty() || self.resized.load(Ordering::Relaxed)
     }
 
-    pub(super) fn next(&mut self) -> Option<Event> {
+    /// Pop a buffered event, prioritizing a pending resize.
+    pub fn next_event(&mut self) -> Option<Event> {
         if self.resized.swap(false, Ordering::Relaxed) {
             return Some(Event::Resize);
         }
         self.parser.decoder.events.pop_front()
     }
 
-    pub(super) fn read_ready(&mut self) -> io::Result<()> {
+    /// Read and decode the next bounded input chunk.
+    ///
+    /// # Errors
+    /// Returns an error on EOF or input failure.
+    pub async fn read_ready(&mut self) -> io::Result<()> {
         if !self.parser.decoder.events.is_empty() {
             return Ok(());
         }
-        let mut bytes = [0; 16 * 1024];
-        let read = match rustix::io::read(&self.fd, &mut bytes) {
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(read) => read,
-            Err(Errno::AGAIN | Errno::INTR) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        for &byte in &bytes[..read] {
+        let read = self.fd.read(&mut self.bytes).await?;
+        if read == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        for &byte in &self.bytes[..read] {
             self.parser.push(byte);
         }
         Ok(())
+    }
+
+    /// Read raw capability replies before starting event decoding.
+    ///
+    /// # Errors
+    /// Returns an error if terminal input fails.
+    pub async fn read_raw(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.fd.read(bytes).await
+    }
+}
+
+impl std::fmt::Debug for Reader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reader")
+            .field("pending", &self.pending())
+            .finish_non_exhaustive()
     }
 }
 
@@ -272,6 +297,7 @@ impl VTActor for Decoder {
     fn apc_dispatch(&mut self, _data: Vec<u8>) {}
 }
 
+#[must_use]
 pub fn number(params: &[CsiParam]) -> Option<u32> {
     match params {
         [CsiParam::Integer(value)] => u32::try_from(*value).ok(),

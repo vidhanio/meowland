@@ -12,7 +12,6 @@ use meowland_protocol::clipboard::{
 };
 
 use super::Action;
-use crate::output::Output;
 
 #[derive(Default)]
 struct Credentials {
@@ -90,7 +89,7 @@ struct Operation {
     deadline: Instant,
 }
 
-pub(super) struct Clipboard {
+pub struct Clipboard {
     password: String,
     focused: bool,
     /// Explicit pastes supersede MIME refreshes issued before them.
@@ -246,9 +245,9 @@ impl Clipboard {
         self.requests = requests;
     }
 
-    pub(super) fn poll(&mut self, output: &mut Output) {
+    pub(super) fn poll(&mut self, output: &mut Vec<u8>) {
         self.expire();
-        if self.active.is_some() || output.pending() {
+        if self.active.is_some() || !output.is_empty() {
             return;
         }
         while let Some(Queued { request, deadline }) = self.requests.pop_front() {
@@ -422,8 +421,10 @@ impl Clipboard {
     }
 }
 
-fn packet(output: &mut Output, metadata: &str, payload: &[u8]) {
-    output.append(format!("\x1b]5522;{metadata};{}\x1b\\", STANDARD.encode(payload)).as_bytes());
+fn packet(output: &mut Vec<u8>, metadata: &str, payload: &[u8]) {
+    output.extend_from_slice(
+        format!("\x1b]5522;{metadata};{}\x1b\\", STANDARD.encode(payload)).as_bytes(),
+    );
 }
 
 struct Packet<'a> {

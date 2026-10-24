@@ -8,10 +8,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+async = ["dep:tokio"]
+
 [dependencies]
+tokio = { workspace = true, optional = true, features = ["io-util", "rt"] }
 meowland-core = { workspace = true }
 postcard = { workspace = true, features = ["use-std"] }
-rustix = { workspace = true, features = ["net", "time"] }
+rustix = { workspace = true, features = ["time"] }
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = { workspace = true }
 mime = { workspace = true }

@@ -8,7 +8,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+async = ["dep:tokio", "dep:rustix"]
+
 [dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, optional = true, features = ["fs"] }
+tokio = { workspace = true, optional = true, features = ["io-util", "net"] }
 signal-hook = { workspace = true }
 thiserror = { workspace = true }

@@ -4,34 +4,47 @@ use std::collections::HashMap;
 
 use meowland_core::pixels::FrameSize;
 use smithay::{
-    utils::Point,
-    wayland::compositor::{SurfaceData, TraversalAction, with_surface_tree_upward},
+    desktop::{PopupKind, PopupManager},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Point, Rectangle, Size},
+    wayland::{
+        compositor::{
+            SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
+            with_surface_tree_upward,
+        },
+        shell::xdg::SurfaceCachedState,
+        viewporter::ViewportCachedState,
+    },
 };
 
-use super::{
-    Logical, PopupKind, PopupManager, Rectangle, Size, Snapshot, State, SubsurfaceCachedState,
-    SurfaceAttributes, SurfaceCachedState, ViewportCachedState, Window, WindowId, WlSurface,
-    with_states,
-};
+use super::Snapshot;
 
 /// Scratch allocations owned by the compositor, not by any client or pane.
 #[derive(Default)]
 pub struct Renderer {
     pixels: Vec<u8>,
-    pub(super) stack: SurfaceStack,
+    stack: SurfaceStack,
+}
+
+impl std::fmt::Debug for Renderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Renderer")
+            .field("bytes", &self.pixels.len())
+            .field("surfaces", &self.stack.surfaces.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Renderer {
     /// Compose one pane while borrowing scene state only for this draw.
-    pub(super) fn render(
+    pub fn render(
         &mut self,
-        windows: &HashMap<WindowId, Window>,
+        root: Option<&WlSurface>,
         snapshots: &HashMap<WlSurface, Snapshot>,
-        window: Option<WindowId>,
         size: FrameSize,
     ) -> &[u8] {
-        if let Some(window) = window.and_then(|id| windows.get(&id)) {
-            self.stack.rebuild(window.surface.wl_surface());
+        if let Some(root) = root {
+            self.stack.rebuild(root);
         } else {
             self.stack.clear();
         }
@@ -53,13 +66,13 @@ impl Renderer {
 
 /// Window surfaces in bottom-to-top order, with origins in pane coordinates.
 #[derive(Default)]
-pub struct SurfaceStack {
-    pub(super) surfaces: Vec<(WlSurface, Point<i32, Logical>)>,
+struct SurfaceStack {
+    surfaces: Vec<(WlSurface, Point<i32, Logical>)>,
     popups: Vec<(PopupKind, Point<i32, Logical>)>,
 }
 
 impl SurfaceStack {
-    pub(super) fn rebuild(&mut self, root: &WlSurface) {
+    fn rebuild(&mut self, root: &WlSurface) {
         self.clear();
         collect_surface(root, (0, 0).into(), &mut self.surfaces);
         let geometry = window_geometry(root);
@@ -70,12 +83,13 @@ impl SurfaceStack {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    fn clear(&mut self) {
         self.surfaces.clear();
         self.popups.clear();
     }
 }
 
+#[must_use]
 pub fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
     let mut stack = SurfaceStack::default();
     stack.rebuild(root);
@@ -83,6 +97,7 @@ pub fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> 
 }
 
 /// Popup positions are measured against the parent's window geometry origin.
+#[must_use]
 pub fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
     with_states(surface, |states| {
         states
@@ -96,6 +111,7 @@ pub fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
 
 /// Convert a popup's window-geometry position to its surface origin in the
 /// pane.
+#[must_use]
 pub fn popup_origin(
     parent_geometry: Point<i32, Logical>,
     location: Point<i32, Logical>,
@@ -319,6 +335,7 @@ fn opaque_cover(
         && origin.y.saturating_add(snapshot.height as i32) >= height as i32
 }
 
+#[must_use]
 pub fn extents(
     snapshot: &Snapshot,
     viewport: ViewportCachedState,
@@ -334,31 +351,40 @@ pub fn extents(
     (src, dst)
 }
 
+#[must_use]
 pub fn viewport_of(surface: &WlSurface) -> ViewportCachedState {
     with_states(surface, |states| {
         *states.cached_state.get::<ViewportCachedState>().current()
     })
 }
 
-impl State {
-    /// Smithay expects the surface origin, not the local point, for pointer
+impl Renderer {
+    /// Visit mapped surfaces without exposing traversal scratch state.
+    pub fn for_each_surface(&mut self, root: &WlSurface, mut visit: impl FnMut(&WlSurface)) {
+        self.stack.rebuild(root);
+        for (surface, _) in &self.stack.surfaces {
+            visit(surface);
+        }
+        self.stack.clear();
+    }
+
+    /// Return the hit surface and its origin, as expected by Smithay's pointer
     /// focus.
-    pub(super) fn hit_test(
+    pub fn hit_test(
         &mut self,
-        window: WindowId,
+        root: &WlSurface,
+        snapshots: &HashMap<WlSurface, Snapshot>,
         x: f64,
         y: f64,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let root = self.windows.get(&window)?.surface.wl_surface();
-        self.renderer.stack.rebuild(root);
+        self.stack.rebuild(root);
         let hit = self
-            .renderer
             .stack
             .surfaces
             .iter()
             .rev()
             .find_map(|(surface, origin)| {
-                let snapshot = self.snapshots.get(surface)?;
+                let snapshot = snapshots.get(surface)?;
                 let (_, dst) = extents(snapshot, viewport_of(surface));
                 let local =
                     Point::<f64, Logical>::from((x - f64::from(origin.x), y - f64::from(origin.y)));
@@ -387,7 +413,7 @@ impl State {
                     )
                 })
             });
-        self.renderer.stack.clear();
+        self.stack.clear();
         hit
     }
 }

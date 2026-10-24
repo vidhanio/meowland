@@ -73,7 +73,7 @@ impl XdgShellHandler for State {
             dismiss_popup(self, &root, &kind);
             return;
         };
-        if seat != self.seat || !input::valid_serial(self, serial) {
+        if seat != self.seat || !input::valid_serial(self, serial, &root) {
             dismiss_popup(self, &root, &kind);
             return;
         }

@@ -288,7 +288,7 @@ struct State {
     keyboard_pane: Option<PaneId>,
     keyboard_keys: HashSet<u16>,
     keyboard_known: bool,
-    recent_serials: VecDeque<Serial>,
+    recent_serials: VecDeque<(Serial, ClientId)>,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<WindowId, Window>,

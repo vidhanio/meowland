@@ -7,10 +7,11 @@ use smithay::{
         keyboard::{KeyboardHandle, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
     },
+    reexports::wayland_server::Resource,
     utils::{Point, SERIAL_COUNTER, Serial},
 };
 
-use super::{Input, Pane, PaneId, State, WindowId};
+use super::{Input, Pane, PaneId, State, WindowId, WlSurface};
 
 const SCROLL_FACTOR: f64 = 0.5;
 const SERIAL_HISTORY: usize = 32;
@@ -120,7 +121,7 @@ fn pointer_input(
             },
         );
         if let Some(button) = button {
-            let serial = event_serial(state);
+            let serial = event_serial(state, pointer.current_focus());
             pointer.button(
                 state,
                 &ButtonEvent {
@@ -200,17 +201,24 @@ fn keyboard_grabbed(state: &State) -> bool {
         .is_some_and(KeyboardHandle::is_grabbed)
 }
 
-fn event_serial(state: &mut State) -> Serial {
+fn event_serial(state: &mut State, focus: Option<WlSurface>) -> Serial {
     let serial = SERIAL_COUNTER.next_serial();
-    state.recent_serials.push_back(serial);
-    if state.recent_serials.len() > SERIAL_HISTORY {
-        state.recent_serials.pop_front();
+    if let Some(client) = focus.and_then(|surface| surface.client()) {
+        state.recent_serials.push_back((serial, client.id()));
+        if state.recent_serials.len() > SERIAL_HISTORY {
+            state.recent_serials.pop_front();
+        }
     }
     serial
 }
 
-pub fn valid_serial(state: &State, serial: Serial) -> bool {
-    state.recent_serials.contains(&serial)
+pub fn valid_serial(state: &State, serial: Serial, surface: &WlSurface) -> bool {
+    surface.client().is_some_and(|client| {
+        state
+            .recent_serials
+            .iter()
+            .any(|(recent, recipient)| *recent == serial && *recipient == client.id())
+    })
 }
 
 /// A pane cannot leave keys or snapshot-only modifiers down when it loses
@@ -271,7 +279,7 @@ fn inject_key(
 }
 
 fn forward(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, pressed: bool) {
-    let serial = event_serial(state);
+    let serial = event_serial(state, keyboard.current_focus());
     keyboard.input_forward(
         state,
         Keycode::from(u32::from(code) + 8),

@@ -108,7 +108,16 @@ struct Server {
 /// Fails if startup or socket I/O cannot complete, or the compositor exits
 /// unexpectedly.
 pub async fn serve(paths: &Paths) -> Result<()> {
-    actor::serve(paths).await
+    serve_scaled(paths, meowland_core::scale::UiScale::default()).await
+}
+
+/// Run the compositor server with a shared UI scale for all terminal panes.
+///
+/// # Errors
+/// Fails if startup or socket I/O cannot complete, or the compositor exits
+/// unexpectedly.
+pub async fn serve_scaled(paths: &Paths, scale: meowland_core::scale::UiScale) -> Result<()> {
+    actor::serve(paths, scale).await
 }
 
 fn notify(state: &[sd_notify::NotifyState<'_>]) {

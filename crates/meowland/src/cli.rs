@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration,
 };
 
-use meowland_core::{Error, Result};
+use meowland_core::{Error, Result, scale::UiScale};
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowInfo,
 };
@@ -27,9 +27,16 @@ enum Commands {
     /// List windows.
     List,
     /// Start the compositor server in the foreground.
-    Server,
+    Server(ServerArgs),
     /// Generate a shell completion script.
     Completions(CompletionArgs),
+}
+
+#[derive(Args)]
+struct ServerArgs {
+    /// UI scale for all panes (0.5–4), rounded to the nearest 1/120.
+    #[usage(long, default = "1")]
+    scale: UiScale,
 }
 
 #[derive(Args)]
@@ -156,7 +163,10 @@ impl From<CompletionShell> for usage_rs::complete::Shell {
 pub fn start() -> Result<()> {
     let cli = Meowland::parse();
     match cli.command {
-        Commands::Server => run_async(meowland_server::serve(&Paths::discover()?)),
+        Commands::Server(args) => run_async(meowland_server::serve_scaled(
+            &Paths::discover()?,
+            args.scale,
+        )),
         Commands::List => {
             let paths = Paths::discover()?;
             for window in list(&paths)? {

@@ -2,9 +2,7 @@
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
-use smithay::{
-    output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel, utils::Size,
-};
+use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
 
 use super::{
     Binding, Command, Event, Pane, PaneId, Selection, State, WindowId, clipboard, input::pane_input,
@@ -234,7 +232,7 @@ impl State {
             size: (size.width() as i32, size.height() as i32).into(),
             refresh: 60_000,
         };
-        self.mode = Size::from((mode.size.w, mode.size.h));
+        self.mode = self.logical_size(size.width(), size.height());
         for previous in self.output.modes() {
             if previous != mode {
                 self.output.delete_mode(previous);

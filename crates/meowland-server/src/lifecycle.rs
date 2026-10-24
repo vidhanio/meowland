@@ -4,9 +4,26 @@ use std::time::{Duration, Instant};
 
 use rustix::process::Signal;
 
-use super::{CompositorCommand, ControlResponse, Ordering, Server, Termination, notify};
+use super::{CompositorCommand, Server, Termination, notify};
 
 const GRACE: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositorStatus {
+    Running,
+    Failed,
+    Exited,
+}
+
+impl CompositorStatus {
+    pub const fn alive(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub const fn failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
 
 pub enum Escalation {
     Hangup,
@@ -47,14 +64,18 @@ impl Shutdown {
 
 impl Server {
     pub fn compositor_gone(&mut self) {
-        self.compositor_alive = false;
         match self.shutdown {
             Shutdown::Running => {
-                self.compositor_failed = true;
+                self.compositor = CompositorStatus::Failed;
                 self.begin_shutdown();
             }
-            Shutdown::Waiting => self.shutdown = Shutdown::Stopped,
-            _ => {}
+            Shutdown::Waiting => {
+                self.compositor = CompositorStatus::Exited;
+                self.shutdown = Shutdown::Stopped;
+            }
+            Shutdown::Closing { .. } | Shutdown::Escalating { .. } | Shutdown::Stopped => {
+                self.compositor = CompositorStatus::Exited;
+            }
         }
     }
 
@@ -71,12 +92,7 @@ impl Server {
         ]);
         self.listeners.take();
         self.handshakes.abort_all();
-        for (_, pending) in self.pending.drain() {
-            pending.reply.waiting.store(false, Ordering::Relaxed);
-            pending
-                .reply
-                .send(ControlResponse::Error("server stopping".into()));
-        }
+        self.requests.close_all("server stopping");
         let _ = self.commands.send(CompositorCommand::CloseAll);
         let ids: Vec<_> = self.panes.keys().copied().collect();
         for id in ids {
@@ -87,12 +103,10 @@ impl Server {
     pub fn force_shutdown(&mut self) {
         let mut tree = match std::mem::replace(&mut self.shutdown, Shutdown::Stopped) {
             Shutdown::Escalating { tree, .. } => tree,
-            _ => Termination::new(std::mem::take(&mut self.child_groups)),
+            _ => Termination::new(self.children.take_groups()),
         };
         tree.signal(Signal::KILL);
-        for (_, pending) in self.pending.drain() {
-            pending.reply.waiting.store(false, Ordering::Relaxed);
-        }
+        self.requests.abandon_all();
         self.controls.abort_all();
         self.handshakes.abort_all();
         self.connections.abort_all();
@@ -106,7 +120,7 @@ impl Server {
                 self.controls.abort_all();
                 self.panes.clear();
                 self.connections.abort_all();
-                let mut tree = Termination::new(std::mem::take(&mut self.child_groups));
+                let mut tree = Termination::new(self.children.take_groups());
                 tree.signal(Signal::HUP);
                 Shutdown::Escalating {
                     stage: Escalation::Hangup,
@@ -143,7 +157,7 @@ impl Server {
                 ..
             } => {
                 let _ = self.commands.send(CompositorCommand::Shutdown);
-                if self.compositor_alive {
+                if self.compositor.alive() {
                     Shutdown::Waiting
                 } else {
                     Shutdown::Stopped

@@ -1,28 +1,20 @@
 use std::{
-    collections::{HashMap, HashSet},
-    ffi::OsString,
+    collections::HashMap,
     io,
-    path::PathBuf,
-    process::Child,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::{Duration, Instant},
 };
 
 use calloop::channel;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinSet,
-};
+use tokio::{sync::mpsc, task::JoinSet};
 
 mod actor;
+mod control;
 mod lifecycle;
 mod process;
 mod transport;
 
-use lifecycle::Shutdown;
+use control::{Launch, Operation, PendingControl, Reply, Requests};
+use lifecycle::{CompositorStatus, Shutdown};
 use meowland_compositor::{
     self as compositor, Command as CompositorCommand, Event as CompositorEvent, PaneId,
 };
@@ -31,7 +23,7 @@ use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, KEY_Q, KEY_W, PaneToServer, Paths,
     ServerToPane, WindowInfo,
 };
-use process::{Termination, launch_client};
+use process::{Children, Termination, launch_client};
 use transport::{Listeners, Pane, ReadyPane};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -43,40 +35,6 @@ enum Incoming {
     PaneMessage(PaneId, PaneToServer),
 }
 
-struct Reply {
-    sender: oneshot::Sender<ControlResponse>,
-    waiting: Arc<AtomicBool>,
-    deadline: Instant,
-}
-
-impl Reply {
-    fn waiting(&self) -> bool {
-        self.waiting.load(Ordering::Relaxed)
-            && !self.sender.is_closed()
-            && Instant::now() < self.deadline
-    }
-
-    fn send(self, response: ControlResponse) {
-        let _ = self.sender.send(response);
-    }
-}
-
-struct Launch {
-    args: Vec<OsString>,
-    env: Vec<(OsString, OsString)>,
-    cwd: PathBuf,
-}
-
-enum Operation {
-    Launch(Launch),
-    Close,
-}
-
-struct PendingControl {
-    operation: Operation,
-    reply: Reply,
-}
-
 struct Server {
     incoming: IncomingSender,
     messages: mpsc::Receiver<Incoming>,
@@ -85,10 +43,8 @@ struct Server {
     display: String,
     panes: HashMap<PaneId, Pane>,
     windows: HashMap<u64, WindowInfo>,
-    children: Vec<Child>,
-    child_groups: HashSet<u32>,
-    pending: HashMap<u64, PendingControl>,
-    next_request: u64,
+    children: Children,
+    requests: Requests,
     next_pane: u64,
     listeners: Option<Listeners>,
     controls: JoinSet<io::Result<()>>,
@@ -96,8 +52,7 @@ struct Server {
     connections: JoinSet<PaneId>,
     accept_retry: Option<Instant>,
     shutdown: Shutdown,
-    compositor_alive: bool,
-    compositor_failed: bool,
+    compositor: CompositorStatus,
     interrupted: signals::TerminationFlag,
 }
 
@@ -250,55 +205,32 @@ impl Server {
                 return;
             }
             ControlRequest::Kill(show) => {
-                let waiting = reply.waiting.clone();
-                let request = self.begin_control(Operation::Close, reply);
+                let waiting = reply.waiting_handle();
+                let begun = self.requests.begin(Operation::Close, reply);
                 CompositorCommand::Kill {
-                    request,
+                    request: begun.request,
                     show,
                     waiting,
-                    deadline: self.pending[&request].reply.deadline,
+                    deadline: begun.deadline,
                 }
             }
             ControlRequest::Run { args, env, cwd } => {
-                let request =
-                    self.begin_control(Operation::Launch(Launch { args, env, cwd }), reply);
-                CompositorCommand::CreateActivationToken { request }
+                let begun = self
+                    .requests
+                    .begin(Operation::Launch(Launch { args, env, cwd }), reply);
+                CompositorCommand::CreateActivationToken {
+                    request: begun.request,
+                }
             }
         };
         if self.commands.send(command).is_err() {
-            self.compositor_failed = true;
+            self.compositor = CompositorStatus::Failed;
             self.begin_shutdown();
         }
     }
 
-    fn begin_control(&mut self, operation: Operation, reply: Reply) -> u64 {
-        let request = self.next_request;
-        self.next_request += 1;
-        self.pending
-            .insert(request, PendingControl { operation, reply });
-        request
-    }
-
     fn finish_control(&mut self, request: u64) -> Option<PendingControl> {
-        let pending = self.pending.remove(&request)?;
-        if pending.reply.waiting() && self.shutdown.running() {
-            Some(pending)
-        } else {
-            pending.reply.waiting.store(false, Ordering::Relaxed);
-            pending
-                .reply
-                .send(ControlResponse::Error("control request expired".into()));
-            None
-        }
-    }
-
-    fn timeout_control(&mut self, request: u64) {
-        if let Some(pending) = self.pending.remove(&request) {
-            pending.reply.waiting.store(false, Ordering::Relaxed);
-            pending.reply.send(ControlResponse::Error(
-                "compositor request timed out".into(),
-            ));
-        }
+        self.requests.finish(request, self.shutdown.running())
     }
 
     fn activation_created(&mut self, request: u64, token: String) {
@@ -325,8 +257,7 @@ impl Server {
             &token,
         ) {
             Ok(child) => {
-                self.child_groups.insert(child.id());
-                self.children.push(child);
+                self.children.add(child);
                 pending.reply.send(ControlResponse::Started(token));
             }
             Err(error) => {
@@ -430,15 +361,5 @@ impl Server {
         if self.panes.remove(&id).is_some() {
             let _ = self.commands.send(CompositorCommand::Detach { pane: id });
         }
-    }
-
-    fn reap_children(&mut self) {
-        self.children.retain_mut(|child| {
-            let running = matches!(child.try_wait(), Ok(None));
-            if !running {
-                self.child_groups.remove(&child.id());
-            }
-            running
-        });
     }
 }

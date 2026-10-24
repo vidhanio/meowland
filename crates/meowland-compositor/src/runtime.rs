@@ -1,6 +1,7 @@
 //! Wayland client acceptance and compositor event-loop ownership.
 
 use std::{
+    io,
     sync::{Arc, mpsc},
     time::Instant,
 };
@@ -18,6 +19,8 @@ use smithay::{
 
 use super::{Command, Event, State};
 
+const ACCEPTS_PER_TURN: usize = 32;
+
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
@@ -29,6 +32,97 @@ impl ClientData for ClientState {
     fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
 }
 
+struct Runtime {
+    display: Display<State>,
+    event_loop: EventLoop<'static, State>,
+    state: State,
+}
+
+impl Runtime {
+    fn new(
+        name: &str,
+        rx: channel::Channel<Command>,
+        events: tokio::sync::mpsc::UnboundedSender<Event>,
+        scale: UiScale,
+    ) -> io::Result<Self> {
+        let display = Display::<State>::new().map_err(io::Error::other)?;
+        let event_loop = EventLoop::<State>::try_new()?;
+        let mut state = State::new(display.handle(), event_loop.handle(), events, scale);
+        let keymap = XkbConfig {
+            layout: "us",
+            ..XkbConfig::default()
+        };
+        state.keyboard = Some(
+            state
+                .seat
+                .add_keyboard(keymap, 600, 25)
+                .map_err(io::Error::other)?,
+        );
+        let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;
+        let handle = event_loop.handle();
+        handle
+            .insert_source(rx, |event, (), state| match event {
+                channel::Event::Msg(command) => state.handle_command(command),
+                channel::Event::Closed => state.shutdown = true,
+            })
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        handle
+            .insert_source(
+                Generic::new(listener, Interest::READ, Mode::Level),
+                |_, listener, state| {
+                    for _ in 0..ACCEPTS_PER_TURN {
+                        let Some(stream) = listener.accept()? else {
+                            break;
+                        };
+                        if let Err(error) = state
+                            .display
+                            .insert_client(stream, Arc::new(ClientState::default()))
+                        {
+                            tracing::debug!(%error, "Cannot register Wayland client");
+                        }
+                    }
+                    Ok(PostAction::Continue)
+                },
+            )
+            .map_err(io::Error::other)?;
+        handle
+            .insert_source(
+                Generic::new(rustix::io::dup(&display)?, Interest::READ, Mode::Level),
+                |_, _, _| Ok(PostAction::Continue),
+            )
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            display,
+            event_loop,
+            state,
+        })
+    }
+
+    fn run(mut self) {
+        while !self.state.shutdown {
+            if let Err(error) = self
+                .event_loop
+                .dispatch(self.state.next_wakeup(Instant::now()), &mut self.state)
+            {
+                tracing::warn!(%error, "compositor readiness loop stopped");
+                break;
+            }
+            if let Err(error) = self.display.dispatch_clients(&mut self.state) {
+                tracing::warn!(%error, "Wayland client dispatch stopped");
+                break;
+            }
+            self.state.refresh_popup_grab();
+            self.state.expire_activation_tokens();
+            self.state.frame_callbacks();
+            self.state.dispatch_frames();
+            if let Err(error) = self.display.flush_clients() {
+                tracing::warn!(%error, "Wayland client flush stopped");
+                break;
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the compositor thread's channels are handed over once, when the thread starts"
@@ -37,82 +131,17 @@ pub fn run(
     name: String,
     rx: channel::Channel<Command>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
-    ready: mpsc::Sender<std::io::Result<()>>,
+    ready: mpsc::Sender<io::Result<()>>,
     scale: UiScale,
 ) {
-    let Ok(mut display) = Display::<State>::new() else {
-        let _ = ready.send(Err(std::io::Error::other(
-            "could not create Wayland display",
-        )));
-        return;
-    };
-    let mut event_loop = match EventLoop::<State>::try_new() {
-        Ok(event_loop) => event_loop,
+    match Runtime::new(&name, rx, events, scale) {
+        Ok(runtime) => {
+            if ready.send(Ok(())).is_ok() {
+                runtime.run();
+            }
+        }
         Err(error) => {
-            let _ = ready.send(Err(std::io::Error::other(error)));
-            return;
+            let _ = ready.send(Err(error));
         }
-    };
-    let mut state = State::new(display.handle(), event_loop.handle(), events, scale);
-    let keymap = XkbConfig {
-        layout: "us",
-        ..XkbConfig::default()
-    };
-    let Ok(keyboard) = state.seat.add_keyboard(keymap, 600, 25) else {
-        let _ = ready.send(Err(std::io::Error::other(
-            "could not compile the keyboard keymap",
-        )));
-        return;
-    };
-    state.keyboard = Some(keyboard);
-    let Ok(listener) = ListeningSocket::bind(name) else {
-        let _ = ready.send(Err(std::io::Error::other("could not bind Wayland socket")));
-        return;
-    };
-    let setup = (|| -> std::io::Result<()> {
-        let handle = event_loop.handle();
-        handle
-            .insert_source(rx, |event, (), state| match event {
-                channel::Event::Msg(command) => state.handle_command(command),
-                channel::Event::Closed => state.shutdown = true,
-            })
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        handle
-            .insert_source(
-                Generic::new(listener, Interest::READ, Mode::Level),
-                |_, listener, state| {
-                    while let Some(stream) = listener.accept()? {
-                        let _ = state
-                            .display
-                            .insert_client(stream, Arc::new(ClientState::default()));
-                    }
-                    Ok(PostAction::Continue)
-                },
-            )
-            .map_err(std::io::Error::other)?;
-        handle
-            .insert_source(
-                Generic::new(rustix::io::dup(&display)?, Interest::READ, Mode::Level),
-                |_, _, _| Ok(PostAction::Continue),
-            )
-            .map_err(std::io::Error::other)?;
-        Ok(())
-    })();
-    if let Err(error) = setup {
-        let _ = ready.send(Err(error));
-        return;
-    }
-    let _ = ready.send(Ok(()));
-    while !state.shutdown {
-        if let Err(error) = event_loop.dispatch(state.next_wakeup(Instant::now()), &mut state) {
-            tracing::warn!(%error, "compositor readiness loop stopped");
-            break;
-        }
-        let _ = display.dispatch_clients(&mut state);
-        state.refresh_popup_grab();
-        state.expire_activation_tokens();
-        state.frame_callbacks();
-        state.dispatch_frames();
-        let _ = display.flush_clients();
     }
 }

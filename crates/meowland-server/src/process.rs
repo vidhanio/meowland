@@ -52,6 +52,43 @@ pub fn launch_client(
         .map_err(|error| Error::io(format!("starting {}", executable.to_string_lossy()), error))
 }
 
+/// Live child roots and the process groups they lead.
+#[derive(Default)]
+pub struct Children {
+    handles: Vec<Child>,
+    groups: HashSet<u32>,
+}
+
+impl Children {
+    pub fn add(&mut self, child: Child) {
+        self.groups.insert(child.id());
+        self.handles.push(child);
+    }
+
+    pub fn reap(&mut self) {
+        let groups = &mut self.groups;
+        self.handles.retain_mut(|child| {
+            let id = child.id();
+            match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(_)) => {
+                    groups.remove(&id);
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(pid = id, %error, "cannot reap child process");
+                    groups.remove(&id);
+                    false
+                }
+            }
+        });
+    }
+
+    pub fn take_groups(&mut self) -> HashSet<u32> {
+        std::mem::take(&mut self.groups)
+    }
+}
+
 /// Retain process handles across escalation so orphaned helpers remain
 /// reachable without signaling a reused PID.
 pub struct Termination {

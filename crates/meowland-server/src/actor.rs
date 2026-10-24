@@ -1,7 +1,7 @@
 //! The server actor exclusively owns policy, clients, and request deadlines.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
     time::{Duration, Instant},
 };
@@ -10,7 +10,14 @@ use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
 use meowland_protocol::Paths;
 use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 
-use super::{Server, compositor, lifecycle::Shutdown, notify, transport};
+use super::{
+    Server, compositor,
+    control::Requests,
+    lifecycle::{CompositorStatus, Shutdown},
+    notify,
+    process::Children,
+    transport,
+};
 
 const MAX_PANES: usize = 256;
 const MAX_CONTROLS: usize = 64;
@@ -34,10 +41,14 @@ pub async fn serve(paths: &Paths, scale: meowland_core::scale::UiScale) -> Resul
     ])?;
     let descriptor = Descriptor::new(rustix::io::dup(&wakeup).map_err(io::Error::from)?)?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
-    let (commands, events, display, compositor_thread) =
-        tokio::task::spawn_blocking(move || compositor::spawn_scaled(scale))
-            .await
-            .map_err(io::Error::other)??;
+    let compositor::Handle {
+        commands,
+        events,
+        display,
+        thread: compositor_thread,
+    } = tokio::task::spawn_blocking(move || compositor::spawn_scaled(scale))
+        .await
+        .map_err(io::Error::other)??;
     let (incoming, messages) = mpsc::channel(INCOMING_QUEUE);
     let mut server = Server {
         incoming,
@@ -47,10 +58,8 @@ pub async fn serve(paths: &Paths, scale: meowland_core::scale::UiScale) -> Resul
         display,
         panes: HashMap::new(),
         windows: HashMap::new(),
-        children: Vec::new(),
-        child_groups: HashSet::new(),
-        pending: HashMap::new(),
-        next_request: 1,
+        children: Children::default(),
+        requests: Requests::new(),
         next_pane: 1,
         listeners: Some(listeners),
         controls: JoinSet::new(),
@@ -58,8 +67,7 @@ pub async fn serve(paths: &Paths, scale: meowland_core::scale::UiScale) -> Resul
         connections: JoinSet::new(),
         accept_retry: None,
         shutdown: Shutdown::Running,
-        compositor_alive: true,
-        compositor_failed: false,
+        compositor: CompositorStatus::Running,
         interrupted,
     };
     notify(&[
@@ -79,9 +87,9 @@ pub async fn serve(paths: &Paths, scale: meowland_core::scale::UiScale) -> Resul
     let joined = tokio::task::spawn_blocking(move || compositor_thread.join())
         .await
         .map_err(io::Error::other)?;
-    server.reap_children();
+    server.children.reap();
     result?;
-    if server.compositor_failed || joined.is_err() {
+    if server.compositor.failed() || joined.is_err() {
         return Err(Error::io(
             "compositor thread stopped unexpectedly",
             io::Error::other("display unavailable"),
@@ -107,10 +115,10 @@ impl Server {
             let pane_capacity = self.handshakes.len() < MAX_HANDSHAKES
                 && self.handshakes.len() + self.connections.len() < MAX_PANES;
             tokio::select! {
-                result = wakeup.read(&mut signals) => { result?; self.reap_children(); }
+                result = wakeup.read(&mut signals) => { result?; self.children.reap(); }
                 () = sleep_until(deadline) => {}
                 Some(message) = self.messages.recv() => self.incoming(message),
-                event = self.events.recv(), if self.compositor_alive => {
+                event = self.events.recv(), if self.compositor.alive() => {
                     if let Some(event) = event { self.compositor_event(event); }
                     else { self.compositor_gone(); }
                 }
@@ -174,9 +182,9 @@ impl Server {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        self.pending
-            .values()
-            .map(|pending| pending.reply.deadline)
+        self.requests
+            .next_deadline()
+            .into_iter()
             .chain(self.shutdown.deadline())
             .chain(self.accept_retry)
             .min()
@@ -184,15 +192,7 @@ impl Server {
 
     fn expire_deadlines(&mut self) {
         let now = Instant::now();
-        let expired: Vec<_> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| !pending.reply.waiting())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            self.timeout_control(id);
-        }
+        self.requests.expire(now);
         if self.accept_retry.is_some_and(|deadline| deadline <= now) {
             self.accept_retry = None;
         }

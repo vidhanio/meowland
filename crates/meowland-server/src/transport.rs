@@ -210,15 +210,11 @@ impl Drop for Waiting {
 pub async fn control(socket: UnixStream, incoming: IncomingSender) -> io::Result<()> {
     let (mut rx, mut tx) = socket.into_split();
     let request: ControlRequest =
-        tokio::time::timeout(Duration::from_secs(1), Reader::new(&mut rx).read()).await??;
+        tokio::time::timeout(CONTROL_TIMEOUT, Reader::new(&mut rx).read()).await??;
     let (sender, answer) = oneshot::channel();
     let waiting = Waiting(Arc::new(AtomicBool::new(true)));
     let deadline = std::time::Instant::now() + CONTROL_TIMEOUT;
-    let reply = Reply {
-        sender,
-        waiting: Arc::clone(&waiting.0),
-        deadline,
-    };
+    let reply = Reply::new(sender, Arc::clone(&waiting.0), deadline);
     let response = tokio::time::timeout_at(deadline.into(), async {
         incoming
             .send(Incoming::Control(request, reply))

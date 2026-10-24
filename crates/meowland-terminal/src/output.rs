@@ -7,6 +7,9 @@ use std::{
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+/// Most bytes written to the terminal in one scheduling turn.
+const WRITE_BUDGET: usize = 64 * 1024;
+
 /// A separate open file description leaves stdout's blocking flags untouched,
 /// including the descriptor used to restore terminal modes on exit.
 pub fn open() -> io::Result<File> {
@@ -40,7 +43,7 @@ impl Output {
 
     /// Never monopolize the input loop, even when the terminal is writable.
     pub async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
-        let end = self.bytes.len().min(self.offset + 64 * 1024);
+        let end = self.bytes.len().min(self.offset + WRITE_BUDGET);
         if self.offset < end {
             let written = writer.write(&self.bytes[self.offset..end]).await?;
             if written == 0 {

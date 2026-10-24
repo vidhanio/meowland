@@ -200,9 +200,10 @@ impl Clipboard {
             self.failed(&request);
             return;
         }
-        if matches!(request, Request::Write { .. }) {
-            self.requests
-                .retain(|queued| !matches!(queued.request, Request::Write { .. }));
+        if let Request::Write { selection, .. } = &request {
+            self.requests.retain(|queued| {
+                !matches!(&queued.request, Request::Write { selection: target, .. } if target == selection)
+            });
         }
         if self.requests.len() >= 16 {
             tracing::warn!("Clipboard request queue is full");

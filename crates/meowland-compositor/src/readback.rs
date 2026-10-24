@@ -10,7 +10,7 @@ use std::{
 
 use calloop::{Interest, Mode, PostAction, generic::Generic};
 use meowland_core::pixels::FrameSize;
-use meowland_render::{Readback, Submission};
+use meowland_render::{Readback, Submission, source_bound};
 use smithay::{
     backend::allocator::{
         Buffer,
@@ -19,7 +19,10 @@ use smithay::{
     reexports::wayland_server::{
         Client, DisplayHandle, Resource, Weak, backend::ObjectId, protocol::wl_buffer::WlBuffer,
     },
-    wayland::compositor::{Blocker, BlockerState, Cacheable, add_blocker, with_states},
+    utils::Transform,
+    wayland::compositor::{
+        Blocker, BlockerState, Cacheable, SurfaceAttributes, add_blocker, with_states,
+    },
 };
 
 use super::{ClientState, Snapshot, State, WlSurface, sources::Sources};
@@ -187,6 +190,10 @@ pub struct Readbacks {
     budget: Arc<Mutex<Budget>>,
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "`cached` borrows the cached state and must outlive `pending`"
+)]
 pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf: Dmabuf) {
     let Some(client) = surface.client() else {
         return;
@@ -216,6 +223,15 @@ pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf
         tracing::warn!("DMA-BUF readback budget exhausted; retaining previous pixels");
         return;
     };
+    let (scale, transform) = with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<SurfaceAttributes>();
+        let pending = cached.pending();
+        (
+            pending.buffer_scale,
+            Transform::from(pending.buffer_transform),
+        )
+    });
+    let bound = source_bound(state.pane_bound(surface), scale, transform);
     readers.pending.fetch_add(1, Ordering::AcqRel);
     let slot = Arc::new(Slot {
         snapshot: Mutex::new(None),
@@ -242,7 +258,7 @@ pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf
             acquire_cancelled: acquire_cancelled.clone(),
             phase: Phase::Acquiring(dmabuf),
             sources: Sources::new(&state.handle),
-            bound: state.pane_bound(surface),
+            bound,
         },
     );
     match acquire {

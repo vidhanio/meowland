@@ -12,6 +12,17 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Create the one-pixel snapshot behind a `wp_single_pixel_buffer`.
+    #[must_use]
+    pub fn single_pixel(pixel: [u8; 4]) -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            pixels: pixel.to_vec(),
+            opaque: pixel[3] == 255,
+        }
+    }
+
     /// Copy a committed shm buffer, reusing the previous snapshot's storage.
     /// On invalid input, the previous snapshot remains intact.
     ///

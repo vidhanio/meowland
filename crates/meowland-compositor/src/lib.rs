@@ -30,9 +30,9 @@ use smithay::{
     reexports::wayland_server::{
         Client, Display, DisplayHandle, ListeningSocket, Resource,
         backend::{ClientData, ClientId, DisconnectReason},
-        protocol::{wl_buffer, wl_surface::WlSurface},
+        protocol::{wl_buffer, wl_output, wl_surface::WlSurface},
     },
-    utils::{Logical, Rectangle, SERIAL_COUNTER, Serial, Size},
+    utils::{Logical, Rectangle, SERIAL_COUNTER, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -69,6 +69,7 @@ use smithay::{
             xdg::{ToplevelSurface, XdgShellState, decoration::XdgDecorationState},
         },
         shm::{ShmHandler, ShmState, with_buffer_contents},
+        single_pixel_buffer::{SinglePixelBufferState, get_single_pixel_buffer},
         viewporter::{ViewportCachedState, ViewporterState},
         xdg_activation::XdgActivationState,
     },
@@ -268,7 +269,12 @@ struct Window {
     callback_pending: bool,
 }
 
-type ViewportGeometry = (Option<Rectangle<f64, Logical>>, Option<Size<i32, Logical>>);
+type SurfaceGeometryState = (
+    Option<Rectangle<f64, Logical>>,
+    Option<Size<i32, Logical>>,
+    i32,
+    wl_output::Transform,
+);
 
 struct State {
     display: DisplayHandle,
@@ -286,6 +292,7 @@ struct State {
     _viewporter: ViewporterState,
     _fractional_scale: FractionalScaleManagerState,
     scale: UiScale,
+    _single_pixel_buffer: SinglePixelBufferState,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
     data_control: WlrDataControlState,
@@ -308,8 +315,8 @@ struct State {
     windows: HashMap<WindowId, Window>,
     ids: HashMap<WlSurface, WindowId>,
     snapshots: HashMap<WlSurface, Snapshot>,
-    /// Cached to distinguish viewport changes from frame-only commits.
-    viewport_geometry: HashMap<WlSurface, ViewportGeometry>,
+    /// Cached to distinguish geometry changes from frame-only commits.
+    surface_geometry: HashMap<WlSurface, SurfaceGeometryState>,
     catalog: WindowCatalog,
     toplevels: toplevels::Toplevels,
     attachments: Attachments,
@@ -400,22 +407,32 @@ impl CompositorHandler for State {
     )]
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
-        let (assignment, damaged, viewport, callbacks) = with_states(surface, |states| {
-            let (assignment, damaged, callbacks) = {
-                let mut cached = states.cached_state.get::<SurfaceAttributes>();
-                let current = cached.current();
-                let damaged = !current.damage.is_empty();
-                current.damage.clear();
+        let (assignment, damaged, scale, transform, viewport, callbacks) =
+            with_states(surface, |states| {
+                let (assignment, damaged, scale, transform, callbacks) = {
+                    let mut cached = states.cached_state.get::<SurfaceAttributes>();
+                    let current = cached.current();
+                    let damaged = !current.damage.is_empty();
+                    current.damage.clear();
+                    (
+                        current.buffer.take(),
+                        damaged,
+                        current.buffer_scale,
+                        current.buffer_transform,
+                        !current.frame_callbacks.is_empty(),
+                    )
+                };
+                let mut viewport = states.cached_state.get::<ViewportCachedState>();
+                let current = viewport.current();
                 (
-                    current.buffer.take(),
+                    assignment,
                     damaged,
-                    !current.frame_callbacks.is_empty(),
+                    scale,
+                    transform,
+                    (current.src, current.dst),
+                    callbacks,
                 )
-            };
-            let mut viewport = states.cached_state.get::<ViewportCachedState>();
-            let current = viewport.current();
-            (assignment, damaged, (current.src, current.dst), callbacks)
-        });
+            });
         if callbacks
             && let Some(window) = self
                 .window_for_surface(surface)
@@ -423,34 +440,49 @@ impl CompositorHandler for State {
         {
             window.callback_pending = true;
         }
-        let viewport_changed = if viewport.0.is_some() || viewport.1.is_some() {
-            self.viewport_geometry.insert(surface.clone(), viewport) != Some(viewport)
+        let geometry = (viewport.0, viewport.1, scale, transform);
+        let geometry_changed = if geometry.0.is_some()
+            || geometry.1.is_some()
+            || scale != 1
+            || transform != wl_output::Transform::Normal
+        {
+            self.surface_geometry.insert(surface.clone(), geometry) != Some(geometry)
         } else {
-            self.viewport_geometry.remove(surface).is_some()
+            self.surface_geometry.remove(surface).is_some()
         };
         let visual_change = assignment.is_some()
             || damaged
-            || viewport_changed
+            || geometry_changed
             || get_parent(surface).is_some()
             || !get_children(surface).is_empty()
             || self.popups.find_popup(surface).is_some()
             || PopupManager::popups_for_surface(surface).next().is_some();
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
-                let bound = self.pane_bound(surface);
+                let bound = render::source_bound(
+                    self.pane_bound(surface),
+                    scale,
+                    Transform::from(transform),
+                );
                 let mut previous = self.snapshots.remove(surface);
-                let snapshot = if get_dmabuf(&buffer).is_ok() {
-                    readback::snapshot(surface)
-                } else {
-                    with_buffer_contents(&buffer, |ptr, len, data| {
-                        // SAFETY: Smithay keeps the mapped pool readable for
-                        // this callback and supplies
-                        // its pointer and length together.
-                        unsafe { Snapshot::copy_shm(ptr, len, &data, bound, &mut previous) }
-                    })
+                let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
-                    .flatten()
-                };
+                    .map(|pixel| Snapshot::single_pixel(pixel.rgba8888()));
+                let snapshot = single_pixel.or_else(|| {
+                    if get_dmabuf(&buffer).is_ok() {
+                        readback::snapshot(surface)
+                    } else {
+                        with_buffer_contents(&buffer, |ptr, len, data| {
+                            // SAFETY: Smithay keeps the mapped pool readable
+                            // for this callback and
+                            // supplies its pointer and length
+                            // together.
+                            unsafe { Snapshot::copy_shm(ptr, len, &data, bound, &mut previous) }
+                        })
+                        .ok()
+                        .flatten()
+                    }
+                });
                 buffer.release();
                 if let Some(snapshot) = snapshot.or(previous) {
                     self.snapshots.insert(surface.clone(), snapshot);
@@ -471,7 +503,7 @@ impl CompositorHandler for State {
     /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.snapshots.remove(surface);
-        self.viewport_geometry.remove(surface);
+        self.surface_geometry.remove(surface);
         readback::destroyed(self, surface);
     }
 }
@@ -543,6 +575,7 @@ impl State {
             _viewporter: ViewporterState::new::<Self>(&display_handle),
             _fractional_scale: FractionalScaleManagerState::new::<Self>(&display_handle),
             scale,
+            _single_pixel_buffer: SinglePixelBufferState::new::<Self>(&display_handle),
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),
             data_control,
@@ -564,7 +597,7 @@ impl State {
             windows: HashMap::new(),
             ids: HashMap::new(),
             snapshots: HashMap::new(),
-            viewport_geometry: HashMap::new(),
+            surface_geometry: HashMap::new(),
             catalog: WindowCatalog::default(),
             toplevels: toplevels::Toplevels::new(&display_handle),
             attachments: Attachments::default(),
@@ -583,7 +616,7 @@ impl State {
         }
     }
 
-    /// Pane-relative buffer limit: twice the widest and tallest attached
+    /// Logical buffer limit: twice the widest and tallest attached
     /// panes, independently, to allow an in-flight resize. Without an attached
     /// pane only the global surface limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
@@ -594,8 +627,8 @@ impl State {
             .filter(|pane| pane.window() == Some(window))
             .fold(None, |bound: Option<(u32, u32)>, pane| {
                 let pane = (
-                    pane.presentation.size.width() * 2,
-                    pane.presentation.size.height() * 2,
+                    self.scale.logical(pane.presentation.size.width()) as u32 * 2,
+                    self.scale.logical(pane.presentation.size.height()) as u32 * 2,
                 );
                 Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))))
             })

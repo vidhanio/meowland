@@ -43,7 +43,6 @@ smithay = { git = "https://github.com/Smithay/smithay.git", default-features = f
 usage-rs = { version = "7.1.0", default-features = false }
 sd-notify = "0.5.0"
 listenfd = "1.0.2"
-criterion = { version = "0.8.2", default-features = false }
 
 [workspace.lints.cargo]
 unused_dependencies = "allow"

@@ -829,8 +829,12 @@ impl State {
 
     fn focus_window(&mut self, window: WindowId) {
         self.refresh_popup_grab();
-        if self.popup_grab.is_some() || self.catalog.focused() == Some(window) {
+        if self.catalog.focused() == Some(window) {
             return;
+        }
+        if let Some(grab) = &mut self.popup_grab {
+            grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
+            self.refresh_popup_grab();
         }
         input::reset_keyboard(self);
         self.recent_serials.clear();

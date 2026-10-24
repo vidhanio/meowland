@@ -4,7 +4,7 @@
 //! frame in transit to a terminal.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -32,7 +32,7 @@ use smithay::{
         backend::{ClientData, ClientId, DisconnectReason},
         protocol::{wl_buffer, wl_surface::WlSurface},
     },
-    utils::{Logical, Rectangle, SERIAL_COUNTER, Size},
+    utils::{Logical, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -288,6 +288,7 @@ struct State {
     keyboard_pane: Option<PaneId>,
     keyboard_keys: HashSet<u16>,
     keyboard_known: bool,
+    recent_serials: VecDeque<Serial>,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<WindowId, Window>,
@@ -532,6 +533,7 @@ impl State {
             keyboard_pane: None,
             keyboard_keys: HashSet::new(),
             keyboard_known: false,
+            recent_serials: VecDeque::new(),
             pointer,
             output,
             windows: HashMap::new(),

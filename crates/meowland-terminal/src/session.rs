@@ -11,16 +11,21 @@ use meowland_protocol::{
     asynchronous::{Outgoing, Reader},
     clipboard::Selection,
 };
+use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol};
 use tokio::{
     io::AsyncReadExt,
     net::unix::{OwnedReadHalf, OwnedWriteHalf},
 };
 
 use super::{
-    Clipboard, ClipboardProtocol, FALLBACK_CELL, KEYBOARD_FLAGS, Keyboard, PanePresentation,
-    PaneStats, TerminalGuard, cursor_bytes, derived_cell, input, output, pane_pixels,
-    send_clipboard_actions, send_deferred, send_event, terminal_probe, title_bytes, window_pixels,
+    Keyboard, input, output,
+    presentation::PanePresentation,
+    probe::terminal_probe,
+    send_clipboard_actions, send_deferred, send_event,
+    terminal::{self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes},
 };
+
+const EVENTS_PER_TURN: usize = 64;
 
 enum Lifecycle {
     Handshaking { deadline: Instant },
@@ -70,7 +75,11 @@ impl TerminalSession {
         writer: OwnedWriteHalf,
         show: Show,
     ) -> Result<Self> {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let cells = terminal::cells();
+        let pixels = terminal::window_pixels();
+        let cell = terminal::derived_cell(pixels, cells);
+        let (width, height) =
+            terminal::pane_pixels(None, pixels, cells, cell.unwrap_or(FALLBACK_CELL));
         let interrupted = signals::termination_flag()?;
         let input = input::Reader::new()?;
         let signals = signals::Wakeup::new(&[
@@ -80,10 +89,6 @@ impl TerminalSession {
             signal_hook::consts::SIGWINCH,
         ])?;
         let wakeup = Descriptor::new(rustix::io::dup(&signals).map_err(io::Error::from)?)?;
-        let pixels = window_pixels();
-        let cell = derived_cell(pixels, (cols, rows));
-        let (width, height) =
-            pane_pixels(None, pixels, (cols, rows), cell.unwrap_or(FALLBACK_CELL));
         let mut tx = Outgoing::default();
         tx.send(&PaneToServer::Hello(Hello {
             width,
@@ -117,7 +122,7 @@ impl TerminalSession {
             }
             self.prepare_pending_work()?;
             let active = matches!(self.lifecycle, Lifecycle::Active(_));
-            let pending_output = active && self.presentation.pending.pending();
+            let pending_output = active && self.presentation.pending();
             let pending_input = self.input.pending();
             let deadline = self.next_deadline();
             let mut signal = [0; 256];
@@ -186,7 +191,7 @@ impl TerminalSession {
         if self.keyboard.deferred_expired() {
             send_deferred(&mut self.keyboard, &mut self.tx)?;
         }
-        self.clipboard.advance(self.presentation.pending.buffer());
+        self.clipboard.advance(self.presentation.buffer());
         send_clipboard_actions(&mut self.clipboard, &mut self.keyboard, &mut self.tx)
     }
 
@@ -218,13 +223,13 @@ impl TerminalSession {
             }
             ServerToPane::Bell => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.presentation.pending.append(b"\x07");
+                    self.presentation.append(b"\x07");
                 }
             }
             ServerToPane::ClipboardWrite { selection, data } => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
                     self.clipboard
-                        .copy(selection, data, self.presentation.pending.buffer());
+                        .copy(selection, data, self.presentation.buffer());
                 } else if selection == Selection::Primary {
                     self.window.primary = Some(data);
                 } else {
@@ -240,16 +245,14 @@ impl TerminalSession {
             ServerToPane::ClipboardCancel { request } => self.clipboard.cancel(request),
             ServerToPane::Title(title) => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.presentation.pending.append(&title_bytes(&title));
+                    self.presentation.append(&title_bytes(&title));
                 } else {
                     self.window.title = Some(title);
                 }
             }
             ServerToPane::Cursor(shape) => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.presentation
-                        .pending
-                        .append(&cursor_bytes(shape.as_deref()));
+                    self.presentation.append(&cursor_bytes(shape.as_deref()));
                 } else {
                     self.window.cursor = shape;
                 }
@@ -270,34 +273,33 @@ impl TerminalSession {
                 self.presentation
                     .draw(width, height, y, rgb, &mut self.tx)?;
                 if starting {
-                    let PendingWindow {
-                        title,
-                        cursor,
-                        clipboard,
-                        primary,
-                    } = std::mem::take(&mut self.window);
-                    if let Some(title) = title {
-                        self.presentation.pending.append(&title_bytes(&title));
-                    }
-                    self.presentation
-                        .pending
-                        .append(&cursor_bytes(cursor.as_deref()));
-                    for (selection, data) in [
-                        (Selection::Clipboard, clipboard),
-                        (Selection::Primary, primary),
-                    ] {
-                        if let Some(data) = data {
-                            self.clipboard.copy(
-                                selection,
-                                data,
-                                self.presentation.pending.buffer(),
-                            );
-                        }
-                    }
+                    self.apply_pending_window();
                 }
             }
         }
         Ok(())
+    }
+
+    fn apply_pending_window(&mut self) {
+        let PendingWindow {
+            title,
+            cursor,
+            clipboard: clipboard_data,
+            primary,
+        } = std::mem::take(&mut self.window);
+        if let Some(title) = title {
+            self.presentation.append(&title_bytes(&title));
+        }
+        self.presentation.append(&cursor_bytes(cursor.as_deref()));
+        for (selection, data) in [
+            (Selection::Clipboard, clipboard_data),
+            (Selection::Primary, primary),
+        ] {
+            if let Some(data) = data {
+                self.clipboard
+                    .copy(selection, data, self.presentation.buffer());
+            }
+        }
     }
 
     async fn start_presentation(&mut self) -> Result<()> {
@@ -330,10 +332,10 @@ impl TerminalSession {
             mode.enable_clipboard(previous)?;
         }
         self.cell = probe.cell_width.zip(probe.cell_height).or(self.cell);
-        let (width, height) = pane_pixels(
+        let (width, height) = terminal::pane_pixels(
             probe.pixel_width.zip(probe.pixel_height),
-            window_pixels(),
-            crossterm::terminal::size().unwrap_or((80, 24)),
+            terminal::window_pixels(),
+            terminal::cells(),
             self.cell.unwrap_or(FALLBACK_CELL),
         );
         self.presentation = PanePresentation::new(self.cell, shared);
@@ -345,13 +347,13 @@ impl TerminalSession {
         let _ = self.clipboard.refresh(Selection::Clipboard, false);
         let _ = self.clipboard.refresh(Selection::Primary, false);
         self.tx.send(&PaneToServer::Resize { width, height })?;
-        PaneStats::capabilities(&probe, width, height);
+        probe.log_capabilities(width, height);
         self.lifecycle = Lifecycle::Active(mode);
         Ok(())
     }
 
     fn handle_terminal_events(&mut self) -> Result<()> {
-        for _ in 0..64 {
+        for _ in 0..EVENTS_PER_TURN {
             if self.interrupted.interrupted() {
                 break;
             }
@@ -366,7 +368,7 @@ impl TerminalSession {
             send_event(
                 event,
                 &mut self.tx,
-                &mut self.presentation.presenter,
+                &mut self.presentation,
                 &mut self.cell,
                 &mut self.clipboard,
                 &mut self.keyboard,
@@ -377,15 +379,16 @@ impl TerminalSession {
     }
 
     fn close(&mut self, reason: Option<&str>) -> Result<()> {
-        if let Lifecycle::Active(mut mode) =
-            std::mem::replace(&mut self.lifecycle, Lifecycle::Closed)
-        {
-            mode.restore()?;
-        }
-        if let Some(reason) = reason {
+        let restored = match std::mem::replace(&mut self.lifecycle, Lifecycle::Closed) {
+            Lifecycle::Active(mut mode) => mode.restore(),
+            _ => Ok(()),
+        };
+        let printed = reason.map_or(Ok(()), |reason| {
             let clean = protocol::sanitize_with_limit(reason, 512);
-            writeln!(io::stdout(), "meowland: {clean}")?;
-        }
+            writeln!(io::stdout(), "meowland: {clean}")
+        });
+        restored?;
+        printed?;
         Ok(())
     }
 }

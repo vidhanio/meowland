@@ -14,8 +14,6 @@ use smithay::{
 
 use super::State;
 
-const MAX_BYTES: usize = 4096;
-
 pub fn manager(display: &DisplayHandle, seat: &Seat<State>) -> TextInputManagerState {
     let manager = TextInputManagerState::new::<State>(display);
     seat.text_input().set_compositor_input_method(true);
@@ -48,7 +46,9 @@ impl TextInputActivation for State {
 }
 
 fn valid(text: &str) -> bool {
-    !text.is_empty() && text.len() <= MAX_BYTES && !text.chars().any(char::is_control)
+    !text.is_empty()
+        && text.len() <= meowland_protocol::MAX_INPUT_TEXT
+        && !text.chars().any(char::is_control)
 }
 
 fn fallback(state: &mut State, text: &str) {

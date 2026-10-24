@@ -13,6 +13,11 @@ use meowland_protocol::clipboard::{
 
 use super::Action;
 
+const MAX_REQUESTS: usize = 16;
+const MAX_OFFERS: usize = 16;
+/// Room for every accepted MIME type at its maximum length plus a separator.
+const MAX_TYPE_LIST: usize = MAX_TYPES * 257;
+
 #[derive(Default)]
 struct Credentials {
     primary: bool,
@@ -153,8 +158,7 @@ impl Clipboard {
             selection,
             shortcut,
             epoch: self.epoch(selection),
-        });
-        self.deadline()
+        })
     }
 
     pub fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
@@ -168,7 +172,7 @@ impl Clipboard {
                     Selection::Clipboard
                 }
             });
-        self.enqueue(Request::Read {
+        let _ = self.enqueue(Request::Read {
             selection,
             request,
             offer,
@@ -227,10 +231,10 @@ impl Clipboard {
         if !data.valid() {
             return;
         }
-        self.enqueue(Request::Write { selection, data });
+        let _ = self.enqueue(Request::Write { selection, data });
     }
 
-    fn enqueue(&mut self, request: Request) {
+    fn enqueue(&mut self, request: Request) -> Option<Instant> {
         let timeout = match &request {
             Request::List { .. } => Duration::from_secs(1),
             Request::Read { deadline, .. } => deadline.remaining(),
@@ -238,23 +242,26 @@ impl Clipboard {
         };
         if timeout.is_zero() {
             self.failed(&request);
-            return;
+            return None;
         }
-        if let Request::Write { selection, .. } = &request {
-            self.cancel_lists(*selection);
+        let write_selection = match &request {
+            Request::Write { selection, .. } => Some(*selection),
+            _ => None,
+        };
+        if let Some(selection) = write_selection {
             self.requests.retain(|queued| {
-                !matches!(&queued.request, Request::Write { selection: target, .. } if target == selection)
+                !matches!(&queued.request, Request::Write { selection: target, .. } if *target == selection)
             });
+            self.cancel_lists(selection);
         }
-        if self.requests.len() >= 16 {
+        if self.requests.len() >= MAX_REQUESTS {
             tracing::warn!("Clipboard request queue is full");
             self.failed(&request);
-        } else {
-            self.requests.push_back(Queued {
-                request,
-                deadline: Instant::now() + timeout,
-            });
+            return None;
         }
+        let deadline = Instant::now() + timeout;
+        self.requests.push_back(Queued { request, deadline });
+        Some(deadline)
     }
 
     pub fn next_action(&mut self) -> Option<Action> {
@@ -383,7 +390,7 @@ impl Clipboard {
                 self.notification = Some(Reading::new());
             }
             if let Some(reading) = &mut self.notification {
-                match reading.accept(&packet, ".", MAX_TYPES * 257) {
+                match reading.accept(&packet, ".", MAX_TYPE_LIST) {
                     Some(true) => {
                         let reading = self.notification.take().unwrap();
                         let selection = if reading.credentials.primary {
@@ -415,7 +422,7 @@ impl Clipboard {
                 _ => None,
             },
             Request::List { .. } if packet.kind == "read" => {
-                operation.reading.accept(&packet, ".", MAX_TYPES * 257)
+                operation.reading.accept(&packet, ".", MAX_TYPE_LIST)
             }
             Request::Read { mime, .. } if packet.kind == "read" => {
                 operation.reading.accept(&packet, mime, MAX_BYTES)
@@ -469,7 +476,7 @@ impl Clipboard {
         let mimes = mime_types(types.split_ascii_whitespace().map(str::to_owned));
         self.next += 1;
         let offer = self.next;
-        if self.offers.len() >= 16
+        if self.offers.len() >= MAX_OFFERS
             && let Some(oldest) = self.offers.keys().min().copied()
         {
             self.offers.remove(&oldest);

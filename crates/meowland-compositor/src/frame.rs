@@ -126,8 +126,8 @@ impl State {
             .min()
     }
 
-    /// Pace visible clients at the output refresh rate and hidden clients at
-    /// one Hz, independently of terminal acknowledgements.
+    /// Pace visible clients at 120 Hz and hidden clients at one Hz,
+    /// independently of terminal acknowledgements.
     pub fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed().as_millis() as u32;
@@ -140,7 +140,11 @@ impl State {
             } else {
                 Duration::from_secs(1)
             };
-            window.callback_due = now + interval;
+            let late = now
+                .saturating_duration_since(window.callback_due)
+                .as_nanos();
+            let ticks = late / interval.as_nanos() + 1;
+            window.callback_due += interval * u32::try_from(ticks).unwrap_or(u32::MAX);
             window.callback_pending = false;
             self.renderer
                 .for_each_surface(window.surface.wl_surface(), |surface| {

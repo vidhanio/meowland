@@ -12,7 +12,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use meowland_core::pixels::FrameSize;
-use rustix::{fs::Mode, io::Errno, shm};
+use rustix::{fs::Mode, shm};
 
 mod encoding;
 use encoding::{Encoder, Encoding};
@@ -34,6 +34,7 @@ pub const PROBE_ID: u32 = 32;
 #[derive(Debug)]
 pub struct SharedMemory {
     name: String,
+    encoded_name: String,
 }
 
 impl SharedMemory {
@@ -45,7 +46,8 @@ impl SharedMemory {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
-        let slot = Self { name };
+        let encoded_name = STANDARD.encode(name.as_bytes());
+        let slot = Self { name, encoded_name };
         slot.clear();
         slot
     }
@@ -62,7 +64,7 @@ impl SharedMemory {
         Some(
             format!(
                 "\x1b_Ga=q,f=24,s=1,v=1,i={PROBE_ID},t=s;{}\x1b\\",
-                STANDARD.encode(self.name.as_bytes())
+                self.encoded_name
             )
             .into_bytes(),
         )
@@ -94,12 +96,11 @@ impl SharedMemory {
             self.clear();
             return false;
         }
-        let payload = STANDARD.encode(self.name.as_bytes());
-        out.reserve(payload.len() + 96);
+        out.reserve(self.encoded_name.len() + 96);
         out.extend_from_slice(b"\x1b_G");
         transmit(out, SCREEN_ID, width, height, 0);
         out.extend_from_slice(b",t=s;");
-        out.extend_from_slice(payload.as_bytes());
+        out.extend_from_slice(self.encoded_name.as_bytes());
         out.extend_from_slice(b"\x1b\\");
         true
     }
@@ -275,7 +276,7 @@ impl Presenter {
                 self.drops = 0;
                 return SharedFrame::Ready(file);
             }
-            Err(error) if error.raw_os_error() == Some(Errno::EXIST.raw_os_error()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 tracing::warn!(%error, "Shared-memory transport unavailable; using inline frames");
                 self.shared = None;

@@ -382,12 +382,18 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         _ => return None,
     };
     let shortcut = modifiers & (CONTROL | ALT | SUPER | HYPER | META) != 0;
-    if let Some(text) = text
-        && matches!(kind, Kind::Press | Kind::Repeat)
+    if matches!(kind, Kind::Press | Kind::Repeat)
         && !shortcut
         && crate::keyboard::key_code(code).is_none()
     {
-        return Some(Event::Text(text));
+        let text = text.or_else(|| {
+            char::from_u32(code)
+                .filter(|character| !character.is_control() && !(0xe000..=0xf8ff).contains(&code))
+                .map(|character| character.to_string())
+        });
+        if let Some(text) = text {
+            return Some(Event::Text(text));
+        }
     }
     Some(Event::Key(Key {
         code,
@@ -405,7 +411,7 @@ fn committed_text(params: &[CsiParam]) -> Option<String> {
         }
         text.push(character);
     }
-    (!text.is_empty() && text.len() <= MAX_TEXT).then_some(text)
+    (!text.is_empty() && text.len() <= meowland_protocol::MAX_INPUT_TEXT).then_some(text)
 }
 
 fn mouse(report: &[u8]) -> Option<Event> {

@@ -442,8 +442,8 @@ fn send_event(
             }
         }
         Event::Text(text) => {
-            if text.len() <= MAX_TEXT {
-                tx.send(&PaneToServer::Input(Input::Text(text)))?;
+            if text.len() <= protocol::MAX_INPUT_TEXT {
+                send_input(Input::Text(text), keyboard.deadline(), keyboard, tx)?;
             }
         }
         Event::Focus(focused) => {

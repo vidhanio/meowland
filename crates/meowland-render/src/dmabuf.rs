@@ -326,7 +326,6 @@ impl DmabufBackend {
 
     /// Submit rendering and PBO readback in one context, then fence both
     /// operations.
-    /// Submit readback work and export a fence covering rendering and the copy.
     ///
     /// # Errors
     /// Returns a snapshot error; check `release_safe` before releasing the
@@ -366,7 +365,6 @@ impl DmabufBackend {
     }
 
     /// Map only after the submission's native fence has reported completion.
-    /// Complete a submitted readback after its fence becomes readable.
     ///
     /// # Errors
     /// Returns an error if mapping or pixel conversion fails.

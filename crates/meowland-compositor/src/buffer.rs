@@ -71,7 +71,7 @@ impl DmabufHandler for State {
 
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor
+        &mut self.surfaces
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {

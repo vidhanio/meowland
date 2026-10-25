@@ -7,7 +7,7 @@ use smithay::{
 use super::State;
 
 impl State {
-    pub fn refresh_popup_grab(&mut self) {
+    pub(crate) fn refresh_popup_grab(&mut self) {
         self.popups.cleanup();
         if self
             .popup_grab

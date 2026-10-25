@@ -106,7 +106,7 @@ impl TerminalSession {
             presentation: PanePresentation::new(cell, None),
             cell,
             lifecycle: Lifecycle::Handshaking {
-                deadline: Instant::now() + Duration::from_secs(1),
+                deadline: Instant::now() + protocol::REQUEST_TIMEOUT,
             },
             wakeup,
             _signals: signals,

@@ -1,5 +1,6 @@
 mod codec;
 mod pipeline;
+mod session;
 mod stats;
 
 use std::{env, process, time::Duration};
@@ -41,7 +42,8 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo bench -p meowland-bench -- [--quick] [--frames N] [--filter TEXT]"
+                    "usage: cargo bench -p meowland-bench -- [--quick] [--frames N] [--filter TEXT]\n\
+                     Set MEOWLAND_BENCH_SERVER=/path/to/meowland to benchmark the full server."
                 );
                 process::exit(0);
             }
@@ -106,6 +108,7 @@ fn main() {
     rows.extend(pipeline::run(&pipeline::Settings {
         quick: options.quick,
         frames: options.frames,
+        filter: options.filter.clone(),
     }));
     if let Some(filter) = &options.filter {
         rows.retain(|row| row.label.contains(filter));

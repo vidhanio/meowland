@@ -509,6 +509,7 @@ dependencies = [
  "drm",
  "memmap2",
  "meowland-compositor",
+ "meowland-core",
  "meowland-kitty",
  "meowland-protocol",
  "rustix 1.1.5",
@@ -527,7 +528,6 @@ dependencies = [
  "meowland-render",
  "rustix 1.1.5",
  "smithay",
- "tokio",
  "tracing",
 ]
 
@@ -598,6 +598,7 @@ dependencies = [
  "meowland-compositor",
  "meowland-core",
  "meowland-protocol",
+ "postcard",
  "rustix 1.1.5",
  "sd-notify",
  "serde",

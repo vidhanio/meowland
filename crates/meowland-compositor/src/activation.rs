@@ -10,7 +10,7 @@ use smithay::{
     },
 };
 
-use super::{Binding, Event, Selection, State, WindowId};
+use super::{Binding, Selection, ServerToPane, State, WindowId};
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -20,6 +20,7 @@ pub struct Launch {
 }
 
 impl State {
+    /// Reserve an activation token for a client launched by the host.
     pub fn create_activation_token(&mut self) -> String {
         let (token, data) = self.activation.create_external_token(None);
         let token = token.as_str().to_owned();
@@ -34,11 +35,12 @@ impl State {
         token
     }
 
-    pub fn forget_activation(&mut self, token: &str) {
+    pub(crate) fn forget_activation(&mut self, token: &str) {
         self.launches.remove(token);
         self.activation.remove_token(&token.to_owned().into());
     }
 
+    /// Revoke a launch token and release panes waiting for it.
     pub fn cancel_activation(&mut self, token: &str, reason: &str) {
         self.forget_activation(token);
         let waiting: Vec<_> = self
@@ -50,14 +52,11 @@ impl State {
             .collect();
         for pane in waiting {
             self.remove_pane(pane);
-            let _ = self.events.send(Event::Release {
-                pane,
-                reason: reason.to_owned(),
-            });
+            self.emit(pane, ServerToPane::Release(reason.to_owned()));
         }
     }
 
-    pub fn cancel_window_activations(&mut self, window: WindowId) {
+    pub(crate) fn cancel_window_activations(&mut self, window: WindowId) {
         let tokens: Vec<_> = self
             .launches
             .iter()
@@ -69,7 +68,7 @@ impl State {
         }
     }
 
-    pub fn next_activation_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_activation_deadline(&self) -> Option<Instant> {
         self.launches
             .values()
             .map(|launch| launch.expires)
@@ -82,7 +81,7 @@ impl State {
     }
 
     /// Expiry is scheduled by the readiness loop, not window-detection polling.
-    pub fn expire_activation_tokens(&mut self) {
+    pub(crate) fn expire_activation_tokens(&mut self) {
         let now = Instant::now();
         let expired: Vec<_> = self
             .launches

@@ -32,10 +32,10 @@ use smithay::{
     },
 };
 
-use super::{Event, Pane, PaneId, State, WindowId, clipboard, input};
+use super::{Pane, PaneId, ServerToPane, State, WindowId, clipboard, input};
 
 impl State {
-    pub fn focus_window(&mut self, window: WindowId) {
+    pub(crate) fn focus_window(&mut self, window: WindowId) {
         self.refresh_popup_grab();
         if self.catalog.focused() == Some(window) {
             return;
@@ -59,10 +59,9 @@ impl State {
             self.apply_window_state(previous);
         }
         self.apply_window_state(window);
-        let _ = self.events.send(Event::Focus(Some(window)));
     }
 
-    pub fn send_pane_cursor(&mut self, pane: PaneId) {
+    pub(crate) fn send_pane_cursor(&mut self, pane: PaneId) {
         let window = self.attachments.panes.get(&pane).and_then(Pane::window);
         let focused = self
             .pointer
@@ -82,10 +81,7 @@ impl State {
         if self.sent_cursor.as_ref() == Some(&cursor) {
             return;
         }
-        let _ = self.events.send(Event::Cursor {
-            pane,
-            shape: cursor.1.clone(),
-        });
+        self.emit(pane, ServerToPane::Cursor(cursor.1.clone()));
         self.sent_cursor = Some(cursor);
     }
 }

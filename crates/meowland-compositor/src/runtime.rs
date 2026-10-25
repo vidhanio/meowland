@@ -2,11 +2,11 @@
 
 use std::{
     io,
-    sync::{Arc, mpsc},
-    time::Instant,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
-use calloop::{EventLoop, Interest, Mode, PostAction, channel, generic::Generic};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use meowland_core::scale::UiScale;
 use smithay::{
     input::keyboard::XkbConfig,
@@ -17,9 +17,7 @@ use smithay::{
     wayland::compositor::CompositorClientState,
 };
 
-use super::{Command, Event, State};
-
-const ACCEPTS_PER_TURN: usize = 32;
+use super::State;
 
 #[derive(Default)]
 pub struct ClientState {
@@ -32,22 +30,24 @@ impl ClientData for ClientState {
     fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
 }
 
-struct Runtime {
+/// A compositor and its event loop, driven on the calling thread.
+#[derive(Debug)]
+pub struct Runtime {
     display: Display<State>,
     event_loop: EventLoop<'static, State>,
     state: State,
 }
 
 impl Runtime {
-    fn new(
-        name: &str,
-        rx: channel::Channel<Command>,
-        events: tokio::sync::mpsc::UnboundedSender<Event>,
-        scale: UiScale,
-    ) -> io::Result<Self> {
+    /// Bind a Wayland socket and initialize the renderer and seat.
+    ///
+    /// # Errors
+    /// Returns an error if the display, socket, event sources or keymap cannot
+    /// start.
+    pub fn new(name: &str, scale: UiScale) -> io::Result<Self> {
         let display = Display::<State>::new().map_err(io::Error::other)?;
         let event_loop = EventLoop::<State>::try_new()?;
-        let mut state = State::new(display.handle(), event_loop.handle(), events, scale);
+        let mut state = State::new(display.handle(), event_loop.handle(), scale);
         let keymap = XkbConfig {
             layout: "us",
             ..XkbConfig::default()
@@ -61,25 +61,15 @@ impl Runtime {
         let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;
         let handle = event_loop.handle();
         handle
-            .insert_source(rx, |event, (), state| match event {
-                channel::Event::Msg(command) => state.handle_command(command),
-                channel::Event::Closed => state.shutdown = true,
-            })
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        handle
             .insert_source(
                 Generic::new(listener, Interest::READ, Mode::Level),
                 |_, listener, state| {
-                    for _ in 0..ACCEPTS_PER_TURN {
-                        let Some(stream) = listener.accept()? else {
-                            break;
-                        };
-                        if let Err(error) = state
+                    if let Some(stream) = listener.accept()?
+                        && let Err(error) = state
                             .display
                             .insert_client(stream, Arc::new(ClientState::default()))
-                        {
-                            tracing::debug!(%error, "Cannot register Wayland client");
-                        }
+                    {
+                        tracing::debug!(%error, "Cannot register Wayland client");
                     }
                     Ok(PostAction::Continue)
                 },
@@ -98,50 +88,32 @@ impl Runtime {
         })
     }
 
-    fn run(mut self) {
-        while !self.state.shutdown {
-            if let Err(error) = self
-                .event_loop
-                .dispatch(self.state.next_wakeup(Instant::now()), &mut self.state)
-            {
-                tracing::warn!(%error, "compositor readiness loop stopped");
-                break;
-            }
-            if let Err(error) = self.display.dispatch_clients(&mut self.state) {
-                tracing::warn!(%error, "Wayland client dispatch stopped");
-                break;
-            }
-            self.state.refresh_popup_grab();
-            self.state.expire_activation_tokens();
-            self.state.frame_callbacks();
-            self.state.dispatch_frames();
-            if let Err(error) = self.display.flush_clients() {
-                tracing::warn!(%error, "Wayland client flush stopped");
-                break;
-            }
-        }
+    /// Register host sockets, timers, signals or async tasks on the same loop.
+    #[must_use]
+    pub fn handle(&self) -> LoopHandle<'static, State> {
+        self.event_loop.handle()
     }
-}
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the compositor thread's channels are handed over once, when the thread starts"
-)]
-pub fn run(
-    name: String,
-    rx: channel::Channel<Command>,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
-    ready: mpsc::Sender<io::Result<()>>,
-    scale: UiScale,
-) {
-    match Runtime::new(&name, rx, events, scale) {
-        Ok(runtime) => {
-            if ready.send(Ok(())).is_ok() {
-                runtime.run();
-            }
-        }
-        Err(error) => {
-            let _ = ready.send(Err(error));
-        }
+    /// Access the compositor without a command channel or mirrored state.
+    pub const fn compositor(&mut self) -> &mut State {
+        &mut self.state
+    }
+
+    /// Dispatch one turn, respecting both host and compositor deadlines.
+    ///
+    /// # Errors
+    /// Returns an error if readiness polling or Wayland dispatch fails.
+    pub fn dispatch(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        let timeout = timeout
+            .into_iter()
+            .chain(self.state.next_wakeup(Instant::now()))
+            .min();
+        self.event_loop.dispatch(timeout, &mut self.state)?;
+        self.display.dispatch_clients(&mut self.state)?;
+        self.state.refresh_popup_grab();
+        self.state.expire_activation_tokens();
+        self.state.frame_callbacks();
+        self.state.dispatch_frames();
+        self.display.flush_clients()
     }
 }

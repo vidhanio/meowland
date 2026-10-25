@@ -21,5 +21,4 @@ smithay = { workspace = true, features = [
   "backend_drm",
   "renderer_gl",
 ] }
-tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

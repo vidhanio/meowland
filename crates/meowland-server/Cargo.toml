@@ -18,6 +18,7 @@ rustix = { workspace = true, features = ["net", "process"] }
 sd-notify = { workspace = true }
 signal-hook = { workspace = true }
 serde = { workspace = true }
+postcard = { workspace = true, features = ["use-std"] }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",

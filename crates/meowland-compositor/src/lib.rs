@@ -1,18 +1,18 @@
-//! Wayland compositor and its command/event channels.
+//! Wayland compositor driven by the host's calloop event loop.
 //!
 //! Client buffers are copied on commit so later client writes cannot tear a
 //! frame in transit to a terminal.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, mpsc},
-    thread,
     time::{Duration, Instant},
 };
 
-use calloop::{LoopHandle, channel};
+use calloop::LoopHandle;
 use meowland_core::scale::UiScale;
-use meowland_protocol::{Input, Show, WindowInfo, clipboard::Selection as ClipboardSelection};
+use meowland_protocol::{
+    Input, ServerToPane, Show, WindowInfo, clipboard::Selection as ClipboardSelection,
+};
 use smithay::{
     delegate_dispatch2,
     desktop::{PopupGrab, PopupKind, PopupManager},
@@ -67,28 +67,18 @@ mod sources;
 mod text;
 mod toplevels;
 
+use Compositor as State;
 use attachment::{Attachments, Binding, Pane, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot, surface_stack};
 use runtime::ClientState;
+pub use runtime::Runtime;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    CreateActivationToken {
-        request: u64,
-    },
-    CancelActivation {
-        token: String,
-    },
-    Kill {
-        request: u64,
-        show: Show,
-        waiting: Arc<std::sync::atomic::AtomicBool>,
-        deadline: Instant,
-    },
     Attach {
         pane: PaneId,
         show: Show,
@@ -134,111 +124,11 @@ pub enum Command {
     Shutdown,
 }
 
+/// An owned notification ready for delivery to one terminal pane.
 #[derive(Debug)]
-pub enum Event {
-    ActivationCreated {
-        request: u64,
-        token: String,
-    },
-    CloseRequested {
-        request: u64,
-        result: Result<(), String>,
-    },
-    /// A window appeared, or its title or app id changed.
-    WindowUp(WindowInfo),
-    WindowDown(WindowId),
-    Title {
-        pane: PaneId,
-        title: String,
-    },
-    /// The pointer shape a pane should show, or `None` for the terminal's own.
-    Cursor {
-        pane: PaneId,
-        shape: Option<String>,
-    },
-    Focus(Option<WindowId>),
-    Bell {
-        pane: PaneId,
-    },
-    ClipboardWrite {
-        pane: PaneId,
-        selection: ClipboardSelection,
-        data: meowland_protocol::clipboard::ClipboardData,
-    },
-    ClipboardRead {
-        pane: PaneId,
-        request: u64,
-        offer: u64,
-        mime: String,
-        deadline: meowland_protocol::clipboard::Deadline,
-    },
-    ClipboardCancel {
-        pane: PaneId,
-        request: u64,
-    },
-    Frame {
-        pane: PaneId,
-        width: u32,
-        height: u32,
-        /// The first row `rgb` covers.
-        y: u32,
-        rgb: Vec<u8>,
-    },
-    Release {
-        pane: PaneId,
-        reason: String,
-    },
-}
-
-/// Command and event endpoints, socket name, and ownership of the display
-/// thread.
-#[derive(Debug)]
-pub struct Handle {
-    pub commands: channel::Sender<Command>,
-    pub events: tokio::sync::mpsc::UnboundedReceiver<Event>,
-    pub display: String,
-    pub thread: thread::JoinHandle<()>,
-}
-
-/// Start the compositor thread and wait for its Wayland socket to be ready.
-///
-/// # Errors
-/// Returns an error if the thread, display, keymap or socket cannot start, or
-/// if readiness is not reported within two seconds.
-pub fn spawn() -> meowland_core::Result<Handle> {
-    spawn_scaled(UiScale::default())
-}
-
-/// Start the compositor with the same UI scale on every terminal pane.
-///
-/// # Errors
-/// Returns an error if the thread, display, keymap or socket cannot start.
-pub fn spawn_scaled(scale: UiScale) -> meowland_core::Result<Handle> {
-    let (commands, rx) = channel::channel();
-    let (tx, events) = tokio::sync::mpsc::unbounded_channel();
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let socket = format!("wayland-meowland-{}", std::process::id());
-    let socket_for_thread = socket.clone();
-    let handle = thread::Builder::new()
-        .name("meowland-wayland".into())
-        .spawn(move || runtime::run(socket_for_thread, rx, tx, ready_tx, scale))?;
-    match ready_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(result) => result?,
-        Err(error) => {
-            let _ = commands.send(Command::Shutdown);
-            let kind = match error {
-                mpsc::RecvTimeoutError::Timeout => std::io::ErrorKind::TimedOut,
-                mpsc::RecvTimeoutError::Disconnected => std::io::ErrorKind::BrokenPipe,
-            };
-            return Err(std::io::Error::new(kind, "Wayland compositor did not start").into());
-        }
-    }
-    Ok(Handle {
-        commands,
-        events,
-        display: socket,
-        thread: handle,
-    })
+pub struct Event {
+    pub pane: PaneId,
+    pub message: ServerToPane,
 }
 
 struct Window {
@@ -248,10 +138,11 @@ struct Window {
     callback_pending: bool,
 }
 
-struct State {
+/// Single-owner Wayland state, also available to host event sources.
+pub struct Compositor {
     display: DisplayHandle,
     handle: LoopHandle<'static, Self>,
-    compositor: CompositorState,
+    surfaces: CompositorState,
     shm: ShmState,
     dmabuf: DmabufState,
     gpu: Option<DmabufBackend>,
@@ -300,18 +191,28 @@ struct State {
     /// Last delivered cursor, including its destination pane.
     sent_cursor: Option<(PaneId, Option<String>)>,
     renderer: Renderer,
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
+    events: Vec<Event>,
     /// Output mode, rewritten as panes attach and leave.
     mode: Size<i32, Logical>,
     started: Instant,
     shutdown: bool,
 }
 
+impl std::fmt::Debug for Compositor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Compositor")
+            .field("windows", &self.windows.len())
+            .field("panes", &self.attachments.panes.len())
+            .field("shutdown", &self.shutdown)
+            .finish_non_exhaustive()
+    }
+}
+
 impl State {
     fn new(
         display_handle: DisplayHandle,
         handle: LoopHandle<'static, Self>,
-        events: tokio::sync::mpsc::UnboundedSender<Event>,
         scale: UiScale,
     ) -> Self {
         let mut seat_state = SeatState::new();
@@ -339,7 +240,7 @@ impl State {
             }
         }
         Self {
-            compositor: CompositorState::new::<Self>(&display_handle),
+            surfaces: CompositorState::new::<Self>(&display_handle),
             shm: ShmState::new::<Self>(&display_handle, vec![]),
             dmabuf,
             gpu,
@@ -385,7 +286,7 @@ impl State {
             cursor: None,
             sent_cursor: None,
             renderer: Renderer::default(),
-            events,
+            events: Vec::new(),
             mode: Size::from((
                 scale.logical(mode.size.w as u32),
                 scale.logical(mode.size.h as u32),
@@ -450,8 +351,6 @@ impl State {
         }
         self.follow_panes(id);
         self.resolve_pending_panes();
-        let info = self.window_info(id);
-        let _ = self.events.send(Event::WindowUp(info));
         self.apply_window_state(id);
         self.enter_output(id);
         self.focus_window(id);
@@ -469,17 +368,49 @@ impl State {
         }
     }
 
-    fn send_title(&self, pane: PaneId, window: WindowId) {
+    fn send_title(&mut self, pane: PaneId, window: WindowId) {
         let title = meowland_protocol::sanitize(self.catalog.title(window));
-        let _ = self.events.send(Event::Title { pane, title });
+        self.emit(pane, ServerToPane::Title(title));
     }
 
-    fn send_titles(&self, window: WindowId) {
+    fn send_titles(&mut self, window: WindowId) {
+        let title = meowland_protocol::sanitize(self.catalog.title(window));
         for (&pane, entry) in &self.attachments.panes {
             if entry.window() == Some(window) {
-                self.send_title(pane, window);
+                self.events.push(Event {
+                    pane,
+                    message: ServerToPane::Title(title.clone()),
+                });
             }
         }
+    }
+
+    fn emit(&mut self, pane: PaneId, message: ServerToPane) {
+        self.events.push(Event { pane, message });
+    }
+
+    /// Drain notifications while retaining the queue's allocation.
+    pub fn drain_events(&mut self) -> impl Iterator<Item = Event> + '_ {
+        self.events.drain(..)
+    }
+
+    /// List mapped windows directly from the compositor's catalog.
+    #[must_use]
+    pub fn window_list(&self) -> Vec<WindowInfo> {
+        let mut windows: Vec<_> = self
+            .windows
+            .keys()
+            .filter(|&&id| self.catalog.drawable(id))
+            .map(|&id| self.window_info(id))
+            .collect();
+        windows.sort_unstable_by_key(|window| window.id);
+        windows
+    }
+
+    /// Whether the host should stop dispatching this compositor.
+    #[must_use]
+    pub const fn stopped(&self) -> bool {
+        self.shutdown
     }
 
     fn enter_output(&self, window: WindowId) {

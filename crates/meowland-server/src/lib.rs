@@ -1,77 +1,67 @@
-use std::{
-    collections::HashMap,
-    io,
-    time::{Duration, Instant},
-};
+//! Socket I/O and process ownership, with rendering isolated on its own thread.
 
-use calloop::channel;
-use tokio::{sync::mpsc, task::JoinSet};
+use std::{collections::HashMap, io};
+
+use meowland_compositor::{Command, Event, PaneId};
+use meowland_core::{Result, scale::UiScale};
+use meowland_protocol::{
+    ControlRequest, ControlResponse, Hello, KEY_Q, KEY_W, PaneToServer, Paths, ServerToPane,
+};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::{AbortHandle, JoinSet},
+};
 
 mod actor;
-mod control;
+mod compositor;
 mod lifecycle;
 mod process;
+mod sockets;
 mod transport;
 
-use control::{Launch, Operation, PendingControl, Reply, Requests};
-use lifecycle::{CompositorStatus, Shutdown};
-use meowland_compositor::{
-    self as compositor, Command as CompositorCommand, Event as CompositorEvent, PaneId,
-};
-use meowland_core::{Result, pixels::FrameSize, signals};
-use meowland_protocol::{
-    self as protocol, ControlRequest, ControlResponse, KEY_Q, KEY_W, PaneToServer, Paths,
-    ServerToPane, WindowInfo,
-};
-use process::{Children, Termination, launch_client};
-use transport::{Listeners, Pane, ReadyPane};
+use compositor::DisplayThread;
+use lifecycle::Shutdown;
+use process::{Children, launch_client};
+use sockets::Listeners;
+use transport::Pane;
 
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+/// One socket budget, with the last slot reserved for control traffic.
+const MAX_CONNECTIONS: usize = 256;
 
 type IncomingSender = mpsc::Sender<Incoming>;
 
 enum Incoming {
-    Control(ControlRequest, Reply),
+    Control(ControlRequest, oneshot::Sender<ControlResponse>),
+    Attach(PaneId, Hello, Pane),
     PaneMessage(PaneId, PaneToServer),
 }
 
 struct Server {
+    compositor: DisplayThread,
     incoming: IncomingSender,
     messages: mpsc::Receiver<Incoming>,
-    events: mpsc::UnboundedReceiver<CompositorEvent>,
-    commands: channel::Sender<CompositorCommand>,
-    display: String,
-    panes: HashMap<PaneId, Pane>,
-    windows: HashMap<u64, WindowInfo>,
-    children: Children,
-    requests: Requests,
-    next_pane: u64,
     listeners: Option<Listeners>,
-    controls: JoinSet<io::Result<()>>,
-    handshakes: JoinSet<io::Result<ReadyPane>>,
-    connections: JoinSet<PaneId>,
-    accept_retry: Option<Instant>,
+    connections: HashMap<PaneId, AbortHandle>,
+    tasks: JoinSet<(PaneId, io::Result<()>)>,
+    panes: HashMap<PaneId, Pane>,
+    next_connection: u64,
+    children: Children,
     shutdown: Shutdown,
-    compositor: CompositorStatus,
-    interrupted: signals::TerminationFlag,
 }
 
-/// Run the single-owner server actor on Tokio, with a dedicated compositor
-/// thread.
+/// Run the compositor server with default UI scaling.
 ///
 /// # Errors
-/// Fails if startup or socket I/O cannot complete, or the compositor exits
-/// unexpectedly.
+/// Returns an error if startup, socket I/O or compositor dispatch fails.
 pub async fn serve(paths: &Paths) -> Result<()> {
-    serve_scaled(paths, meowland_core::scale::UiScale::default()).await
+    serve_scaled(paths, UiScale::default()).await
 }
 
-/// Run the compositor server with a shared UI scale for all terminal panes.
+/// Run the server with a shared UI scale for all terminal panes.
 ///
 /// # Errors
-/// Fails if startup or socket I/O cannot complete, or the compositor exits
-/// unexpectedly.
-pub async fn serve_scaled(paths: &Paths, scale: meowland_core::scale::UiScale) -> Result<()> {
+/// Returns an error if startup, socket I/O or compositor dispatch fails.
+pub async fn serve_scaled(paths: &Paths, scale: UiScale) -> Result<()> {
     actor::serve(paths, scale).await
 }
 
@@ -82,284 +72,174 @@ fn notify(state: &[sd_notify::NotifyState<'_>]) {
 }
 
 impl Server {
-    fn incoming(&mut self, message: Incoming) {
+    async fn incoming(&mut self, message: Incoming) {
         match message {
-            Incoming::Control(request, reply) => {
-                if !reply.waiting() {
+            Incoming::Control(request, mut reply) => {
+                if reply.is_closed() {
                     return;
                 }
-                if self.shutdown.running() {
-                    self.control(request, reply);
+                let response = if self.shutdown.running() {
+                    tokio::select! {
+                        result = self.control(request) => result.unwrap_or_else(|error| ControlResponse::Error(error.to_string())),
+                        () = reply.closed() => return,
+                    }
                 } else {
-                    reply.send(ControlResponse::Error("server stopping".into()));
+                    ControlResponse::Error("server stopping".into())
+                };
+                let _ = reply.send(response);
+            }
+            Incoming::Attach(id, hello, pane) => {
+                if self.shutdown.running() && self.connections.contains_key(&id) {
+                    self.panes.insert(id, pane);
+                    self.send_to_pane(id, ServerToPane::HelloOk);
+                    let _ = self.compositor.command(Command::Attach {
+                        pane: id,
+                        show: hello.show,
+                        width: hello.width,
+                        height: hello.height,
+                    });
                 }
             }
-            Incoming::PaneMessage(id, message) => {
-                if self.panes.get(&id).is_some_and(Pane::active) && self.shutdown.running() {
-                    self.pane_message(id, message);
-                }
-            }
+            Incoming::PaneMessage(id, message) => self.pane_message(id, message),
         }
     }
 
-    fn compositor_event(&mut self, event: CompositorEvent) {
-        match event {
-            CompositorEvent::ActivationCreated { request, token } => {
-                self.activation_created(request, token);
-            }
-            CompositorEvent::CloseRequested { request, result } => {
-                if let Some(pending) = self.finish_control(request) {
-                    pending
-                        .reply
-                        .send(result.map_or_else(ControlResponse::Error, |()| ControlResponse::Ok));
-                }
-            }
-            CompositorEvent::WindowUp(info) => {
-                self.windows.insert(info.id, info);
-            }
-            CompositorEvent::WindowDown(id) => {
-                self.windows.remove(&id.0);
-            }
-            CompositorEvent::Title { pane, title } => {
-                self.send_to_pane(pane, ServerToPane::Title(title));
-            }
-            CompositorEvent::Cursor { pane, shape } => {
-                self.send_to_pane(pane, ServerToPane::Cursor(shape));
-            }
-            CompositorEvent::Bell { pane } => {
-                self.send_to_pane(pane, ServerToPane::Bell);
-            }
-            CompositorEvent::ClipboardWrite {
-                pane,
-                selection,
-                data,
-            } => {
-                self.send_to_pane(pane, ServerToPane::ClipboardWrite { selection, data });
-            }
-            CompositorEvent::ClipboardRead {
-                pane,
-                request,
-                offer,
-                mime,
-                deadline,
-            } => self.send_to_pane(
-                pane,
-                ServerToPane::ClipboardRead {
-                    request,
-                    offer,
-                    mime,
-                    deadline,
-                },
+    async fn control(&mut self, request: ControlRequest) -> io::Result<ControlResponse> {
+        Ok(match request {
+            ControlRequest::Ping => ControlResponse::Ok,
+            ControlRequest::List => ControlResponse::Windows(
+                self.compositor
+                    .call(|compositor| compositor.window_list())
+                    .await?,
             ),
-            CompositorEvent::ClipboardCancel { pane, request } => {
-                self.send_to_pane(pane, ServerToPane::ClipboardCancel { request });
-            }
-            CompositorEvent::Focus(id) => {
-                for window in self.windows.values_mut() {
-                    window.active = Some(window.id) == id.map(|id| id.0);
-                }
-            }
-            CompositorEvent::Frame {
-                pane,
-                width,
-                height,
-                y,
-                rgb,
-            } => self.send_to_pane(
-                pane,
-                ServerToPane::Frame {
-                    width,
-                    height,
-                    y,
-                    rgb,
-                },
-            ),
-            CompositorEvent::Release { pane, reason } => self.release_pane(pane, reason),
-        }
-    }
-
-    fn send_to_pane(&mut self, pane: PaneId, message: ServerToPane) {
-        if self
-            .panes
-            .get(&pane)
-            .is_some_and(|target| target.active() && !target.send(message))
-        {
-            tracing::warn!(
-                ?pane,
-                "pane output stalled or disconnected; closing connection"
-            );
-            self.pane_gone(pane);
-        }
-    }
-
-    fn control(&mut self, request: ControlRequest, reply: Reply) {
-        let command = match request {
-            ControlRequest::Ping => {
-                reply.send(ControlResponse::Ok);
-                return;
-            }
-            ControlRequest::List => {
-                let mut list: Vec<_> = self.windows.values().cloned().collect();
-                list.sort_by_key(|window| window.id);
-                reply.send(ControlResponse::Windows(list));
-                return;
-            }
-            ControlRequest::Kill(show) => {
-                let waiting = reply.waiting_handle();
-                let begun = self.requests.begin(Operation::Close, reply);
-                CompositorCommand::Kill {
-                    request: begun.request,
-                    show,
-                    waiting,
-                    deadline: begun.deadline,
-                }
-            }
+            ControlRequest::Kill(show) => self
+                .compositor
+                .call(move |compositor| compositor.close_window(&show))
+                .await?
+                .map_or_else(ControlResponse::Error, |()| ControlResponse::Ok),
             ControlRequest::Run { args, env, cwd } => {
-                let begun = self
-                    .requests
-                    .begin(Operation::Launch(Launch { args, env, cwd }), reply);
-                CompositorCommand::CreateActivationToken {
-                    request: begun.request,
+                let token = self
+                    .compositor
+                    .call(meowland_compositor::Compositor::create_activation_token)
+                    .await?;
+                match launch_client(&args, &env, &cwd, &self.compositor.display, &token) {
+                    Ok(child) => {
+                        self.children.add(child);
+                        ControlResponse::Started(token)
+                    }
+                    Err(error) => {
+                        self.cancel_activation(token);
+                        ControlResponse::Error(format!("{error:#}"))
+                    }
                 }
             }
-        };
-        if self.commands.send(command).is_err() {
-            self.compositor = CompositorStatus::Failed;
-            self.begin_shutdown();
-        }
+        })
     }
 
-    fn finish_control(&mut self, request: u64) -> Option<PendingControl> {
-        self.requests.finish(request, self.shutdown.running())
+    fn cancel_activation(&self, token: String) {
+        let _ = self
+            .compositor
+            .execute(move |compositor| compositor.cancel_activation(&token, "launch cancelled"));
     }
 
-    fn activation_created(&mut self, request: u64, token: String) {
-        let Some(pending) = self.finish_control(request) else {
-            let _ = self
-                .commands
-                .send(CompositorCommand::CancelActivation { token });
+    fn pane_message(&mut self, pane: PaneId, message: PaneToServer) {
+        if !self.shutdown.running() || !self.panes.get(&pane).is_some_and(Pane::active) {
             return;
-        };
-        let Operation::Launch(launch) = pending.operation else {
-            let _ = self
-                .commands
-                .send(CompositorCommand::CancelActivation { token });
-            pending.reply.send(ControlResponse::Error(
-                "unexpected activation response".into(),
-            ));
-            return;
-        };
-        match launch_client(
-            &launch.args,
-            &launch.env,
-            &launch.cwd,
-            &self.display,
-            &token,
-        ) {
-            Ok(child) => {
-                self.children.add(child);
-                pending.reply.send(ControlResponse::Started(token));
-            }
-            Err(error) => {
-                let _ = self
-                    .commands
-                    .send(CompositorCommand::CancelActivation { token });
-                pending
-                    .reply
-                    .send(ControlResponse::Error(format!("{error:#}")));
-            }
         }
-    }
-
-    fn attach_pane(&mut self, ReadyPane { hello, socket }: ReadyPane) {
-        let id = PaneId(self.next_pane);
-        self.next_pane += 1;
-        let pane = Pane::start(id, socket, self.incoming.clone(), &mut self.connections);
-        self.panes.insert(id, pane);
-        self.send_to_pane(id, ServerToPane::HelloOk);
-        let _ = self.commands.send(CompositorCommand::Attach {
-            pane: id,
-            show: hello.show,
-            width: hello.width,
-            height: hello.height,
-        });
-    }
-
-    fn pane_message(&mut self, id: PaneId, message: PaneToServer) {
         let command = match message {
             PaneToServer::Hello(_) => return,
-            PaneToServer::Paste(text) => {
-                if text.len() > meowland_protocol::clipboard::MAX_TEXT {
-                    return;
-                }
-                CompositorCommand::Paste { pane: id, text }
-            }
+            PaneToServer::Paste(text) => Command::Paste { pane, text },
             PaneToServer::ClipboardOffer {
                 selection,
                 offer,
                 mimes,
                 paste,
-            } => {
-                if mimes.len() > meowland_protocol::clipboard::MAX_TYPES {
-                    return;
-                }
-                CompositorCommand::ClipboardOffer {
-                    pane: id,
-                    selection,
-                    offer,
-                    mimes,
-                    paste,
-                }
-            }
-            PaneToServer::ClipboardReply { request, data } => CompositorCommand::ClipboardReply {
-                pane: id,
+            } => Command::ClipboardOffer {
+                pane,
+                selection,
+                offer,
+                mimes,
+                paste,
+            },
+            PaneToServer::ClipboardReply { request, data } => Command::ClipboardReply {
+                pane,
                 request,
                 data,
             },
             PaneToServer::Input(event) => match &event {
-                protocol::Input::Key {
+                meowland_protocol::Input::Key {
                     code: KEY_W,
                     pressed: true,
                     modifiers,
                     ..
-                } if protocol::modifiers::alt_only(*modifiers) => {
-                    self.release_pane(id, "detached".into());
-                    CompositorCommand::Detach { pane: id }
+                } if meowland_protocol::modifiers::alt_only(*modifiers) => {
+                    if let Some(pane) = self.panes.get_mut(&pane) {
+                        pane.release("detached".into());
+                    }
+                    Command::Detach { pane }
                 }
-                protocol::Input::Key {
+                meowland_protocol::Input::Key {
                     code: KEY_Q,
                     pressed: true,
                     modifiers,
                     ..
-                } if protocol::modifiers::alt_only(*modifiers) => {
-                    CompositorCommand::CloseShown { pane: id }
+                } if meowland_protocol::modifiers::alt_only(*modifiers) => {
+                    Command::CloseShown { pane }
                 }
-                _ => CompositorCommand::Input { pane: id, event },
+                _ => Command::Input { pane, event },
             },
-            PaneToServer::Resize { width, height } => {
-                if FrameSize::new(width, height).is_none() {
-                    return;
-                }
-                CompositorCommand::Resize {
-                    pane: id,
-                    width,
-                    height,
-                }
-            }
-            PaneToServer::Ack { drawn } => CompositorCommand::Ack { pane: id, drawn },
+            PaneToServer::Resize { width, height } => Command::Resize {
+                pane,
+                width,
+                height,
+            },
+            PaneToServer::Ack { drawn } => Command::Ack { pane, drawn },
         };
-        let _ = self.commands.send(command);
+        let _ = self.compositor.command(command);
     }
 
-    fn release_pane(&mut self, id: PaneId, reason: String) {
-        if let Some(pane) = self.panes.get_mut(&id) {
-            pane.release(reason);
+    fn event(&mut self, Event { pane, message }: Event) {
+        if let ServerToPane::Release(reason) = message {
+            if let Some(pane) = self.panes.get_mut(&pane) {
+                pane.release(reason);
+            }
+        } else {
+            self.send_to_pane(pane, message);
+        }
+    }
+
+    fn send_to_pane(&mut self, id: PaneId, message: ServerToPane) {
+        if self
+            .panes
+            .get(&id)
+            .is_some_and(|pane| pane.active() && !pane.send(message))
+        {
+            tracing::warn!(?id, "pane output exceeded its byte budget or disconnected");
+            if let Some(task) = self.connections.remove(&id) {
+                task.abort();
+            }
+            self.pane_gone(id);
         }
     }
 
     fn pane_gone(&mut self, id: PaneId) {
         if self.panes.remove(&id).is_some() {
-            let _ = self.commands.send(CompositorCommand::Detach { pane: id });
+            let _ = self.compositor.command(Command::Detach { pane: id });
         }
+    }
+
+    fn connection_finished(&mut self, id: PaneId, result: io::Result<()>) {
+        self.connections.remove(&id);
+        self.pane_gone(id);
+        if let Err(error) = result {
+            tracing::debug!(?id, %error, "connection ended");
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.tasks.abort_all();
+        self.terminate_children();
     }
 }

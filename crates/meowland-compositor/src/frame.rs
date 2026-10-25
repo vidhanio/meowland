@@ -7,7 +7,7 @@ use std::{
 
 use meowland_core::pixels::FrameSize;
 
-use super::{Event, FRAME_INTERVAL, State, SurfaceAttributes, with_states};
+use super::{Event, FRAME_INTERVAL, ServerToPane, State, SurfaceAttributes, with_states};
 
 /// Each pane owns its scheduling state. No separate dirty-pane index can drift
 /// out of sync with attachment, resizing, or acknowledgements.
@@ -63,7 +63,7 @@ impl PaneState {
 
     /// Record exactly the pixels sent, not a newer commit or an unacknowledged
     /// assumption. The allocation crossing threads is only the changed band.
-    fn frame(&mut self, pane: super::PaneId, pixels: &[u8]) -> Option<Event> {
+    fn frame(&mut self, pixels: &[u8]) -> Option<ServerToPane> {
         self.presentation = Presentation::Clean;
         let stride = self.size.rgb_stride();
         let rows = if self.shown_size == Some(self.size) {
@@ -76,8 +76,7 @@ impl PaneState {
         self.shown[bytes.clone()].copy_from_slice(&pixels[bytes.clone()]);
         self.shown_size = Some(self.size);
         self.presentation = Presentation::InFlight { dirty: false };
-        Some(Event::Frame {
-            pane,
+        Some(ServerToPane::Frame {
             width: self.size.width(),
             height: self.size.height(),
             y: rows.start as u32,
@@ -105,7 +104,7 @@ impl PaneState {
 impl State {
     /// Wait for frame or activation deadlines; transfers wake through readiness
     /// sources.
-    pub fn next_wakeup(&self, now: Instant) -> Option<Duration> {
+    pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
         if self
             .attachments
             .panes
@@ -128,7 +127,7 @@ impl State {
 
     /// Pace visible clients at 120 Hz and hidden clients at one Hz,
     /// independently of terminal acknowledgements.
-    pub fn frame_callbacks(&mut self) {
+    pub(crate) fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed().as_millis() as u32;
         for (&id, window) in &mut self.windows {
@@ -163,7 +162,7 @@ impl State {
         }
     }
 
-    pub fn resume_callbacks(&mut self, window: super::WindowId) {
+    pub(crate) fn resume_callbacks(&mut self, window: super::WindowId) {
         if self.attachments.visible(window)
             && let Some(window) = self.windows.get_mut(&window)
         {
@@ -171,14 +170,14 @@ impl State {
         }
     }
 
-    pub fn pane_ack(&mut self, pane: super::PaneId, drawn: bool) {
+    pub(crate) fn pane_ack(&mut self, pane: super::PaneId, drawn: bool) {
         if let Some(entry) = self.attachments.panes.get_mut(&pane) {
             entry.presentation.ack(drawn);
         }
     }
 
     /// Borrow disjoint fields instead of allocating a list of due pane IDs.
-    pub fn dispatch_frames(&mut self) {
+    pub(crate) fn dispatch_frames(&mut self) {
         for (&pane, entry) in &mut self.attachments.panes {
             if !entry.presentation.due() {
                 continue;
@@ -193,8 +192,8 @@ impl State {
                 entry.presentation.size,
                 self.scale.factor(),
             );
-            if let Some(frame) = entry.presentation.frame(pane, pixels) {
-                let _ = self.events.send(frame);
+            if let Some(message) = entry.presentation.frame(pixels) {
+                self.events.push(Event { pane, message });
             }
         }
     }

@@ -26,7 +26,7 @@ use smithay::wayland::selection::{
     primary_selection::{request_primary_client_selection, set_primary_selection},
 };
 
-use super::{Event, PaneId, State, input::paste_action, sources::Sources};
+use super::{PaneId, ServerToPane, State, input::paste_action, sources::Sources};
 
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -142,11 +142,13 @@ pub fn selection(state: &mut State, target: SelectionTarget, source: Option<Sele
         return;
     };
     let Some(source) = source else {
-        let _ = state.events.send(Event::ClipboardWrite {
+        state.emit(
             pane,
-            selection: wire_selection(target),
-            data: ClipboardData::default(),
-        });
+            ServerToPane::ClipboardWrite {
+                selection: wire_selection(target),
+                data: ClipboardData::default(),
+            },
+        );
         return;
     };
     let id = state.clipboard.id();
@@ -214,11 +216,13 @@ fn export_next(state: &mut State, target: SelectionTarget) {
             Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
         }
     }
-    let _ = state.events.send(Event::ClipboardWrite {
-        pane: export.pane,
-        selection: wire_selection(target),
-        data: export.data,
-    });
+    state.emit(
+        export.pane,
+        ServerToPane::ClipboardWrite {
+            selection: wire_selection(target),
+            data: export.data,
+        },
+    );
 }
 
 fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sources> {
@@ -365,19 +369,15 @@ pub fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) {
                     sources,
                 },
             );
-            if state
-                .events
-                .send(Event::ClipboardRead {
-                    pane: *pane,
+            state.emit(
+                *pane,
+                ServerToPane::ClipboardRead {
                     request,
                     offer: *offer,
                     mime: mime.to_owned(),
                     deadline,
-                })
-                .is_err()
-            {
-                state.clipboard.deliveries.remove(&request);
-            }
+                },
+            );
         }
     }
 }
@@ -393,7 +393,7 @@ fn delivery_timer(state: &State, request: u64, deadline: Deadline) -> io::Result
                     if let Some(mut delivery) = state.clipboard.deliveries.remove(&request) {
                         delivery.sources.timer = None;
                         if let DeliveryPhase::AwaitingTerminal { pane, .. } = delivery.phase {
-                            let _ = state.events.send(Event::ClipboardCancel { pane, request });
+                            state.emit(pane, ServerToPane::ClipboardCancel { request });
                         }
                     }
                     TimeoutAction::Drop

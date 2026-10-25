@@ -1,43 +1,15 @@
-//! Commands entering the display thread and their Wayland side effects.
+//! Pane commands and their Wayland side effects.
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
 use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
 
-use super::{Command, Event, Pane, State, WindowId, clipboard, input::pane_input};
+use super::{Command, Pane, ServerToPane, State, WindowId, clipboard, input::pane_input};
 
 impl State {
+    /// Apply one pane or lifecycle command on the event-loop thread.
     pub fn handle_command(&mut self, command: Command) {
         match command {
-            Command::CreateActivationToken { request } => {
-                let token = self.create_activation_token();
-                if self
-                    .events
-                    .send(Event::ActivationCreated {
-                        request,
-                        token: token.clone(),
-                    })
-                    .is_err()
-                {
-                    self.cancel_activation(&token, "launch cancelled");
-                }
-            }
-            Command::CancelActivation { token } => {
-                self.cancel_activation(&token, "launch cancelled");
-            }
-            Command::Kill {
-                request,
-                show,
-                waiting,
-                deadline,
-            } => {
-                if waiting.load(std::sync::atomic::Ordering::Relaxed)
-                    && std::time::Instant::now() < deadline
-                {
-                    let result = self.close_window(&show);
-                    let _ = self.events.send(Event::CloseRequested { request, result });
-                }
-            }
             Command::Attach {
                 pane,
                 show,
@@ -45,10 +17,10 @@ impl State {
                 height,
             } => {
                 let Some(size) = FrameSize::new(width, height) else {
-                    let _ = self.events.send(Event::Release {
+                    self.emit(
                         pane,
-                        reason: "invalid pane dimensions".into(),
-                    });
+                        ServerToPane::Release("invalid pane dimensions".into()),
+                    );
                     return;
                 };
                 self.attach_pane(pane, show, size);
@@ -88,10 +60,7 @@ impl State {
                 {
                     window.surface.send_close();
                 } else {
-                    let _ = self.events.send(Event::Release {
-                        pane,
-                        reason: "empty pane".into(),
-                    });
+                    self.emit(pane, ServerToPane::Release("empty pane".into()));
                 }
             }
             command @ (Command::CloseAll | Command::Shutdown) => {
@@ -103,7 +72,11 @@ impl State {
         }
     }
 
-    fn close_window(&self, show: &Show) -> Result<(), String> {
+    /// Ask the selected mapped window to close.
+    ///
+    /// # Errors
+    /// Returns an error if the selection does not identify a mapped window.
+    pub fn close_window(&self, show: &Show) -> Result<(), String> {
         let window = self
             .selected_window(show)
             .and_then(|id| self.windows.get(&id))
@@ -112,7 +85,7 @@ impl State {
         Ok(())
     }
 
-    pub fn selected_window(&self, show: &Show) -> Option<WindowId> {
+    pub(crate) fn selected_window(&self, show: &Show) -> Option<WindowId> {
         let activation = match show {
             Show::Activation(token) => self.launches.get(token).and_then(|launch| launch.window),
             _ => None,
@@ -120,7 +93,7 @@ impl State {
         self.catalog.select(show, activation)
     }
 
-    pub fn apply_window_state(&self, window: WindowId) {
+    pub(crate) fn apply_window_state(&self, window: WindowId) {
         let Some(entry) = self.windows.get(&window) else {
             return;
         };
@@ -144,7 +117,7 @@ impl State {
         entry.surface.send_configure();
     }
 
-    pub fn configure_output(&mut self, size: FrameSize) {
+    pub(crate) fn configure_output(&mut self, size: FrameSize) {
         let mode = Mode {
             size: (size.width() as i32, size.height() as i32).into(),
             refresh: 60_000,

@@ -19,7 +19,7 @@ use smithay::{
     },
 };
 
-use super::{Event, Policy, State, Window, WlSurface, input, render};
+use super::{Policy, ServerToPane, State, Window, WlSurface, input, render};
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -135,16 +135,10 @@ impl XdgShellHandler for State {
                 if let Some(entry) = self.attachments.panes.get_mut(&pane) {
                     entry.clear();
                 }
-                let _ = self.events.send(Event::Title {
-                    pane,
-                    title: String::new(),
-                });
+                self.emit(pane, ServerToPane::Title(String::new()));
             } else {
                 self.remove_pane(pane);
-                let _ = self.events.send(Event::Release {
-                    pane,
-                    reason: "window closed".into(),
-                });
+                self.emit(pane, ServerToPane::Release("window closed".into()));
             }
         }
         self.leave_output(id);
@@ -162,10 +156,8 @@ impl XdgShellHandler for State {
                 self.focus_window(next);
             } else {
                 self.catalog.focus(None);
-                let _ = self.events.send(Event::Focus(None));
             }
         }
-        let _ = self.events.send(Event::WindowDown(id));
     }
 
     fn fullscreen_request(
@@ -213,7 +205,6 @@ impl XdgShellHandler for State {
         self.resolve_pending_panes();
         let info = self.window_info(id);
         self.toplevels.update(id, &info.title, &info.app_id);
-        let _ = self.events.send(Event::WindowUp(info));
         self.send_titles(id);
     }
 

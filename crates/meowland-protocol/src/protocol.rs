@@ -5,11 +5,14 @@ use std::{
     ffi::OsString,
     io::{self, Read, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+/// Time allowed for a local control request or initial pane handshake.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum UTF-8 bytes in a single committed keyboard-text event.
 pub const MAX_INPUT_TEXT: usize = 4096;
 

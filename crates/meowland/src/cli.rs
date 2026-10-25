@@ -237,7 +237,7 @@ fn run_async(operation: impl Future<Output = Result<()>>) -> Result<()> {
 }
 
 fn list(paths: &Paths) -> Result<Vec<WindowInfo>> {
-    list_with_timeout(paths, Duration::from_secs(2))
+    list_with_timeout(paths, protocol::REQUEST_TIMEOUT)
 }
 
 fn list_with_timeout(paths: &Paths, timeout: Duration) -> Result<Vec<WindowInfo>> {
@@ -250,7 +250,7 @@ fn list_with_timeout(paths: &Paths, timeout: Duration) -> Result<Vec<WindowInfo>
 }
 
 fn request(paths: &Paths, value: &ControlRequest) -> Result<ControlResponse> {
-    request_with_timeout(paths, value, Duration::from_secs(2))
+    request_with_timeout(paths, value, protocol::REQUEST_TIMEOUT)
 }
 
 fn request_with_timeout(

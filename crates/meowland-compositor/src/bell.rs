@@ -7,7 +7,7 @@ use smithay::{
     wayland::xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState},
 };
 
-use super::{Event, State, WlSurface};
+use super::{ServerToPane, State, WlSurface};
 
 const INTERVAL: Duration = Duration::from_millis(250);
 
@@ -46,6 +46,6 @@ impl XdgSystemBellHandler for State {
             return;
         }
         self.bell.last = Some(now);
-        let _ = self.events.send(Event::Bell { pane });
+        self.emit(pane, ServerToPane::Bell);
     }
 }

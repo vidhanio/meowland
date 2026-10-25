@@ -16,13 +16,14 @@ doctest = false
 [dependencies]
 
 [dev-dependencies]
+meowland-core = { workspace = true }
 meowland-compositor = { workspace = true }
 meowland-kitty = { workspace = true }
 meowland-protocol = { workspace = true }
 calloop = { workspace = true }
 drm = "0.14.1"
 memmap2 = "0.9.12"
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client"] }
 

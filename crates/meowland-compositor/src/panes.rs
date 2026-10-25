@@ -4,18 +4,18 @@ use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
 use smithay::utils::{Logical, Size};
 
-use super::{Binding, Event, Pane, PaneId, Selection, State, WindowId, input};
+use super::{Binding, Pane, PaneId, Selection, ServerToPane, State, WindowId, input};
 
 impl State {
     /// The last-used pane decides the window's size; otherwise use the first
     /// attached pane, then the output mode.
-    pub fn pane_size(&self, window: WindowId) -> Size<i32, Logical> {
+    pub(crate) fn pane_size(&self, window: WindowId) -> Size<i32, Logical> {
         self.attachments.size(window).map_or(self.mode, |size| {
             self.logical_size(size.width(), size.height())
         })
     }
 
-    pub fn panes_showing(&self, window: WindowId) -> Vec<PaneId> {
+    pub(crate) fn panes_showing(&self, window: WindowId) -> Vec<PaneId> {
         self.attachments.showing(window)
     }
 
@@ -30,7 +30,7 @@ impl State {
 
     /// Remove every pane-keyed entry, restoring the remaining output mode and
     /// window size owner.
-    pub fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
+    pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
         if self.keyboard_pane == Some(pane) {
             input::reset_keyboard(self);
         }
@@ -69,7 +69,7 @@ impl State {
 
     /// Move focus to another attached window when the released window is no
     /// longer visible. Empty panes do not block focus restoration.
-    pub fn release_pane_window(&mut self, pane: PaneId) {
+    pub(crate) fn release_pane_window(&mut self, pane: PaneId) {
         let Some(window) = self.remove_pane(pane) else {
             return;
         };
@@ -81,13 +81,13 @@ impl State {
         }
     }
 
-    pub fn follow_panes(&mut self, window: WindowId) {
+    pub(crate) fn follow_panes(&mut self, window: WindowId) {
         for pane in self.attachments.following() {
             self.bind_pane_window(pane, window);
         }
     }
 
-    pub fn resize_pane(&mut self, pane: PaneId, size: FrameSize) {
+    pub(crate) fn resize_pane(&mut self, pane: PaneId, size: FrameSize) {
         let Some(entry) = self.attachments.panes.get_mut(&pane) else {
             return;
         };
@@ -102,20 +102,14 @@ impl State {
         }
     }
 
-    pub fn attach_pane(&mut self, pane: PaneId, show: Show, size: FrameSize) {
+    pub(crate) fn attach_pane(&mut self, pane: PaneId, show: Show, size: FrameSize) {
         if matches!(&show, Show::Activation(token) if !self.launches.contains_key(token)) {
-            let _ = self.events.send(Event::Release {
-                pane,
-                reason: "no such activation".into(),
-            });
+            self.emit(pane, ServerToPane::Release("no such activation".into()));
             return;
         }
         let window = self.selected_window(&show);
         if window.is_none() && matches!(show, Show::Id(_)) {
-            let _ = self.events.send(Event::Release {
-                pane,
-                reason: "no such window".into(),
-            });
+            self.emit(pane, ServerToPane::Release("no such window".into()));
             return;
         }
         let token = match &show {
@@ -163,7 +157,7 @@ impl State {
         self.apply_window_state(window);
     }
 
-    pub fn resolve_pending_panes(&mut self) {
+    pub(crate) fn resolve_pending_panes(&mut self) {
         let ready: Vec<_> = self
             .attachments
             .panes

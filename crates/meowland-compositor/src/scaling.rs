@@ -52,7 +52,7 @@ impl FractionalScaleHandler for State {
 }
 
 impl State {
-    pub fn logical_size(&self, width: u32, height: u32) -> Size<i32, Logical> {
+    pub(crate) fn logical_size(&self, width: u32, height: u32) -> Size<i32, Logical> {
         Size::from((self.scale.logical(width), self.scale.logical(height)))
     }
 }

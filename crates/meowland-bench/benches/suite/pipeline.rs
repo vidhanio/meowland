@@ -1,10 +1,7 @@
 use std::{
-    collections::VecDeque,
     env, fs,
-    hint::black_box,
     os::fd::{AsFd, OwnedFd},
     path::PathBuf,
-    process,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -18,8 +15,7 @@ use drm::{
     control::{Device as ControlDevice, dumbbuffer::DumbBuffer},
 };
 use memmap2::MmapMut;
-use meowland_compositor::{Command, Event, Handle, PaneId};
-use meowland_kitty::Presenter;
+use meowland_compositor::{Command, PaneId};
 use meowland_protocol::{Input as PaneInput, Show};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use wayland_client::{
@@ -35,12 +31,13 @@ use wayland_protocols::{
     xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 
-use crate::stats::{Rate, Row};
+use crate::{
+    session::{CommitLog, Session, TIMEOUT},
+    stats::{Rate, Row},
+};
 
 const BUFFERS: usize = 3;
 const APP_ID: &str = "meowland-bench";
-const CELL: (u16, u16) = (10, 20);
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -191,110 +188,6 @@ fn video_frame(width: u32, height: u32, index: u32) -> Vec<u8> {
         }
     }
     frame
-}
-
-struct CommitLog {
-    queue: VecDeque<(Instant, bool)>,
-    latencies: Vec<Duration>,
-    presented: usize,
-    released: bool,
-}
-
-struct Session {
-    commands: calloop::channel::Sender<Command>,
-    display: String,
-    thread: Option<thread::JoinHandle<()>>,
-    receiver: Option<thread::JoinHandle<()>>,
-    log: Arc<Mutex<CommitLog>>,
-}
-
-impl Session {
-    fn new() -> Result<Self, String> {
-        clear_stale_socket();
-        let Handle {
-            commands,
-            mut events,
-            display,
-            thread,
-        } = meowland_compositor::spawn().map_err(|error| error.to_string())?;
-        let log = Arc::new(Mutex::new(CommitLog {
-            queue: VecDeque::new(),
-            latencies: Vec::new(),
-            presented: 0,
-            released: false,
-        }));
-        let receiver_log = log.clone();
-        let receiver_commands = commands.clone();
-        let receiver = thread::spawn(move || {
-            let mut presenter = Presenter::new(Some(CELL), None);
-            let mut terminal_output = Vec::new();
-            while let Some(event) = events.blocking_recv() {
-                match event {
-                    Event::Frame {
-                        pane,
-                        width,
-                        height,
-                        y,
-                        rgb,
-                    } => {
-                        presenter.present_into(width, height, y, rgb, &mut terminal_output);
-                        black_box(terminal_output.len());
-                        let now = Instant::now();
-                        let mut log = receiver_log.lock().unwrap();
-                        log.presented += 1;
-                        let started = log
-                            .queue
-                            .drain(..)
-                            .filter_map(|(started, record)| record.then_some(started))
-                            .next_back();
-                        if let Some(started) = started {
-                            log.latencies.push(now.saturating_duration_since(started));
-                        }
-                        drop(log);
-                        let _ = receiver_commands.send(Command::Ack { pane, drawn: true });
-                    }
-                    Event::Release { .. } => {
-                        receiver_log.lock().unwrap().released = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-        Ok(Self {
-            commands,
-            display,
-            thread: Some(thread),
-            receiver: Some(receiver),
-            log,
-        })
-    }
-
-    fn socket(&self) -> Result<PathBuf, String> {
-        let runtime = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?;
-        Ok(runtime.join(&self.display))
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let _ = self.commands.send(Command::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        if let Some(receiver) = self.receiver.take() {
-            let _ = receiver.join();
-        }
-    }
-}
-
-fn clear_stale_socket() {
-    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
-        let socket = PathBuf::from(runtime).join(format!("wayland-meowland-{}", process::id()));
-        let _ = fs::remove_file(socket);
-    }
 }
 
 struct State {
@@ -946,6 +839,15 @@ fn input(frame_count: usize, quick: bool) -> Result<Option<Row>, String> {
 pub struct Settings {
     pub quick: bool,
     pub frames: Option<usize>,
+    pub filter: Option<String>,
+}
+
+impl Settings {
+    fn includes(&self, label: &str) -> bool {
+        self.filter
+            .as_ref()
+            .is_none_or(|filter| label.contains(filter))
+    }
 }
 
 pub fn run(settings: &Settings) -> Vec<Row> {
@@ -956,10 +858,15 @@ pub fn run(settings: &Settings) -> Vec<Row> {
         .unwrap_or(if settings.quick { 45 } else { 120 });
     let warmup = if settings.quick { 12 } else { 24 };
     let mut rows = Vec::new();
-    let mut run = |config: Config| match video(config) {
-        Ok(Some(row)) => rows.push(row),
-        Ok(None) => {}
-        Err(error) => eprintln!("pipeline skipped: {error}"),
+    let mut run = |config: Config| {
+        if !settings.includes(&config.label) {
+            return;
+        }
+        match video(config) {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => {}
+            Err(error) => eprintln!("pipeline skipped: {error}"),
+        }
     };
 
     for (label, kind) in [
@@ -1036,10 +943,12 @@ pub fn run(settings: &Settings) -> Vec<Row> {
             });
         }
     }
-    match input(frames, settings.quick) {
-        Ok(Some(row)) => rows.push(row),
-        Ok(None) => {}
-        Err(error) => eprintln!("input pipeline skipped: {error}"),
+    if settings.includes("interactive/key/roundtrip") {
+        match input(frames, settings.quick) {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => {}
+            Err(error) => eprintln!("input pipeline skipped: {error}"),
+        }
     }
     rows
 }

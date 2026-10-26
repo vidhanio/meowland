@@ -3,29 +3,25 @@
 use std::{collections::HashMap, io, time::Instant};
 
 use meowland_compositor::PaneId;
-use meowland_core::{Result, asynchronous::Descriptor, scale::UiScale, signals};
+use meowland_core::{
+    Result,
+    scale::UiScale,
+    signals::{Termination, TerminationSignal},
+};
 use meowland_protocol::Paths;
-use tokio::{io::AsyncReadExt, net::UnixStream, sync::mpsc, task::JoinSet};
+use tokio::{net::UnixStream, sync::mpsc, task::JoinSet};
 
 use super::{
     MAX_CONNECTIONS, Server,
     compositor::DisplayThread,
     lifecycle::Shutdown,
-    notify,
-    process::Children,
-    sockets,
+    notify, sockets,
     transport::{self, ConnectionKind},
 };
 
 pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
     let listeners = sockets::listeners(paths)?;
-    let interrupted = signals::server_termination_flag()?;
-    let wakeup = signals::Wakeup::new(&[
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGCHLD,
-    ])?;
-    let descriptor = Descriptor::new(rustix::io::dup(&wakeup).map_err(io::Error::from)?)?;
+    let termination = Termination::new()?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
     let compositor = DisplayThread::start(scale)?;
     let (incoming, messages) = mpsc::channel(MAX_CONNECTIONS);
@@ -39,17 +35,18 @@ pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
         controls: JoinSet::new(),
         panes: HashMap::new(),
         next_connection: 1,
-        children: Children::default(),
+        children: JoinSet::new(),
         shutdown: Shutdown::Running,
     };
     notify(&[
         sd_notify::NotifyState::Ready,
         sd_notify::NotifyState::Status("Accepting control and pane connections"),
     ]);
-    let result = server.run(descriptor, &interrupted).await;
+    let result = server.run(termination).await;
     server.listeners.take();
     server.controls.shutdown().await;
     server.tasks.shutdown().await;
+    server.children.shutdown().await;
     server.panes.clear();
     let stopped = server.compositor.stop();
     result?;
@@ -58,16 +55,8 @@ pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
 }
 
 impl Server {
-    async fn run(
-        &mut self,
-        mut wakeup: Descriptor,
-        interrupted: &signals::TerminationFlag,
-    ) -> io::Result<()> {
-        let mut signals = [0; 256];
+    async fn run(&mut self, mut termination: Termination) -> io::Result<()> {
         loop {
-            if interrupted.interrupted() {
-                self.begin_shutdown();
-            }
             self.advance_shutdown(Instant::now());
             if self.shutdown.stopped() {
                 return Ok(());
@@ -78,7 +67,14 @@ impl Server {
             let pane_capacity =
                 self.shutdown.running() && self.connections.len() < MAX_CONNECTIONS - 1;
             tokio::select! {
-                result = wakeup.read(&mut signals) => { result?; self.children.reap(); }
+                signal = termination.recv() => {
+                    if signal != TerminationSignal::Hangup {
+                        self.begin_shutdown();
+                    }
+                }
+                Some(result) = self.children.join_next(), if !self.children.is_empty() => {
+                    result.map_err(io::Error::other)?;
+                }
                 () = sleep_until(deadline) => {}
                 Some(message) = self.messages.recv() => self.incoming(message),
                 Some(result) = self.controls.join_next(), if !self.controls.is_empty() => {

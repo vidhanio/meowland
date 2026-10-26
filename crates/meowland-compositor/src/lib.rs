@@ -16,7 +16,7 @@ use smithay::{
     reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
     utils::{Logical, Size},
     wayland::{
-        compositor::{CompositorState, SurfaceAttributes, get_parent, with_states},
+        compositor::{CompositorState, get_parent},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         fractional_scale::FractionalScaleManagerState,
@@ -66,7 +66,7 @@ use attachment::{AttachedPane, Attachments, Binding, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
 pub use commands::Command;
-use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot, surface_stack};
+use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;
 pub use runtime::Runtime;
 
@@ -332,16 +332,10 @@ impl State {
         if !self.attachments.visible(window) {
             return;
         }
-        let Some(root) = self
-            .windows
-            .get(&window)
-            .filter(|_| self.catalog.drawable(window))
-            .map(|entry| entry.surface.wl_surface())
-        else {
-            return;
-        };
-        for (surface, _) in surface_stack(root) {
-            self.output.enter(&surface);
+        if let Some(entry) = self.windows.get(&window)
+            && self.catalog.drawable(window)
+        {
+            entry.with_surfaces(|surface| self.output.enter(surface));
         }
     }
 
@@ -349,15 +343,8 @@ impl State {
         if self.attachments.visible(window) && self.catalog.drawable(window) {
             return;
         }
-        let Some(root) = self
-            .windows
-            .get(&window)
-            .map(|entry| entry.surface.wl_surface())
-        else {
-            return;
-        };
-        for (surface, _) in surface_stack(root) {
-            self.output.leave(&surface);
+        if let Some(entry) = self.windows.get(&window) {
+            entry.with_surfaces(|surface| self.output.leave(surface));
         }
     }
 }

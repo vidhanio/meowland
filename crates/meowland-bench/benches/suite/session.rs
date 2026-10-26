@@ -137,6 +137,7 @@ impl Session {
             PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?);
         let directory = runtime.join(format!("meowland-bench-{}", process::id()));
         fs::create_dir(&directory).map_err(|error| error.to_string())?;
+        let paths = Paths::in_runtime_dir(&directory).map_err(|error| error.to_string())?;
         let child = match process::Command::new(binary)
             .env("XDG_RUNTIME_DIR", &directory)
             .arg("server")
@@ -147,12 +148,11 @@ impl Session {
             Ok(child) => child,
             Err(error) => {
                 let _ = fs::remove_dir(&directory);
-                return Err(error.to_string());
+                return Err(format!("starting benchmark server: {error}"));
             }
         };
         let mut server = RemoteServer { child, directory };
         let display = format!("wayland-meowland-{}", server.child.id());
-        let paths = Paths::in_runtime_dir(&server.directory).map_err(|error| error.to_string())?;
         let deadline = Instant::now() + TIMEOUT;
         while !paths.pane.exists() || !server.directory.join(&display).exists() {
             if server

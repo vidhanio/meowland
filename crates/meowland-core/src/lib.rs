@@ -1,4 +1,4 @@
-//! Shared errors, validated frame dimensions, and signal guards.
+//! Shared errors, validated frame dimensions, and async runtime helpers.
 
 #[cfg(feature = "async")]
 pub mod asynchronous;
@@ -6,6 +6,7 @@ pub mod asynchronous;
 mod error;
 pub mod pixels;
 pub mod scale;
+#[cfg(feature = "async")]
 pub mod signals;
 pub mod timing;
 

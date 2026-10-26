@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use meowland_core::{asynchronous::Descriptor, signals};
 use meowland_input as input;
 use meowland_kitty::SharedMemory;
-use tokio::io::AsyncReadExt;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
 use super::output;
@@ -53,13 +52,12 @@ impl ProbeInfo {
     }
 }
 
-/// Probe through the same async descriptors used for presentation and input.
+/// Probe through the presentation descriptors, returning `None` on termination.
 pub async fn terminal_probe(
     input: &mut input::Reader,
     output: &mut Descriptor,
-    wakeup: &mut Descriptor,
-    interrupted: &signals::TerminationFlag,
-) -> std::io::Result<(ProbeInfo, Option<SharedMemory>)> {
+    termination: &mut signals::Termination,
+) -> std::io::Result<Option<(ProbeInfo, Option<SharedMemory>)>> {
     let slot = SharedMemory::new();
     let shared_probe = slot.probe();
     let mut pending = output::Output::default();
@@ -72,13 +70,12 @@ pub async fn terminal_probe(
     let mut received = 0;
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut quiet_deadline = None;
-    while !interrupted.interrupted() {
+    loop {
         let mut buffer = [0; 1024];
-        let mut signal = [0; 256];
         tokio::select! {
+            _ = termination.recv() => return Ok(None),
             () = tokio::time::sleep_until(quiet_deadline.unwrap_or(deadline).into()) => break,
             result = pending.drain(output), if pending.pending() => result?,
-            result = wakeup.read(&mut signal) => { if result? == 0 { break; } },
             result = input.read_raw(&mut buffer), if !pending.pending() => {
                 let read = result?;
                 if read == 0 { break; }
@@ -99,7 +96,7 @@ pub async fn terminal_probe(
     } else {
         None
     };
-    Ok((probe, shared))
+    Ok(Some((probe, shared)))
 }
 
 struct ProbeParser {

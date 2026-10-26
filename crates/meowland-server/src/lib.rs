@@ -20,7 +20,6 @@ mod transport;
 
 use compositor::DisplayThread;
 use lifecycle::Shutdown;
-use process::Children;
 use sockets::Listeners;
 use transport::PaneTransport;
 
@@ -45,7 +44,7 @@ struct Server {
     controls: JoinSet<control::Completion>,
     panes: HashMap<PaneId, PaneTransport>,
     next_connection: u64,
-    children: Children,
+    children: JoinSet<()>,
     shutdown: Shutdown,
 }
 
@@ -59,9 +58,11 @@ pub async fn serve(paths: &Paths) -> Result<()> {
 
 /// Run the server with a shared UI scale for all terminal panes.
 ///
-/// Shutdown gives clients a bounded Wayland-close grace period. Run in the
-/// supplied systemd service for descendant cleanup; standalone operation does
-/// not forcibly terminate clients that remain after the grace period.
+/// Binds the supplied paths unless listeners are provided by socket activation.
+/// Shutdown gives clients a bounded Wayland-close grace period. With the
+/// systemd service, its cgroup also cleans up remaining client processes;
+/// standalone operation does not forcibly terminate clients that ignore window
+/// closure.
 ///
 /// # Errors
 /// Returns an error if startup, socket I/O or compositor dispatch fails.
@@ -144,6 +145,6 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.controls.abort_all();
         self.tasks.abort_all();
-        self.children.reap();
+        self.children.abort_all();
     }
 }

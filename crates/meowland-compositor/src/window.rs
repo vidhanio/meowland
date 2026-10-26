@@ -1,8 +1,40 @@
 //! Coordinated window map, unmap and destruction transitions.
 
-use smithay::desktop::PopupUngrabStrategy;
+use std::time::Duration;
 
-use super::{Policy, ServerToPane, State, WindowId, WlSurface, input};
+use smithay::{
+    desktop::{
+        PopupManager, PopupUngrabStrategy,
+        utils::{send_frames_surface_tree, with_surfaces_surface_tree},
+    },
+    output::Output,
+};
+
+use super::{Policy, ServerToPane, State, Window, WindowId, WlSurface, input};
+
+impl Window {
+    fn with_surface_trees(&self, mut visit: impl FnMut(&WlSurface)) {
+        let root = self.surface.wl_surface();
+        visit(root);
+        for (popup, _) in PopupManager::popups_for_surface(root) {
+            visit(popup.wl_surface());
+        }
+    }
+
+    /// Visit the window's surface trees without building a render stack.
+    pub fn with_surfaces(&self, mut visit: impl FnMut(&WlSurface)) {
+        self.with_surface_trees(|root| {
+            with_surfaces_surface_tree(root, |surface, _| visit(surface));
+        });
+    }
+
+    /// Deliver callbacks at the compositor's already-paced frame deadline.
+    pub fn send_frame(&self, output: &Output, time: Duration) {
+        self.with_surface_trees(|root| {
+            send_frames_surface_tree(root, output, time, Some(Duration::ZERO), |_, _| None);
+        });
+    }
+}
 
 impl State {
     pub(crate) fn refresh_window_mapping(&mut self, surface: &WlSurface) {

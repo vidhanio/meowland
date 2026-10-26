@@ -1,14 +1,7 @@
 //! Nonblocking terminal input with signed SGR pixel mouse decoding and
 //! `vtparse`.
 
-use std::{
-    collections::VecDeque,
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::VecDeque, io};
 
 use meowland_core::asynchronous::Descriptor;
 use meowland_protocol::{
@@ -17,7 +10,6 @@ use meowland_protocol::{
     modifiers::{ALT, CONTROL, HYPER, META, SUPER},
 };
 use rustix::fs::{Mode, OFlags, open};
-use signal_hook::SigId;
 use tokio::io::AsyncReadExt;
 use vtparse::{CsiParam, VTActor, VTParser};
 
@@ -56,8 +48,6 @@ pub struct Reader {
     fd: Descriptor,
     parser: Parser,
     bytes: Box<[u8]>,
-    resized: Arc<AtomicBool>,
-    handler: SigId,
 }
 
 impl Reader {
@@ -72,28 +62,20 @@ impl Reader {
             Mode::empty(),
         )?;
         let fd = Descriptor::new(fd)?;
-        let resized = Arc::new(AtomicBool::new(false));
-        let handler =
-            signal_hook::flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&resized))?;
         Ok(Self {
             fd,
             parser: Parser::new(),
             bytes: vec![0; 16 * 1024].into_boxed_slice(),
-            resized,
-            handler,
         })
     }
 
     #[must_use]
     pub fn pending(&self) -> bool {
-        !self.parser.decoder.events.is_empty() || self.resized.load(Ordering::Relaxed)
+        !self.parser.decoder.events.is_empty()
     }
 
-    /// Pop a buffered event, prioritizing a pending resize.
+    /// Pop a decoded terminal event.
     pub fn next_event(&mut self) -> Option<Event> {
-        if self.resized.swap(false, Ordering::Relaxed) {
-            return Some(Event::Resize);
-        }
         self.parser.decoder.events.pop_front()
     }
 
@@ -129,12 +111,6 @@ impl std::fmt::Debug for Reader {
         f.debug_struct("Reader")
             .field("pending", &self.pending())
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        signal_hook::low_level::unregister(self.handler);
     }
 }
 

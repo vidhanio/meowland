@@ -1,114 +1,44 @@
-//! Shared signal handling for the server and terminal pane.
+//! Runtime-managed termination signals shared by the server and terminal.
 
-use std::{
-    os::unix::net::UnixStream,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::io;
 
-use signal_hook::SigId;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
-/// Signal registrations that wake a readiness loop without masking child
-/// signals.
-#[derive(Debug)]
-pub struct Wakeup {
-    socket: UnixStream,
-    handlers: Vec<SigId>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminationSignal {
+    Interrupt,
+    Terminate,
+    Hangup,
 }
 
-impl Wakeup {
-    /// Register signals that wake the returned readiness source.
+/// Termination subscriptions owned by one server or terminal session.
+#[derive(Debug)]
+pub struct Termination {
+    interrupt: Signal,
+    terminate: Signal,
+    hangup: Signal,
+}
+
+impl Termination {
+    /// Subscribe on the current Tokio runtime before starting session work.
     ///
     /// # Errors
-    /// Returns an error when socket creation or signal registration fails.
-    pub fn new(signals: &[i32]) -> std::io::Result<Self> {
-        let (socket, writer) = UnixStream::pair()?;
-        socket.set_nonblocking(true)?;
-        let mut wakeup = Self {
-            socket,
-            handlers: Vec::new(),
-        };
-        for &signal in signals {
-            wakeup.handlers.push(signal_hook::low_level::pipe::register(
-                signal,
-                writer.try_clone()?,
-            )?);
-        }
-        Ok(wakeup)
+    /// Returns an error if a signal subscription cannot be installed.
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
     }
-}
 
-impl std::os::fd::AsFd for Wakeup {
-    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-        self.socket.as_fd()
-    }
-}
-
-impl Drop for Wakeup {
-    fn drop(&mut self) {
-        for handler in &self.handlers {
-            signal_hook::low_level::unregister(*handler);
+    /// Wait for termination or hangup, retaining pending signals on
+    /// cancellation.
+    pub async fn recv(&mut self) -> TerminationSignal {
+        tokio::select! {
+            _ = self.interrupt.recv() => TerminationSignal::Interrupt,
+            _ = self.terminate.recv() => TerminationSignal::Terminate,
+            _ = self.hangup.recv() => TerminationSignal::Hangup,
         }
     }
-}
-
-/// Termination handlers owned by one server or pane invocation.
-#[derive(Debug)]
-pub struct TerminationFlag {
-    flag: Arc<AtomicBool>,
-    handlers: [Option<SigId>; 3],
-}
-
-impl TerminationFlag {
-    #[must_use]
-    pub fn interrupted(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for TerminationFlag {
-    fn drop(&mut self) {
-        for handler in self.handlers.iter().flatten() {
-            signal_hook::low_level::unregister(*handler);
-        }
-    }
-}
-
-/// Register termination handlers until the returned guard is dropped.
-///
-/// # Errors
-/// Returns an error when a signal handler cannot be registered.
-pub fn termination_flag() -> std::io::Result<TerminationFlag> {
-    register_termination(true)
-}
-
-/// Register server termination handlers, ignoring SIGHUP because there is no
-/// reloadable configuration. Terminal panes still treat hangup as termination.
-///
-/// # Errors
-/// Returns an error when a signal handler cannot be registered.
-pub fn server_termination_flag() -> std::io::Result<TerminationFlag> {
-    register_termination(false)
-}
-
-fn register_termination(hangup: bool) -> std::io::Result<TerminationFlag> {
-    let mut guard = TerminationFlag {
-        flag: Arc::new(AtomicBool::new(false)),
-        handlers: [None; 3],
-    };
-    for (slot, signal) in guard.handlers.iter_mut().zip([
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-    ]) {
-        let flag = if signal == signal_hook::consts::SIGHUP && !hangup {
-            Arc::new(AtomicBool::new(false))
-        } else {
-            Arc::clone(&guard.flag)
-        };
-        *slot = Some(signal_hook::flag::register(signal, flag)?);
-    }
-    Ok(guard)
 }

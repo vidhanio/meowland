@@ -28,7 +28,7 @@ enum Commands {
     List,
     /// Start the compositor server in the foreground.
     ///
-    /// Use the systemd service for cleanup of remaining client processes.
+    /// Uses `XDG_RUNTIME_DIR` or listeners supplied by socket activation.
     Server(ServerArgs),
     /// Generate a shell completion script.
     Completions(CompletionArgs),
@@ -255,7 +255,7 @@ fn request_with_timeout(
 ) -> Result<ControlResponse> {
     let mut socket = UnixStream::connect(&paths.control).map_err(|error| {
         Error::io(
-            "server is not running; start it with `meowland server`",
+            "cannot reach the server; run `meowland server` or start `meowland.socket` with systemctl --user",
             error,
         )
     })?;

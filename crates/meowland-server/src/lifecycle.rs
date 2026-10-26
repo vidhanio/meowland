@@ -1,4 +1,4 @@
-//! Bounded Wayland-close grace before service-manager process cleanup.
+//! Bounded Wayland-close grace for standalone and managed servers.
 
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ impl Server {
         };
         notify(&[
             sd_notify::NotifyState::Stopping,
-            sd_notify::NotifyState::Status("Closing windows before service-manager cleanup"),
+            sd_notify::NotifyState::Status("Closing windows and releasing panes"),
         ]);
         self.listeners.take();
         let _ = self.compositor.command(Command::CloseAll);

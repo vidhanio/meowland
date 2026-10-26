@@ -116,13 +116,6 @@ impl SurfaceStack {
     }
 }
 
-#[must_use]
-pub fn surface_stack(root: &WlSurface) -> Vec<(WlSurface, Point<i32, Logical>)> {
-    let mut stack = SurfaceStack::default();
-    stack.rebuild(root);
-    stack.surfaces
-}
-
 /// Popup positions are measured against the parent's window geometry origin.
 #[must_use]
 pub fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
@@ -413,15 +406,6 @@ fn opaque_cover(
 }
 
 impl Renderer {
-    /// Visit mapped surfaces without exposing traversal scratch state.
-    pub fn for_each_surface(&mut self, root: &WlSurface, mut visit: impl FnMut(&WlSurface)) {
-        self.stack.rebuild(root);
-        for (surface, _) in &self.stack.surfaces {
-            visit(surface);
-        }
-        self.stack.clear();
-    }
-
     /// Return the hit surface and its origin, as expected by Smithay's pointer
     /// focus.
     pub fn hit_test(

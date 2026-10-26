@@ -16,14 +16,15 @@ calloop = { workspace = true }
 listenfd = { workspace = true }
 rustix = { workspace = true, features = ["net"] }
 sd-notify = { workspace = true }
-signal-hook = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true, features = ["use-std"] }
 tokio = { workspace = true, features = [
   "io-util",
   "macros",
   "net",
+  "process",
   "rt",
+  "signal",
   "sync",
   "time",
 ] }

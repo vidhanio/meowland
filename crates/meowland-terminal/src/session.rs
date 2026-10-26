@@ -14,8 +14,8 @@ use meowland_protocol::{
 };
 use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol};
 use tokio::{
-    io::AsyncReadExt,
     net::unix::{OwnedReadHalf, OwnedWriteHalf},
+    signal::unix::{Signal, SignalKind, signal},
 };
 
 use super::{
@@ -46,7 +46,8 @@ struct PendingWindow {
 }
 
 enum Ready {
-    Signal(io::Result<usize>),
+    Terminate,
+    Resize,
     Deadline,
     Server(io::Result<ServerToPane>),
     Output(Result<()>),
@@ -67,9 +68,8 @@ pub struct TerminalSession {
     presentation: PanePresentation,
     cell: Option<(u16, u16)>,
     lifecycle: Lifecycle,
-    wakeup: Descriptor,
-    _signals: signals::Wakeup,
-    interrupted: signals::TerminationFlag,
+    termination: signals::Termination,
+    resize: Signal,
     window: PendingWindow,
 }
 
@@ -84,15 +84,9 @@ impl TerminalSession {
         let cell = terminal::derived_cell(pixels, cells);
         let (width, height) =
             terminal::pane_pixels(None, pixels, cells, cell.unwrap_or(FALLBACK_CELL));
-        let interrupted = signals::termination_flag()?;
+        let termination = signals::Termination::new()?;
+        let resize = signal(SignalKind::window_change())?;
         let input = input::Reader::new()?;
-        let signals = signals::Wakeup::new(&[
-            signal_hook::consts::SIGINT,
-            signal_hook::consts::SIGTERM,
-            signal_hook::consts::SIGHUP,
-            signal_hook::consts::SIGWINCH,
-        ])?;
-        let wakeup = Descriptor::new(rustix::io::dup(&signals).map_err(io::Error::from)?)?;
         let mut tx = Outgoing::default();
         tx.send(&PaneToServer::Hello(Hello {
             width,
@@ -113,26 +107,22 @@ impl TerminalSession {
             lifecycle: Lifecycle::Handshaking {
                 deadline: Instant::now() + protocol::REQUEST_TIMEOUT,
             },
-            wakeup,
-            _signals: signals,
-            interrupted,
+            termination,
+            resize,
             window: PendingWindow::default(),
         })
     }
 
     pub async fn run(mut self) -> Result<()> {
         while !matches!(self.lifecycle, Lifecycle::Closed) {
-            if self.interrupted.interrupted() {
-                return self.close(None);
-            }
             self.prepare_pending_work()?;
             let active = matches!(self.lifecycle, Lifecycle::Active(_));
             let pending_output = active && self.presentation.pending();
             let pending_input = self.input.pending();
             let deadline = self.next_deadline();
-            let mut signal = [0; 256];
             let ready = tokio::select! {
-                result = self.wakeup.read(&mut signal) => Ready::Signal(result),
+                _ = self.termination.recv() => Ready::Terminate,
+                _ = self.resize.recv() => Ready::Resize,
                 () = wait_deadline(deadline) => Ready::Deadline,
                 result = self.presentation.drain(&mut self.stdout), if pending_output => Ready::Output(result),
                 result = self.receiver.read(), if !pending_output && !self.tx.pending() => Ready::Server(result),
@@ -140,15 +130,9 @@ impl TerminalSession {
                 result = self.input.read_ready(), if active && !pending_input && !self.tx.pending() => Ready::Input(result),
                 () = tokio::task::yield_now(), if pending_input && !self.tx.pending() => Ready::BufferedInput,
             };
-            if self.interrupted.interrupted() {
-                continue;
-            }
             match ready {
-                Ready::Signal(result) => {
-                    if result? == 0 {
-                        return self.close(None);
-                    }
-                }
+                Ready::Terminate => return self.close(None),
+                Ready::Resize => self.send_event(input::Event::Resize)?,
                 Ready::Server(result) => self.handle_server_message(result?).await?,
                 Ready::Output(result) => {
                     result?;
@@ -172,13 +156,9 @@ impl TerminalSession {
     async fn finish_after_write_error(&mut self, error: io::Error) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if self.interrupted.interrupted() {
-                return self.close(None);
-            }
-            let mut signal = [0; 256];
             tokio::select! {
+                _ = self.termination.recv() => return self.close(None),
                 () = tokio::time::sleep_until(deadline.into()) => return Err(error.into()),
-                result = self.wakeup.read(&mut signal) => { result?; }
                 result = self.receiver.read::<ServerToPane>() => match result {
                     Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)),
                     Err(_) => return Err(error.into()),
@@ -305,17 +285,12 @@ impl TerminalSession {
 
     async fn start_presentation(&mut self) -> Result<()> {
         let mut mode = TerminalGuard::enter()?;
-        let (probe, shared) = terminal_probe(
-            &mut self.input,
-            &mut self.stdout,
-            &mut self.wakeup,
-            &self.interrupted,
-        )
-        .await?;
-        if self.interrupted.interrupted() {
+        let Some((probe, shared)) =
+            terminal_probe(&mut self.input, &mut self.stdout, &mut self.termination).await?
+        else {
             mode.restore()?;
             return self.close(None);
-        }
+        };
         if !probe.graphics {
             return Err(Error::GraphicsUnsupported);
         }
@@ -356,9 +331,6 @@ impl TerminalSession {
 
     fn handle_terminal_events(&mut self) -> Result<()> {
         for _ in 0..EVENTS_PER_TURN {
-            if self.interrupted.interrupted() {
-                break;
-            }
             let Some(event) = self.input.next_event() else {
                 break;
             };

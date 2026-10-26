@@ -9,7 +9,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-signal-hook = { workspace = true }
 meowland-input = { workspace = true }
 meowland-terminal-clipboard = { workspace = true }
 meowland-core = { workspace = true, features = ["async"] }
@@ -19,6 +18,7 @@ tokio = { workspace = true, features = [
   "macros",
   "net",
   "rt",
+  "signal",
   "time",
 ] }
 meowland-kitty = { workspace = true }

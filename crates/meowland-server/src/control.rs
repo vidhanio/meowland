@@ -5,7 +5,7 @@ use std::{ffi::OsString, io, path::PathBuf};
 use meowland_protocol::{ControlRequest, ControlResponse};
 use tokio::sync::oneshot;
 
-use super::{MAX_CONNECTIONS, Server};
+use super::{MAX_CONNECTIONS, Server, process};
 
 type Reply = oneshot::Sender<ControlResponse>;
 
@@ -112,14 +112,17 @@ impl Server {
                     let _ = reply.send(ControlResponse::Error("server stopping".into()));
                     return;
                 }
-                let response = match self.children.launch(
+                let response = match process::launch(
                     &launch.args,
                     &launch.env,
                     &launch.cwd,
                     &self.compositor.display,
                     &token,
                 ) {
-                    Ok(()) => ControlResponse::Started(token),
+                    Ok(child) => {
+                        self.children.spawn(process::wait(child));
+                        ControlResponse::Started(token)
+                    }
                     Err(error) => {
                         self.cancel_activation(token);
                         ControlResponse::Error(error.to_string())

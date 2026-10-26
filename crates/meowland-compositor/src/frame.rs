@@ -8,7 +8,7 @@ use std::{
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameAck, FrameBand};
 
-use super::{Event, FRAME_INTERVAL, ServerToPane, State, SurfaceAttributes, with_states};
+use super::{Event, FRAME_INTERVAL, ServerToPane, State};
 
 /// Each pane owns its scheduling state. No separate dirty-pane index can drift
 /// out of sync with attachment, resizing, or acknowledgements.
@@ -129,7 +129,7 @@ impl State {
     /// independently of terminal acknowledgements.
     pub(crate) fn frame_callbacks(&mut self) {
         let now = Instant::now();
-        let time = self.started.elapsed().as_millis() as u32;
+        let time = self.started.elapsed();
         for (&id, window) in &mut self.windows {
             if !window.callback_pending || now < window.callback_due {
                 continue;
@@ -145,20 +145,7 @@ impl State {
             let ticks = late / interval.as_nanos() + 1;
             window.callback_due += interval * u32::try_from(ticks).unwrap_or(u32::MAX);
             window.callback_pending = false;
-            self.renderer
-                .for_each_surface(window.surface.wl_surface(), |surface| {
-                    with_states(surface, |states| {
-                        for callback in states
-                            .cached_state
-                            .get::<SurfaceAttributes>()
-                            .current()
-                            .frame_callbacks
-                            .drain(..)
-                        {
-                            callback.done(time);
-                        }
-                    });
-                });
+            window.send_frame(&self.output, time);
         }
     }
 

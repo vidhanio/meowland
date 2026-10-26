@@ -13,6 +13,10 @@ async = ["dep:tokio", "dep:rustix"]
 
 [dependencies]
 rustix = { workspace = true, optional = true, features = ["fs"] }
-tokio = { workspace = true, optional = true, features = ["io-util", "net"] }
-signal-hook = { workspace = true }
+tokio = { workspace = true, optional = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "signal",
+] }
 thiserror = { workspace = true }

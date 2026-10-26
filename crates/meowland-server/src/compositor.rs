@@ -95,19 +95,22 @@ impl DisplayThread {
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
-    pub async fn call<T: Send + 'static>(
+    pub fn call<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Compositor) -> T + Send + 'static,
-    ) -> io::Result<T> {
+    ) -> impl Future<Output = io::Result<T>> + Send + 'static {
         let (sender, receiver) = oneshot::channel();
-        self.execute(move |compositor| {
+        let queued = self.execute(move |compositor| {
             if !sender.is_closed() {
                 let _ = sender.send(operation(compositor));
             }
-        })?;
-        tokio::time::timeout(REQUEST_TIMEOUT, receiver)
-            .await?
-            .map_err(io::Error::other)
+        });
+        async move {
+            queued?;
+            tokio::time::timeout(REQUEST_TIMEOUT, receiver)
+                .await?
+                .map_err(io::Error::other)
+        }
     }
 
     pub fn stop(&mut self) -> io::Result<()> {

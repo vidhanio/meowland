@@ -1,6 +1,5 @@
 use std::{
-    collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, path::PathBuf,
-    time::Duration,
+    collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration,
 };
 
 use meowland_core::{Error, Result, scale::UiScale};
@@ -13,9 +12,6 @@ use usage_rs::{Args, Cli, Subcommands, ValueEnum};
 #[derive(Cli)]
 #[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
 struct Meowland {
-    /// Runtime directory containing the control and pane sockets.
-    #[usage(long, global, value_hint = usage_rs::ValueHint::DirPath)]
-    runtime_dir: Option<PathBuf>,
     #[usage(subcommand)]
     command: Commands,
 }
@@ -31,6 +27,8 @@ enum Commands {
     /// List windows.
     List,
     /// Start the compositor server in the foreground.
+    ///
+    /// Use the systemd service for cleanup of remaining client processes.
     Server(ServerArgs),
     /// Generate a shell completion script.
     Completions(CompletionArgs),
@@ -165,22 +163,19 @@ impl From<CompletionShell> for usage_rs::complete::Shell {
 /// # Errors
 /// Returns an error when the selected command cannot be completed.
 pub fn start() -> Result<()> {
-    let Meowland {
-        runtime_dir,
-        command,
-    } = Meowland::parse();
-    let paths = || {
-        runtime_dir
-            .clone()
-            .map_or_else(Paths::discover, Paths::in_runtime_dir)
-    };
+    let Meowland { command } = Meowland::parse();
+    crate::init_logging(match &command {
+        Commands::Server(_) => crate::LogDestination::Stderr,
+        Commands::Run(_) | Commands::Attach(_) => crate::LogDestination::Journal,
+        _ => crate::LogDestination::None,
+    });
     match command {
         Commands::Server(args) => {
-            let paths = paths()?;
+            let paths = Paths::discover()?;
             run_async(meowland_server::serve_scaled(&paths, args.scale))
         }
         Commands::List => {
-            let paths = paths()?;
+            let paths = Paths::discover()?;
             for window in list(&paths)? {
                 println!(
                     "{}\t{}\t{}\t{}",
@@ -196,7 +191,7 @@ pub fn start() -> Result<()> {
             app_id,
             command: client,
         }) => {
-            let paths = paths()?;
+            let paths = Paths::discover()?;
             let launch = ControlRequest::Run {
                 args: client,
                 env: std::env::vars_os().collect(),
@@ -214,11 +209,11 @@ pub fn start() -> Result<()> {
             }
         }
         Commands::Attach(AttachArgs { window }) => {
-            let paths = paths()?;
+            let paths = Paths::discover()?;
             run_async(terminal::attach(&paths.pane, window_target(window)))
         }
         Commands::Kill(args) => {
-            let paths = paths()?;
+            let paths = Paths::discover()?;
             request(&paths, &ControlRequest::Kill(args.show()))?;
             Ok(())
         }

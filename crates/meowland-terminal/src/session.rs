@@ -6,8 +6,9 @@ use std::{
 };
 
 use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
+use meowland_input::{self as input, keyboard::Keyboard};
 use meowland_protocol::{
-    self as protocol, Hello, PaneToServer, ServerToPane, Show,
+    self as protocol, Hello, PaneAction, PaneToServer, ServerToPane, Show,
     asynchronous::{Outgoing, Reader},
     clipboard::Selection,
 };
@@ -18,12 +19,14 @@ use tokio::{
 };
 
 use super::{
-    Keyboard, input, output,
+    input_gate::InputGate,
+    output,
     presentation::PanePresentation,
     probe::terminal_probe,
-    send_clipboard_actions, send_deferred, send_event,
     terminal::{self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes},
 };
+
+mod events;
 
 const EVENTS_PER_TURN: usize = 64;
 
@@ -59,6 +62,7 @@ pub struct TerminalSession {
     input: input::Reader,
     stdout: Descriptor,
     keyboard: Keyboard,
+    input_gate: InputGate,
     clipboard: Clipboard,
     presentation: PanePresentation,
     cell: Option<(u16, u16)>,
@@ -102,6 +106,7 @@ impl TerminalSession {
             input,
             stdout: Descriptor::new(output::open()?.into())?,
             keyboard: Keyboard::default(),
+            input_gate: InputGate::default(),
             clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
             presentation: PanePresentation::new(cell, None),
             cell,
@@ -174,7 +179,7 @@ impl TerminalSession {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline.into()) => return Err(error.into()),
                 result = self.wakeup.read(&mut signal) => { result?; }
-                result = self.receiver.read() => match result {
+                result = self.receiver.read::<ServerToPane>() => match result {
                     Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)),
                     Err(_) => return Err(error.into()),
                     Ok(_) => {}
@@ -188,11 +193,12 @@ impl TerminalSession {
         {
             return Err(Error::PaneHandshakeTimeout);
         }
-        if self.keyboard.deferred_expired() {
-            send_deferred(&mut self.keyboard, &mut self.tx)?;
+        if self.input_gate.expired() {
+            self.input_gate.flush(&mut self.tx)?;
         }
+        self.presentation.advance(&mut self.tx)?;
         self.clipboard.advance(self.presentation.buffer());
-        send_clipboard_actions(&mut self.clipboard, &mut self.keyboard, &mut self.tx)
+        self.send_clipboard_actions()
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -202,7 +208,8 @@ impl TerminalSession {
         };
         handshake
             .into_iter()
-            .chain(self.keyboard.deadline())
+            .chain(self.input_gate.deadline())
+            .chain(self.presentation.deadline())
             .chain(self.clipboard.deadline())
             .min()
     }
@@ -257,12 +264,7 @@ impl TerminalSession {
                     self.window.cursor = shape;
                 }
             }
-            ServerToPane::Frame {
-                width,
-                height,
-                y,
-                rgb,
-            } => {
+            ServerToPane::Frame(band) => {
                 let starting = !matches!(self.lifecycle, Lifecycle::Active(_));
                 if starting {
                     self.start_presentation().await?;
@@ -270,8 +272,7 @@ impl TerminalSession {
                         return Ok(());
                     }
                 }
-                self.presentation
-                    .draw(width, height, y, rgb, &mut self.tx)?;
+                self.presentation.draw(band, &mut self.tx)?;
                 if starting {
                     self.apply_pending_window();
                 }
@@ -346,7 +347,8 @@ impl TerminalSession {
         })?;
         let _ = self.clipboard.refresh(Selection::Clipboard, false);
         let _ = self.clipboard.refresh(Selection::Primary, false);
-        self.tx.send(&PaneToServer::Resize { width, height })?;
+        self.tx
+            .send(&PaneToServer::Action(PaneAction::Resize { width, height }))?;
         probe.log_capabilities(width, height);
         self.lifecycle = Lifecycle::Active(mode);
         Ok(())
@@ -365,15 +367,8 @@ impl TerminalSession {
             {
                 continue;
             }
-            send_event(
-                event,
-                &mut self.tx,
-                &mut self.presentation,
-                &mut self.cell,
-                &mut self.clipboard,
-                &mut self.keyboard,
-            )?;
-            send_clipboard_actions(&mut self.clipboard, &mut self.keyboard, &mut self.tx)?;
+            self.send_event(event)?;
+            self.send_clipboard_actions()?;
         }
         Ok(())
     }

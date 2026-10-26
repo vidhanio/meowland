@@ -121,7 +121,7 @@ impl Bridge {
 pub fn selection(state: &mut State, target: SelectionTarget, source: Option<SelectionSource>) {
     state.clipboard.set_export(target, None);
     let pane = state
-        .cursor_pane
+        .last_input_pane
         .filter(|pane| {
             state.attachments.panes.get(pane).is_some_and(|pane| {
                 pane.window().is_some() && pane.window() == state.catalog.focused()

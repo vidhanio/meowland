@@ -1,16 +1,14 @@
 //! Cancellation-safe framing and bounded outgoing bytes for async transports.
 
-use std::{
-    collections::VecDeque,
-    io::{self, Write},
-};
+use std::{collections::VecDeque, io};
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{MAX_MESSAGE, ServerToPane, protocol::decode};
-
-const HEADER: usize = 4;
+use crate::{
+    MAX_MESSAGE, PanePacket, ServerToPane,
+    protocol::{HEADER, decode, message_size},
+};
 const IO_BUDGET: usize = 64 * 1024;
 
 /// A bounded packet reader retaining progress between readiness turns.
@@ -63,10 +61,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
             if self.header_read < HEADER {
                 return Ok(None);
             }
-            self.body_size = u32::from_le_bytes(self.header) as usize;
-            if self.body_size > MAX_MESSAGE {
-                return Err(invalid("message too large"));
-            }
+            self.body_size = message_size(self.header)?;
         }
         if self.body_read < self.body_size {
             let end = (self.body_read + IO_BUDGET).min(self.body_size);
@@ -115,42 +110,44 @@ impl Outgoing {
     /// Returns an error on serialization failure or if the byte limit is
     /// exceeded.
     pub fn send<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
-        let size = self.message_size(message)?;
-        let packet = encode_prefix(message, size, size)?;
+        let size = postcard::experimental::serialized_size(message).map_err(invalid)?;
+        self.reserve_packet(size)?;
+        let packet = encode_packet(message, size, size)?;
         self.push(packet);
         Ok(())
     }
 
-    /// Append a pane message, transferring RGB storage without copying it.
-    /// Frame RGB bytes are the final field in the serialized message.
+    /// Append a pane message, transferring RGB storage after an explicit
+    /// header.
     ///
     /// # Errors
     /// Returns an error on serialization failure or if the byte limit is
     /// exceeded.
     pub fn send_pane(&mut self, message: ServerToPane) -> io::Result<()> {
-        let size = self.message_size(&message)?;
-        let prefix = match &message {
-            ServerToPane::Frame { rgb, .. } => size - rgb.len(),
-            _ => size,
+        let ServerToPane::Frame(frame) = message else {
+            return self.send(&message);
         };
-        let header = encode_prefix(&message, size, prefix)?;
-        self.push(header);
-        if let ServerToPane::Frame { rgb, .. } = message {
-            self.push(rgb);
-        }
+        let header = PanePacket::Frame(frame.header());
+        let prefix = postcard::experimental::serialized_size(&header).map_err(invalid)?;
+        let size = prefix + frame.rgb().len();
+        self.reserve_packet(size)?;
+        let packet = encode_packet(&header, prefix, size)?;
+        let (_, _, rgb) = frame.into_parts();
+        self.push(packet);
+        self.push(rgb);
         Ok(())
     }
 
-    fn message_size<T: Serialize>(&self, message: &T) -> io::Result<usize> {
-        let size = postcard::experimental::serialized_size(message).map_err(invalid)?;
-        if self
-            .queued
-            .checked_add(size)
-            .is_none_or(|queued| queued > MAX_MESSAGE)
+    fn reserve_packet(&self, size: usize) -> io::Result<()> {
+        if size > MAX_MESSAGE
+            || self
+                .queued
+                .checked_add(HEADER + size)
+                .is_none_or(|queued| queued > HEADER + MAX_MESSAGE)
         {
             return Err(invalid("outgoing message queue exceeded its byte limit"));
         }
-        Ok(size)
+        Ok(())
     }
 
     fn push(&mut self, bytes: Vec<u8>) {
@@ -194,41 +191,14 @@ impl Outgoing {
     }
 }
 
-fn encode_prefix<T: Serialize>(message: &T, size: usize, prefix: usize) -> io::Result<Vec<u8>> {
-    let mut output = Prefix {
-        bytes: Vec::with_capacity(HEADER + prefix),
-        remaining: size,
-        limit: HEADER + prefix,
-    };
-    output.bytes.extend_from_slice(&(size as u32).to_le_bytes());
-    postcard::to_io(message, &mut output).map_err(invalid)?;
-    if output.remaining != 0 {
+fn encode_packet<T: Serialize>(message: &T, prefix: usize, size: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0; HEADER + prefix];
+    bytes[..HEADER].copy_from_slice(&(size as u32).to_le_bytes());
+    let encoded = postcard::to_slice(message, &mut bytes[HEADER..]).map_err(invalid)?;
+    if encoded.len() != prefix {
         return Err(invalid("serialized message size changed"));
     }
-    Ok(output.bytes)
-}
-
-/// Retains the prefix while counting, but not copying, the serialized tail.
-struct Prefix {
-    bytes: Vec<u8>,
-    remaining: usize,
-    limit: usize,
-}
-
-impl Write for Prefix {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.remaining {
-            return Err(invalid("serialized message size changed"));
-        }
-        let keep = (self.limit - self.bytes.len()).min(bytes.len());
-        self.bytes.extend_from_slice(&bytes[..keep]);
-        self.remaining -= bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    Ok(bytes)
 }
 
 fn invalid(error: impl std::fmt::Display) -> io::Error {

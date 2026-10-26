@@ -19,7 +19,7 @@ use smithay::{
     },
 };
 
-use super::{Policy, ServerToPane, State, Window, WlSurface, input, render};
+use super::{State, Window, WlSurface, input, render};
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -103,7 +103,10 @@ impl XdgShellHandler for State {
         self.popup_grab = Some(grab);
     }
 
-    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()) {
+            self.touch(window);
+        }
         self.refresh_popup_grab();
     }
 
@@ -111,53 +114,7 @@ impl XdgShellHandler for State {
         let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
             return;
         };
-        let stale: Vec<WlSurface> = self
-            .snapshots
-            .keys()
-            .filter(|surface| self.window_for_surface(surface) == Some(id))
-            .cloned()
-            .collect();
-        for surface in stale {
-            self.snapshots.remove(&surface);
-        }
-        self.ids.remove(surface.wl_surface());
-        self.cancel_window_activations(id);
-        if self.keyboard_pane.is_some_and(|pane| {
-            self.attachments
-                .panes
-                .get(&pane)
-                .is_some_and(|entry| entry.window() == Some(id))
-        }) {
-            input::reset_keyboard(self);
-        }
-        for pane in self.panes_showing(id) {
-            if self.attachments.panes[&pane].policy == Policy::FollowNewest {
-                if let Some(entry) = self.attachments.panes.get_mut(&pane) {
-                    entry.clear();
-                }
-                self.emit(pane, ServerToPane::Title(String::new()));
-            } else {
-                self.remove_pane(pane);
-                self.emit(pane, ServerToPane::Release("window closed".into()));
-            }
-        }
-        self.leave_output(id);
-        self.windows.remove(&id);
-        self.toplevels.remove(id);
-        self.attachments.forget_window(id);
-        let was_newest = self.catalog.newest() == Some(id);
-        self.catalog.remove(id);
-        if was_newest && let Some(newest) = self.catalog.newest() {
-            self.follow_panes(newest);
-        }
-        self.popups.cleanup();
-        if self.catalog.focused() == Some(id) {
-            if let Some(next) = self.catalog.newest() {
-                self.focus_window(next);
-            } else {
-                self.catalog.focus(None);
-            }
-        }
+        self.remove_window(id);
     }
 
     fn fullscreen_request(

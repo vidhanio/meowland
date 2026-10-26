@@ -1,10 +1,30 @@
 //! Pane commands and their Wayland side effects.
 
-use meowland_core::pixels::FrameSize;
-use meowland_protocol::Show;
+use meowland_core::{pixels::FrameSize, timing::REFRESH_MILLIHZ};
+use meowland_protocol::{Input, PaneAction, Shortcut, Show};
 use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
 
-use super::{Command, Pane, ServerToPane, State, WindowId, clipboard, input::pane_input};
+use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input::pane_input};
+
+/// Owned operations applied exclusively on the Wayland event-loop thread.
+#[derive(Clone, Debug)]
+pub enum Command {
+    Attach {
+        pane: PaneId,
+        show: Show,
+        width: u32,
+        height: u32,
+    },
+    Detach {
+        pane: PaneId,
+    },
+    Pane {
+        pane: PaneId,
+        action: PaneAction,
+    },
+    CloseAll,
+    Shutdown,
+}
 
 impl State {
     /// Apply one pane or lifecycle command on the event-loop thread.
@@ -26,49 +46,68 @@ impl State {
                 self.attach_pane(pane, show, size);
             }
             Command::Detach { pane } => self.release_pane_window(pane),
-            Command::Resize {
-                pane,
-                width,
-                height,
-            } => {
-                if let Some(size) = FrameSize::new(width, height) {
-                    self.resize_pane(pane, size);
-                }
-            }
-            Command::Input { pane, event } => pane_input(self, pane, &event),
-            Command::Paste { pane, text } => clipboard::paste(self, pane, &text),
-            Command::ClipboardOffer {
-                pane,
-                selection,
-                offer,
-                mimes,
-                paste,
-            } => clipboard::offer(self, pane, selection, offer, mimes, paste),
-            Command::ClipboardReply {
-                pane,
-                request,
-                data,
-            } => clipboard::reply(self, pane, request, data),
-            Command::Ack { pane, drawn } => self.pane_ack(pane, drawn),
-            Command::CloseShown { pane } => {
-                if let Some(window) = self
-                    .attachments
-                    .panes
-                    .get(&pane)
-                    .and_then(Pane::window)
-                    .and_then(|id| self.windows.get(&id))
-                {
-                    window.surface.send_close();
-                } else {
-                    self.emit(pane, ServerToPane::Release("empty pane".into()));
-                }
-            }
+            Command::Pane { pane, action } => self.pane_action(pane, action),
             command @ (Command::CloseAll | Command::Shutdown) => {
                 for window in self.windows.values() {
                     window.surface.send_close();
                 }
                 self.shutdown |= matches!(command, Command::Shutdown);
             }
+        }
+    }
+
+    fn pane_action(&mut self, pane: PaneId, action: PaneAction) {
+        match action {
+            PaneAction::Resize { width, height } => {
+                if let Some(size) = FrameSize::new(width, height) {
+                    self.resize_pane(pane, size);
+                }
+            }
+            PaneAction::Input(event) => {
+                if let Input::Key {
+                    code,
+                    modifiers,
+                    pressed: true,
+                    ..
+                } = &event
+                    && let Some(shortcut) = Shortcut::from_key(*code, *modifiers)
+                {
+                    match shortcut {
+                        Shortcut::CloseWindow => self.close_shown(pane),
+                        Shortcut::DetachPane => {
+                            self.release_pane_window(pane);
+                            self.emit(pane, ServerToPane::Release("detached".into()));
+                        }
+                    }
+                } else {
+                    pane_input(self, pane, &event);
+                }
+            }
+            PaneAction::Paste(text) => clipboard::paste(self, pane, &text),
+            PaneAction::ClipboardOffer {
+                selection,
+                offer,
+                mimes,
+                paste,
+            } => clipboard::offer(self, pane, selection, offer, mimes, paste),
+            PaneAction::ClipboardReply { request, data } => {
+                clipboard::reply(self, pane, request, data);
+            }
+            PaneAction::Ack(ack) => self.pane_ack(pane, ack),
+        }
+    }
+
+    fn close_shown(&mut self, pane: PaneId) {
+        if let Some(window) = self
+            .attachments
+            .panes
+            .get(&pane)
+            .and_then(AttachedPane::window)
+            .and_then(|id| self.windows.get(&id))
+        {
+            window.surface.send_close();
+        } else {
+            self.emit(pane, ServerToPane::Release("empty pane".into()));
         }
     }
 
@@ -120,7 +159,7 @@ impl State {
     pub(crate) fn configure_output(&mut self, size: FrameSize) {
         let mode = Mode {
             size: (size.width() as i32, size.height() as i32).into(),
-            refresh: 60_000,
+            refresh: REFRESH_MILLIHZ,
         };
         self.mode = self.logical_size(size.width(), size.height());
         for previous in self.output.modes() {

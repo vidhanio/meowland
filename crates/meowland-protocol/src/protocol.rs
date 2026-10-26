@@ -16,7 +16,7 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum UTF-8 bytes in a single committed keyboard-text event.
 pub const MAX_INPUT_TEXT: usize = 4096;
 
-const HEADER: usize = 4;
+pub const HEADER: usize = 4;
 
 thread_local! {
     /// Reuse a message buffer across frames to avoid megabyte-scale allocations.
@@ -46,6 +46,37 @@ pub mod modifiers {
 /// The keys a pane treats as compositor bindings, in Linux input codes.
 pub const KEY_Q: u16 = 16;
 pub const KEY_W: u16 = 17;
+pub const KEY_V: u16 = 47;
+pub const KEY_INSERT: u16 = 110;
+
+/// Compositor bindings shared by terminal release interception and dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortcut {
+    CloseWindow,
+    DetachPane,
+}
+
+impl Shortcut {
+    #[must_use]
+    pub const fn from_key(code: u16, bits: u8) -> Option<Self> {
+        if !modifiers::alt_only(bits) {
+            return None;
+        }
+        match code {
+            KEY_Q => Some(Self::CloseWindow),
+            KEY_W => Some(Self::DetachPane),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the pane retained a frame's pixels as a valid basis for future
+/// bands.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum FrameAck {
+    Retained,
+    Resync,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Show {
@@ -107,16 +138,18 @@ pub enum Input {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PaneToServer {
     Hello(Hello),
+    Action(PaneAction),
+}
+
+/// Actions accepted after the pane handshake, independent of socket ownership.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum PaneAction {
     Input(Input),
     Resize {
         width: u32,
         height: u32,
     },
-    /// `drawn` is false if the pane dropped the frame; the compositor must
-    /// resend.
-    Ack {
-        drawn: bool,
-    },
+    Ack(FrameAck),
     Paste(String),
     ClipboardOffer {
         selection: crate::clipboard::Selection,
@@ -131,20 +164,13 @@ pub enum PaneToServer {
     },
 }
 
+/// Server packets share one schema for owned frames and split frame headers.
 #[derive(Debug, Deserialize, Serialize)]
-pub enum ServerToPane {
+pub enum PanePacket<F> {
     HelloOk,
     Reject(String),
-    /// RGB rows of a frame, starting at `y`.
-    /// The RGB byte string stays last so writers can transmit its storage
-    /// directly.
-    Frame {
-        width: u32,
-        height: u32,
-        y: u32,
-        #[serde(with = "serde_bytes")]
-        rgb: Vec<u8>,
-    },
+    /// A validated RGB band, or its explicit header during split transmission.
+    Frame(F),
     Release(String),
     Title(String),
     /// The pointer shape the terminal should show, or `None` for its own.
@@ -164,6 +190,8 @@ pub enum ServerToPane {
     },
     Bell,
 }
+
+pub type ServerToPane = PanePacket<crate::FrameBand>;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ControlRequest {
@@ -239,7 +267,7 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
     })
 }
 
-fn message_size(header: [u8; HEADER]) -> io::Result<usize> {
+pub fn message_size(header: [u8; HEADER]) -> io::Result<usize> {
     let size = u32::from_le_bytes(header) as usize;
     if size > MAX_MESSAGE {
         return Err(io::Error::new(

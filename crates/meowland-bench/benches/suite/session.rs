@@ -16,7 +16,9 @@ use std::{
 use meowland_compositor::{Command, Event, PaneId, Runtime};
 use meowland_core::scale::UiScale;
 use meowland_kitty::Presenter;
-use meowland_protocol::{self as protocol, Hello, PaneToServer, Paths, ServerToPane};
+use meowland_protocol::{
+    self as protocol, FrameAck, Hello, PaneAction, PaneToServer, Paths, ServerToPane,
+};
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 const CELL: (u16, u16) = (10, 20);
@@ -50,8 +52,7 @@ impl Commands {
                         width,
                         height,
                     }),
-                    Command::Ack { drawn, .. } => PaneToServer::Ack { drawn },
-                    Command::Input { event, .. } => PaneToServer::Input(event),
+                    Command::Pane { action, .. } => PaneToServer::Action(action),
                     Command::Shutdown => return Ok(()),
                     _ => return Err("unsupported benchmark command".into()),
                 };
@@ -66,6 +67,7 @@ pub struct Session {
     pub commands: Commands,
     pub log: Arc<Mutex<CommitLog>>,
     display: String,
+    runtime: PathBuf,
     thread: Option<thread::JoinHandle<()>>,
     receiver: Option<thread::JoinHandle<()>>,
     server: Option<RemoteServer>,
@@ -121,6 +123,7 @@ impl Session {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         Ok(Self::receive(
+            PathBuf::from(env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?),
             display,
             Commands::Local(commands),
             events.into_iter(),
@@ -135,8 +138,7 @@ impl Session {
         let directory = runtime.join(format!("meowland-bench-{}", process::id()));
         fs::create_dir(&directory).map_err(|error| error.to_string())?;
         let child = match process::Command::new(binary)
-            .arg("--runtime-dir")
-            .arg(&directory)
+            .env("XDG_RUNTIME_DIR", &directory)
             .arg("server")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -152,7 +154,7 @@ impl Session {
         let display = format!("wayland-meowland-{}", server.child.id());
         let paths = Paths::in_runtime_dir(&server.directory).map_err(|error| error.to_string())?;
         let deadline = Instant::now() + TIMEOUT;
-        while !paths.pane.exists() || !runtime.join(&display).exists() {
+        while !paths.pane.exists() || !server.directory.join(&display).exists() {
             if server
                 .child
                 .try_wait()
@@ -178,6 +180,7 @@ impl Session {
             })
         });
         Ok(Self::receive(
+            server.directory.clone(),
             display,
             Commands::Socket(Arc::new(Mutex::new(writer))),
             events,
@@ -187,6 +190,7 @@ impl Session {
     }
 
     fn receive(
+        runtime: PathBuf,
         display: String,
         commands: Commands,
         events: impl Iterator<Item = Event> + Send + 'static,
@@ -206,13 +210,8 @@ impl Session {
             let mut terminal_output = Vec::new();
             for Event { pane, message } in events {
                 match message {
-                    ServerToPane::Frame {
-                        width,
-                        height,
-                        y,
-                        rgb,
-                    } => {
-                        presenter.present_into(width, height, y, rgb, &mut terminal_output);
+                    ServerToPane::Frame(band) => {
+                        presenter.present_into(band, &mut terminal_output);
                         black_box(terminal_output.len());
                         let now = Instant::now();
                         let mut log = receiver_log.lock().unwrap();
@@ -226,7 +225,10 @@ impl Session {
                             log.latencies.push(now.saturating_duration_since(started));
                         }
                         drop(log);
-                        let _ = receiver_commands.send(Command::Ack { pane, drawn: true });
+                        let _ = receiver_commands.send(Command::Pane {
+                            pane,
+                            action: PaneAction::Ack(FrameAck::Retained),
+                        });
                     }
                     ServerToPane::Release(_) => {
                         receiver_log.lock().unwrap().released = true;
@@ -239,6 +241,7 @@ impl Session {
         Self {
             commands,
             display,
+            runtime,
             thread,
             receiver: Some(receiver),
             log,
@@ -246,11 +249,8 @@ impl Session {
         }
     }
 
-    pub fn socket(&self) -> Result<PathBuf, String> {
-        let runtime = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "XDG_RUNTIME_DIR is not set".to_owned())?;
-        Ok(runtime.join(&self.display))
+    pub fn socket(&self) -> PathBuf {
+        self.runtime.join(&self.display)
     }
 }
 

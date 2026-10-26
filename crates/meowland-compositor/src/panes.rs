@@ -4,7 +4,7 @@ use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
 use smithay::utils::{Logical, Size};
 
-use super::{Binding, Pane, PaneId, Selection, ServerToPane, State, WindowId, input};
+use super::{AttachedPane, Binding, PaneId, Selection, ServerToPane, State, WindowId, input};
 
 impl State {
     /// The last-used pane decides the window's size; otherwise use the first
@@ -20,7 +20,7 @@ impl State {
     }
 
     /// The lowest-numbered pane sets the output mode seen by clients.
-    fn insert_pane(&mut self, pane: PaneId, entry: Pane) {
+    fn insert_pane(&mut self, pane: PaneId, entry: AttachedPane) {
         let size = entry.presentation.size;
         self.attachments.panes.insert(pane, entry);
         if self.attachments.first() == Some(pane) {
@@ -31,29 +31,30 @@ impl State {
     /// Remove every pane-keyed entry, restoring the remaining output mode and
     /// window size owner.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
-        if self.keyboard_pane == Some(pane) {
+        if self.keyboard_state.owner == Some(pane) {
             input::reset_keyboard(self);
         }
         let first = self.attachments.first() == Some(pane);
         let removed = self.attachments.remove(pane);
-        let window = removed.as_ref().and_then(Pane::window);
+        let window = removed.as_ref().and_then(AttachedPane::window);
         self.clipboard.detach(pane);
-        if let Some(Pane {
+        if let Some(AttachedPane {
             binding: Binding::Waiting(Selection::Activation(token)),
             ..
         }) = removed
         {
             self.forget_activation(&token);
         }
-        if self.cursor_pane == Some(pane) {
-            self.cursor_pane = None;
+        if self.last_input_pane == Some(pane) {
+            self.last_input_pane = None;
         }
         if self
-            .sent_cursor
+            .cursor
+            .sent
             .as_ref()
             .is_some_and(|(sent, _)| *sent == pane)
         {
-            self.sent_cursor = None;
+            self.cursor.sent = None;
         }
         if first && let Some(next) = self.attachments.first() {
             self.configure_output(self.attachments.panes[&next].presentation.size);
@@ -116,7 +117,7 @@ impl State {
             Show::Activation(token) if window.is_some() => Some(token.clone()),
             _ => None,
         };
-        self.insert_pane(pane, Pane::new(show, window, size));
+        self.insert_pane(pane, AttachedPane::new(show, window, size));
         if let Some(window) = window {
             self.show_pane_window(pane, window);
         }
@@ -130,7 +131,7 @@ impl State {
         self.focus_window(window);
     }
 
-    fn bind_pane_window(&mut self, pane: PaneId, window: WindowId) {
+    pub(crate) fn bind_pane_window(&mut self, pane: PaneId, window: WindowId) {
         let Some(entry) = self.attachments.panes.get_mut(&pane) else {
             return;
         };
@@ -140,7 +141,7 @@ impl State {
             self.forget_activation(&token);
         }
         if previous != Some(window) {
-            if self.keyboard_pane == Some(pane) {
+            if self.keyboard_state.owner == Some(pane) {
                 input::reset_keyboard(self);
             }
             if let Some(previous) = previous {

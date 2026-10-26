@@ -32,13 +32,13 @@ pub enum Policy {
     FollowNewest,
 }
 
-pub struct Pane {
+pub struct AttachedPane {
     pub binding: Binding,
     pub policy: Policy,
     pub presentation: PaneState,
 }
 
-impl Pane {
+impl AttachedPane {
     pub fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
         let policy = if matches!(show, Show::Newest)
             || (window.is_none() && matches!(show, Show::Focused))
@@ -86,7 +86,7 @@ impl Pane {
 
 #[derive(Default)]
 pub struct Attachments {
-    pub panes: HashMap<PaneId, Pane>,
+    pub panes: HashMap<PaneId, AttachedPane>,
     deciding: HashMap<WindowId, PaneId>,
 }
 
@@ -151,7 +151,7 @@ impl Attachments {
             .any(|pane| pane.window() == Some(window))
     }
 
-    pub fn remove(&mut self, pane: PaneId) -> Option<Pane> {
+    pub fn remove(&mut self, pane: PaneId) -> Option<AttachedPane> {
         self.deciding.retain(|_, owner| *owner != pane);
         self.panes.remove(&pane)
     }

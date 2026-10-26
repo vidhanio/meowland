@@ -7,5 +7,6 @@ mod error;
 pub mod pixels;
 pub mod scale;
 pub mod signals;
+pub mod timing;
 
 pub use error::{Error, Result};

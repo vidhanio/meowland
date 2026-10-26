@@ -1,7 +1,19 @@
 use std::{hint::black_box, time::Instant};
 
+use meowland_core::pixels::FrameSize;
 use meowland_kitty::{Presenter, SharedMemory};
-use meowland_protocol::{Input, PaneToServer, ServerToPane, modifiers, recv, send};
+use meowland_protocol::{
+    FrameBand, Input, PaneAction, PaneToServer, ServerToPane, modifiers, recv, send,
+};
+
+fn frame_band(width: u32, height: u32, rgb: Vec<u8>) -> FrameBand {
+    FrameBand::new(
+        FrameSize::new(width, height).expect("valid benchmark size"),
+        0,
+        rgb,
+    )
+    .expect("valid benchmark pixels")
+}
 
 use crate::stats::{Rate, Row, measure};
 
@@ -100,14 +112,14 @@ fn encode_frames(
         frame
     };
     for _ in 0..WARM_UP {
-        let frame = frame_iteration();
-        presenter.present_into(WIDTH, HEIGHT, 0, frame, &mut out);
+        let frame = frame_band(WIDTH, HEIGHT, frame_iteration());
+        presenter.present_into(frame, &mut out);
     }
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
-        let frame = frame_iteration();
+        let frame = frame_band(WIDTH, HEIGHT, frame_iteration());
         let sample = Instant::now();
-        presenter.present_into(WIDTH, HEIGHT, 0, frame, &mut out);
+        presenter.present_into(frame, &mut out);
         samples.push(sample.elapsed());
         black_box(out.len());
     }
@@ -166,10 +178,10 @@ pub fn terminal(quick: bool) -> Vec<Row> {
         let mut out = Vec::with_capacity(64 * 1024);
         let mut samples = Vec::with_capacity(iterations);
         for index in 0..iterations {
-            let frame = frames[index % frames.len()].clone();
+            let frame = frame_band(WIDTH, HEIGHT, frames[index % frames.len()].clone());
             let mut presenter = Presenter::new(None, Some(SharedMemory::new()));
             let sample = Instant::now();
-            presenter.present_into(WIDTH, HEIGHT, 0, frame, &mut out);
+            presenter.present_into(frame, &mut out);
             samples.push(sample.elapsed());
             black_box(out.len());
             drop(presenter);
@@ -187,12 +199,7 @@ pub fn terminal(quick: bool) -> Vec<Row> {
 }
 
 fn frame_message(width: u32, height: u32) -> ServerToPane {
-    ServerToPane::Frame {
-        width,
-        height,
-        y: 0,
-        rgb: vec![17; pixels(width, height)],
-    }
+    ServerToPane::Frame(frame_band(width, height, vec![17; pixels(width, height)]))
 }
 
 fn wire_frame(prefix: &str, width: u32, height: u32, iterations: usize) -> Vec<Row> {
@@ -247,12 +254,12 @@ pub fn wire(quick: bool) -> Vec<Row> {
         if quick { 40 } else { 160 },
     ));
 
-    let key = PaneToServer::Input(Input::Key {
+    let key = PaneToServer::Action(PaneAction::Input(Input::Key {
         code: 30,
         pressed: true,
         modifiers: modifiers::ALT,
         held: vec![56],
-    });
+    }));
     let mut encoded = Vec::with_capacity(64);
     send(&mut encoded, &key).expect("input encoding cannot fail");
     let encoded = black_box(encoded);

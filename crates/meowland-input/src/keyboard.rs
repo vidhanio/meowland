@@ -3,29 +3,18 @@
 //! Kitty sends logical (unshifted) keys, not Linux scan codes. Keep that
 //! translation here; key lifetimes and modifier snapshots are never strokes.
 
-use std::{
-    collections::{BTreeSet, HashSet},
-    time::Instant,
-};
+use std::collections::{BTreeSet, HashSet};
 
-use meowland_protocol::{Input, KEY_Q, KEY_W, modifiers};
+use meowland_protocol::{Input, KEY_INSERT, KEY_V, modifiers};
 
 use super::input::{Key, Kind};
 
-/// Releases of intercepted shortcuts must stay intercepted even if their
-/// modifiers have changed by the time the key comes up.
-#[derive(Debug)]
-struct Deferred {
-    inputs: Vec<Input>,
-    deadline: Instant,
-}
-
+/// Held keys and releases intercepted by compositor shortcuts.
 #[derive(Debug, Default)]
 pub struct Keyboard {
     intercepted: HashSet<u16>,
     held: BTreeSet<u16>,
     modifiers: u8,
-    deferred: Option<Deferred>,
 }
 
 impl Keyboard {
@@ -66,73 +55,18 @@ impl Keyboard {
         }
     }
 
-    #[must_use]
-    pub const fn deferred(&self) -> bool {
-        self.deferred.is_some()
-    }
-
-    pub fn defer(&mut self, input: Input, deadline: Instant) {
-        self.deferred
-            .get_or_insert_with(|| Deferred {
-                inputs: Vec::new(),
-                deadline,
-            })
-            .inputs
-            .push(input);
-    }
-
-    pub fn take_deferred(&mut self) -> Vec<Input> {
-        self.deferred
-            .take()
-            .map_or_else(Vec::new, |deferred| deferred.inputs)
-    }
-
-    #[must_use]
-    pub const fn deadline(&self) -> Option<Instant> {
-        match &self.deferred {
-            Some(deferred) => Some(deferred.deadline),
-            None => None,
-        }
-    }
-
-    #[must_use]
-    pub fn deferred_expired(&self) -> bool {
-        self.deadline()
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }
-
-    #[must_use]
-    pub fn deferred_len(&self) -> usize {
-        self.deferred
-            .as_ref()
-            .map_or(0, |deferred| deferred.inputs.len())
-    }
-
-    pub fn reset(&mut self, preserve_deferred: bool) {
+    pub fn reset(&mut self) {
         self.intercepted.clear();
         self.held.clear();
         self.modifiers = 0;
-        if preserve_deferred {
-            if let Some(deferred) = &mut self.deferred
-                && !matches!(deferred.inputs.last(), Some(Input::ResetKeyboard))
-            {
-                deferred.inputs.push(Input::ResetKeyboard);
-            }
-        } else {
-            self.deferred = None;
-        }
     }
-}
-
-#[must_use]
-pub const fn binding(code: u16, bits: u8) -> bool {
-    modifiers::alt_only(bits) && matches!(code, KEY_Q | KEY_W)
 }
 
 #[must_use]
 pub const fn paste(code: u16, bits: u8) -> bool {
     let bits = bits & !(modifiers::CAPS_LOCK | modifiers::NUM_LOCK);
-    (code == 47 && bits == modifiers::CONTROL) || (code == 110 && bits == modifiers::SHIFT)
+    (code == KEY_V && bits == modifiers::CONTROL)
+        || (code == KEY_INSERT && bits == modifiers::SHIFT)
 }
 
 pub(crate) fn key_code(code: u32) -> Option<u16> {

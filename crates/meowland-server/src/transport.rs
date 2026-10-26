@@ -83,7 +83,7 @@ async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::R
     };
     let (sender, messages) = mpsc::unbounded_channel();
     let (release, reason) = oneshot::channel();
-    let output = Pane {
+    let output = PaneTransport {
         sender: Some(sender),
         release: Some(release),
         bytes: Arc::new(AtomicUsize::new(0)),
@@ -94,9 +94,14 @@ async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::R
         .map_err(io::Error::other)?;
     let receiving = async {
         loop {
-            let message = reader.read().await?;
+            let PaneToServer::Action(action) = reader.read().await? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate pane hello",
+                ));
+            };
             incoming
-                .send(Incoming::PaneMessage(id, message))
+                .send(Incoming::PaneMessage(id, action))
                 .await
                 .map_err(io::Error::other)?;
         }
@@ -107,7 +112,7 @@ async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::R
     }
 }
 
-pub struct Pane {
+pub struct PaneTransport {
     sender: Option<mpsc::UnboundedSender<Queued>>,
     release: Option<oneshot::Sender<String>>,
     bytes: Arc<AtomicUsize>,
@@ -129,7 +134,7 @@ struct Queued {
     _reservation: Reservation,
 }
 
-impl Pane {
+impl PaneTransport {
     pub const fn active(&self) -> bool {
         self.sender.is_some()
     }

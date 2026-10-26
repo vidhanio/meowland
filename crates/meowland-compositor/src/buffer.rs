@@ -1,5 +1,7 @@
 //! Surface commits, copied snapshots, and buffer protocol handling.
 
+use std::collections::HashMap;
+
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     desktop::PopupManager,
@@ -21,7 +23,33 @@ use smithay::{
     },
 };
 
-use super::{Snapshot, State, readback, render, runtime::ClientState};
+use super::{Snapshot, State, WindowId, readback, render, runtime::ClientState};
+
+#[derive(Default)]
+pub struct SurfaceCache {
+    pub snapshots: HashMap<WlSurface, Snapshot>,
+    geometry: HashMap<WlSurface, Geometry>,
+    pub owners: HashMap<WlSurface, WindowId>,
+}
+
+impl SurfaceCache {
+    fn remove(&mut self, surface: &WlSurface) {
+        self.snapshots.remove(surface);
+        self.geometry.remove(surface);
+        self.owners.remove(surface);
+    }
+
+    pub fn remove_window(&mut self, id: WindowId) {
+        let surfaces: Vec<_> = self
+            .owners
+            .iter()
+            .filter_map(|(surface, &owner)| (owner == id).then_some(surface.clone()))
+            .collect();
+        for surface in surfaces {
+            self.remove(&surface);
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Geometry {
@@ -113,6 +141,9 @@ impl CompositorHandler for State {
     )]
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
+        if let Some(window) = self.window_for_surface(surface) {
+            self.surface_cache.owners.insert(surface.clone(), window);
+        }
         let (assignment, damaged, geometry, callbacks) = with_states(surface, |states| {
             let (assignment, damaged, scale, transform, callbacks) = {
                 let mut cached = states.cached_state.get::<SurfaceAttributes>();
@@ -149,9 +180,12 @@ impl CompositorHandler for State {
             window.callback_pending = true;
         }
         let geometry_changed = if geometry.is_default() {
-            self.surface_geometry.remove(surface).is_some()
+            self.surface_cache.geometry.remove(surface).is_some()
         } else {
-            self.surface_geometry.insert(surface.clone(), geometry) != Some(geometry)
+            self.surface_cache
+                .geometry
+                .insert(surface.clone(), geometry)
+                != Some(geometry)
         };
         let visual_change = assignment.is_some()
             || damaged
@@ -167,7 +201,7 @@ impl CompositorHandler for State {
                     geometry.scale,
                     Transform::from(geometry.transform),
                 );
-                let mut previous = self.snapshots.remove(surface);
+                let mut previous = self.surface_cache.snapshots.remove(surface);
                 let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
                     .map(|pixel| Snapshot::single_pixel(pixel.rgba8888()));
@@ -188,17 +222,19 @@ impl CompositorHandler for State {
                 });
                 buffer.release();
                 if let Some(snapshot) = snapshot.or(previous) {
-                    self.snapshots.insert(surface.clone(), snapshot);
+                    self.surface_cache
+                        .snapshots
+                        .insert(surface.clone(), snapshot);
                 }
             }
             Some(BufferAssignment::Removed) => {
-                self.snapshots.remove(surface);
+                self.surface_cache.snapshots.remove(surface);
             }
             None => {}
         }
-        self.announce(surface);
+        self.refresh_window_mapping(surface);
         if let Some(window) = self.window_for_surface(surface) {
-            if self.attachments.visible(window) {
+            if self.attachments.visible(window) && self.catalog.drawable(window) {
                 self.output.enter(surface);
             }
             if visual_change {
@@ -210,8 +246,15 @@ impl CompositorHandler for State {
     /// A destroyed surface may not belong to any toplevel, so remove its
     /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
-        self.snapshots.remove(surface);
-        self.surface_geometry.remove(surface);
+        let window = self.window_for_surface(surface);
+        self.surface_cache.remove(surface);
         readback::destroyed(self, surface);
+        if let Some(window) = window {
+            if self.ids.get(surface) == Some(&window) {
+                self.unmap_window(window);
+            } else {
+                self.touch(window);
+            }
+        }
     }
 }

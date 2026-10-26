@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use meowland_core::Result;
-use meowland_kitty::{Presenter, SharedMemory};
-use meowland_protocol::{PaneToServer, asynchronous::Outgoing};
+use meowland_kitty::{PresentOutcome, Presenter, SharedMemory};
+use meowland_protocol::{FrameAck, FrameBand, PaneAction, PaneToServer, asynchronous::Outgoing};
 use tokio::io::AsyncWrite;
 
 use super::output;
@@ -71,13 +71,14 @@ pub struct PanePresentation {
     stats: PaneStats,
     pending: output::Output,
     frame: Option<PendingFrame>,
+    retry: Option<Instant>,
 }
 
 struct PendingFrame {
     started: Instant,
     encoded: Duration,
     bytes: usize,
-    dropped: bool,
+    accepted: bool,
 }
 
 impl PanePresentation {
@@ -87,6 +88,7 @@ impl PanePresentation {
             stats: PaneStats::new(),
             pending: output::Output::default(),
             frame: None,
+            retry: None,
         }
     }
 
@@ -104,28 +106,53 @@ impl PanePresentation {
     }
 
     pub fn set_cell_size(&mut self, cell: Option<(u16, u16)>) {
-        self.presenter.set_cell_size(cell);
+        if self.presenter.set_cell_size(cell) {
+            self.retry = Some(Instant::now());
+        }
     }
 
-    pub fn draw(
-        &mut self,
-        width: u32,
-        height: u32,
-        y: u32,
-        rgb: Vec<u8>,
-        tx: &mut Outgoing,
-    ) -> Result<()> {
-        debug_assert!(!self.pending());
-        let encode_started = Instant::now();
-        self.presenter
-            .present_into(width, height, y, rgb, self.pending.buffer());
+    pub fn deadline(&self) -> Option<Instant> {
+        self.retry.filter(|_| !self.pending())
+    }
+
+    pub fn draw(&mut self, band: FrameBand, tx: &mut Outgoing) -> Result<()> {
+        debug_assert!(!self.pending() && self.frame.is_none());
+        let started = Instant::now();
+        let outcome = self.presenter.present_into(band, self.pending.buffer());
         self.frame = Some(PendingFrame {
-            encoded: encode_started.elapsed(),
-            started: Instant::now(),
+            encoded: started.elapsed(),
+            started,
             bytes: self.pending.len(),
-            dropped: self.presenter.dropped(),
+            accepted: outcome != PresentOutcome::NeedsKeyframe,
         });
+        self.schedule(outcome);
         self.finish(tx)
+    }
+
+    pub fn advance(&mut self, tx: &mut Outgoing) -> Result<()> {
+        if self
+            .deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let started = Instant::now();
+            let outcome = self.presenter.repaint_into(self.pending.buffer());
+            if let Some(frame) = &mut self.frame {
+                frame.encoded += started.elapsed();
+                frame.bytes += self.pending.len();
+            }
+            self.schedule(outcome);
+            self.finish(tx)?;
+        }
+        Ok(())
+    }
+
+    const fn schedule(&mut self, outcome: PresentOutcome) {
+        self.retry = match outcome {
+            PresentOutcome::RetryAt(deadline) => Some(deadline),
+            PresentOutcome::Unchanged | PresentOutcome::Encoded | PresentOutcome::NeedsKeyframe => {
+                None
+            }
+        };
     }
 
     pub async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
@@ -134,7 +161,7 @@ impl PanePresentation {
     }
 
     pub fn finish(&mut self, tx: &mut Outgoing) -> Result<()> {
-        if self.pending() {
+        if self.pending() || self.retry.is_some() {
             return Ok(());
         }
         let Some(frame) = self.frame.take() else {
@@ -142,13 +169,15 @@ impl PanePresentation {
         };
         self.stats.frame(
             frame.bytes,
-            frame.dropped,
+            !frame.accepted,
             frame.encoded,
             frame.started.elapsed(),
         );
-        tx.send(&PaneToServer::Ack {
-            drawn: !frame.dropped,
-        })?;
+        tx.send(&PaneToServer::Action(PaneAction::Ack(if frame.accepted {
+            FrameAck::Retained
+        } else {
+            FrameAck::Resync
+        })))?;
         Ok(())
     }
 }

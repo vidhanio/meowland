@@ -6,6 +6,7 @@ use std::{
 };
 
 use meowland_core::pixels::FrameSize;
+use meowland_protocol::{FrameAck, FrameBand};
 
 use super::{Event, FRAME_INTERVAL, ServerToPane, State, SurfaceAttributes, with_states};
 
@@ -43,14 +44,15 @@ impl PaneState {
         };
     }
 
-    const fn ack(&mut self, drawn: bool) {
+    const fn ack(&mut self, ack: FrameAck) {
         let Presentation::InFlight { dirty } = self.presentation else {
             return;
         };
-        if !drawn {
+        let resync = matches!(ack, FrameAck::Resync);
+        if resync {
             self.shown_size = None;
         }
-        self.presentation = if dirty || !drawn {
+        self.presentation = if dirty || resync {
             Presentation::Dirty
         } else {
             Presentation::Clean
@@ -76,12 +78,10 @@ impl PaneState {
         self.shown[bytes.clone()].copy_from_slice(&pixels[bytes.clone()]);
         self.shown_size = Some(self.size);
         self.presentation = Presentation::InFlight { dirty: false };
-        Some(ServerToPane::Frame {
-            width: self.size.width(),
-            height: self.size.height(),
-            y: rows.start as u32,
-            rgb: pixels[bytes].to_vec(),
-        })
+        Some(ServerToPane::Frame(
+            FrameBand::new(self.size, rows.start as u32, pixels[bytes].to_vec())
+                .expect("composed row band fits its frame"),
+        ))
     }
 
     fn changed_rows(&self, pixels: &[u8], stride: usize) -> Option<Range<usize>> {
@@ -134,7 +134,7 @@ impl State {
             if !window.callback_pending || now < window.callback_due {
                 continue;
             }
-            let interval = if self.attachments.visible(id) {
+            let interval = if self.attachments.visible(id) && self.catalog.drawable(id) {
                 FRAME_INTERVAL
             } else {
                 Duration::from_secs(1)
@@ -170,9 +170,9 @@ impl State {
         }
     }
 
-    pub(crate) fn pane_ack(&mut self, pane: super::PaneId, drawn: bool) {
+    pub(crate) fn pane_ack(&mut self, pane: super::PaneId, ack: FrameAck) {
         if let Some(entry) = self.attachments.panes.get_mut(&pane) {
-            entry.presentation.ack(drawn);
+            entry.presentation.ack(ack);
         }
     }
 
@@ -184,11 +184,12 @@ impl State {
             }
             let root = entry
                 .window()
+                .filter(|&id| self.catalog.drawable(id))
                 .and_then(|id| self.windows.get(&id))
                 .map(|window| window.surface.wl_surface());
             let pixels = self.renderer.render_scaled(
                 root,
-                &self.snapshots,
+                &self.surface_cache.snapshots,
                 entry.presentation.size,
                 self.scale.factor(),
             );

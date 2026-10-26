@@ -1,10 +1,11 @@
 //! Seat focus, cursor delivery, and selection protocol integration.
 
 use smithay::{
+    backend::input::InputTime,
     input::{
         Seat, SeatHandler, SeatState,
         dnd::DndGrabHandler,
-        pointer::{CursorIcon, CursorImageStatus, PointerHandle},
+        pointer::{CursorIcon, CursorImageStatus, MotionEvent, PointerHandle},
         tablet::TabletSeatHandler,
     },
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
@@ -32,10 +33,19 @@ use smithay::{
     },
 };
 
-use super::{Pane, PaneId, ServerToPane, State, WindowId, clipboard, input};
+use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input};
+
+#[derive(Default)]
+pub struct CursorState {
+    pub shape: Option<String>,
+    pub sent: Option<(PaneId, Option<String>)>,
+}
 
 impl State {
     pub(crate) fn focus_window(&mut self, window: WindowId) {
+        if !self.catalog.drawable(window) {
+            return;
+        }
         self.refresh_popup_grab();
         if self.catalog.focused() == Some(window) {
             return;
@@ -45,7 +55,7 @@ impl State {
             self.refresh_popup_grab();
         }
         input::reset_keyboard(self);
-        self.recent_serials.clear();
+        self.keyboard_state.serials.clear();
         let previous = self.catalog.focus(Some(window));
         let surface = self
             .windows
@@ -62,27 +72,59 @@ impl State {
     }
 
     pub(crate) fn send_pane_cursor(&mut self, pane: PaneId) {
-        let window = self.attachments.panes.get(&pane).and_then(Pane::window);
+        let window = self
+            .attachments
+            .panes
+            .get(&pane)
+            .and_then(AttachedPane::window);
         let focused = self
             .pointer
             .as_ref()
             .and_then(PointerHandle::current_focus)
             .and_then(|surface| self.window_for_surface(&surface));
         let shape = if window.is_some() && window == focused {
-            self.cursor.clone()
+            self.cursor.shape.clone()
         } else {
             None
         };
         self.send_cursor(pane, shape);
     }
 
+    pub(crate) fn clear_window_pointer(&mut self, window: WindowId) {
+        let focused = self
+            .pointer
+            .as_ref()
+            .and_then(PointerHandle::current_focus)
+            .and_then(|surface| self.window_for_surface(&surface));
+        if focused != Some(window) {
+            return;
+        }
+        if let Some(pointer) = self.pointer.take() {
+            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location: (0.0, 0.0).into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: InputTime::now(),
+                },
+            );
+            pointer.frame(self);
+            self.pointer = Some(pointer);
+        }
+        if let Some(pane) = self.last_input_pane {
+            self.send_pane_cursor(pane);
+        }
+    }
+
     fn send_cursor(&mut self, pane: PaneId, shape: Option<String>) {
         let cursor = (pane, shape);
-        if self.sent_cursor.as_ref() == Some(&cursor) {
+        if self.cursor.sent.as_ref() == Some(&cursor) {
             return;
         }
         self.emit(pane, ServerToPane::Cursor(cursor.1.clone()));
-        self.sent_cursor = Some(cursor);
+        self.cursor.sent = Some(cursor);
     }
 }
 
@@ -108,9 +150,9 @@ impl SeatHandler for State {
             CursorImageStatus::Named(icon) => Some(cursor_name(icon).to_owned()),
             CursorImageStatus::Hidden | CursorImageStatus::Surface(_) => None,
         };
-        self.cursor = shape;
+        self.cursor.shape = shape;
         if self.pointer.is_some()
-            && let Some(pane) = self.cursor_pane
+            && let Some(pane) = self.last_input_pane
         {
             self.send_pane_cursor(pane);
         }

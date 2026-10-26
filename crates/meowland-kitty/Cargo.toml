@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 tracing = { workspace = true }
 meowland-core = { workspace = true }
+meowland-protocol = { workspace = true }
 base64 = { workspace = true }
 flate2 = { workspace = true }
 rustix = { workspace = true, features = ["fs", "shm"] }

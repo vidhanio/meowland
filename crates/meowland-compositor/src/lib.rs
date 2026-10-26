@@ -3,25 +3,18 @@
 //! Client buffers are copied on commit so later client writes cannot tear a
 //! frame in transit to a terminal.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Instant};
 
 use calloop::LoopHandle;
-use meowland_core::scale::UiScale;
-use meowland_protocol::{
-    Input, ServerToPane, Show, WindowInfo, clipboard::Selection as ClipboardSelection,
-};
+use meowland_core::{scale::UiScale, timing::FRAME_INTERVAL};
+use meowland_protocol::{ServerToPane, WindowInfo};
 use smithay::{
     delegate_dispatch2,
     desktop::{PopupGrab, PopupKind, PopupManager},
     input::{Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle},
     output::Output,
-    reexports::wayland_server::{
-        DisplayHandle, backend::ClientId, protocol::wl_surface::WlSurface,
-    },
-    utils::{Logical, Serial, Size},
+    reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
+    utils::{Logical, Size},
     wayland::{
         compositor::{CompositorState, SurfaceAttributes, get_parent, with_states},
         cursor_shape::CursorShapeManagerState,
@@ -66,63 +59,16 @@ mod shell;
 mod sources;
 mod text;
 mod toplevels;
+mod window;
 
 use Compositor as State;
-use attachment::{Attachments, Binding, Pane, Policy, Selection};
+use attachment::{AttachedPane, Attachments, Binding, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
+pub use commands::Command;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot, surface_stack};
 use runtime::ClientState;
 pub use runtime::Runtime;
-
-const FRAME_INTERVAL: Duration = Duration::from_micros(8_334);
-
-#[derive(Clone, Debug)]
-pub enum Command {
-    Attach {
-        pane: PaneId,
-        show: Show,
-        width: u32,
-        height: u32,
-    },
-    Detach {
-        pane: PaneId,
-    },
-    Resize {
-        pane: PaneId,
-        width: u32,
-        height: u32,
-    },
-    Input {
-        pane: PaneId,
-        event: Input,
-    },
-    Ack {
-        pane: PaneId,
-        drawn: bool,
-    },
-    Paste {
-        pane: PaneId,
-        text: String,
-    },
-    ClipboardOffer {
-        pane: PaneId,
-        selection: ClipboardSelection,
-        offer: u64,
-        mimes: Vec<String>,
-        paste: bool,
-    },
-    ClipboardReply {
-        pane: PaneId,
-        request: u64,
-        data: Option<Vec<u8>>,
-    },
-    CloseAll,
-    CloseShown {
-        pane: PaneId,
-    },
-    Shutdown,
-}
 
 /// An owned notification ready for delivery to one terminal pane.
 #[derive(Debug)]
@@ -170,26 +116,18 @@ pub struct Compositor {
     seats: SeatState<Self>,
     seat: Seat<Self>,
     keyboard: Option<KeyboardHandle<Self>>,
-    /// One terminal pane owns the seat's held keyboard state at a time.
-    keyboard_pane: Option<PaneId>,
-    keyboard_keys: HashSet<u16>,
-    keyboard_known: bool,
-    recent_serials: VecDeque<(Serial, ClientId)>,
+    keyboard_state: input::KeyboardState,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<WindowId, Window>,
     ids: HashMap<WlSurface, WindowId>,
-    snapshots: HashMap<WlSurface, Snapshot>,
-    /// Cached to distinguish geometry changes from frame-only commits.
-    surface_geometry: HashMap<WlSurface, buffer::Geometry>,
+    surface_cache: buffer::SurfaceCache,
     catalog: WindowCatalog,
     toplevels: toplevels::Toplevels,
     attachments: Attachments,
-    /// Most recent input pane, used for cursor shape events.
-    cursor_pane: Option<PaneId>,
-    cursor: Option<String>,
-    /// Last delivered cursor, including its destination pane.
-    sent_cursor: Option<(PaneId, Option<String>)>,
+    /// Most recent input source, also used to route selection exports.
+    last_input_pane: Option<PaneId>,
+    cursor: seat::CursorState,
     renderer: Renderer,
     events: Vec<Event>,
     /// Output mode, rewritten as panes attach and leave.
@@ -269,22 +207,17 @@ impl State {
             seats: seat_state,
             seat,
             keyboard: None,
-            keyboard_pane: None,
-            keyboard_keys: HashSet::new(),
-            keyboard_known: false,
-            recent_serials: VecDeque::new(),
+            keyboard_state: input::KeyboardState::default(),
             pointer,
             output,
             windows: HashMap::new(),
             ids: HashMap::new(),
-            snapshots: HashMap::new(),
-            surface_geometry: HashMap::new(),
+            surface_cache: buffer::SurfaceCache::default(),
             catalog: WindowCatalog::default(),
             toplevels: toplevels::Toplevels::new(&display_handle),
             attachments: Attachments::default(),
-            cursor_pane: None,
-            cursor: None,
-            sent_cursor: None,
+            last_input_pane: None,
+            cursor: seat::CursorState::default(),
             renderer: Renderer::default(),
             events: Vec::new(),
             mode: Size::from((
@@ -318,7 +251,11 @@ impl State {
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
         let mut surface = surface.clone();
         for _ in 0..64 {
-            if let Some(id) = self.ids.get(&surface) {
+            if let Some(id) = self
+                .ids
+                .get(&surface)
+                .or_else(|| self.surface_cache.owners.get(&surface))
+            {
                 return Some(*id);
             }
             if let Some(popup) = self.popups.find_popup(&surface) {
@@ -332,28 +269,6 @@ impl State {
             surface = get_parent(&surface)?;
         }
         None
-    }
-
-    fn announce(&mut self, surface: &WlSurface) {
-        let Some(id) = self.ids.get(surface).copied() else {
-            return;
-        };
-        if !self.snapshots.contains_key(surface) {
-            self.toplevels.remove(id);
-            return;
-        }
-        if !self.toplevels.contains(id) {
-            let info = self.window_info(id);
-            self.toplevels.announce(id, &info.title, &info.app_id);
-        }
-        if !self.catalog.announce(id) {
-            return;
-        }
-        self.follow_panes(id);
-        self.resolve_pending_panes();
-        self.apply_window_state(id);
-        self.enter_output(id);
-        self.focus_window(id);
     }
 
     fn window_info(&self, window: WindowId) -> WindowInfo {
@@ -431,7 +346,7 @@ impl State {
     }
 
     fn leave_output(&self, window: WindowId) {
-        if self.attachments.visible(window) {
+        if self.attachments.visible(window) && self.catalog.drawable(window) {
             return;
         }
         let Some(root) = self

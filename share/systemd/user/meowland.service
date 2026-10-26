@@ -6,6 +6,8 @@ After=meowland.socket
 [Service]
 Type=notify
 NotifyAccess=main
+KillMode=mixed
+TimeoutStopSec=5s
 ExecStart=meowland server
 Restart=on-failure
 RestartSec=1s

@@ -36,6 +36,7 @@ pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
         listeners: Some(listeners),
         connections: HashMap::new(),
         tasks: JoinSet::new(),
+        controls: JoinSet::new(),
         panes: HashMap::new(),
         next_connection: 1,
         children: Children::default(),
@@ -47,6 +48,7 @@ pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
     ]);
     let result = server.run(descriptor, &interrupted).await;
     server.listeners.take();
+    server.controls.shutdown().await;
     server.tasks.shutdown().await;
     server.panes.clear();
     let stopped = server.compositor.stop();
@@ -78,7 +80,14 @@ impl Server {
             tokio::select! {
                 result = wakeup.read(&mut signals) => { result?; self.children.reap(); }
                 () = sleep_until(deadline) => {}
-                Some(message) = self.messages.recv() => self.incoming(message).await,
+                Some(message) = self.messages.recv() => self.incoming(message),
+                Some(result) = self.controls.join_next(), if !self.controls.is_empty() => {
+                    match result {
+                        Ok(completion) => self.control_finished(completion),
+                        Err(error) if error.is_cancelled() => {},
+                        Err(error) => return Err(io::Error::other(error)),
+                    }
+                }
                 event = self.compositor.events.recv() => {
                     self.event(event.ok_or_else(|| io::Error::other("compositor stopped unexpectedly"))?);
                 }

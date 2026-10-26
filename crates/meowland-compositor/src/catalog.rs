@@ -1,4 +1,4 @@
-//! Window identity, mapping, selection and focus policy without Wayland
+//! Window identity, mapping order, selection and focus without Wayland
 //! resources.
 
 use std::collections::HashMap;
@@ -10,13 +10,14 @@ use super::WindowId;
 struct Metadata {
     app_id: String,
     title: String,
-    drawable: bool,
+    mapped_at: Option<u64>,
 }
 
 #[derive(Default)]
 pub struct WindowCatalog {
     windows: HashMap<WindowId, Metadata>,
     next: u64,
+    mapping_order: u64,
     newest: Option<WindowId>,
     focused: Option<WindowId>,
 }
@@ -30,7 +31,7 @@ impl WindowCatalog {
             Metadata {
                 app_id,
                 title,
-                drawable: false,
+                mapped_at: None,
             },
         );
         id
@@ -43,19 +44,38 @@ impl WindowCatalog {
         }
     }
 
-    pub fn announce(&mut self, id: WindowId) -> bool {
+    pub fn map(&mut self, id: WindowId) -> bool {
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
-        if std::mem::replace(&mut window.drawable, true) {
+        if window.mapped_at.is_some() {
             return false;
         }
+        self.mapping_order += 1;
+        window.mapped_at = Some(self.mapping_order);
         self.newest = Some(id);
         true
     }
 
+    pub fn unmap(&mut self, id: WindowId) -> bool {
+        let changed = self
+            .windows
+            .get_mut(&id)
+            .and_then(|window| window.mapped_at.take())
+            .is_some();
+        if self.newest == Some(id) {
+            self.newest = self.newest_matching(|_| true);
+        }
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
+        changed
+    }
+
     pub fn drawable(&self, id: WindowId) -> bool {
-        self.windows.get(&id).is_some_and(|window| window.drawable)
+        self.windows
+            .get(&id)
+            .is_some_and(|window| window.mapped_at.is_some())
     }
 
     pub const fn newest(&self) -> Option<WindowId> {
@@ -66,7 +86,8 @@ impl WindowCatalog {
         self.focused
     }
 
-    pub const fn focus(&mut self, window: Option<WindowId>) -> Option<WindowId> {
+    pub fn focus(&mut self, window: Option<WindowId>) -> Option<WindowId> {
+        let window = window.filter(|&id| self.drawable(id));
         std::mem::replace(&mut self.focused, window)
     }
 
@@ -94,26 +115,23 @@ impl WindowCatalog {
             Show::Id(id) => Some(WindowId(*id)),
             Show::Newest => self.newest,
             Show::Focused => self.focused,
-            Show::AppId(app_id) => self
-                .windows
-                .iter()
-                .filter(|(_, window)| window.drawable && window.app_id == *app_id)
-                .map(|(id, _)| *id)
-                .max(),
+            Show::AppId(app_id) => self.newest_matching(|window| window.app_id == *app_id),
             Show::Activation(_) => activation,
         }?;
         self.drawable(window).then_some(window)
     }
 
     pub fn remove(&mut self, window: WindowId) {
+        self.unmap(window);
         self.windows.remove(&window);
-        if self.newest == Some(window) {
-            self.newest = self
-                .windows
-                .iter()
-                .filter(|(_, entry)| entry.drawable)
-                .map(|(id, _)| *id)
-                .max();
-        }
+    }
+
+    fn newest_matching(&self, predicate: impl Fn(&Metadata) -> bool) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .filter(|(_, window)| predicate(window))
+            .filter_map(|(id, window)| window.mapped_at.map(|order| (order, *id)))
+            .max_by_key(|(order, _)| *order)
+            .map(|(_, id)| id)
     }
 }

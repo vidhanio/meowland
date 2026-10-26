@@ -16,7 +16,7 @@ use drm::{
 };
 use memmap2::MmapMut;
 use meowland_compositor::{Command, PaneId};
-use meowland_protocol::{Input as PaneInput, Show};
+use meowland_protocol::{Input as PaneInput, PaneAction, Show};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
@@ -626,7 +626,7 @@ struct Client {
 impl Client {
     fn connect(config: &Config) -> Result<Self, String> {
         let session = Session::new()?;
-        let socket = session.socket()?;
+        let socket = session.socket();
         let stream = std::os::unix::net::UnixStream::connect(&socket)
             .map_err(|error| format!("connecting to {}: {error}", socket.display()))?;
         let connection = Connection::from_socket(stream)
@@ -736,14 +736,14 @@ impl Client {
     fn press(&self, pressed: bool) -> Result<(), String> {
         self.session
             .commands
-            .send(Command::Input {
+            .send(Command::Pane {
                 pane: PaneId(1),
-                event: PaneInput::Key {
+                action: PaneAction::Input(PaneInput::Key {
                     code: 30,
                     pressed,
                     modifiers: 0,
                     held: Vec::new(),
-                },
+                }),
             })
             .map_err(|error| format!("sending input: {error}"))
     }

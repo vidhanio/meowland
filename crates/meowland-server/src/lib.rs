@@ -4,9 +4,7 @@ use std::{collections::HashMap, io};
 
 use meowland_compositor::{Command, Event, PaneId};
 use meowland_core::{Result, scale::UiScale};
-use meowland_protocol::{
-    ControlRequest, ControlResponse, Hello, KEY_Q, KEY_W, PaneToServer, Paths, ServerToPane,
-};
+use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
 use tokio::{
     sync::{mpsc, oneshot},
     task::{AbortHandle, JoinSet},
@@ -14,6 +12,7 @@ use tokio::{
 
 mod actor;
 mod compositor;
+mod control;
 mod lifecycle;
 mod process;
 mod sockets;
@@ -21,9 +20,9 @@ mod transport;
 
 use compositor::DisplayThread;
 use lifecycle::Shutdown;
-use process::{Children, launch_client};
+use process::Children;
 use sockets::Listeners;
-use transport::Pane;
+use transport::PaneTransport;
 
 /// One socket budget, with the last slot reserved for control traffic.
 const MAX_CONNECTIONS: usize = 256;
@@ -32,8 +31,8 @@ type IncomingSender = mpsc::Sender<Incoming>;
 
 enum Incoming {
     Control(ControlRequest, oneshot::Sender<ControlResponse>),
-    Attach(PaneId, Hello, Pane),
-    PaneMessage(PaneId, PaneToServer),
+    Attach(PaneId, Hello, PaneTransport),
+    PaneMessage(PaneId, PaneAction),
 }
 
 struct Server {
@@ -43,7 +42,8 @@ struct Server {
     listeners: Option<Listeners>,
     connections: HashMap<PaneId, AbortHandle>,
     tasks: JoinSet<(PaneId, io::Result<()>)>,
-    panes: HashMap<PaneId, Pane>,
+    controls: JoinSet<control::Completion>,
+    panes: HashMap<PaneId, PaneTransport>,
     next_connection: u64,
     children: Children,
     shutdown: Shutdown,
@@ -59,6 +59,10 @@ pub async fn serve(paths: &Paths) -> Result<()> {
 
 /// Run the server with a shared UI scale for all terminal panes.
 ///
+/// Shutdown gives clients a bounded Wayland-close grace period. Run in the
+/// supplied systemd service for descendant cleanup; standalone operation does
+/// not forcibly terminate clients that remain after the grace period.
+///
 /// # Errors
 /// Returns an error if startup, socket I/O or compositor dispatch fails.
 pub async fn serve_scaled(paths: &Paths, scale: UiScale) -> Result<()> {
@@ -72,22 +76,9 @@ fn notify(state: &[sd_notify::NotifyState<'_>]) {
 }
 
 impl Server {
-    async fn incoming(&mut self, message: Incoming) {
+    fn incoming(&mut self, message: Incoming) {
         match message {
-            Incoming::Control(request, mut reply) => {
-                if reply.is_closed() {
-                    return;
-                }
-                let response = if self.shutdown.running() {
-                    tokio::select! {
-                        result = self.control(request) => result.unwrap_or_else(|error| ControlResponse::Error(error.to_string())),
-                        () = reply.closed() => return,
-                    }
-                } else {
-                    ControlResponse::Error("server stopping".into())
-                };
-                let _ = reply.send(response);
-            }
+            Incoming::Control(request, reply) => self.start_control(request, reply),
             Incoming::Attach(id, hello, pane) => {
                 if self.shutdown.running() && self.connections.contains_key(&id) {
                     self.panes.insert(id, pane);
@@ -100,102 +91,14 @@ impl Server {
                     });
                 }
             }
-            Incoming::PaneMessage(id, message) => self.pane_message(id, message),
-        }
-    }
-
-    async fn control(&mut self, request: ControlRequest) -> io::Result<ControlResponse> {
-        Ok(match request {
-            ControlRequest::Ping => ControlResponse::Ok,
-            ControlRequest::List => ControlResponse::Windows(
-                self.compositor
-                    .call(|compositor| compositor.window_list())
-                    .await?,
-            ),
-            ControlRequest::Kill(show) => self
-                .compositor
-                .call(move |compositor| compositor.close_window(&show))
-                .await?
-                .map_or_else(ControlResponse::Error, |()| ControlResponse::Ok),
-            ControlRequest::Run { args, env, cwd } => {
-                let token = self
-                    .compositor
-                    .call(meowland_compositor::Compositor::create_activation_token)
-                    .await?;
-                match launch_client(&args, &env, &cwd, &self.compositor.display, &token) {
-                    Ok(child) => {
-                        self.children.add(child);
-                        ControlResponse::Started(token)
-                    }
-                    Err(error) => {
-                        self.cancel_activation(token);
-                        ControlResponse::Error(format!("{error:#}"))
-                    }
+            Incoming::PaneMessage(pane, action) => {
+                if self.shutdown.running()
+                    && self.panes.get(&pane).is_some_and(PaneTransport::active)
+                {
+                    let _ = self.compositor.command(Command::Pane { pane, action });
                 }
             }
-        })
-    }
-
-    fn cancel_activation(&self, token: String) {
-        let _ = self
-            .compositor
-            .execute(move |compositor| compositor.cancel_activation(&token, "launch cancelled"));
-    }
-
-    fn pane_message(&mut self, pane: PaneId, message: PaneToServer) {
-        if !self.shutdown.running() || !self.panes.get(&pane).is_some_and(Pane::active) {
-            return;
         }
-        let command = match message {
-            PaneToServer::Hello(_) => return,
-            PaneToServer::Paste(text) => Command::Paste { pane, text },
-            PaneToServer::ClipboardOffer {
-                selection,
-                offer,
-                mimes,
-                paste,
-            } => Command::ClipboardOffer {
-                pane,
-                selection,
-                offer,
-                mimes,
-                paste,
-            },
-            PaneToServer::ClipboardReply { request, data } => Command::ClipboardReply {
-                pane,
-                request,
-                data,
-            },
-            PaneToServer::Input(event) => match &event {
-                meowland_protocol::Input::Key {
-                    code: KEY_W,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if meowland_protocol::modifiers::alt_only(*modifiers) => {
-                    if let Some(pane) = self.panes.get_mut(&pane) {
-                        pane.release("detached".into());
-                    }
-                    Command::Detach { pane }
-                }
-                meowland_protocol::Input::Key {
-                    code: KEY_Q,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if meowland_protocol::modifiers::alt_only(*modifiers) => {
-                    Command::CloseShown { pane }
-                }
-                _ => Command::Input { pane, event },
-            },
-            PaneToServer::Resize { width, height } => Command::Resize {
-                pane,
-                width,
-                height,
-            },
-            PaneToServer::Ack { drawn } => Command::Ack { pane, drawn },
-        };
-        let _ = self.compositor.command(command);
     }
 
     fn event(&mut self, Event { pane, message }: Event) {
@@ -239,7 +142,8 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        self.controls.abort_all();
         self.tasks.abort_all();
-        self.terminate_children();
+        self.children.reap();
     }
 }

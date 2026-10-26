@@ -61,6 +61,8 @@
                 Service = {
                   Type = "notify";
                   NotifyAccess = "main";
+                  KillMode = "mixed";
+                  TimeoutStopSec = "5s";
                   ExecStart = "${lib.getExe cfg.package} server --scale ${toString cfg.scale}";
                   Restart = "on-failure";
                   RestartSec = "1s";

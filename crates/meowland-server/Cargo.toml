@@ -14,7 +14,7 @@ meowland-protocol = { workspace = true, features = ["async"] }
 meowland-compositor = { workspace = true }
 calloop = { workspace = true }
 listenfd = { workspace = true }
-rustix = { workspace = true, features = ["net", "process"] }
+rustix = { workspace = true, features = ["net"] }
 sd-notify = { workspace = true }
 signal-hook = { workspace = true }
 serde = { workspace = true }

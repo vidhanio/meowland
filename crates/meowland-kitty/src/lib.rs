@@ -8,18 +8,19 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use meowland_core::pixels::FrameSize;
+use meowland_core::{pixels::FrameSize, timing::FRAME_INTERVAL};
+use meowland_protocol::FrameBand;
 use rustix::{fs::Mode, shm};
 
 mod encoding;
 use encoding::{Encoder, Encoding};
 
 const MAX_PATCHES: usize = 32;
-/// Consecutive unread frames before abandoning shared memory permanently.
-const DROP_LIMIT: u32 = 30;
+const SHARED_TIMEOUT: Duration = Duration::from_millis(250);
 /// Most of a frame a cell-aligned diff may cover while a shared slot is
 /// available: past this, one whole transfer into the object costs less than
 /// megabytes of patches on the pty.
@@ -136,8 +137,7 @@ pub struct Presenter {
     shared: Option<SharedMemory>,
     encoder: Encoder,
     patch_pixels: Vec<u8>,
-    dropped: bool,
-    drops: u32,
+    shared_blocked_since: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -158,7 +158,16 @@ struct Rect {
 enum SharedFrame {
     Inline,
     Ready(File),
-    Unread,
+    Unread(Instant),
+}
+
+/// Whether a retained image was encoded, unchanged, or temporarily deferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentOutcome {
+    Unchanged,
+    Encoded,
+    RetryAt(Instant),
+    NeedsKeyframe,
 }
 
 impl Presenter {
@@ -174,51 +183,40 @@ impl Presenter {
     }
 
     /// Changing the grid invalidates displayed patches.
-    pub fn set_cell_size(&mut self, cell_size: Option<(u16, u16)>) {
-        if self.cell_size != cell_size {
-            self.cell_size = cell_size;
-            self.base = None;
-            self.patch_count = 0;
+    pub fn set_cell_size(&mut self, cell_size: Option<(u16, u16)>) -> bool {
+        if self.cell_size == cell_size {
+            return false;
+        }
+        self.cell_size = cell_size;
+        self.base = None;
+        self.patch_count = 0;
+        self.display_current = false;
+        true
+    }
+
+    /// Retain a validated row band and encode its terminal update.
+    pub fn present_into(&mut self, band: FrameBand, out: &mut Vec<u8>) -> PresentOutcome {
+        out.clear();
+        let Some(changed) = self.apply_band(band) else {
+            return PresentOutcome::NeedsKeyframe;
+        };
+        if changed {
             self.display_current = false;
         }
+        self.repaint_into(out)
     }
 
-    /// Whether the latest update was dropped while shared memory remained
-    /// unread.
-    #[must_use]
-    pub const fn dropped(&self) -> bool {
-        self.dropped
-    }
-
-    /// Compose a changed row band and encode its terminal update.
-    ///
-    /// Out-of-bounds or malformed bands leave the frame unchanged.
-    #[must_use]
-    #[inline]
-    pub fn present(&mut self, width: u32, height: u32, y: u32, band: Vec<u8>) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.present_into(width, height, y, band, &mut out);
-        out
-    }
-
-    /// Compose and encode into reusable output storage. Clears `out`, retaining
-    /// its capacity, even when the band is invalid, unchanged, or dropped.
-    pub fn present_into(
-        &mut self,
-        width: u32,
-        height: u32,
-        y: u32,
-        band: Vec<u8>,
-        out: &mut Vec<u8>,
-    ) {
+    /// Retry or invalidate terminal presentation without requesting pixels
+    /// again.
+    pub fn repaint_into(&mut self, out: &mut Vec<u8>) -> PresentOutcome {
         out.clear();
-        self.dropped = false;
-        let Some(changed) = self.apply_band(width, height, y, band) else {
-            return;
+        let Some(size) = self.size else {
+            return PresentOutcome::Unchanged;
         };
-        if !changed && self.display_current {
-            return;
+        if self.display_current {
+            return PresentOutcome::Unchanged;
         }
+        let (width, height) = (size.width(), size.height());
 
         if self.patch_count == 0
             && self.base.as_ref().is_some_and(|old| {
@@ -231,9 +229,8 @@ impl Presenter {
                     })
             })
         {
-            self.drops = 0;
             self.display_current = true;
-            return;
+            return PresentOutcome::Unchanged;
         }
 
         let patches = self.select_patches();
@@ -244,7 +241,7 @@ impl Presenter {
             match self.ready_shared() {
                 SharedFrame::Inline => None,
                 SharedFrame::Ready(file) => Some(file),
-                SharedFrame::Unread => return,
+                SharedFrame::Unread(deadline) => return PresentOutcome::RetryAt(deadline),
             }
         };
 
@@ -263,34 +260,35 @@ impl Presenter {
 
         out.extend_from_slice(b"\x1b[?2026l");
         self.display_current = true;
+        PresentOutcome::Encoded
     }
 
-    /// Drop frames while the terminal is briefly behind, then permanently
-    /// fall back to pty transfer rather than cycling through freezes.
+    /// Retry unread shared frames on a clock, then fall back to inline
+    /// transport.
     fn ready_shared(&mut self) -> SharedFrame {
         let Some(slot) = &self.shared else {
             return SharedFrame::Inline;
         };
         match slot.create() {
             Ok(file) => {
-                self.drops = 0;
+                self.shared_blocked_since = None;
                 return SharedFrame::Ready(file);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 tracing::warn!(%error, "Shared-memory transport unavailable; using inline frames");
                 self.shared = None;
-                self.drops = 0;
+                self.shared_blocked_since = None;
                 return SharedFrame::Inline;
             }
         }
-        self.drops += 1;
-        if self.drops < DROP_LIMIT {
-            self.dropped = true;
-            self.display_current = false;
-            return SharedFrame::Unread;
+        let now = Instant::now();
+        let blocked = *self.shared_blocked_since.get_or_insert(now);
+        if now.duration_since(blocked) < SHARED_TIMEOUT {
+            return SharedFrame::Unread((now + FRAME_INTERVAL).min(blocked + SHARED_TIMEOUT));
         }
-        self.drops = 0;
+        tracing::warn!("Shared-memory image remained unread; using inline transport");
+        self.shared_blocked_since = None;
         slot.clear();
         self.shared = None;
         SharedFrame::Inline
@@ -310,7 +308,6 @@ impl Presenter {
             self.encoder
                 .image(out, id, (rect.width, rect.height), &self.patch_pixels, true);
         }
-        self.drops = 0;
         self.patch_count = self.rects.len();
     }
 
@@ -356,11 +353,12 @@ impl Presenter {
         self.damage = 0..0;
     }
 
-    fn apply_band(&mut self, width: u32, height: u32, y: u32, band: Vec<u8>) -> Option<bool> {
-        let size = FrameSize::new(width, height)?;
+    fn apply_band(&mut self, band: FrameBand) -> Option<bool> {
+        let (size, y, band) = band.into_parts();
         let bytes = size.rgb_band(y, band.len())?;
         let (start, end) = (bytes.start, bytes.end);
         let stride = size.rgb_stride();
+        let height = size.height();
         let rows = height as usize;
 
         if start == 0 && end == rows * stride {
@@ -374,10 +372,9 @@ impl Presenter {
         }
 
         if self.size != Some(size) {
-            self.size = Some(size);
-            self.image = Arc::new(vec![0; rows * stride]);
-            self.damage = 0..height;
-        } else if &self.image[start..end] == band.as_slice() {
+            return None;
+        }
+        if &self.image[start..end] == band.as_slice() {
             return Some(false);
         }
         Arc::make_mut(&mut self.image)[start..end].copy_from_slice(&band);

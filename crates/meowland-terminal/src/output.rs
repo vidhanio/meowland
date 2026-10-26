@@ -1,10 +1,8 @@
 //! Ordered, resumable terminal writes with a bounded per-turn budget.
-use std::{
-    fs::{File, OpenOptions},
-    io,
-    os::unix::fs::OpenOptionsExt,
-};
+use std::fs::File;
+use std::io;
 
+use rustix::fs::{self, Mode, OFlags};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Most bytes written to the terminal in one scheduling turn.
@@ -12,37 +10,40 @@ const WRITE_BUDGET: usize = 64 * 1024;
 
 /// A separate open file description leaves stdout's blocking flags untouched,
 /// including the descriptor used to restore terminal modes on exit.
-pub fn open() -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .custom_flags((rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits() as i32)
-        .open("/proc/self/fd/1")
+pub(crate) fn open() -> io::Result<File> {
+    fs::open(
+        "/proc/self/fd/1",
+        OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(Into::into)
 }
 
 #[derive(Default)]
-pub struct Output {
+pub(crate) struct Output {
     bytes: Vec<u8>,
     offset: usize,
 }
 impl Output {
-    pub const fn pending(&self) -> bool {
+    pub(crate) const fn pending(&self) -> bool {
         self.offset < self.bytes.len()
     }
 
-    pub fn append(&mut self, bytes: &[u8]) {
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
 
-    pub const fn buffer(&mut self) -> &mut Vec<u8> {
+    pub(crate) const fn buffer(&mut self) -> &mut Vec<u8> {
         &mut self.bytes
     }
 
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.bytes.len()
     }
 
     /// Never monopolize the input loop, even when the terminal is writable.
-    pub async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
+    pub(crate) async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         let end = self.bytes.len().min(self.offset + WRITE_BUDGET);
         if self.offset < end {
             let written = writer.write(&self.bytes[self.offset..end]).await?;

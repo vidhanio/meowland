@@ -1,14 +1,14 @@
 //! Cancellation-safe framing and bounded outgoing bytes for async transports.
 
-use std::{collections::VecDeque, io};
+use std::collections::VecDeque;
+use std::io;
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    MAX_MESSAGE, PanePacket, ServerToPane,
-    protocol::{HEADER, decode, message_size},
-};
+use crate::protocol::{HEADER, decode, message_size};
+use crate::{MAX_MESSAGE, PanePacket, ServerToPane};
 const IO_BUDGET: usize = 64 * 1024;
 
 /// A bounded packet reader retaining progress between readiness turns.
@@ -23,6 +23,7 @@ pub struct Reader<R> {
 }
 
 impl<R: AsyncRead + Unpin> Reader<R> {
+    /// Own a stream and retain partial packet bytes across cancelled reads.
     pub const fn new(stream: R) -> Self {
         Self {
             stream,
@@ -98,6 +99,7 @@ pub struct Outgoing {
 }
 
 impl Outgoing {
+    /// Whether any encoded packet bytes remain to be written.
     #[must_use]
     pub const fn pending(&self) -> bool {
         self.queued != 0
@@ -193,7 +195,8 @@ impl Outgoing {
 
 fn encode_packet<T: Serialize>(message: &T, prefix: usize, size: usize) -> io::Result<Vec<u8>> {
     let mut bytes = vec![0; HEADER + prefix];
-    bytes[..HEADER].copy_from_slice(&(size as u32).to_le_bytes());
+    let length = u32::try_from(size).map_err(invalid)?;
+    bytes[..HEADER].copy_from_slice(&length.to_le_bytes());
     let encoded = postcard::to_slice(message, &mut bytes[HEADER..]).map_err(invalid)?;
     if encoded.len() != prefix {
         return Err(invalid("serialized message size changed"));

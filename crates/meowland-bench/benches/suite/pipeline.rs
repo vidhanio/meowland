@@ -1,40 +1,33 @@
-use std::{
-    env, fs,
-    os::fd::{AsFd, OwnedFd},
-    path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::{Duration, Instant},
-};
+use std::io::{self, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
 
-use drm::{
-    buffer::{Buffer as _, DrmFourcc},
-    control::{Device as ControlDevice, dumbbuffer::DumbBuffer},
-};
+use drm::buffer::{Buffer as _, DrmFourcc};
+use drm::control::Device as ControlDevice;
+use drm::control::dumbbuffer::DumbBuffer;
 use memmap2::MmapMut;
 use meowland_compositor::{Command, PaneId};
 use meowland_protocol::{Input as PaneInput, PaneAction, Show};
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
-use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
-    globals::{GlobalList, GlobalListContents},
-    protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
-    },
+use wayland_client::globals::GlobalList;
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_keyboard, wl_seat, wl_shm, wl_surface,
 };
-use wayland_protocols::{
-    wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1},
-    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+use wayland_client::{Connection, EventQueue, QueueHandle};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use crate::{
-    session::{CommitLog, Session, TIMEOUT},
-    stats::{Rate, Row},
-};
+use crate::RunLength;
+use crate::session::{CommitLog, Sampling, Session, TIMEOUT};
+use crate::stats::{Rate, Row};
+
+mod dispatch;
 
 const BUFFERS: usize = 3;
 const APP_ID: &str = "meowland-bench";
@@ -53,6 +46,12 @@ enum Pattern {
     Band,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Disabled,
+    Keyboard,
+}
+
 struct Config {
     label: String,
     width: u32,
@@ -61,7 +60,7 @@ struct Config {
     pattern: Pattern,
     frames: usize,
     warmup: usize,
-    input: bool,
+    input: InputMode,
 }
 
 #[derive(Clone)]
@@ -80,11 +79,12 @@ struct FrameBuffer {
 
 impl FrameBuffer {
     fn upload(&mut self, frame: &[u8]) {
-        let row = self.width as usize * 4;
+        let row = usize::try_from(self.width).expect("benchmark width fits usize") * 4;
+        let height = usize::try_from(self.height).expect("benchmark height fits usize");
         if self.stride == row {
-            self.mapping[..row * self.height as usize].copy_from_slice(frame);
+            self.mapping[..row * height].copy_from_slice(frame);
         } else {
-            for y in 0..self.height as usize {
+            for y in 0..height {
                 let source = &frame[y * row..(y + 1) * row];
                 let dest = &mut self.mapping[y * self.stride..y * self.stride + row];
                 dest.copy_from_slice(source);
@@ -94,8 +94,10 @@ impl FrameBuffer {
 
     fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, value: u8) {
         for row in y..y + height {
-            let start = row as usize * self.stride + x as usize * 4;
-            self.mapping[start..start + width as usize * 4].fill(value);
+            let start = usize::try_from(row).expect("rectangle row fits usize") * self.stride
+                + usize::try_from(x).expect("rectangle column fits usize") * 4;
+            let bytes = usize::try_from(width).expect("rectangle width fits usize") * 4;
+            self.mapping[start..start + bytes].fill(value);
         }
     }
 }
@@ -108,16 +110,18 @@ enum Prepared {
 
 impl Prepared {
     fn new(config: &Config) -> Self {
-        let len = config.width as usize * config.height as usize * 4;
+        let len = usize::try_from(config.width).expect("benchmark width fits usize")
+            * usize::try_from(config.height).expect("benchmark height fits usize")
+            * 4;
         match config.pattern {
             Pattern::Noise => Self::Full(
                 (0..4)
-                    .map(|index| noise_frame(config.width, config.height, index as u32 + 1))
+                    .map(|index| noise_frame(config.width, config.height, index + 1))
                     .collect(),
             ),
             Pattern::Video => Self::Full(
                 (0..4)
-                    .map(|index| video_frame(config.width, config.height, index as u32))
+                    .map(|index| video_frame(config.width, config.height, index))
                     .collect(),
             ),
             Pattern::Cell => Self::Cell {
@@ -139,14 +143,18 @@ impl Prepared {
             }
             Self::Cell { base, cell } => {
                 buffer.upload(base);
-                let x = (index as u32 * cell.0 * 2) % (buffer.width - cell.0);
+                let x =
+                    (u32::try_from(index).expect("benchmark frame index fits u32") * cell.0 * 2)
+                        % (buffer.width - cell.0);
                 let y = buffer.height / 2;
                 buffer.fill_rect(x, y, cell.0, cell.1, 0xab);
                 (x, y, cell.0, cell.1)
             }
             Self::Band { base, cell_height } => {
                 buffer.upload(base);
-                let y = (index as u32 * cell_height) % (buffer.height - cell_height);
+                let y = (u32::try_from(index).expect("benchmark frame index fits u32")
+                    * cell_height)
+                    % (buffer.height - cell_height);
                 buffer.fill_rect(0, y, buffer.width, *cell_height, 0xab);
                 (0, y, buffer.width, *cell_height)
             }
@@ -164,25 +172,30 @@ fn flat_frame(len: usize) -> Vec<u8> {
 
 fn noise_frame(width: u32, height: u32, seed: u32) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9e37_79b9);
-    let mut frame = Vec::with_capacity(width as usize * height as usize * 4);
-    for _ in 0..width as usize * height as usize {
+    let pixels = usize::try_from(width).expect("benchmark width fits usize")
+        * usize::try_from(height).expect("benchmark height fits usize");
+    let mut frame = Vec::with_capacity(pixels * 4);
+    for _ in 0..pixels {
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
-        frame.extend_from_slice(&[state as u8, (state >> 8) as u8, (state >> 16) as u8, 0xff]);
+        let [red, green, blue, _] = state.to_le_bytes();
+        frame.extend_from_slice(&[red, green, blue, 0xff]);
     }
     frame
 }
 
 fn video_frame(width: u32, height: u32, index: u32) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(width as usize * height as usize * 4);
+    let pixels = usize::try_from(width).expect("benchmark width fits usize")
+        * usize::try_from(height).expect("benchmark height fits usize");
+    let mut frame = Vec::with_capacity(pixels * 4);
     for y in 0..height {
         for x in 0..width {
             let noise = (x.wrapping_mul(17) ^ y.wrapping_mul(31) ^ index).wrapping_mul(0x9e37_79b9);
             frame.extend_from_slice(&[
-                ((x * 255 / width) ^ (index * 7)) as u8,
-                ((y * 255 / height) ^ (index * 11)) as u8,
-                (noise >> 24) as u8,
+                ((x * 255 / width) ^ (index * 7)).to_le_bytes()[0],
+                ((y * 255 / height) ^ (index * 11)).to_le_bytes()[0],
+                noise.to_be_bytes()[0],
                 0xff,
             ]);
         }
@@ -206,7 +219,7 @@ struct State {
     buffers: Vec<FrameBuffer>,
     next_buffer: usize,
     prepared: Prepared,
-    card: Option<Arc<Card>>,
+    card: Option<Card>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     keyboard_focus: bool,
     last_key: Option<u32>,
@@ -272,7 +285,7 @@ impl State {
         &mut self,
         globals: &GlobalList,
         qh: &QueueHandle<Self>,
-        wants_input: bool,
+        input: InputMode,
     ) -> Result<(), String> {
         self.compositor = Some(
             globals
@@ -296,7 +309,7 @@ impl State {
                     .map_err(|error| format!("zwp_linux_dmabuf_v1: {error}"))?,
             );
         }
-        if wants_input {
+        if input == InputMode::Keyboard {
             self.seat = Some(
                 globals
                     .bind(qh, 1..=1, ())
@@ -322,34 +335,43 @@ impl State {
     }
 
     fn create_buffers(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
-        let surface = self
-            .surface
-            .clone()
-            .ok_or_else(|| "surface was not created".to_owned())?;
+        if self.surface.is_none() {
+            return Err("surface was not created".to_owned());
+        }
         match self.kind {
             Kind::Shm => {
                 let shm = self
                     .shm
                     .as_ref()
                     .ok_or_else(|| "wl_shm was not bound".to_owned())?;
-                let stride = self.width as usize * 4;
-                let len = stride * self.height as usize;
+                let stride = usize::try_from(self.width).map_err(|error| error.to_string())? * 4;
+                let len =
+                    stride * usize::try_from(self.height).map_err(|error| error.to_string())?;
                 for _ in 0..BUFFERS {
                     let fd = memfd_create("meowland-bench", MemfdFlags::CLOEXEC)
                         .map_err(|error| format!("memfd_create: {error}"))?;
-                    ftruncate(&fd, len as u64).map_err(|error| format!("ftruncate: {error}"))?;
+                    ftruncate(&fd, u64::try_from(len).map_err(|error| error.to_string())?)
+                        .map_err(|error| format!("ftruncate: {error}"))?;
+                    // SAFETY: This process owns and sizes the memfd, retains
+                    // the mapping, and writes only after
+                    // the compositor releases the corresponding buffer.
                     let mapping = unsafe { MmapMut::map_mut(&fd) }
                         .map_err(|error| format!("mmap: {error}"))?;
-                    let pool = shm.create_pool(fd.as_fd(), len as i32, qh, ());
+                    let pool = shm.create_pool(
+                        fd.as_fd(),
+                        i32::try_from(len).map_err(|error| error.to_string())?,
+                        qh,
+                        (),
+                    );
                     let released = Arc::new(AtomicBool::new(true));
                     let buffer = pool.create_buffer(
                         0,
-                        self.width as i32,
-                        self.height as i32,
-                        stride as i32,
+                        i32::try_from(self.width).map_err(|error| error.to_string())?,
+                        i32::try_from(self.height).map_err(|error| error.to_string())?,
+                        i32::try_from(stride).map_err(|error| error.to_string())?,
                         wl_shm::Format::Xrgb8888,
                         qh,
-                        BufferState(released.clone()),
+                        BufferState(Arc::clone(&released)),
                     );
                     pool.destroy();
                     self.buffers.push(FrameBuffer {
@@ -369,35 +391,36 @@ impl State {
                     .dmabuf
                     .as_ref()
                     .ok_or_else(|| "zwp_linux_dmabuf_v1 was not bound".to_owned())?;
-                let card = Arc::new(open_card()?);
+                let card = open_card()?;
                 for _ in 0..BUFFERS {
                     let dumb = card
                         .create_dumb_buffer((self.width, self.height), DrmFourcc::Xrgb8888, 32)
                         .map_err(|error| format!("create_dumb_buffer: {error}"))?;
-                    let stride = dumb.pitch() as usize;
+                    let stride =
+                        usize::try_from(dumb.pitch()).map_err(|error| error.to_string())?;
                     let fd = card
                         .buffer_to_prime_fd(dumb.handle(), drm::RDWR)
                         .map_err(|error| format!("buffer_to_prime_fd: {error}"))?;
+                    // SAFETY: The exported dumb buffer has a stable allocation
+                    // owned by this client; writes occur
+                    // only between compositor releases and commits.
                     let mapping = unsafe { MmapMut::map_mut(&fd) }
                         .map_err(|error| format!("mapping dmabuf: {error}"))?;
                     let params = dmabuf.create_params(qh, ());
-                    let modifier = 0u64;
-                    params.add(
-                        fd.as_fd(),
-                        0,
-                        0,
-                        stride as u32,
-                        (modifier >> 32) as u32,
-                        modifier as u32,
-                    );
+                    params.add(fd.as_fd(), 0, 0, dumb.pitch(), 0, 0);
                     let released = Arc::new(AtomicBool::new(true));
+                    #[expect(
+                        clippy::as_conversions,
+                        reason = "DrmFourcc is repr(u32), matching the Wayland format argument"
+                    )]
+                    let format = DrmFourcc::Xrgb8888 as u32;
                     let buffer = params.create_immed(
-                        self.width as i32,
-                        self.height as i32,
-                        DrmFourcc::Xrgb8888 as u32,
+                        i32::try_from(self.width).map_err(|error| error.to_string())?,
+                        i32::try_from(self.height).map_err(|error| error.to_string())?,
+                        format,
                         zwp_linux_buffer_params_v1::Flags::empty(),
                         qh,
-                        BufferState(released.clone()),
+                        BufferState(Arc::clone(&released)),
                     );
                     params.destroy();
                     self.buffers.push(FrameBuffer {
@@ -414,24 +437,35 @@ impl State {
                 self.card = Some(card);
             }
         }
-        if self.configured && !self.buffers.is_empty() {
-            surface.attach(Some(&self.buffers[0].buffer), 0, 0);
-            surface.damage_buffer(0, 0, self.width as i32, self.height as i32);
+        self.attach_initial();
+        Ok(())
+    }
+
+    fn attach_initial(&self) {
+        if self.configured
+            && let (Some(surface), Some(buffer)) = (&self.surface, self.buffers.first())
+        {
+            surface.attach(Some(&buffer.buffer), 0, 0);
+            surface.damage_buffer(
+                0,
+                0,
+                i32::try_from(self.width).expect("benchmark width fits Wayland coordinates"),
+                i32::try_from(self.height).expect("benchmark height fits Wayland coordinates"),
+            );
             surface.commit();
         }
-        Ok(())
     }
 
     fn commit_next(
         &mut self,
         qh: &QueueHandle<Self>,
         event_queue: &mut EventQueue<Self>,
-        log: &Arc<Mutex<CommitLog>>,
+        log: &Mutex<CommitLog>,
         index: usize,
-        record: bool,
+        sampling: Sampling,
     ) -> Result<(), String> {
         let buffer_index = self.next_buffer;
-        let released = self.buffers[buffer_index].released.clone();
+        let released = Arc::clone(&self.buffers[buffer_index].released);
         while !released.swap(false, Ordering::AcqRel) {
             event_queue
                 .blocking_dispatch(self)
@@ -441,12 +475,15 @@ impl State {
         let damage = self.prepared.prepare(index, buffer);
         let callback = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        log.lock().unwrap().queue.push_back((started, record));
+        log.lock()
+            .expect("benchmark commit log lock poisoned")
+            .queue
+            .push_back((started, sampling));
         let surface = self
             .surface
             .as_ref()
             .ok_or_else(|| "surface was not created".to_owned())?;
-        surface.frame(qh, callback.clone());
+        surface.frame(qh, Arc::clone(&callback));
         surface.attach(Some(&buffer.buffer), 0, 0);
         surface.damage_buffer(
             i32::try_from(damage.0).unwrap_or(i32::MAX),
@@ -468,151 +505,6 @@ impl State {
                 .map_err(|error| format!("waiting for frame callback: {error}"))?;
         }
         Ok(())
-    }
-}
-
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-delegate_noop!(State: ignore wl_compositor::WlCompositor);
-delegate_noop!(State: ignore wl_surface::WlSurface);
-delegate_noop!(State: ignore wl_shm::WlShm);
-delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
-
-impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-        _: zwp_linux_dmabuf_v1::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_callback::WlCallback, Arc<AtomicBool>> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_callback::WlCallback,
-        event: wl_callback::Event,
-        data: &Arc<AtomicBool>,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_callback::Event::Done { .. } = event {
-            data.store(true, Ordering::Release);
-        }
-    }
-}
-
-impl Dispatch<wl_buffer::WlBuffer, BufferState> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_buffer::WlBuffer,
-        event: wl_buffer::Event,
-        data: &BufferState,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if matches!(event, wl_buffer::Event::Release) {
-            data.0.store(true, Ordering::Release);
-        }
-    }
-}
-
-impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
-    fn event(
-        _: &mut Self,
-        wm_base: &xdg_wm_base::XdgWmBase,
-        event: xdg_wm_base::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_wm_base::Event::Ping { serial } = event {
-            wm_base.pong(serial);
-        }
-    }
-}
-
-impl Dispatch<xdg_surface::XdgSurface, ()> for State {
-    fn event(
-        state: &mut Self,
-        xdg_surface: &xdg_surface::XdgSurface,
-        event: xdg_surface::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let xdg_surface::Event::Configure { serial } = event {
-            xdg_surface.ack_configure(serial);
-            state.configured = true;
-            if let (Some(surface), Some(buffer)) = (&state.surface, state.buffers.first()) {
-                surface.attach(Some(&buffer.buffer), 0, 0);
-                surface.damage_buffer(0, 0, state.width as i32, state.height as i32);
-                surface.commit();
-            }
-        }
-    }
-}
-
-impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
-    fn event(
-        _: &mut Self,
-        _: &xdg_toplevel::XdgToplevel,
-        _: xdg_toplevel::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_seat::WlSeat, ()> for State {
-    fn event(
-        state: &mut Self,
-        seat: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        (): &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities { capabilities } = event
-            && let wayland_client::WEnum::Value(capabilities) = capabilities
-            && capabilities.contains(wl_seat::Capability::Keyboard)
-            && state.keyboard.is_none()
-        {
-            state.keyboard = Some(seat.get_keyboard(qh, ()));
-        }
-    }
-}
-
-impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &wl_keyboard::WlKeyboard,
-        event: wl_keyboard::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        match event {
-            wl_keyboard::Event::Key { key, .. } => state.last_key = Some(key),
-            wl_keyboard::Event::Enter { .. } => state.keyboard_focus = true,
-            wl_keyboard::Event::Leave { .. } => state.keyboard_focus = false,
-            _ => {}
-        }
     }
 }
 
@@ -665,7 +557,14 @@ impl Client {
 
     fn wait_present(&mut self, target: usize) -> Result<(), String> {
         let deadline = Instant::now() + TIMEOUT;
-        while self.session.log.lock().unwrap().presented < target {
+        while self
+            .session
+            .log
+            .lock()
+            .expect("benchmark commit log lock poisoned")
+            .presented
+            < target
+        {
             if Instant::now() > deadline {
                 return Err("timed out waiting for a presented frame".to_owned());
             }
@@ -681,7 +580,11 @@ impl Client {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let (empty, released) = {
-                let log = self.session.log.lock().unwrap();
+                let log = self
+                    .session
+                    .log
+                    .lock()
+                    .expect("benchmark commit log lock poisoned");
                 (log.queue.is_empty(), log.released)
             };
             if released {
@@ -708,7 +611,11 @@ impl Client {
                 return Err("timed out waiting for the compositor to settle".to_owned());
             }
             let (pending, released) = {
-                let log = self.session.log.lock().unwrap();
+                let log = self
+                    .session
+                    .log
+                    .lock()
+                    .expect("benchmark commit log lock poisoned");
                 (!log.queue.is_empty(), log.released)
             };
             if released {
@@ -723,24 +630,24 @@ impl Client {
         Ok(())
     }
 
-    fn commit(&mut self, index: usize, record: bool) -> Result<(), String> {
+    fn commit(&mut self, index: usize, sampling: Sampling) -> Result<(), String> {
         self.state.commit_next(
             &self.qh,
             &mut self.event_queue,
             &self.session.log,
             index,
-            record,
+            sampling,
         )
     }
 
-    fn press(&self, pressed: bool) -> Result<(), String> {
+    fn press(&self, transition: wl_keyboard::KeyState) -> Result<(), String> {
         self.session
             .commands
             .send(Command::Pane {
                 pane: PaneId(1),
                 action: PaneAction::Input(PaneInput::Key {
                     code: 30,
-                    pressed,
+                    pressed: transition == wl_keyboard::KeyState::Pressed,
                     modifiers: 0,
                     held: Vec::new(),
                 }),
@@ -760,11 +667,11 @@ impl Client {
             thread::sleep(Duration::from_millis(1));
         }
         for _ in 0..10 {
-            self.press(true)?;
+            self.press(wl_keyboard::KeyState::Pressed)?;
             self.event_queue
                 .roundtrip(&mut self.state)
                 .map_err(|error| format!("warming up input: {error}"))?;
-            self.press(false)?;
+            self.press(wl_keyboard::KeyState::Released)?;
             self.event_queue
                 .roundtrip(&mut self.state)
                 .map_err(|error| format!("warming up input release: {error}"))?;
@@ -774,14 +681,14 @@ impl Client {
         for _ in 0..iterations {
             self.state.last_key = None;
             let sample = Instant::now();
-            self.press(true)?;
+            self.press(wl_keyboard::KeyState::Pressed)?;
             while self.state.last_key.is_none() {
                 self.event_queue
                     .blocking_dispatch(&mut self.state)
                     .map_err(|error| format!("waiting for key: {error}"))?;
             }
             samples.push(sample.elapsed());
-            self.press(false)?;
+            self.press(wl_keyboard::KeyState::Released)?;
             self.event_queue
                 .roundtrip(&mut self.state)
                 .map_err(|error| format!("waiting for key release: {error}"))?;
@@ -799,29 +706,43 @@ impl Client {
 
 fn video(config: Config) -> Result<Option<Row>, String> {
     let mut client = Client::connect(&config)?;
+    let result = measure_video(&mut client, config);
+    client.session.close()?;
+    result
+}
+
+fn measure_video(client: &mut Client, config: Config) -> Result<Option<Row>, String> {
     client.settle()?;
     for index in 0..config.warmup {
-        client.commit(index, false)?;
+        client.commit(index, Sampling::Warmup)?;
     }
     client.wait_queue_empty()?;
     client.settle()?;
-    let mut log = client.session.log.lock().unwrap();
+    let mut log = client
+        .session
+        .log
+        .lock()
+        .expect("benchmark commit log lock poisoned");
     log.latencies.clear();
     drop(log);
     let started = Instant::now();
     for index in config.warmup..config.warmup + config.frames {
-        client.commit(index, true)?;
+        client.commit(index, Sampling::Record)?;
     }
     client.wait_queue_empty()?;
     let elapsed = started.elapsed();
-    let mut log = client.session.log.lock().unwrap();
+    let mut log = client
+        .session
+        .log
+        .lock()
+        .expect("benchmark commit log lock poisoned");
     let samples = std::mem::take(&mut log.latencies);
     drop(log);
     let count = samples.len();
     Ok(Row::new(config.label, count, samples, elapsed, Rate::Fps))
 }
 
-fn input(frame_count: usize, quick: bool) -> Result<Option<Row>, String> {
+fn input(frame_count: usize, length: RunLength) -> Result<Option<Row>, String> {
     let config = Config {
         label: "interactive/key/roundtrip".to_owned(),
         width: 1920,
@@ -830,14 +751,20 @@ fn input(frame_count: usize, quick: bool) -> Result<Option<Row>, String> {
         pattern: Pattern::Cell,
         frames: frame_count,
         warmup: 20,
-        input: true,
+        input: InputMode::Keyboard,
     };
     let mut client = Client::connect(&config)?;
-    client.measure_input(if quick { 200 } else { 1000 })
+    let result = client.measure_input(if length == RunLength::Quick {
+        200
+    } else {
+        1000
+    });
+    client.session.close()?;
+    result
 }
 
-pub struct Settings {
-    pub quick: bool,
+pub(crate) struct Settings {
+    pub length: RunLength,
     pub frames: Option<usize>,
     pub filter: Option<String>,
 }
@@ -850,48 +777,51 @@ impl Settings {
     }
 }
 
-pub fn run(settings: &Settings) -> Vec<Row> {
-    let normal = if settings.quick { 90 } else { 240 };
+fn record_result(result: Result<Option<Row>, String>, rows: &mut Vec<Row>) {
+    match result {
+        Ok(row) => rows.extend(row),
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "pipeline skipped: {error}");
+        }
+    }
+}
+
+pub(crate) fn run(settings: &Settings) -> Vec<Row> {
+    let (normal, large, warmup) = match settings.length {
+        RunLength::Quick => (90, 45, 12),
+        RunLength::Full => (240, 120, 24),
+    };
     let frames = settings.frames.unwrap_or(normal);
-    let four_k = settings
-        .frames
-        .unwrap_or(if settings.quick { 45 } else { 120 });
-    let warmup = if settings.quick { 12 } else { 24 };
+    let four_k = settings.frames.unwrap_or(large);
     let mut rows = Vec::new();
     let mut run = |config: Config| {
         if !settings.includes(&config.label) {
             return;
         }
-        match video(config) {
-            Ok(Some(row)) => rows.push(row),
-            Ok(None) => {}
-            Err(error) => eprintln!("pipeline skipped: {error}"),
-        }
+        record_result(video(config), &mut rows);
     };
 
-    for (label, kind) in [
-        ("pipeline/commit-to-terminal/1080p/noise/shm", Kind::Shm),
-        ("pipeline/commit-to-terminal/1080p/video/shm", Kind::Shm),
-        ("pipeline/commit-to-terminal/1080p/cell/shm", Kind::Shm),
-        ("pipeline/commit-to-terminal/1080p/band/shm", Kind::Shm),
+    for (label, pattern) in [
+        (
+            "pipeline/commit-to-terminal/1080p/noise/shm",
+            Pattern::Noise,
+        ),
+        (
+            "pipeline/commit-to-terminal/1080p/video/shm",
+            Pattern::Video,
+        ),
+        ("pipeline/commit-to-terminal/1080p/cell/shm", Pattern::Cell),
+        ("pipeline/commit-to-terminal/1080p/band/shm", Pattern::Band),
     ] {
         run(Config {
             label: label.to_owned(),
             width: 1920,
             height: 1080,
-            kind,
-            pattern: if label.contains("noise") {
-                Pattern::Noise
-            } else if label.contains("video") {
-                Pattern::Video
-            } else if label.contains("band") {
-                Pattern::Band
-            } else {
-                Pattern::Cell
-            },
+            kind: Kind::Shm,
+            pattern,
             frames,
             warmup,
-            input: false,
+            input: InputMode::Disabled,
         });
     }
     run(Config {
@@ -902,7 +832,7 @@ pub fn run(settings: &Settings) -> Vec<Row> {
         pattern: Pattern::Noise,
         frames,
         warmup,
-        input: false,
+        input: InputMode::Disabled,
     });
     run(Config {
         label: "pipeline/commit-to-terminal/2160p/noise/shm".to_owned(),
@@ -912,9 +842,9 @@ pub fn run(settings: &Settings) -> Vec<Row> {
         pattern: Pattern::Noise,
         frames: four_k,
         warmup,
-        input: false,
+        input: InputMode::Disabled,
     });
-    if !settings.quick {
+    if settings.length == RunLength::Full {
         for (label, width, height, pattern, count) in [
             (
                 "pipeline/commit-to-terminal/1080p/noise/dmabuf",
@@ -939,16 +869,12 @@ pub fn run(settings: &Settings) -> Vec<Row> {
                 pattern,
                 frames: count,
                 warmup,
-                input: false,
+                input: InputMode::Disabled,
             });
         }
     }
     if settings.includes("interactive/key/roundtrip") {
-        match input(frames, settings.quick) {
-            Ok(Some(row)) => rows.push(row),
-            Ok(None) => {}
-            Err(error) => eprintln!("input pipeline skipped: {error}"),
-        }
+        record_result(input(frames, settings.length), &mut rows);
     }
     rows
 }

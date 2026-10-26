@@ -4,14 +4,14 @@ use calloop::{LoopHandle, RegistrationToken};
 
 use super::State;
 
-pub struct Sources {
+pub(crate) struct Sources {
     handle: LoopHandle<'static, State>,
     pub io: Option<RegistrationToken>,
     pub timer: Option<RegistrationToken>,
 }
 
 impl Sources {
-    pub fn new(handle: &LoopHandle<'static, State>) -> Self {
+    pub(crate) fn new(handle: &LoopHandle<'static, State>) -> Self {
         Self {
             handle: handle.clone(),
             io: None,

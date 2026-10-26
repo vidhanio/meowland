@@ -1,28 +1,51 @@
 //! Pane commands and their Wayland side effects.
 
-use meowland_core::{pixels::FrameSize, timing::REFRESH_MILLIHZ};
+use meowland_core::pixels::FrameSize;
+use meowland_core::timing::REFRESH_MILLIHZ;
 use meowland_protocol::{Input, PaneAction, Shortcut, Show};
-use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
+use smithay::output::Mode;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
-use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input::pane_input};
+use super::input::pane_input;
+use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard};
+
+/// The requested selector did not identify a mapped window to close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no such window")]
+pub struct CloseWindowError;
 
 /// Owned operations applied exclusively on the Wayland event-loop thread.
 #[derive(Clone, Debug)]
 pub enum Command {
+    /// Register a terminal pane with a window selector and validated pixel
+    /// bounds.
     Attach {
+        /// Host-assigned pane identity.
         pane: PaneId,
+        /// Window to select or follow.
         show: Show,
+        /// Physical-pixel width, validated before attachment.
         width: u32,
+        /// Physical-pixel height, validated before attachment.
         height: u32,
     },
+    /// Remove pane state without closing its Wayland window.
     Detach {
+        /// Pane to detach.
         pane: PaneId,
     },
+    /// Apply input, geometry, clipboard, or acknowledgement work for an
+    /// attached pane.
     Pane {
+        /// Pane originating the action.
         pane: PaneId,
+        /// Work to apply on the Wayland thread.
         action: PaneAction,
     },
+    /// Ask all windows to close while continuing to dispatch their shutdown
+    /// work.
     CloseAll,
+    /// Ask windows to close and stop event-loop dispatch.
     Shutdown,
 }
 
@@ -89,7 +112,16 @@ impl State {
                 offer,
                 mimes,
                 paste,
-            } => clipboard::offer(self, pane, selection, offer, mimes, paste),
+            } => clipboard::offer(
+                self,
+                pane,
+                clipboard::TerminalOffer {
+                    selection,
+                    id: offer,
+                    mimes,
+                    paste,
+                },
+            ),
             PaneAction::ClipboardReply { request, data } => {
                 clipboard::reply(self, pane, request, data);
             }
@@ -115,11 +147,11 @@ impl State {
     ///
     /// # Errors
     /// Returns an error if the selection does not identify a mapped window.
-    pub fn close_window(&self, show: &Show) -> Result<(), String> {
+    pub fn close_window(&self, show: &Show) -> Result<(), CloseWindowError> {
         let window = self
             .selected_window(show)
             .and_then(|id| self.windows.get(&id))
-            .ok_or_else(|| "no such window".to_owned())?;
+            .ok_or(CloseWindowError)?;
         window.surface.send_close();
         Ok(())
     }
@@ -158,7 +190,13 @@ impl State {
 
     pub(crate) fn configure_output(&mut self, size: FrameSize) {
         let mode = Mode {
-            size: (size.width() as i32, size.height() as i32).into(),
+            size: (
+                i32::try_from(size.width())
+                    .expect("validated frame width fits Wayland coordinates"),
+                i32::try_from(size.height())
+                    .expect("validated frame height fits Wayland coordinates"),
+            )
+                .into(),
             refresh: REFRESH_MILLIHZ,
         };
         self.mode = self.logical_size(size.width(), size.height());

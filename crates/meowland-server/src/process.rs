@@ -1,11 +1,13 @@
 //! Application launch and asynchronous direct-child reaping.
 
-use std::{ffi::OsString, path::Path, process::Stdio};
+use std::ffi::OsString;
+use std::path::Path;
+use std::process::Stdio;
 
 use meowland_core::{Error, Result};
 use tokio::process::{Child, Command};
 
-pub fn launch(
+pub(crate) fn launch(
     args: &[OsString],
     env: &[(OsString, OsString)],
     cwd: &Path,
@@ -42,7 +44,7 @@ pub fn launch(
         .map_err(|error| Error::io(format!("starting {}", executable.to_string_lossy()), error))
 }
 
-pub async fn wait(mut child: Child) {
+pub(crate) async fn wait(mut child: Child) {
     let pid = child.id();
     match child.wait().await {
         Ok(status) => tracing::debug!(?pid, %status, "child exited"),

@@ -8,22 +8,22 @@ use super::{Server, notify};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
-pub enum Shutdown {
+pub(crate) enum Shutdown {
     Running,
     Closing { deadline: Instant },
     Stopped,
 }
 
 impl Shutdown {
-    pub const fn running(&self) -> bool {
+    pub(crate) const fn running(&self) -> bool {
         matches!(self, Self::Running)
     }
 
-    pub const fn stopped(&self) -> bool {
+    pub(crate) const fn stopped(&self) -> bool {
         matches!(self, Self::Stopped)
     }
 
-    pub const fn deadline(&self) -> Option<Instant> {
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Closing { deadline } => Some(*deadline),
             Self::Running | Self::Stopped => None,
@@ -32,7 +32,7 @@ impl Shutdown {
 }
 
 impl Server {
-    pub fn begin_shutdown(&mut self) {
+    pub(crate) fn begin_shutdown(&mut self) {
         if !self.shutdown.running() {
             return;
         }
@@ -50,7 +50,7 @@ impl Server {
         }
     }
 
-    pub fn advance_shutdown(&mut self, now: Instant) {
+    pub(crate) fn advance_shutdown(&mut self, now: Instant) {
         if self
             .shutdown
             .deadline()

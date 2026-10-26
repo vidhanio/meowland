@@ -1,15 +1,14 @@
 //! On-demand OSC 52 text reads with bounded snapshots and uncorrelated-reply
 //! draining.
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use meowland_protocol::clipboard::{ClipboardData, Deadline, MAX_TEXT, Selection, TEXT_MIMES};
 
-use super::Action;
+use super::{Action, Refresh};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -24,7 +23,7 @@ enum State {
 }
 
 #[derive(Default)]
-pub struct Clipboard {
+pub(crate) struct Clipboard {
     state: State,
     next: u64,
     snapshot: Option<(u64, Vec<u8>)>,
@@ -32,11 +31,11 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub const fn pending(&self) -> bool {
+    pub(crate) const fn pending(&self) -> bool {
         matches!(self.state, State::Queued(_) | State::Reading(_))
     }
 
-    pub const fn cancel_refresh(&mut self) {
+    pub(crate) const fn cancel_refresh(&mut self) {
         self.state = match self.state {
             State::Queued(_) => State::Idle,
             State::Reading(_) => State::Draining,
@@ -44,8 +43,11 @@ impl Clipboard {
         };
     }
 
-    pub fn refresh(&mut self, selection: Selection, shortcut: bool) -> Option<Instant> {
-        if selection == Selection::Primary || !shortcut || !matches!(self.state, State::Idle) {
+    pub(crate) fn refresh(&mut self, selection: Selection, refresh: Refresh) -> Option<Instant> {
+        if selection == Selection::Primary
+            || refresh != Refresh::Paste
+            || !matches!(self.state, State::Idle)
+        {
             return None;
         }
         let deadline = Instant::now() + READ_TIMEOUT;
@@ -53,7 +55,7 @@ impl Clipboard {
         Some(deadline)
     }
 
-    pub fn read(&mut self, request: u64, offer: u64, mime: &str, deadline: Deadline) {
+    pub(crate) fn read(&mut self, request: u64, offer: u64, mime: &str, deadline: Deadline) {
         let data = self.snapshot.as_ref().and_then(|(id, bytes)| {
             (*id == offer && TEXT_MIMES.contains(&mime) && !deadline.expired())
                 .then(|| bytes.clone())
@@ -61,13 +63,13 @@ impl Clipboard {
         self.actions.push_back(Action::Reply { request, data });
     }
 
-    pub fn cancel(&mut self, request: u64) {
+    pub(crate) fn cancel(&mut self, request: u64) {
         self.actions.retain(
             |action| !matches!(action, Action::Reply { request: number, .. } if *number == request),
         );
     }
 
-    pub fn copy(selection: Selection, data: &ClipboardData, output: &mut Vec<u8>) {
+    pub(crate) fn copy(selection: Selection, data: &ClipboardData, output: &mut Vec<u8>) {
         if selection == Selection::Primary || !data.valid() {
             return;
         }
@@ -79,11 +81,11 @@ impl Clipboard {
         }
     }
 
-    pub fn next_action(&mut self) -> Option<Action> {
+    pub(crate) fn next_action(&mut self) -> Option<Action> {
         self.actions.pop_front()
     }
 
-    pub const fn deadline(&self) -> Option<Instant> {
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
         match self.state {
             State::Queued(deadline) | State::Reading(deadline) => Some(deadline),
             State::Idle | State::Draining => None,
@@ -108,7 +110,7 @@ impl Clipboard {
         }
     }
 
-    pub fn poll(&mut self, output: &mut Vec<u8>) {
+    pub(crate) fn poll(&mut self, output: &mut Vec<u8>) {
         self.expire();
         if let State::Queued(deadline) = self.state
             && output.is_empty()
@@ -118,7 +120,7 @@ impl Clipboard {
         }
     }
 
-    pub fn text(&mut self, payload: &[u8]) {
+    pub(crate) fn text(&mut self, payload: &[u8]) {
         self.expire();
         match self.state {
             State::Draining => {

@@ -2,22 +2,20 @@
 
 use std::time::{Duration, Instant};
 
-use smithay::{
-    reexports::wayland_server::DisplayHandle,
-    wayland::xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState},
-};
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::wayland::xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState};
 
 use super::{ServerToPane, State, WlSurface};
 
 const INTERVAL: Duration = Duration::from_millis(250);
 
-pub struct Bell {
+pub(crate) struct Bell {
     _protocol: XdgSystemBellState,
     last: Option<Instant>,
 }
 
 impl Bell {
-    pub fn new(display: &DisplayHandle) -> Self {
+    pub(crate) fn new(display: &DisplayHandle) -> Self {
         Self {
             _protocol: XdgSystemBellState::new::<State>(display),
             last: None,

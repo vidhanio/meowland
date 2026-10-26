@@ -4,10 +4,14 @@ use std::io;
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
+/// Unix signal requesting shutdown of the current session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminationSignal {
+    /// Interactive interrupt (`SIGINT`).
     Interrupt,
+    /// Service termination (`SIGTERM`).
     Terminate,
+    /// Controlling terminal disconnected (`SIGHUP`).
     Hangup,
 }
 

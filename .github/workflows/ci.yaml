@@ -22,15 +22,52 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
 
       - name: install rust
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: check formatting
+        run: cargo fmt --all --check
+
       - name: check code
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: check optional runtime features
+        run: |
+          cargo check --locked -p meowland-core --no-default-features
+          cargo check --locked -p meowland-protocol --no-default-features
+
+      - name: run tests
+        run: cargo test --locked --workspace --all-features
+
+      - name: check documentation
+        run: cargo doc --locked --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  dependencies:
+    name: check dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: install audit tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny,cargo-machete
+
+      - name: audit vulnerabilities
+        run: cargo audit --deny warnings
+
+      - name: check licenses and sources
+        run: cargo deny --locked check
+
+      - name: check unused dependencies
+        run: cargo machete --with-metadata
 
   check-nix:
     name: check nix

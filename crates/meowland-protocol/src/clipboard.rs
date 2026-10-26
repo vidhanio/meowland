@@ -5,9 +5,13 @@ use std::time::Duration;
 use rustix::time::{ClockId, clock_gettime};
 use serde::{Deserialize, Serialize};
 
+/// Maximum UTF-8 text bytes accepted by bracketed paste and legacy OSC 52.
 pub const MAX_TEXT: usize = 1024 * 1024;
+/// Maximum aggregate bytes across all MIME representations of a selection.
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum distinct MIME representations advertised for one selection.
 pub const MAX_TYPES: usize = 64;
+/// Canonical UTF-8 text representations offered for plain-text selections.
 pub const TEXT_MIMES: [&str; 2] = ["text/plain;charset=utf-8", "text/plain"];
 
 const MAX_MIME_LENGTH: usize = 256;
@@ -15,24 +19,35 @@ const MAX_MIME_LENGTH: usize = 256;
 /// The selection a clipboard transfer belongs to.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Selection {
+    /// Explicit copy-and-paste selection.
     #[default]
     Clipboard,
+    /// Selection commonly pasted with the middle mouse button.
     Primary,
 }
 
+/// One MIME representation of clipboard contents, validated by the receiving
+/// transport.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Item {
+    /// MIME type or opaque Wayland selection target, such as `UTF8_STRING`.
     pub mime: String,
+    /// Raw representation bytes, not necessarily UTF-8.
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
+/// Selection contents in multiple formats; call [`Self::valid`] before
+/// accepting external data.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ClipboardData {
+    /// Available representations in preference order; an empty list clears the
+    /// selection.
     pub items: Vec<Item>,
 }
 
 impl ClipboardData {
+    /// Offer text under both canonical UTF-8 MIME types without truncation.
     #[must_use]
     pub fn text(text: &str) -> Self {
         Self {
@@ -46,6 +61,8 @@ impl ClipboardData {
         }
     }
 
+    /// Check aggregate size, representation count, and MIME syntax against
+    /// transport limits.
     #[must_use]
     pub fn valid(&self) -> bool {
         self.items.len() <= MAX_TYPES
@@ -82,6 +99,8 @@ fn is_utf8_text_mime(mime: &str) -> bool {
         })
 }
 
+/// Accept a bounded printable MIME type or opaque Wayland target, excluding the
+/// list sentinel.
 #[must_use]
 pub fn valid_mime(mime: &str) -> bool {
     !mime.is_empty()
@@ -91,6 +110,9 @@ pub fn valid_mime(mime: &str) -> bool {
         && (!mime.contains('/') || mime.parse::<mime::Mime>().is_ok())
 }
 
+/// Filter invalid or duplicate types, preserving order and retaining at most
+/// [`MAX_TYPES`].
+#[must_use]
 pub fn mime_types(types: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut result = Vec::new();
     for mime in types {
@@ -110,16 +132,21 @@ pub fn mime_types(types: impl IntoIterator<Item = String>) -> Vec<String> {
 pub struct Deadline(u64);
 
 impl Deadline {
+    /// Start a timeout on the boot-scoped monotonic clock, saturating on
+    /// overflow.
     #[must_use]
     pub fn new(timeout: Duration) -> Self {
-        Self(Self::now().saturating_add(timeout.as_nanos().min(u128::from(u64::MAX)) as u64))
+        let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        Self(Self::now().saturating_add(nanos))
     }
 
+    /// Time until expiry, or zero once the deadline has passed.
     #[must_use]
     pub fn remaining(self) -> Duration {
         Duration::from_nanos(self.0.saturating_sub(Self::now()))
     }
 
+    /// Whether the monotonic clock has reached this deadline.
     #[must_use]
     pub fn expired(self) -> bool {
         self.remaining().is_zero()
@@ -127,10 +154,13 @@ impl Deadline {
 
     fn now() -> u64 {
         let time = clock_gettime(ClockId::Monotonic);
-        (time.tv_sec as u64)
+        u64::try_from(time.tv_sec)
+            .unwrap_or_default()
             .saturating_mul(1_000_000_000)
-            .saturating_add(time.tv_nsec as u64)
+            .saturating_add(u64::try_from(time.tv_nsec).unwrap_or_default())
     }
 }
 
+/// Transfer timeout, including time spent awaiting terminal clipboard
+/// permission.
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);

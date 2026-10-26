@@ -2,6 +2,7 @@
 name = "meowland-bench"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -21,11 +22,11 @@ meowland-compositor = { workspace = true }
 meowland-kitty = { workspace = true }
 meowland-protocol = { workspace = true }
 calloop = { workspace = true }
-drm = "0.14.1"
-memmap2 = "0.9.12"
+drm = { workspace = true }
+memmap2 = { workspace = true }
 rustix = { workspace = true, features = ["fs", "process"] }
-wayland-client = "0.31.15"
-wayland-protocols = { version = "0.32.13", features = ["client"] }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }
 
 [[bench]]
 name = "suite"

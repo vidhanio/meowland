@@ -18,6 +18,8 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
+    /// Translate a transition, retaining held keys and suppressing intercepted
+    /// releases or repeats.
     pub fn input(&mut self, key: Key) -> Option<Input> {
         self.modifiers = key.modifiers;
         if key.kind == Kind::Repeat {
@@ -42,11 +44,14 @@ impl Keyboard {
         })
     }
 
+    /// Consume a shortcut press so its later release is not forwarded to the
+    /// application.
     pub fn intercept(&mut self, code: u16) {
         self.held.remove(&code);
         self.intercepted.insert(code);
     }
 
+    /// Snapshot held keys and modifiers for a newly focused compositor pane.
     #[must_use]
     pub fn enter(&self) -> Input {
         Input::KeyboardEnter {
@@ -55,6 +60,7 @@ impl Keyboard {
         }
     }
 
+    /// Forget held keys, intercepted releases, and modifiers after focus loss.
     pub fn reset(&mut self) {
         self.intercepted.clear();
         self.held.clear();
@@ -62,6 +68,7 @@ impl Keyboard {
     }
 }
 
+/// Recognize Control-V or Shift-Insert, ignoring lock modifiers.
 #[must_use]
 pub const fn paste(code: u16, bits: u8) -> bool {
     let bits = bits & !(modifiers::CAPS_LOCK | modifiers::NUM_LOCK);
@@ -91,11 +98,13 @@ pub(crate) fn key_code(code: u32) -> Option<u16> {
         57361 => 99,
         57362 => 119,
         57363 => 127,
-        57364..=57373 => (code - 57364 + 59) as u16,
+        57364..=57373 => u16::try_from(code - 57364 + 59).ok()?,
         57374 => 87,
         57375 => 88,
-        57376..=57387 => (code - 57376 + 183) as u16,
-        57399..=57408 => [82, 79, 80, 81, 75, 76, 77, 71, 72, 73][(code - 57399) as usize],
+        57376..=57387 => u16::try_from(code - 57376 + 183).ok()?,
+        57399..=57408 => {
+            [82, 79, 80, 81, 75, 76, 77, 71, 72, 73][usize::try_from(code - 57399).ok()?]
+        }
         57409 | 57426 => 83,
         57410 => 98,
         57411 => 55,

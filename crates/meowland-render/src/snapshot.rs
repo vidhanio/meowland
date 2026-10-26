@@ -3,12 +3,13 @@
 use meowland_core::pixels::FrameSize;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 
+/// An owned, tightly packed RGBA image copied from a validated client buffer.
 #[derive(Debug)]
 pub struct Snapshot {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-    pub opaque: bool,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) opaque: bool,
 }
 
 impl Snapshot {
@@ -45,14 +46,17 @@ impl Snapshot {
         {
             return None;
         }
-        let size = FrameSize::new(data.width as u32, data.height as u32)?;
+        let size = FrameSize::new(
+            u32::try_from(data.width).ok()?,
+            u32::try_from(data.height).ok()?,
+        )?;
         let stride = usize::try_from(data.stride).ok()?;
         let offset = usize::try_from(data.offset).ok()?;
         let row_bytes = size.rgba_stride();
         if stride < row_bytes || !size.fits(bound) {
             return None;
         }
-        if offset.checked_add(stride.checked_mul(size.height() as usize)?)? > len {
+        if offset.checked_add(stride.checked_mul(usize::try_from(size.height()).ok()?)?)? > len {
             return None;
         }
         let mut pixels = previous
@@ -62,15 +66,17 @@ impl Snapshot {
         if pixels.capacity() >= pixels.len().saturating_mul(4).max(1 << 20) {
             pixels.shrink_to_fit();
         }
-        // SAFETY: The caller retains the mapping; offset, stride, and all rows
-        // fit within its checked length. The destination owns exactly one
-        // frame.
-        let opaque = unsafe {
-            if data.format == wl_shm::Format::Xrgb8888 {
-                Self::copy_rows::<true>(ptr.add(offset), stride, row_bytes, &mut pixels)
-            } else {
-                Self::copy_rows::<false>(ptr.add(offset), stride, row_bytes, &mut pixels)
-            }
+        let source = ptr.wrapping_add(offset);
+        let opaque = if data.format == wl_shm::Format::Xrgb8888 {
+            // SAFETY: The caller retains the mapping, all source rows fit
+            // within its checked length, and pixels owns exactly
+            // one destination frame.
+            unsafe { Self::copy_rows::<true>(source, stride, row_bytes, &mut pixels) }
+        } else {
+            // SAFETY: The same checked source bounds and owned destination
+            // apply to ARGB; only alpha interpretation differs from
+            // the XRGB path.
+            unsafe { Self::copy_rows::<false>(source, stride, row_bytes, &mut pixels) }
         };
         Some(Self {
             width: size.width(),
@@ -89,25 +95,9 @@ impl Snapshot {
         let mut opaque = true;
         for (y, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
             for (x, out_pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                // SAFETY: The caller checked every pixel against the live
-                // mapping. Word reads require the checked alignment; byte
-                // reads handle unaligned pixels. Neither creates references
-                // to externally writable memory.
-                let pixel = unsafe {
-                    let pixel = source.add(y * stride + x * 4);
-                    #[expect(clippy::cast_ptr_alignment)]
-                    let word = pixel.cast::<u32>();
-                    if word.is_aligned() {
-                        word.read_volatile().to_ne_bytes()
-                    } else {
-                        [
-                            pixel.read_volatile(),
-                            pixel.add(1).read_volatile(),
-                            pixel.add(2).read_volatile(),
-                            pixel.add(3).read_volatile(),
-                        ]
-                    }
-                };
+                let pixel = source.wrapping_add(y * stride + x * 4);
+                // SAFETY: The caller checked all four bytes against the live mapping.
+                let pixel = unsafe { read_pixel(pixel) };
                 let alpha = if XRGB { 255 } else { pixel[3] };
                 *out_pixel = [pixel[2], pixel[1], pixel[0], alpha];
                 if !XRGB {
@@ -116,5 +106,28 @@ impl Snapshot {
             }
         }
         opaque
+    }
+}
+
+/// Read one pixel without forming a reference to externally writable memory.
+///
+/// # Safety
+/// `source` must remain readable for four bytes throughout this call.
+#[inline]
+unsafe fn read_pixel(source: *const u8) -> [u8; 4] {
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the u32 pointer is dereferenced only after checking its alignment"
+    )]
+    let aligned = source.cast::<u32>();
+    if aligned.is_aligned() {
+        // SAFETY: Alignment is checked and the caller guarantees four readable bytes.
+        unsafe { aligned.read_volatile() }.to_ne_bytes()
+    } else {
+        std::array::from_fn(|channel| {
+            let component = source.wrapping_add(channel);
+            // SAFETY: Each byte lies within the caller's readable pixel; u8 needs no alignment.
+            unsafe { component.read_volatile() }
+        })
     }
 }

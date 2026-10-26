@@ -2,29 +2,31 @@
 
 use std::io::Write;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use flate2::{Compression, write::ZlibEncoder};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 
-use super::transmit;
+use crate::presenter::{Placement, transmit};
 
 const CHUNK: usize = 4096;
 /// Base64 payload bytes per 4096-character chunk.
 const CHUNK_PAYLOAD: usize = CHUNK / 4 * 3;
 
 #[derive(Clone, Copy, Debug)]
-pub enum Encoding {
+pub(crate) enum Encoding {
     Raw,
     Zlib,
 }
 
 #[derive(Debug, Default)]
-pub struct Encoder {
+pub(crate) struct Encoder {
     compressed: Vec<u8>,
     sample: Vec<u8>,
 }
 
 impl Encoder {
-    pub fn prepare(&mut self, pixels: &[u8]) -> Encoding {
+    pub(crate) fn prepare(&mut self, pixels: &[u8]) -> Encoding {
         if self.compress(pixels) && self.compressed.len() * 4 <= pixels.len() * 3 {
             Encoding::Zlib
         } else {
@@ -32,7 +34,7 @@ impl Encoder {
         }
     }
 
-    pub fn capacity(&self, pixels: &[u8], encoding: Encoding) -> usize {
+    pub(crate) fn capacity(&self, pixels: &[u8], encoding: Encoding) -> usize {
         encoded_capacity(self.payload(pixels, encoding).len())
     }
 
@@ -43,26 +45,26 @@ impl Encoder {
         }
     }
 
-    pub fn image(
+    pub(crate) fn image(
         &mut self,
         out: &mut Vec<u8>,
         id: u32,
         size: (u32, u32),
         pixels: &[u8],
-        patch: bool,
+        placement: Placement,
     ) {
         let encoding = self.prepare(pixels);
-        self.write(out, id, size, pixels, patch, encoding);
+        self.write(out, id, size, pixels, placement, encoding);
     }
 
     /// Write the most recently prepared image without repeating compression.
-    pub fn write(
+    pub(crate) fn write(
         &self,
         out: &mut Vec<u8>,
         id: u32,
         size: (u32, u32),
         pixels: &[u8],
-        patch: bool,
+        placement: Placement,
         encoding: Encoding,
     ) {
         let payload = self.payload(pixels, encoding);
@@ -77,7 +79,7 @@ impl Encoder {
             let more = chunks.peek().is_some();
             if first {
                 out.extend_from_slice(b"\x1b_G");
-                transmit(out, id, size.0, size.1, u32::from(patch));
+                transmit(out, id, size.0, size.1, placement);
                 if matches!(encoding, Encoding::Zlib) {
                     out.extend_from_slice(b",o=z");
                 }

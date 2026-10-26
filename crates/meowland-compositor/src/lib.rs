@@ -3,41 +3,39 @@
 //! Client buffers are copied on commit so later client writes cannot tear a
 //! frame in transit to a terminal.
 
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
+use std::time::Instant;
 
 use calloop::LoopHandle;
-use meowland_core::{scale::UiScale, timing::FRAME_INTERVAL};
+use meowland_core::scale::UiScale;
+use meowland_core::timing::FRAME_INTERVAL;
 use meowland_protocol::{ServerToPane, WindowInfo};
-use smithay::{
-    delegate_dispatch2,
-    desktop::{PopupGrab, PopupKind, PopupManager},
-    input::{Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle},
-    output::Output,
-    reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
-    utils::{Logical, Size},
-    wayland::{
-        compositor::{CompositorState, get_parent},
-        cursor_shape::CursorShapeManagerState,
-        dmabuf::{DmabufFeedbackBuilder, DmabufState},
-        fractional_scale::FractionalScaleManagerState,
-        output::OutputManagerState,
-        selection::{
-            data_device::DataDeviceState,
-            ext_data_control::DataControlState as ExtDataControlState,
-            primary_selection::PrimarySelectionState,
-            wlr_data_control::DataControlState as WlrDataControlState,
-        },
-        shell::{
-            kde::decoration::KdeDecorationState,
-            xdg::{ToplevelSurface, XdgShellState, decoration::XdgDecorationState},
-        },
-        shm::ShmState,
-        single_pixel_buffer::SinglePixelBufferState,
-        text_input::TextInputManagerState,
-        viewporter::ViewporterState,
-        xdg_activation::XdgActivationState,
-    },
-};
+use smithay::delegate_dispatch2;
+use smithay::desktop::{PopupGrab, PopupKind, PopupManager};
+use smithay::input::keyboard::KeyboardHandle;
+use smithay::input::pointer::PointerHandle;
+use smithay::input::{Seat, SeatState};
+use smithay::output::Output;
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Logical, Size};
+use smithay::wayland::compositor::{CompositorState, get_parent};
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::ext_data_control::DataControlState as ExtDataControlState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::selection::wlr_data_control::DataControlState as WlrDataControlState;
+use smithay::wayland::shell::kde::decoration::KdeDecorationState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState};
+use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::text_input::TextInputManagerState;
+use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::xdg_activation::XdgActivationState;
 
 mod activation;
 mod attachment;
@@ -65,7 +63,7 @@ use Compositor as State;
 use attachment::{AttachedPane, Attachments, Binding, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
-pub use commands::Command;
+pub use commands::{CloseWindowError, Command};
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;
 pub use runtime::Runtime;
@@ -73,7 +71,9 @@ pub use runtime::Runtime;
 /// An owned notification ready for delivery to one terminal pane.
 #[derive(Debug)]
 pub struct Event {
+    /// Pane whose connection should receive this notification.
     pub pane: PaneId,
+    /// Owned packet ready for encoding by the host transport.
     pub message: ServerToPane,
 }
 
@@ -221,8 +221,11 @@ impl State {
             renderer: Renderer::default(),
             events: Vec::new(),
             mode: Size::from((
-                scale.logical(mode.size.w as u32),
-                scale.logical(mode.size.h as u32),
+                scale
+                    .logical(u32::try_from(mode.size.w).expect("virtual output width is positive")),
+                scale.logical(
+                    u32::try_from(mode.size.h).expect("virtual output height is positive"),
+                ),
             )),
             started: Instant::now(),
             shutdown: false,
@@ -241,8 +244,14 @@ impl State {
             .filter(|pane| pane.window() == Some(window))
             .fold(None, |bound: Option<(u32, u32)>, pane| {
                 let pane = (
-                    self.scale.logical(pane.presentation.size.width()) as u32 * 2,
-                    self.scale.logical(pane.presentation.size.height()) as u32 * 2,
+                    self.scale
+                        .logical(pane.presentation.size.width())
+                        .unsigned_abs()
+                        * 2,
+                    self.scale
+                        .logical(pane.presentation.size.height())
+                        .unsigned_abs()
+                        * 2,
                 );
                 Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))))
             })

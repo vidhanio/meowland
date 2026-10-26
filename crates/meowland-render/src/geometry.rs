@@ -1,14 +1,10 @@
 //! Buffer-to-surface coordinate geometry for scale, transform, and viewport
 //! state.
 
-use smithay::{
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, Rectangle, Size, Transform},
-    wayland::{
-        compositor::{SurfaceAttributes, with_states},
-        viewporter::ViewportCachedState,
-    },
-};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::wayland::compositor::{SurfaceAttributes, with_states};
+use smithay::wayland::viewporter::ViewportCachedState;
 
 use super::Snapshot;
 
@@ -97,19 +93,17 @@ impl SurfaceGeometry {
 
 /// Read the committed scale, transform, and viewport for a surface.
 #[must_use]
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "`attributes` borrows the cached state and must outlive `current`"
-)]
 pub fn surface_geometry(surface: &WlSurface, snapshot: &Snapshot) -> SurfaceGeometry {
     with_states(surface, |states| {
         let (scale, transform) = {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let current = attributes.current();
-            (
+            let properties = (
                 current.buffer_scale,
                 Transform::from(current.buffer_transform),
-            )
+            );
+            drop(attributes);
+            properties
         };
         let viewport = *states.cached_state.get::<ViewportCachedState>().current();
         SurfaceGeometry::new(snapshot, scale, transform, viewport)
@@ -143,7 +137,12 @@ pub fn source_bound(
     )
 }
 
-fn rounded(value: f64) -> i32 {
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "rounding and saturating to the Wayland coordinate range are intentional"
+)]
+pub(crate) fn rounded(value: f64) -> i32 {
     value
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32

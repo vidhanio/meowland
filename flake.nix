@@ -98,15 +98,17 @@
             ...
           }:
           let
-            nightlyToolchain =
+            rustToolchain =
               p:
-              p.rust-bin.nightly.latest.default.override {
+              p.rust-bin.stable."1.99.0".default.override {
                 extensions = [
                   "rust-src"
                   "rust-analyzer"
+                  "clippy"
+                  "rustfmt"
                 ];
               };
-            craneLib = (inputs.crane.mkLib pkgs).overrideToolchain nightlyToolchain;
+            craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
             src = pkgs.lib.cleanSourceWith {
               src = ./.;
@@ -191,6 +193,22 @@
               );
 
               fmt = craneLib.cargoFmt { inherit src; };
+
+              docs = craneLib.cargoDoc (
+                commonArgs
+                // {
+                  inherit cargoArtifacts;
+                  cargoDocExtraArgs = "--no-deps";
+                  RUSTDOCFLAGS = "-D warnings";
+                }
+              );
+
+              tests = craneLib.cargoTest (
+                commonArgs
+                // {
+                  inherit cargoArtifacts;
+                }
+              );
             };
 
             devShells.default = craneLib.devShell {
@@ -201,7 +219,13 @@
                 LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libglvnd ];
               };
 
-              packages = [ config.treefmt.build.wrapper ];
+              packages = [
+                config.treefmt.build.wrapper
+                pkgs.cargo-audit
+                pkgs.cargo-deny
+                pkgs.cargo-edit
+                pkgs.cargo-machete
+              ];
 
               inherit buildInputs nativeBuildInputs;
             };
@@ -213,7 +237,7 @@
                 deadnix.enable = true;
                 rustfmt = {
                   enable = true;
-                  package = nightlyToolchain pkgs;
+                  package = rustToolchain pkgs;
                 };
                 taplo.enable = true;
               };

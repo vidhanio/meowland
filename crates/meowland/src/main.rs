@@ -1,6 +1,12 @@
+//! Command-line entry point for the compositor server and terminal-pane client.
+
 mod cli;
 
-use tracing_subscriber::{EnvFilter, prelude::*};
+use std::io::{self, Write};
+
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Clone, Copy)]
 enum LogDestination {
@@ -34,7 +40,7 @@ fn init_logging(destination: LogDestination) {
 
 fn main() {
     if let Err(error) = cli::start() {
-        eprintln!("meowland: {error}");
+        let _ = writeln!(io::stderr().lock(), "meowland: {error}");
         std::process::exit(1);
     }
 }

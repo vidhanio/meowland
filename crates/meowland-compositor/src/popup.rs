@@ -1,22 +1,17 @@
 //! Popup-grab lifetime and focus restoration.
 
-use smithay::{
-    backend::input::InputTime, reexports::wayland_server::Resource, utils::SERIAL_COUNTER,
-};
+use smithay::backend::input::InputTime;
+use smithay::reexports::wayland_server::Resource;
+use smithay::utils::SERIAL_COUNTER;
 
 use super::State;
 
 impl State {
     pub(crate) fn refresh_popup_grab(&mut self) {
         self.popups.cleanup();
-        if self
-            .popup_grab
-            .as_ref()
-            .is_none_or(|grab| !grab.has_ended())
-        {
+        let Some(grab) = self.popup_grab.take_if(|grab| grab.has_ended()) else {
             return;
-        }
-        let grab = self.popup_grab.take().unwrap();
+        };
         if let Some(keyboard) = self.keyboard.take() {
             if keyboard.has_grab(grab.serial()) {
                 keyboard.unset_grab(self);

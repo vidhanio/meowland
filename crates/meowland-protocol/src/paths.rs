@@ -1,11 +1,14 @@
-use std::{env, path::PathBuf};
+use std::env;
+use std::path::PathBuf;
 
 use meowland_core::{Error, Result};
 
 /// The server's control and pane socket addresses.
 #[derive(Clone, Debug)]
 pub struct Paths {
+    /// Socket for one-shot control requests.
     pub control: PathBuf,
+    /// Socket for persistent terminal-pane connections.
     pub pane: PathBuf,
 }
 

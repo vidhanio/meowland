@@ -1,8 +1,11 @@
-use std::{
-    collections::BTreeMap, ffi::OsString, io::IsTerminal, os::unix::net::UnixStream, time::Duration,
-};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
-use meowland_core::{Error, Result, scale::UiScale};
+use meowland_core::scale::UiScale;
+use meowland_core::{Error, Result};
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowInfo,
 };
@@ -85,24 +88,30 @@ fn attach_targets(
     _partial: &<AttachArgs as usage_rs::spec::CommandArgs>::Partial,
     _context: &usage_rs::complete::CompleteCtx<'_>,
 ) -> Vec<usage_rs::complete::Candidate<'static>> {
-    complete_windows(true)
+    complete_windows(CompletionTargets::All)
 }
 
 fn window_targets(
     _partial: &<WindowArgs as usage_rs::spec::CommandArgs>::Partial,
     _context: &usage_rs::complete::CompleteCtx<'_>,
 ) -> Vec<usage_rs::complete::Candidate<'static>> {
-    complete_windows(true)
+    complete_windows(CompletionTargets::All)
 }
 
 fn app_ids(
     _partial: &<RunArgs as usage_rs::spec::CommandArgs>::Partial,
     _context: &usage_rs::complete::CompleteCtx<'_>,
 ) -> Vec<usage_rs::complete::Candidate<'static>> {
-    complete_windows(false)
+    complete_windows(CompletionTargets::AppIds)
 }
 
-fn complete_windows(include_ids: bool) -> Vec<usage_rs::complete::Candidate<'static>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionTargets {
+    All,
+    AppIds,
+}
+
+fn complete_windows(targets: CompletionTargets) -> Vec<usage_rs::complete::Candidate<'static>> {
     let Ok(paths) = Paths::discover() else {
         return Vec::new();
     };
@@ -110,6 +119,7 @@ fn complete_windows(include_ids: bool) -> Vec<usage_rs::complete::Candidate<'sta
         return Vec::new();
     };
     windows.sort_unstable_by_key(|window| std::cmp::Reverse(window.id));
+    let include_ids = targets == CompletionTargets::All;
     let mut targets = BTreeMap::new();
     for window in windows {
         let title = protocol::sanitize(&window.title);
@@ -162,7 +172,7 @@ impl From<CompletionShell> for usage_rs::complete::Shell {
 ///
 /// # Errors
 /// Returns an error when the selected command cannot be completed.
-pub fn start() -> Result<()> {
+pub(crate) fn start() -> Result<()> {
     let Meowland { command } = Meowland::parse();
     crate::init_logging(match &command {
         Commands::Server(_) => crate::LogDestination::Stderr,
@@ -176,14 +186,16 @@ pub fn start() -> Result<()> {
         }
         Commands::List => {
             let paths = Paths::discover()?;
+            let mut stdout = io::stdout().lock();
             for window in list(&paths)? {
-                println!(
+                writeln!(
+                    stdout,
                     "{}\t{}\t{}\t{}",
                     window.id,
                     protocol::sanitize(&window.app_id),
                     protocol::sanitize(&window.title),
                     if window.active { "active" } else { "" }
-                );
+                )?;
             }
             Ok(())
         }
@@ -218,7 +230,11 @@ pub fn start() -> Result<()> {
             Ok(())
         }
         Commands::Completions(CompletionArgs { shell }) => {
-            print!("{}", Meowland::completion_script(shell.into()));
+            write!(
+                io::stdout().lock(),
+                "{}",
+                Meowland::completion_script(shell.into())
+            )?;
             Ok(())
         }
     }
@@ -263,8 +279,8 @@ fn request_with_timeout(
     socket.set_write_timeout(Some(timeout))?;
     protocol::send(&mut socket, value)?;
     let reply: ControlResponse = protocol::recv(&mut socket)?;
-    if let ControlResponse::Error(error) = &reply {
-        return Err(Error::ServerResponse(error.clone()));
+    match reply {
+        ControlResponse::Error(error) => Err(Error::ServerResponse(error)),
+        reply => Ok(reply),
     }
-    Ok(reply)
 }

@@ -1,26 +1,24 @@
 //! Committed text delivery through focused text-input clients or the keyboard
 //! fallback.
 
-use smithay::{
-    input::{Seat, keyboard::xkb},
-    reexports::{
-        wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
-            ContentHint, ContentPurpose,
-        },
-        wayland_server::DisplayHandle,
-    },
-    wayland::text_input::{TextInputActivation, TextInputManagerState, TextInputSeat},
+use smithay::backend::input::InputTime;
+use smithay::input::Seat;
+use smithay::input::keyboard::xkb;
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
+    ContentHint, ContentPurpose,
 };
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::wayland::text_input::{TextInputActivation, TextInputManagerState, TextInputSeat};
 
 use super::State;
 
-pub fn manager(display: &DisplayHandle, seat: &Seat<State>) -> TextInputManagerState {
+pub(crate) fn manager(display: &DisplayHandle, seat: &Seat<State>) -> TextInputManagerState {
     let manager = TextInputManagerState::new::<State>(display);
     seat.text_input().set_compositor_input_method(true);
     manager
 }
 
-pub fn commit(state: &mut State, text: &str) {
+pub(crate) fn commit(state: &mut State, text: &str) {
     if !valid(text) {
         return;
     }
@@ -60,7 +58,7 @@ fn fallback(state: &mut State, text: &str) {
         return;
     };
     for chunk in keysyms.chunks(200) {
-        keyboard.inject_text_keysyms(state, chunk);
+        keyboard.inject_text_keysyms(state, chunk, InputTime::now());
     }
     state.keyboard = Some(keyboard);
 }

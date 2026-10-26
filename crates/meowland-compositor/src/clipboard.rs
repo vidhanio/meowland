@@ -1,32 +1,30 @@
 //! Readiness-driven Wayland selection exports and terminal-backed deliveries.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    io,
-    os::fd::OwnedFd,
-    sync::Arc,
-};
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
-use calloop::{
-    Interest, Mode, PostAction,
-    generic::Generic,
-    timer::{TimeoutAction, Timer},
-};
+use calloop::generic::Generic;
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{Interest, Mode, PostAction};
 use meowland_protocol::clipboard::{
     ClipboardData, Deadline, Item, MAX_BYTES, Selection as ClipboardSelection, TRANSFER_TIMEOUT,
     mime_types,
 };
-use rustix::{
-    fs::{OFlags, fcntl_getfl, fcntl_setfl},
-    io::Errno,
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+use rustix::io::Errno;
+use smithay::wayland::selection::data_device::{
+    request_data_device_client_selection, set_data_device_selection,
 };
-use smithay::wayland::selection::{
-    SelectionSource, SelectionTarget,
-    data_device::{request_data_device_client_selection, set_data_device_selection},
-    primary_selection::{request_primary_client_selection, set_primary_selection},
+use smithay::wayland::selection::primary_selection::{
+    request_primary_client_selection, set_primary_selection,
 };
+use smithay::wayland::selection::{SelectionSource, SelectionTarget};
 
-use super::{PaneId, ServerToPane, State, input::paste_action, sources::Sources};
+use super::input::paste_action;
+use super::sources::Sources;
+use super::{PaneId, ServerToPane, State};
 
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -78,7 +76,7 @@ const fn wayland_selection(selection: ClipboardSelection) -> SelectionTarget {
 }
 
 #[derive(Default)]
-pub struct Bridge {
+pub(crate) struct Bridge {
     exports: [Option<Export>; 2],
     deliveries: HashMap<u64, Delivery>,
     next: u64,
@@ -106,7 +104,7 @@ impl Bridge {
         self.exports[target_index(target)] = export;
     }
 
-    pub fn detach(&mut self, pane: PaneId) {
+    pub(crate) fn detach(&mut self, pane: PaneId) {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
@@ -118,7 +116,11 @@ impl Bridge {
     }
 }
 
-pub fn selection(state: &mut State, target: SelectionTarget, source: Option<SelectionSource>) {
+pub(crate) fn selection(
+    state: &mut State,
+    target: SelectionTarget,
+    source: Option<SelectionSource>,
+) {
     state.clipboard.set_export(target, None);
     let pane = state
         .last_input_pane
@@ -249,8 +251,9 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                         return Ok(PostAction::Remove);
                     }
                     if deadline.expired() {
-                        let mut export = state.clipboard.take_export(target).unwrap();
-                        if let Some(sources) = &mut export.active {
+                        if let Some(mut export) = state.clipboard.take_export(target)
+                            && let Some(sources) = &mut export.active
+                        {
                             sources.io = None;
                         }
                         return Ok(PostAction::Remove);
@@ -259,7 +262,9 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                     if matches!(result, Ok(false)) {
                         return Ok(PostAction::Continue);
                     }
-                    let export = state.clipboard.export_mut(target).unwrap();
+                    let Some(export) = state.clipboard.export_mut(target) else {
+                        return Ok(PostAction::Remove);
+                    };
                     if let Some(sources) = &mut export.active {
                         sources.io = None;
                     }
@@ -294,12 +299,9 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
             .insert_source(
                 Timer::from_duration(export.deadline.remaining()),
                 move |_, (), state| {
-                    if state
-                        .clipboard
-                        .export(target)
-                        .is_some_and(|export| export.id == id)
+                    if let Some(mut export) = state.clipboard.exports[target_index(target)]
+                        .take_if(|export| export.id == id)
                     {
-                        let mut export = state.clipboard.take_export(target).unwrap();
                         if let Some(sources) = &mut export.active {
                             sources.timer = None;
                         }
@@ -342,7 +344,7 @@ fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io
     Ok(false)
 }
 
-pub fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) {
+pub(crate) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) {
     if state.clipboard.deliveries.len() >= 16 {
         return;
     }
@@ -472,7 +474,7 @@ fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
     }
 }
 
-pub fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<Vec<u8>>) {
+pub(crate) fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<Vec<u8>>) {
     if state.clipboard.deliveries.get(&request).is_none_or(|delivery| {
         !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
     }) {
@@ -489,14 +491,20 @@ pub fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<Vec<u8>
     }
 }
 
-pub fn offer(
-    state: &mut State,
-    pane: PaneId,
-    selection: ClipboardSelection,
-    offer: u64,
-    mimes: Vec<String>,
-    paste: bool,
-) {
+pub(crate) struct TerminalOffer {
+    pub selection: ClipboardSelection,
+    pub id: u64,
+    pub mimes: Vec<String>,
+    pub paste: bool,
+}
+
+pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
+    let TerminalOffer {
+        selection,
+        id: offer,
+        mimes,
+        paste,
+    } = offer;
     if !state.attachments.panes.contains_key(&pane) {
         return;
     }
@@ -522,7 +530,7 @@ pub fn offer(
     }
 }
 
-pub fn paste(state: &mut State, pane: PaneId, text: &str) {
+pub(crate) fn paste(state: &mut State, pane: PaneId, text: &str) {
     if text.len() > meowland_protocol::clipboard::MAX_TEXT
         || state
             .attachments

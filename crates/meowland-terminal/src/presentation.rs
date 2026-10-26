@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use meowland_core::Result;
 use meowland_kitty::{PresentOutcome, Presenter, SharedMemory};
-use meowland_protocol::{FrameAck, FrameBand, PaneAction, PaneToServer, asynchronous::Outgoing};
+use meowland_protocol::asynchronous::Outgoing;
+use meowland_protocol::{FrameAck, FrameBand, PaneAction, PaneToServer};
 use tokio::io::AsyncWrite;
 
 use super::output;
@@ -33,11 +34,16 @@ impl PaneStats {
         }
     }
 
-    fn frame(&mut self, bytes: usize, dropped: bool, encoded: Duration, written: Duration) {
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "throughput is approximate telemetry; byte accounting itself remains integer-valued"
+    )]
+    fn frame(&mut self, bytes: usize, ack: FrameAck, encoded: Duration, written: Duration) {
         self.frames += 1;
         self.drawn += u32::from(bytes > 0);
-        self.dropped += u32::from(dropped);
-        self.bytes += bytes as u64;
+        self.dropped += u32::from(ack == FrameAck::Resync);
+        self.bytes += u64::try_from(bytes).expect("encoded frame length fits u64");
         self.encoded += encoded;
         self.written += written;
         let elapsed = self.window.elapsed();
@@ -66,7 +72,7 @@ impl PaneStats {
 }
 
 /// Own terminal-side presentation buffers together with their accounting.
-pub struct PanePresentation {
+pub(crate) struct PanePresentation {
     presenter: Presenter,
     stats: PaneStats,
     pending: output::Output,
@@ -82,7 +88,7 @@ struct PendingFrame {
 }
 
 impl PanePresentation {
-    pub fn new(cell: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
+    pub(crate) fn new(cell: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
         Self {
             presenter: Presenter::new(cell, shared),
             stats: PaneStats::new(),
@@ -92,31 +98,34 @@ impl PanePresentation {
         }
     }
 
-    pub const fn pending(&self) -> bool {
+    pub(crate) const fn pending(&self) -> bool {
         self.pending.pending()
     }
 
-    pub fn append(&mut self, bytes: &[u8]) {
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
         self.pending.append(bytes);
     }
 
     /// Scratch space for terminal output that is not part of a frame.
-    pub const fn buffer(&mut self) -> &mut Vec<u8> {
+    pub(crate) const fn buffer(&mut self) -> &mut Vec<u8> {
         self.pending.buffer()
     }
 
-    pub fn set_cell_size(&mut self, cell: Option<(u16, u16)>) {
+    pub(crate) fn set_cell_size(&mut self, cell: Option<(u16, u16)>) {
         if self.presenter.set_cell_size(cell) {
             self.retry = Some(Instant::now());
         }
     }
 
-    pub fn deadline(&self) -> Option<Instant> {
+    pub(crate) fn deadline(&self) -> Option<Instant> {
         self.retry.filter(|_| !self.pending())
     }
 
-    pub fn draw(&mut self, band: FrameBand, tx: &mut Outgoing) -> Result<()> {
-        debug_assert!(!self.pending() && self.frame.is_none());
+    pub(crate) fn draw(&mut self, band: FrameBand, tx: &mut Outgoing) -> Result<()> {
+        debug_assert!(
+            !self.pending() && self.frame.is_none(),
+            "previous frame must finish before accepting another band"
+        );
         let started = Instant::now();
         let outcome = self.presenter.present_into(band, self.pending.buffer());
         self.frame = Some(PendingFrame {
@@ -129,7 +138,7 @@ impl PanePresentation {
         self.finish(tx)
     }
 
-    pub fn advance(&mut self, tx: &mut Outgoing) -> Result<()> {
+    pub(crate) fn advance(&mut self, tx: &mut Outgoing) -> Result<()> {
         if self
             .deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -155,29 +164,26 @@ impl PanePresentation {
         };
     }
 
-    pub async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+    pub(crate) async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
         self.pending.drain(stdout).await?;
         Ok(())
     }
 
-    pub fn finish(&mut self, tx: &mut Outgoing) -> Result<()> {
+    pub(crate) fn finish(&mut self, tx: &mut Outgoing) -> Result<()> {
         if self.pending() || self.retry.is_some() {
             return Ok(());
         }
         let Some(frame) = self.frame.take() else {
             return Ok(());
         };
-        self.stats.frame(
-            frame.bytes,
-            !frame.accepted,
-            frame.encoded,
-            frame.started.elapsed(),
-        );
-        tx.send(&PaneToServer::Action(PaneAction::Ack(if frame.accepted {
+        let ack = if frame.accepted {
             FrameAck::Retained
         } else {
             FrameAck::Resync
-        })))?;
+        };
+        self.stats
+            .frame(frame.bytes, ack, frame.encoded, frame.started.elapsed());
+        tx.send(&PaneToServer::Action(PaneAction::Ack(ack)))?;
         Ok(())
     }
 }

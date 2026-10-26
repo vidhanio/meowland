@@ -1,29 +1,25 @@
 //! Async scheduling and explicit lifecycle for one terminal attachment.
 
-use std::{
-    io::{self, Write},
-    time::{Duration, Instant},
-};
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
-use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
-use meowland_input::{self as input, keyboard::Keyboard};
-use meowland_protocol::{
-    self as protocol, Hello, PaneAction, PaneToServer, ServerToPane, Show,
-    asynchronous::{Outgoing, Reader},
-    clipboard::Selection,
-};
-use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol};
-use tokio::{
-    net::unix::{OwnedReadHalf, OwnedWriteHalf},
-    signal::unix::{Signal, SignalKind, signal},
-};
+use meowland_core::asynchronous::Descriptor;
+use meowland_core::{Error, Result, signals};
+use meowland_input::keyboard::Keyboard;
+use meowland_input::{self as input};
+use meowland_protocol::asynchronous::{Outgoing, Reader};
+use meowland_protocol::clipboard::Selection;
+use meowland_protocol::{self as protocol, Hello, PaneAction, PaneToServer, ServerToPane, Show};
+use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
-use super::{
-    input_gate::InputGate,
-    output,
-    presentation::PanePresentation,
-    probe::terminal_probe,
-    terminal::{self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes},
+use super::input_gate::InputGate;
+use super::output;
+use super::presentation::PanePresentation;
+use super::probe::terminal_probe;
+use super::terminal::{
+    self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes,
 };
 
 mod events;
@@ -56,7 +52,7 @@ enum Ready {
     BufferedInput,
 }
 
-pub struct TerminalSession {
+pub(crate) struct TerminalSession {
     receiver: Reader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     tx: Outgoing,
@@ -74,7 +70,7 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    pub fn new(
+    pub(crate) fn new(
         receiver: Reader<OwnedReadHalf>,
         writer: OwnedWriteHalf,
         show: Show,
@@ -113,7 +109,7 @@ impl TerminalSession {
         })
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    pub(crate) async fn run(mut self) -> Result<()> {
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             self.prepare_pending_work()?;
             let active = matches!(self.lifecycle, Lifecycle::Active(_));
@@ -320,8 +316,12 @@ impl TerminalSession {
         } else {
             ClipboardProtocol::Osc52
         })?;
-        let _ = self.clipboard.refresh(Selection::Clipboard, false);
-        let _ = self.clipboard.refresh(Selection::Primary, false);
+        let _ = self
+            .clipboard
+            .refresh(Selection::Clipboard, Refresh::Background);
+        let _ = self
+            .clipboard
+            .refresh(Selection::Primary, Refresh::Background);
         self.tx
             .send(&PaneToServer::Action(PaneAction::Resize { width, height }))?;
         probe.log_capabilities(width, height);

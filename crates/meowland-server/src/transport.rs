@@ -1,35 +1,27 @@
 //! Connection tasks and byte-accounted, ordered pane output.
 
-use std::{
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meowland_compositor::PaneId;
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{
-    self as protocol, ControlRequest, PaneToServer, ServerToPane,
-    asynchronous::{Outgoing, Reader},
-};
+use meowland_protocol::asynchronous::{Outgoing, Reader};
+use meowland_protocol::{self as protocol, ControlRequest, PaneToServer, ServerToPane};
 use serde::Serialize;
-use tokio::{
-    io::{AsyncReadExt, AsyncWrite},
-    net::UnixStream,
-    sync::{mpsc, oneshot},
-};
+use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{Incoming, IncomingSender};
 
 #[derive(Clone, Copy)]
-pub enum ConnectionKind {
+pub(crate) enum ConnectionKind {
     Control,
     Pane,
 }
 
-pub async fn connection(
+pub(crate) async fn connection(
     socket: UnixStream,
     kind: ConnectionKind,
     id: PaneId,
@@ -112,7 +104,7 @@ async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::R
     }
 }
 
-pub struct PaneTransport {
+pub(crate) struct PaneTransport {
     sender: Option<mpsc::UnboundedSender<Queued>>,
     release: Option<oneshot::Sender<String>>,
     bytes: Arc<AtomicUsize>,
@@ -135,11 +127,11 @@ struct Queued {
 }
 
 impl PaneTransport {
-    pub const fn active(&self) -> bool {
+    pub(crate) const fn active(&self) -> bool {
         self.sender.is_some()
     }
 
-    pub fn send(&self, message: ServerToPane) -> bool {
+    pub(crate) fn send(&self, message: ServerToPane) -> bool {
         let Some(sender) = &self.sender else {
             return false;
         };
@@ -161,14 +153,14 @@ impl PaneTransport {
         let queued = Queued {
             message,
             _reservation: Reservation {
-                total: self.bytes.clone(),
+                total: Arc::clone(&self.bytes),
                 bytes,
             },
         };
         sender.send(queued).is_ok()
     }
 
-    pub fn release(&mut self, reason: String) {
+    pub(crate) fn release(&mut self, reason: String) {
         self.sender.take();
         if let Some(release) = self.release.take() {
             let _ = release.send(reason);
@@ -177,7 +169,7 @@ impl PaneTransport {
 }
 
 async fn pane_writer(
-    writer: &mut (impl AsyncWrite + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin + Send),
     mut messages: mpsc::UnboundedReceiver<Queued>,
     reason: oneshot::Receiver<String>,
 ) -> io::Result<()> {
@@ -196,7 +188,10 @@ async fn pane_writer(
     Ok(())
 }
 
-async fn send(writer: &mut (impl AsyncWrite + Unpin), message: &impl Serialize) -> io::Result<()> {
+async fn send(
+    writer: &mut (impl AsyncWrite + Unpin + Send),
+    message: &(impl Serialize + Sync),
+) -> io::Result<()> {
     let mut outgoing = Outgoing::default();
     outgoing.send(message)?;
     outgoing.flush_to(writer).await

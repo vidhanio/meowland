@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
-pub struct Stats {
+pub(crate) struct Stats {
     pub p50: Duration,
     pub p95: Duration,
     pub p99: Duration,
@@ -9,33 +9,45 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn from_samples(mut samples: Vec<Duration>) -> Option<Self> {
+    pub(crate) fn from_samples(mut samples: Vec<Duration>) -> Option<Self> {
         if samples.is_empty() {
             return None;
         }
         samples.sort_unstable();
-        let at = |fraction: f64| {
-            let index = ((samples.len() as f64 * fraction) as usize).min(samples.len() - 1);
-            samples[index]
+        let at = |percent: usize| {
+            let index = samples.len() / 100 * percent + samples.len() % 100 * percent / 100;
+            samples[index.min(samples.len() - 1)]
         };
         Some(Self {
-            p50: at(0.50),
-            p95: at(0.95),
-            p99: at(0.99),
+            p50: at(50),
+            p95: at(95),
+            p99: at(99),
             max: samples[samples.len() - 1],
         })
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum Rate {
+pub(crate) enum Rate {
     Fps,
     Ops,
     Bytes(u64),
 }
 
+impl Rate {
+    pub(crate) fn bytes(bytes: usize, iterations: usize) -> Self {
+        let bytes = u64::try_from(bytes).expect("benchmark byte count fits u64");
+        let iterations = u64::try_from(iterations).expect("benchmark iteration count fits u64");
+        Self::Bytes(
+            bytes
+                .checked_mul(iterations)
+                .expect("benchmark byte total fits u64"),
+        )
+    }
+}
+
 #[derive(Debug)]
-pub struct Row {
+pub(crate) struct Row {
     pub label: String,
     pub count: usize,
     pub stats: Stats,
@@ -44,7 +56,7 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn new(
+    pub(crate) fn new(
         label: impl Into<String>,
         count: usize,
         samples: Vec<Duration>,
@@ -61,7 +73,7 @@ impl Row {
     }
 }
 
-pub fn measure(
+pub(crate) fn measure(
     warmup: usize,
     iterations: usize,
     mut operation: impl FnMut(),

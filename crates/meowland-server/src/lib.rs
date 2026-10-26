@@ -1,14 +1,14 @@
 //! Socket I/O and process ownership, with rendering isolated on its own thread.
 
-use std::{collections::HashMap, io};
+use std::collections::HashMap;
+use std::io;
 
 use meowland_compositor::{Command, Event, PaneId};
-use meowland_core::{Result, scale::UiScale};
+use meowland_core::Result;
+use meowland_core::scale::UiScale;
 use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::{AbortHandle, JoinSet},
-};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{AbortHandle, JoinSet};
 
 mod actor;
 mod compositor;
@@ -84,7 +84,7 @@ impl Server {
                 if self.shutdown.running() && self.connections.contains_key(&id) {
                     self.panes.insert(id, pane);
                     self.send_to_pane(id, ServerToPane::HelloOk);
-                    let _ = self.compositor.command(Command::Attach {
+                    self.send_command(Command::Attach {
                         pane: id,
                         show: hello.show,
                         width: hello.width,
@@ -96,7 +96,7 @@ impl Server {
                 if self.shutdown.running()
                     && self.panes.get(&pane).is_some_and(PaneTransport::active)
                 {
-                    let _ = self.compositor.command(Command::Pane { pane, action });
+                    self.send_command(Command::Pane { pane, action });
                 }
             }
         }
@@ -126,9 +126,16 @@ impl Server {
         }
     }
 
+    fn send_command(&mut self, command: Command) {
+        if let Err(error) = self.compositor.command(command) {
+            tracing::error!(%error, "compositor command queue unavailable");
+            self.begin_shutdown();
+        }
+    }
+
     fn pane_gone(&mut self, id: PaneId) {
         if self.panes.remove(&id).is_some() {
-            let _ = self.compositor.command(Command::Detach { pane: id });
+            self.send_command(Command::Detach { pane: id });
         }
     }
 

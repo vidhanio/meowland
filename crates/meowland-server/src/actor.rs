@@ -1,29 +1,30 @@
 //! A single I/O owner for connections, child processes and shutdown.
 
-use std::{collections::HashMap, io, time::Instant};
+use std::collections::HashMap;
+use std::io;
+use std::time::Instant;
 
 use meowland_compositor::PaneId;
-use meowland_core::{
-    Result,
-    scale::UiScale,
-    signals::{Termination, TerminationSignal},
-};
+use meowland_core::Result;
+use meowland_core::scale::UiScale;
+use meowland_core::signals::{Termination, TerminationSignal};
 use meowland_protocol::Paths;
-use tokio::{net::UnixStream, sync::mpsc, task::JoinSet};
+use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
-use super::{
-    MAX_CONNECTIONS, Server,
-    compositor::DisplayThread,
-    lifecycle::Shutdown,
-    notify, sockets,
-    transport::{self, ConnectionKind},
-};
+use super::compositor::DisplayThread;
+use super::lifecycle::Shutdown;
+use super::transport::{self, ConnectionKind};
+use super::{MAX_CONNECTIONS, Server, notify, sockets};
 
-pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
+pub(crate) async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
     let listeners = sockets::listeners(paths)?;
     let termination = Termination::new()?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
-    let compositor = DisplayThread::start(scale)?;
+    let compositor = tokio::task::spawn_blocking(move || DisplayThread::start(scale))
+        .await
+        .map_err(io::Error::other)??;
     let (incoming, messages) = mpsc::channel(MAX_CONNECTIONS);
     let mut server = Server {
         compositor,
@@ -48,7 +49,7 @@ pub async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
     server.tasks.shutdown().await;
     server.children.shutdown().await;
     server.panes.clear();
-    let stopped = server.compositor.stop();
+    let stopped = server.compositor.stop().await;
     result?;
     stopped?;
     Ok(())

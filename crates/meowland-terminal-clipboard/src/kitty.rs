@@ -1,17 +1,16 @@
 //! Kitty OSC 5522 selection offers, permission-aware reads, and copy writes.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    io,
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::time::{Duration, Instant};
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use meowland_protocol::clipboard::{
     ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, Selection, TRANSFER_TIMEOUT, mime_types,
 };
 
-use super::Action;
+use super::{Action, Focus, Refresh};
 
 const MAX_REQUESTS: usize = 16;
 const MAX_OFFERS: usize = 16;
@@ -100,7 +99,7 @@ struct Operation {
     cancelled: bool,
 }
 
-pub struct Clipboard {
+pub(crate) struct Clipboard {
     password: String,
     focused: bool,
     /// Explicit pastes supersede MIME refreshes issued before them.
@@ -114,7 +113,7 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         let mut password = [0; 32];
         getrandom::fill(&mut password).map_err(io::Error::other)?;
         Ok(Self {
@@ -130,38 +129,38 @@ impl Clipboard {
         })
     }
 
-    pub fn focus(&mut self, focused: bool) {
-        self.focused = focused;
-        if focused {
-            let _ = self.refresh(Selection::Clipboard, false);
-            let _ = self.refresh(Selection::Primary, false);
+    pub(crate) fn focus(&mut self, focus: Focus) {
+        self.focused = focus == Focus::Gained;
+        if self.focused {
+            let _ = self.refresh(Selection::Clipboard, Refresh::Background);
+            let _ = self.refresh(Selection::Primary, Refresh::Background);
         } else {
             self.cancel_refresh();
         }
     }
 
-    pub fn cancel_refresh(&mut self) {
+    pub(crate) fn cancel_refresh(&mut self) {
         self.notification = None;
         self.cancel_lists(Selection::Clipboard);
         self.cancel_lists(Selection::Primary);
     }
 
-    pub fn cancel_refresh_selection(&mut self, selection: Selection) {
+    pub(crate) fn cancel_refresh_selection(&mut self, selection: Selection) {
         self.cancel_lists(selection);
     }
 
-    pub fn refresh(&mut self, selection: Selection, shortcut: bool) -> Option<Instant> {
-        if shortcut && self.has_selection(selection) {
+    pub(crate) fn refresh(&mut self, selection: Selection, refresh: Refresh) -> Option<Instant> {
+        if refresh == Refresh::Paste && self.has_selection(selection) {
             return None;
         }
         self.enqueue(Request::List {
             selection,
-            shortcut,
+            shortcut: refresh == Refresh::Paste,
             epoch: self.epoch(selection),
         })
     }
 
-    pub fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
+    pub(crate) fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
         let selection = self
             .offers
             .get(&offer)
@@ -181,7 +180,7 @@ impl Clipboard {
         });
     }
 
-    pub fn cancel(&mut self, request: u64) {
+    pub(crate) fn cancel(&mut self, request: u64) {
         let matches = |candidate: &Request| matches!(candidate, Request::Read { request: number, .. } if *number == request);
         self.requests.retain(|queued| !matches(&queued.request));
         if let Some(operation) = &mut self.active
@@ -227,7 +226,7 @@ impl Clipboard {
         }
     }
 
-    pub fn copy(&mut self, selection: Selection, data: ClipboardData) {
+    pub(crate) fn copy(&mut self, selection: Selection, data: ClipboardData) {
         if !data.valid() {
             return;
         }
@@ -264,11 +263,11 @@ impl Clipboard {
         Some(deadline)
     }
 
-    pub fn next_action(&mut self) -> Option<Action> {
+    pub(crate) fn next_action(&mut self) -> Option<Action> {
         self.actions.pop_front()
     }
 
-    pub fn deadline(&self) -> Option<Instant> {
+    pub(crate) fn deadline(&self) -> Option<Instant> {
         self.active
             .as_ref()
             .map(|operation| operation.deadline)
@@ -279,16 +278,11 @@ impl Clipboard {
 
     fn expire(&mut self) {
         let now = Instant::now();
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| now >= active.deadline)
+        if let Some(operation) = self.active.take_if(|active| now >= active.deadline)
+            && !operation.cancelled
         {
-            let operation = self.active.take().unwrap();
-            if !operation.cancelled {
-                tracing::warn!(id = operation.id, "Terminal clipboard request timed out");
-                self.failed(&operation.request);
-            }
+            tracing::warn!(id = operation.id, "Terminal clipboard request timed out");
+            self.failed(&operation.request);
         }
         let mut requests = std::mem::take(&mut self.requests);
         requests.retain(|queued| {
@@ -302,7 +296,7 @@ impl Clipboard {
         self.requests = requests;
     }
 
-    pub fn poll(&mut self, output: &mut Vec<u8>) {
+    pub(crate) fn poll(&mut self, output: &mut Vec<u8>) {
         self.expire();
         if self.active.is_some() || !output.is_empty() {
             return;
@@ -380,7 +374,7 @@ impl Clipboard {
         }
     }
 
-    pub fn packet(&mut self, bytes: &[u8]) {
+    pub(crate) fn packet(&mut self, bytes: &[u8]) {
         self.expire();
         let Some(packet) = Packet::parse(bytes) else {
             return;
@@ -392,14 +386,16 @@ impl Clipboard {
             if let Some(reading) = &mut self.notification {
                 match reading.accept(&packet, ".", MAX_TYPE_LIST) {
                     Some(true) => {
-                        let reading = self.notification.take().unwrap();
+                        let Some(reading) = self.notification.take() else {
+                            return;
+                        };
                         let selection = if reading.credentials.primary {
                             Selection::Primary
                         } else {
                             Selection::Clipboard
                         };
                         self.cancel_lists(selection);
-                        self.offer(reading, selection, true);
+                        self.offer(reading, selection, Refresh::Paste);
                         self.actions.push_back(Action::Unblock);
                     }
                     Some(false) => {}
@@ -432,7 +428,9 @@ impl Clipboard {
         if done == Some(false) {
             return;
         }
-        let operation = self.active.take().unwrap();
+        let Some(operation) = self.active.take() else {
+            return;
+        };
         if operation.cancelled {
             return;
         }
@@ -451,7 +449,7 @@ impl Clipboard {
                 shortcut,
                 epoch,
             } if epoch == self.epoch(selection) => {
-                self.offer(operation.reading, selection, false);
+                self.offer(operation.reading, selection, Refresh::Background);
                 if shortcut {
                     self.actions.push_back(Action::Unblock);
                 }
@@ -469,7 +467,7 @@ impl Clipboard {
         }
     }
 
-    fn offer(&mut self, reading: Reading, selection: Selection, paste: bool) {
+    fn offer(&mut self, reading: Reading, selection: Selection, refresh: Refresh) {
         let Ok(types) = String::from_utf8(reading.bytes) else {
             return;
         };
@@ -488,7 +486,7 @@ impl Clipboard {
             selection,
             offer,
             mimes,
-            paste,
+            paste: refresh == Refresh::Paste,
         });
     }
 

@@ -1,13 +1,9 @@
 //! Standalone and systemd-activated Unix sockets with identity-checked cleanup.
 
-use std::{
-    fs, io,
-    os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
-        net::{UnixListener as StdListener, UnixStream as StdStream},
-    },
-    path::{Path, PathBuf},
-};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use meowland_core::{Error, Result};
 use meowland_protocol::Paths;
@@ -42,17 +38,17 @@ impl Drop for SocketPath {
     }
 }
 
-pub struct BoundSocket {
+pub(crate) struct BoundSocket {
     listener: UnixListener,
     _path: Option<SocketPath>,
 }
 
-pub struct Listeners {
+pub(crate) struct Listeners {
     pub control: BoundSocket,
     pub pane: BoundSocket,
 }
 
-pub fn listeners(paths: &Paths) -> Result<Listeners> {
+pub(crate) fn listeners(paths: &Paths) -> Result<Listeners> {
     let mut inherited = listenfd::ListenFd::from_env();
     if inherited.len() == 0 {
         return Ok(Listeners {
@@ -92,7 +88,7 @@ pub fn listeners(paths: &Paths) -> Result<Listeners> {
     }
 }
 
-pub async fn accept(socket: Option<&BoundSocket>) -> io::Result<UnixStream> {
+pub(crate) async fn accept(socket: Option<&BoundSocket>) -> io::Result<UnixStream> {
     match socket {
         Some(socket) => socket.listener.accept().await.map(|(stream, _)| stream),
         None => std::future::pending().await,

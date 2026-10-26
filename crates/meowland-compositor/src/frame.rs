@@ -1,9 +1,7 @@
 //! Independent Wayland callback clock and single-in-flight pane frames.
 
-use std::{
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameAck, FrameBand};
@@ -19,7 +17,7 @@ enum Presentation {
     InFlight { dirty: bool },
 }
 
-pub struct PaneState {
+pub(crate) struct PaneState {
     pub size: FrameSize,
     presentation: Presentation,
     shown: Vec<u8>,
@@ -28,7 +26,7 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    pub const fn new(size: FrameSize) -> Self {
+    pub(crate) const fn new(size: FrameSize) -> Self {
         Self {
             size,
             presentation: Presentation::Clean,
@@ -37,7 +35,7 @@ impl PaneState {
         }
     }
 
-    pub const fn mark_dirty(&mut self) {
+    pub(crate) const fn mark_dirty(&mut self) {
         self.presentation = match self.presentation {
             Presentation::InFlight { .. } => Presentation::InFlight { dirty: true },
             Presentation::Clean | Presentation::Dirty => Presentation::Dirty,
@@ -71,7 +69,7 @@ impl PaneState {
         let rows = if self.shown_size == Some(self.size) {
             self.changed_rows(pixels, stride)?
         } else {
-            0..self.size.height() as usize
+            0..pixels.len() / stride
         };
         let bytes = rows.start * stride..rows.end * stride;
         self.shown.resize(pixels.len(), 0);
@@ -79,8 +77,12 @@ impl PaneState {
         self.shown_size = Some(self.size);
         self.presentation = Presentation::InFlight { dirty: false };
         Some(ServerToPane::Frame(
-            FrameBand::new(self.size, rows.start as u32, pixels[bytes].to_vec())
-                .expect("composed row band fits its frame"),
+            FrameBand::new(
+                self.size,
+                u32::try_from(rows.start).expect("row offset fits validated frame height"),
+                pixels[bytes].to_vec(),
+            )
+            .expect("composed row band fits its frame"),
         ))
     }
 

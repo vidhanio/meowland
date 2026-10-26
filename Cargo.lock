@@ -151,7 +151,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/crossterm-rs/crossterm.git#db287b8c6873166dfe0bdb625c67e981c77164c2"
+source = "git+https://github.com/crossterm-rs/crossterm.git?rev=78eff60fdcfdf62ef9247c13d18e2c9de9452750#78eff60fdcfdf62ef9247c13d18e2c9de9452750"
 dependencies = [
  "bitflags",
  "crossterm_winapi",
@@ -196,6 +196,21 @@ dependencies = [
  "drm-fourcc",
  "libc",
  "rustix 0.38.44",
+]
+
+[[package]]
+name = "drm"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a41816e58f47f49acfd956651055ddcf137c4882c2098c30c448817af21183a"
+dependencies = [
+ "bitflags",
+ "bytemuck",
+ "bytemuck_derive",
+ "drm-ffi",
+ "drm-fourcc",
+ "libc",
+ "rustix 1.1.5",
 ]
 
 [[package]]
@@ -506,7 +521,7 @@ name = "meowland-bench"
 version = "0.1.0"
 dependencies = [
  "calloop",
- "drm",
+ "drm 0.15.0",
  "memmap2",
  "meowland-compositor",
  "meowland-core",
@@ -522,12 +537,12 @@ name = "meowland-compositor"
 version = "0.1.0"
 dependencies = [
  "calloop",
- "getrandom",
  "meowland-core",
  "meowland-protocol",
  "meowland-render",
  "rustix 1.1.5",
  "smithay",
+ "thiserror",
  "tracing",
 ]
 
@@ -1008,14 +1023,14 @@ checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/Smithay/smithay.git#24647fc8d00131eb7f388efed26e35ea316b0018"
+source = "git+https://github.com/Smithay/smithay.git?rev=76118ad7796e3edc46875f44c437485996a8e39d#76118ad7796e3edc46875f44c437485996a8e39d"
 dependencies = [
  "appendlist",
  "bitflags",
  "calloop",
  "cursor-icon",
  "downcast-rs",
- "drm",
+ "drm 0.14.1",
  "drm-ffi",
  "drm-fourcc",
  "drm-sys",
@@ -1224,15 +1239,15 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "usage-argv"
-version = "7.1.0"
+version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d76b30ba236521bfc87a3f32b45dbd7e23a819eba0ffe1fad06ec1c6aa74b3fd"
+checksum = "2cc40affbd6c11f829161c500caeb1518f1bd8729a7d2584b963af88b314c592"
 
 [[package]]
 name = "usage-derive"
-version = "7.1.0"
+version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a83a457f176fa20c2284cba3fa32b824267f888910d8d745090bbaad05e8c5"
+checksum = "d8f99cca010b31bda87f03718e349a04fcdffd4b374e1c3644695a4f03a6f2fe"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1241,9 +1256,9 @@ dependencies = [
 
 [[package]]
 name = "usage-rs"
-version = "7.1.0"
+version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be5de950a7b389d5f634b0c17d46f501f6fc5d773d59ee223cae405d973031a6"
+checksum = "dcc3ab034ff1f5a62f5e0e19557395ac920734ea3ba8a365e7a4fd375b09c555"
 dependencies = [
  "usage-argv",
  "usage-derive",
@@ -1252,9 +1267,9 @@ dependencies = [
 
 [[package]]
 name = "usage-test"
-version = "7.1.0"
+version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8deeeb41c951065e3948e4e1a426a9a4ecc91fbb4e6066009b57d68585f01099"
+checksum = "142d2bec8a20ff24d4fb351d4a45d339926b73472d334d32776d7c676fb0d0ab"
 dependencies = [
  "usage-argv",
 ]

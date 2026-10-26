@@ -2,13 +2,9 @@
 
 use std::time::Duration;
 
-use smithay::{
-    desktop::{
-        PopupManager, PopupUngrabStrategy,
-        utils::{send_frames_surface_tree, with_surfaces_surface_tree},
-    },
-    output::Output,
-};
+use smithay::desktop::utils::{send_frames_surface_tree, with_surfaces_surface_tree};
+use smithay::desktop::{PopupManager, PopupUngrabStrategy};
+use smithay::output::Output;
 
 use super::{Policy, ServerToPane, State, Window, WindowId, WlSurface, input};
 
@@ -22,14 +18,14 @@ impl Window {
     }
 
     /// Visit the window's surface trees without building a render stack.
-    pub fn with_surfaces(&self, mut visit: impl FnMut(&WlSurface)) {
+    pub(crate) fn with_surfaces(&self, mut visit: impl FnMut(&WlSurface)) {
         self.with_surface_trees(|root| {
             with_surfaces_surface_tree(root, |surface, _| visit(surface));
         });
     }
 
     /// Deliver callbacks at the compositor's already-paced frame deadline.
-    pub fn send_frame(&self, output: &Output, time: Duration) {
+    pub(crate) fn send_frame(&self, output: &Output, time: Duration) {
         self.with_surface_trees(|root| {
             send_frames_surface_tree(root, output, time, Some(Duration::ZERO), |_, _| None);
         });
@@ -85,7 +81,9 @@ impl State {
             if let Some(next) = self.catalog.newest() {
                 self.bind_pane_window(pane, next);
             } else {
-                self.attachments.panes.get_mut(&pane).unwrap().clear();
+                if let Some(entry) = self.attachments.panes.get_mut(&pane) {
+                    entry.clear();
+                }
                 self.emit(pane, ServerToPane::Title(String::new()));
                 self.send_pane_cursor(pane);
             }

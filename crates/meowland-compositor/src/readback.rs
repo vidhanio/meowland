@@ -1,58 +1,65 @@
 //! Commit-blocked DMA-BUF acquire, submission, and readback completion.
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex, Weak as SyncWeak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak as SyncWeak};
 
-use calloop::{Interest, Mode, PostAction, generic::Generic};
+use calloop::generic::Generic;
+use calloop::{Interest, Mode, PostAction};
 use meowland_core::pixels::FrameSize;
 use meowland_render::{Readback, Submission, source_bound};
-use smithay::{
-    backend::allocator::{
-        Buffer,
-        dmabuf::{AlreadyReady, Dmabuf, DmabufBlocker},
-    },
-    reexports::wayland_server::{
-        Client, DisplayHandle, Resource, Weak, backend::ObjectId, protocol::wl_buffer::WlBuffer,
-    },
-    utils::Transform,
-    wayland::compositor::{
-        Blocker, BlockerState, Cacheable, SurfaceAttributes, add_blocker, with_states,
-    },
+use smithay::backend::allocator::Buffer;
+use smithay::backend::allocator::dmabuf::{AlreadyReady, Dmabuf, DmabufBlocker};
+use smithay::reexports::wayland_server::backend::ObjectId;
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource, Weak};
+use smithay::utils::Transform;
+use smithay::wayland::compositor::{
+    Blocker, BlockerState, Cacheable, SurfaceAttributes, add_blocker, with_states,
 };
 
-use super::{ClientState, Snapshot, State, WlSurface, sources::Sources};
+use super::sources::Sources;
+use super::{ClientState, Snapshot, State, WlSurface};
 
 const MAX_PENDING: usize = 32;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Default, Debug)]
 struct Budget {
-    pending: usize,
-    bytes: usize,
+    pending: AtomicUsize,
+    bytes: AtomicUsize,
 }
 
 #[derive(Debug)]
 struct Reservation {
-    budget: Arc<Mutex<Budget>>,
+    budget: Arc<Budget>,
     bytes: usize,
 }
 
 impl Reservation {
-    fn new(budget: &Arc<Mutex<Budget>>, bytes: usize) -> Option<Self> {
-        let mut usage = budget.lock().unwrap();
-        if usage.pending >= MAX_PENDING || usage.bytes.saturating_add(bytes) > MAX_PENDING_BYTES {
+    fn new(budget: &Arc<Budget>, bytes: usize) -> Option<Self> {
+        budget
+            .pending
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                pending
+                    .checked_add(1)
+                    .filter(|&pending| pending <= MAX_PENDING)
+            })
+            .ok()?;
+        if budget
+            .bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total
+                    .checked_add(bytes)
+                    .filter(|&total| total <= MAX_PENDING_BYTES)
+            })
+            .is_err()
+        {
+            budget.pending.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
-        usage.pending += 1;
-        usage.bytes += bytes;
-        drop(usage);
         Some(Self {
-            budget: budget.clone(),
+            budget: Arc::clone(budget),
             bytes,
         })
     }
@@ -60,9 +67,8 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut usage = self.budget.lock().unwrap();
-        usage.pending -= 1;
-        usage.bytes -= self.bytes;
+        self.budget.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.budget.pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -73,7 +79,7 @@ struct Slot {
 }
 
 #[derive(Default, Debug)]
-pub struct PreparedSnapshot {
+pub(crate) struct PreparedSnapshot {
     changed: bool,
     slot: Option<Arc<Slot>>,
 }
@@ -90,7 +96,7 @@ impl Cacheable for PreparedSnapshot {
     }
 }
 
-pub fn clear(surface: &WlSurface) {
+pub(crate) fn clear(surface: &WlSurface) {
     with_states(surface, |states| {
         *states.cached_state.get::<PreparedSnapshot>().pending() = PreparedSnapshot {
             changed: true,
@@ -99,7 +105,7 @@ pub fn clear(surface: &WlSurface) {
     });
 }
 
-pub fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
+pub(crate) fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
     with_states(surface, |states| {
         states
             .cached_state
@@ -107,7 +113,12 @@ pub fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
             .current()
             .slot
             .take()
-            .and_then(|slot| slot.snapshot.lock().unwrap().take())
+            .and_then(|slot| {
+                slot.snapshot
+                    .lock()
+                    .expect("readback snapshot lock poisoned")
+                    .take()
+            })
     })
 }
 
@@ -183,42 +194,43 @@ struct Operation {
 }
 
 #[derive(Default)]
-pub struct Readbacks {
+pub(crate) struct Readbacks {
     next: u64,
     operations: HashMap<u64, Operation>,
     buffers: HashMap<ObjectId, SyncWeak<BufferReaders>>,
-    budget: Arc<Mutex<Budget>>,
+    budget: Arc<Budget>,
 }
 
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "`cached` borrows the cached state and must outlive `pending`"
-)]
-pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf: Dmabuf) {
+impl Readbacks {
+    fn readers(&mut self, buffer: &WlBuffer) -> Arc<BufferReaders> {
+        self.buffers.retain(|_, readers| readers.strong_count() > 0);
+        self.buffers
+            .get(&buffer.id())
+            .and_then(SyncWeak::upgrade)
+            .unwrap_or_else(|| {
+                let readers = Arc::new(BufferReaders::default());
+                self.buffers.insert(buffer.id(), Arc::downgrade(&readers));
+                readers
+            })
+    }
+}
+
+pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf: Dmabuf) {
     let Some(client) = surface.client() else {
         return;
     };
-    state
-        .readbacks
-        .buffers
-        .retain(|_, readers| readers.strong_count() > 0);
-    let readers = state
-        .readbacks
-        .buffers
-        .get(&buffer.id())
-        .and_then(SyncWeak::upgrade)
-        .unwrap_or_else(|| {
-            let readers = Arc::new(BufferReaders::default());
-            state
-                .readbacks
-                .buffers
-                .insert(buffer.id(), Arc::downgrade(&readers));
-            readers
-        });
-    add_blocker(surface, BufferBlocker(readers.clone()));
+    let readers = state.readbacks.readers(buffer);
+    add_blocker(surface, BufferBlocker(Arc::clone(&readers)));
     clear(surface);
     let size = dmabuf.size();
-    let bytes = FrameSize::new(size.w as u32, size.h as u32).map_or(0, FrameSize::rgba_len);
+    let size = u32::try_from(size.w)
+        .ok()
+        .zip(u32::try_from(size.h).ok())
+        .and_then(|(width, height)| FrameSize::new(width, height));
+    let Some(size) = size else {
+        return;
+    };
+    let bytes = size.rgba_len();
     let Some(reservation) = Reservation::new(&state.readbacks.budget, bytes) else {
         tracing::warn!("DMA-BUF readback budget exhausted; retaining previous pixels");
         return;
@@ -226,10 +238,12 @@ pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf
     let (scale, transform) = with_states(surface, |states| {
         let mut cached = states.cached_state.get::<SurfaceAttributes>();
         let pending = cached.pending();
-        (
+        let properties = (
             pending.buffer_scale,
             Transform::from(pending.buffer_transform),
-        )
+        );
+        drop(cached);
+        properties
     });
     let bound = source_bound(state.pane_bound(surface), scale, transform);
     readers.pending.fetch_add(1, Ordering::AcqRel);
@@ -238,7 +252,7 @@ pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf
         _reservation: reservation,
     });
     with_states(surface, |states| {
-        states.cached_state.get::<PreparedSnapshot>().pending().slot = Some(slot.clone());
+        states.cached_state.get::<PreparedSnapshot>().pending().slot = Some(Arc::clone(&slot));
     });
     state.readbacks.next += 1;
     let id = state.readbacks.next;
@@ -255,7 +269,7 @@ pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf
                 submitted: false,
                 finished: false,
             },
-            acquire_cancelled: acquire_cancelled.clone(),
+            acquire_cancelled: Arc::clone(&acquire_cancelled),
             phase: Phase::Acquiring(dmabuf),
             sources: Sources::new(&state.handle),
             bound,
@@ -271,7 +285,15 @@ pub fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf
                 Ok(())
             }) {
                 Ok(token) => {
-                    state.readbacks.operations.get_mut(&id).unwrap().sources.io = Some(token);
+                    state
+                        .readbacks
+                        .operations
+                        .get_mut(&id)
+                        .expect(
+                            "operation remains registered while its acquire source is installed",
+                        )
+                        .sources
+                        .io = Some(token);
                     add_blocker(
                         surface,
                         AcquireBlocker {
@@ -357,7 +379,13 @@ fn complete(state: &mut State, id: u64) {
         && operation.surface.upgrade().is_ok()
     {
         match gpu.complete(readback) {
-            Ok(snapshot) => *operation.slot.snapshot.lock().unwrap() = Some(snapshot),
+            Ok(snapshot) => {
+                *operation
+                    .slot
+                    .snapshot
+                    .lock()
+                    .expect("readback snapshot lock poisoned") = Some(snapshot);
+            }
             Err(error) => tracing::warn!(%error, "DMA-BUF readback failed"),
         }
     }
@@ -367,7 +395,7 @@ fn complete(state: &mut State, id: u64) {
     notify(state, &client);
 }
 
-pub fn destroyed(state: &mut State, surface: &WlSurface) {
+pub(crate) fn destroyed(state: &mut State, surface: &WlSurface) {
     let mut clients = Vec::new();
     state.readbacks.operations.retain(|_, operation| {
         if operation.surface == surface.downgrade()

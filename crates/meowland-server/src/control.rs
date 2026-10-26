@@ -1,6 +1,8 @@
 //! Nonblocking control requests and actor-owned process launches.
 
-use std::{ffi::OsString, io, path::PathBuf};
+use std::ffi::OsString;
+use std::io;
+use std::path::PathBuf;
 
 use meowland_protocol::{ControlRequest, ControlResponse};
 use tokio::sync::oneshot;
@@ -9,13 +11,13 @@ use super::{MAX_CONNECTIONS, Server, process};
 
 type Reply = oneshot::Sender<ControlResponse>;
 
-pub struct Launch {
+pub(crate) struct Launch {
     args: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
     cwd: PathBuf,
 }
 
-pub enum Completion {
+pub(crate) enum Completion {
     Response {
         reply: Reply,
         response: io::Result<ControlResponse>,
@@ -28,7 +30,7 @@ pub enum Completion {
 }
 
 impl Server {
-    pub fn start_control(&mut self, request: ControlRequest, reply: Reply) {
+    pub(crate) fn start_control(&mut self, request: ControlRequest, reply: Reply) {
         if reply.is_closed() {
             return;
         }
@@ -59,9 +61,10 @@ impl Server {
             }
             ControlRequest::Kill(show) => {
                 let operation = self.compositor.call(move |state| {
-                    state
-                        .close_window(&show)
-                        .map_or_else(ControlResponse::Error, |()| ControlResponse::Ok)
+                    state.close_window(&show).map_or_else(
+                        |error| ControlResponse::Error(error.to_string()),
+                        |()| ControlResponse::Ok,
+                    )
                 });
                 self.controls.spawn(async move {
                     Completion::Response {
@@ -85,7 +88,7 @@ impl Server {
         }
     }
 
-    pub fn control_finished(&mut self, completion: Completion) {
+    pub(crate) fn control_finished(&mut self, completion: Completion) {
         match completion {
             Completion::Response { reply, response } => {
                 let response = if self.shutdown.running() {

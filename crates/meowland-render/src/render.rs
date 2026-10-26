@@ -3,23 +3,17 @@
 use std::collections::HashMap;
 
 use meowland_core::pixels::FrameSize;
-use smithay::{
-    desktop::{PopupKind, PopupManager},
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, Rectangle, Size},
-    wayland::{
-        compositor::{
-            SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
-            with_surface_tree_upward,
-        },
-        shell::xdg::SurfaceCachedState,
-    },
+use smithay::desktop::{PopupKind, PopupManager};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::wayland::compositor::{
+    SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
+    with_surface_tree_upward,
 };
+use smithay::wayland::shell::xdg::SurfaceCachedState;
 
-use super::{
-    Snapshot,
-    geometry::{SurfaceGeometry, surface_geometry},
-};
+use super::Snapshot;
+use super::geometry::{SurfaceGeometry, rounded, surface_geometry};
 
 /// Scratch allocations owned by the compositor, not by any client or pane.
 #[derive(Default)]
@@ -139,8 +133,7 @@ pub fn popup_origin(
 ) -> Point<i32, Logical> {
     let geometry = popup.geometry().loc;
     let coordinate = |parent, location, geometry| {
-        (i64::from(parent) + i64::from(location) - i64::from(geometry))
-            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        coordinate(i64::from(parent) + i64::from(location) - i64::from(geometry))
     };
     Point::from((
         coordinate(parent_geometry.x, location.x, geometry.x),
@@ -173,14 +166,7 @@ fn collect_surface(
         |node, states, parent| TraversalAction::DoChildren(position(node, states, parent)),
         |node, states, parent| {
             let (x, y) = position(node, states, parent);
-            stack.push((
-                node.clone(),
-                (
-                    x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                )
-                    .into(),
-            ));
+            stack.push((node.clone(), (coordinate(x), coordinate(y)).into()));
         },
         |_, _, _| true,
     );
@@ -205,8 +191,14 @@ fn blit(
     };
     let clip_left = dst.left.max(0);
     let clip_top = dst.top.max(0);
-    let clip_right = dst.left.saturating_add(dst.width).min(width as i32);
-    let clip_bottom = dst.top.saturating_add(dst.height).min(height as i32);
+    let clip_right = dst
+        .left
+        .saturating_add(dst.width)
+        .min(coordinate(i64::from(width)));
+    let clip_bottom = dst
+        .top
+        .saturating_add(dst.height)
+        .min(coordinate(i64::from(height)));
     if clip_right <= clip_left || clip_bottom <= clip_top {
         return;
     }
@@ -255,10 +247,17 @@ fn placement(
     })
 }
 
+fn coordinate(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "edges are sums of two i32 coordinates, exactly representable in f64"
+)]
 fn scaled_edge(value: i64, scale: f64) -> i32 {
-    (value as f64 * scale)
-        .round()
-        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+    rounded(value as f64 * scale)
 }
 
 fn blit_scaled<const OPAQUE: bool>(
@@ -269,18 +268,22 @@ fn blit_scaled<const OPAQUE: bool>(
     out: &mut [u8],
     width: u32,
 ) {
-    let last_x = snapshot.width as usize - 1;
-    let last_y = snapshot.height as usize - 1;
-    let stride = snapshot.width as usize;
+    let stride = usize::try_from(snapshot.width).expect("validated snapshot width fits usize");
+    let last_x = stride - 1;
+    let last_y =
+        usize::try_from(snapshot.height).expect("validated snapshot height fits usize") - 1;
     let pixels = snapshot.pixels.as_chunks::<4>().0;
-    let columns = clip.size.w as usize;
+    let columns = usize::try_from(clip.size.w).expect("clipped width is positive");
+    let pane_stride = usize::try_from(width).expect("validated pane width fits usize");
+    let clip_x = usize::try_from(clip.loc.x).expect("clipping removed negative x coordinates");
     let swapped = geometry.swapped();
     let mut source_columns = [0; 256];
     for start in (0..columns).step_by(source_columns.len()) {
         let count = (columns - start).min(source_columns.len());
         let source_columns = &mut source_columns[..count];
         for (column, source_column) in source_columns.iter_mut().enumerate() {
-            let x = clip.loc.x + (start + column) as i32;
+            let x = clip.loc.x
+                + i32::try_from(start + column).expect("column lies within the clipped pane");
             let sample = geometry.src.loc.x
                 + (f64::from(x) + 0.5 - f64::from(dst.left)) * geometry.src.size.w
                     / f64::from(dst.width);
@@ -299,7 +302,8 @@ fn blit_scaled<const OPAQUE: bool>(
             } else {
                 (pixel_index(geometry.raw_y(sample), last_y) * stride, 1)
             };
-            let to = (y as usize * width as usize + clip.loc.x as usize + start) * 3;
+            let row = usize::try_from(y).expect("clipping removed negative y coordinates");
+            let to = (row * pane_stride + clip_x + start) * 3;
             let rgb_row = out[to..to + count * 3].as_chunks_mut::<3>().0;
             for (&column, rgb) in source_columns.iter().zip(rgb_row) {
                 let pixel = pixels[base + column * advance];
@@ -337,16 +341,18 @@ fn blit_unscaled_inner<const OPAQUE: bool>(
     out: &mut [u8],
     width: u32,
 ) {
-    let columns = clip.size.w as usize;
+    let columns = usize::try_from(clip.size.w).expect("clipped width is positive");
     let row_bytes = columns * 4;
-    let stride = snapshot.width as usize * 4;
-    let pane_stride = width as usize * 3;
-    let first = (clip.loc.x - left) as usize;
-    let first_row = (clip.loc.y - top) as usize;
-    for row in 0..clip.size.h as usize {
+    let stride = usize::try_from(snapshot.width).expect("validated snapshot width fits usize") * 4;
+    let pane_stride = usize::try_from(width).expect("validated pane width fits usize") * 3;
+    let first = usize::try_from(clip.loc.x - left).expect("clipped source x is nonnegative");
+    let first_row = usize::try_from(clip.loc.y - top).expect("clipped source y is nonnegative");
+    let clip_x = usize::try_from(clip.loc.x).expect("clipped destination x is nonnegative");
+    let clip_y = usize::try_from(clip.loc.y).expect("clipped destination y is nonnegative");
+    for row in 0..usize::try_from(clip.size.h).expect("clipped height is positive") {
         let from = (first_row + row) * stride + first * 4;
         let source = snapshot.pixels[from..from + row_bytes].as_chunks::<4>().0;
-        let at = (clip.loc.y as usize + row) * pane_stride + clip.loc.x as usize * 3;
+        let at = (clip_y + row) * pane_stride + clip_x * 3;
         let dest = out[at..at + columns * 3].as_chunks_mut::<3>().0;
         for (pixel, rgb) in source.iter().zip(dest) {
             if OPAQUE {
@@ -359,6 +365,12 @@ fn blit_unscaled_inner<const OPAQUE: bool>(
 }
 
 #[inline]
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "sampling floors nonnegative coordinates and clamps them to the last valid pixel"
+)]
 fn pixel_index(value: f64, last: usize) -> usize {
     (value.floor().max(0.0) as usize).min(last)
 }
@@ -375,7 +387,8 @@ fn blend_pixel(pixel: [u8; 4], rgb: &mut [u8; 3]) {
             let inverse = 255 - alpha;
             for channel in 0..3 {
                 let under = u32::from(rgb[channel]);
-                rgb[channel] = (u32::from(pixel[channel]) + (under * inverse + 127) / 255) as u8;
+                let blended = u32::from(pixel[channel]) + (under * inverse + 127) / 255;
+                rgb[channel] = u8::try_from(blended).unwrap_or(u8::MAX);
             }
         }
     }
@@ -401,8 +414,8 @@ fn opaque_cover(
     snapshot.opaque
         && dst.left <= 0
         && dst.top <= 0
-        && dst.left.saturating_add(dst.width) >= width as i32
-        && dst.top.saturating_add(dst.height) >= height as i32
+        && dst.left.saturating_add(dst.width) >= coordinate(i64::from(width))
+        && dst.top.saturating_add(dst.height) >= coordinate(i64::from(height))
 }
 
 impl Renderer {
@@ -441,7 +454,7 @@ impl Renderer {
                         .input_region
                         .as_ref()
                         .is_none_or(|region| {
-                            region.contains((local.x.floor() as i32, local.y.floor() as i32))
+                            region.contains((rounded(local.x.floor()), rounded(local.y.floor())))
                         })
                 });
                 inside.then(|| {

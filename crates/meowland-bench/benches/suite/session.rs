@@ -1,17 +1,14 @@
 //! Local compositor harness, or full socket transport via
 //! `MEOWLAND_BENCH_SERVER`.
 
-use std::{
-    collections::VecDeque,
-    env, fs,
-    hint::black_box,
-    os::unix::net::UnixStream,
-    path::{Path, PathBuf},
-    process::{self, Child, Stdio},
-    sync::{Arc, Mutex, mpsc},
-    thread,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
+use std::hint::black_box;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{self, Child, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
 
 use meowland_compositor::{Command, Event, PaneId, Runtime};
 use meowland_core::scale::UiScale;
@@ -20,24 +17,30 @@ use meowland_protocol::{
     self as protocol, FrameAck, Hello, PaneAction, PaneToServer, Paths, ServerToPane,
 };
 
-pub const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 const CELL: (u16, u16) = (10, 20);
 
-pub struct CommitLog {
-    pub queue: VecDeque<(Instant, bool)>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sampling {
+    Warmup,
+    Record,
+}
+
+pub(crate) struct CommitLog {
+    pub queue: VecDeque<(Instant, Sampling)>,
     pub latencies: Vec<Duration>,
     pub presented: usize,
     pub released: bool,
 }
 
 #[derive(Clone)]
-pub enum Commands {
+pub(crate) enum Commands {
     Local(calloop::channel::Sender<Command>),
     Socket(Arc<Mutex<UnixStream>>),
 }
 
 impl Commands {
-    pub fn send(&self, command: Command) -> Result<(), String> {
+    pub(crate) fn send(&self, command: Command) -> Result<(), String> {
         match self {
             Self::Local(sender) => sender.send(command).map_err(|error| error.to_string()),
             Self::Socket(socket) => {
@@ -56,14 +59,19 @@ impl Commands {
                     Command::Shutdown => return Ok(()),
                     _ => return Err("unsupported benchmark command".into()),
                 };
-                protocol::send(&mut *socket.lock().unwrap(), &message)
-                    .map_err(|error| error.to_string())
+                protocol::send(
+                    &mut *socket
+                        .lock()
+                        .expect("benchmark socket writer lock poisoned"),
+                    &message,
+                )
+                .map_err(|error| error.to_string())
             }
         }
     }
 }
 
-pub struct Session {
+pub(crate) struct Session {
     pub commands: Commands,
     pub log: Arc<Mutex<CommitLog>>,
     display: String,
@@ -74,7 +82,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         if let Some(binary) = env::var_os("MEOWLAND_BENCH_SERVER") {
             return Self::remote(Path::new(&binary));
         }
@@ -151,12 +159,15 @@ impl Session {
                 return Err(format!("starting benchmark server: {error}"));
             }
         };
-        let mut server = RemoteServer { child, directory };
-        let display = format!("wayland-meowland-{}", server.child.id());
+        let mut server = RemoteServer {
+            child: Some(child),
+            directory,
+        };
+        let display = format!("wayland-meowland-{}", server.child().id());
         let deadline = Instant::now() + TIMEOUT;
         while !paths.pane.exists() || !server.directory.join(&display).exists() {
             if server
-                .child
+                .child()
                 .try_wait()
                 .map_err(|error| error.to_string())?
                 .is_some()
@@ -203,7 +214,7 @@ impl Session {
             presented: 0,
             released: false,
         }));
-        let receiver_log = log.clone();
+        let receiver_log = Arc::clone(&log);
         let receiver_commands = commands.clone();
         let receiver = thread::spawn(move || {
             let mut presenter = Presenter::new(Some(CELL), None);
@@ -214,12 +225,16 @@ impl Session {
                         presenter.present_into(band, &mut terminal_output);
                         black_box(terminal_output.len());
                         let now = Instant::now();
-                        let mut log = receiver_log.lock().unwrap();
+                        let mut log = receiver_log
+                            .lock()
+                            .expect("benchmark commit log lock poisoned");
                         log.presented += 1;
                         let started = log
                             .queue
                             .drain(..)
-                            .filter_map(|(started, record)| record.then_some(started))
+                            .filter_map(|(started, sampling)| {
+                                (sampling == Sampling::Record).then_some(started)
+                            })
                             .next_back();
                         if let Some(started) = started {
                             log.latencies.push(now.saturating_duration_since(started));
@@ -231,7 +246,10 @@ impl Session {
                         });
                     }
                     ServerToPane::Release(_) => {
-                        receiver_log.lock().unwrap().released = true;
+                        receiver_log
+                            .lock()
+                            .expect("benchmark commit log lock poisoned")
+                            .released = true;
                         break;
                     }
                     _ => {}
@@ -249,43 +267,80 @@ impl Session {
         }
     }
 
-    pub fn socket(&self) -> PathBuf {
+    pub(crate) fn socket(&self) -> PathBuf {
         self.runtime.join(&self.display)
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), String> {
+        let _ = self.commands.send(Command::Shutdown);
+        if let Some(mut server) = self.server.take() {
+            server.stop();
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| "benchmark compositor thread panicked".to_owned())?;
+        }
+        if let Some(receiver) = self.receiver.take() {
+            receiver
+                .join()
+                .map_err(|_| "benchmark receiver thread panicked".to_owned())?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
-        self.server.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        if let Some(receiver) = self.receiver.take() {
-            let _ = receiver.join();
-        }
     }
 }
 
 struct RemoteServer {
-    child: Child,
+    child: Option<Child>,
     directory: PathBuf,
 }
 
-impl Drop for RemoteServer {
-    fn drop(&mut self) {
-        if let Some(pid) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+impl RemoteServer {
+    const fn child(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("benchmark server is running until explicit stop")
+    }
+
+    fn stop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Ok(raw) = i32::try_from(child.id())
+            && let Some(pid) = rustix::process::Pid::from_raw(raw)
+        {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         }
         let deadline = Instant::now() + TIMEOUT;
-        while self.child.try_wait().is_ok_and(|status| status.is_none()) {
+        while child.try_wait().is_ok_and(|status| status.is_none()) {
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                let _ = child.kill();
+                let _ = child.wait();
                 break;
             }
             thread::sleep(Duration::from_millis(1));
         }
         let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+impl Drop for RemoteServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let directory = std::mem::take(&mut self.directory);
+            let _ = thread::Builder::new()
+                .name("meowland-bench-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                    let _ = fs::remove_dir_all(directory);
+                });
+        }
     }
 }

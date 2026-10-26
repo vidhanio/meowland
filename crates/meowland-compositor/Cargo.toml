@@ -2,6 +2,7 @@
 name = "meowland-compositor"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
@@ -13,7 +14,6 @@ meowland-render = { workspace = true }
 meowland-core = { workspace = true }
 meowland-protocol = { workspace = true }
 calloop = { workspace = true }
-getrandom = { workspace = true, features = ["std"] }
 rustix = { workspace = true, features = ["event", "fs", "pipe"] }
 smithay = { workspace = true, features = [
   "wayland_frontend",
@@ -22,3 +22,4 @@ smithay = { workspace = true, features = [
   "renderer_gl",
 ] }
 tracing = { workspace = true }
+thiserror = { workspace = true }

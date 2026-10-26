@@ -2,7 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use meowland_core::{asynchronous::Descriptor, signals};
+use meowland_core::asynchronous::Descriptor;
+use meowland_core::signals;
 use meowland_input as input;
 use meowland_kitty::SharedMemory;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
@@ -21,7 +22,7 @@ const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?5522$p\x1b[?u\x1b[c";
 
 /// Terminal capabilities discovered during the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ProbeInfo {
+pub(crate) struct ProbeInfo {
     pub pixel_width: Option<u32>,
     pub pixel_height: Option<u32>,
     pub cell_width: Option<u16>,
@@ -30,14 +31,14 @@ pub struct ProbeInfo {
     pub shared_memory: bool,
     pub sgr_pixels: bool,
     /// OSC 5522 support and the paste-notification mode's previous state.
-    pub clipboard: Option<bool>,
+    pub clipboard: Option<super::terminal::ClipboardMode>,
     /// Kitty's active enhancements after pushing the requested flags.
     pub keyboard_flags: Option<crossterm::event::KeyboardEnhancementFlags>,
     pub name: Option<String>,
 }
 
 impl ProbeInfo {
-    pub fn log_capabilities(&self, width: u32, height: u32) {
+    pub(crate) fn log_capabilities(&self, width: u32, height: u32) {
         tracing::info!(
             width, height,
             cell = ?self.cell_width.zip(self.cell_height),
@@ -53,7 +54,7 @@ impl ProbeInfo {
 }
 
 /// Probe through the presentation descriptors, returning `None` on termination.
-pub async fn terminal_probe(
+pub(crate) async fn terminal_probe(
     input: &mut input::Reader,
     output: &mut Descriptor,
     termination: &mut signals::Termination,
@@ -220,7 +221,13 @@ fn probe_csi(params: &[CsiParam], byte: u8, out: &mut ProbeInfo) {
             if let Some(value) = fields.next().flatten() {
                 match first {
                     1016 => out.sgr_pixels = matches!(value, 1..=3),
-                    5522 if matches!(value, 1..=3) => out.clipboard = Some(value != 2),
+                    5522 if matches!(value, 1..=3) => {
+                        out.clipboard = Some(if value == 2 {
+                            super::terminal::ClipboardMode::Disabled
+                        } else {
+                            super::terminal::ClipboardMode::Enabled
+                        });
+                    }
                     _ => {}
                 }
             }

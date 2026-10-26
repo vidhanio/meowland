@@ -7,39 +7,42 @@ use meowland_protocol::Show;
 
 use super::frame::PaneState;
 
+/// Host-assigned identity of a terminal pane, distinct from a Wayland window
+/// ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PaneId(pub u64);
 
+/// Compositor-assigned identity stable for one Wayland toplevel's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WindowId(pub u64);
 
 #[derive(Clone, Debug)]
-pub enum Selection {
+pub(crate) enum Selection {
     AppId(String),
     Activation(String),
 }
 
 #[derive(Clone, Debug)]
-pub enum Binding {
+pub(crate) enum Binding {
     Waiting(Selection),
     Empty,
     Showing(WindowId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Policy {
+pub(crate) enum Policy {
     Fixed,
     FollowNewest,
 }
 
-pub struct AttachedPane {
+pub(crate) struct AttachedPane {
     pub binding: Binding,
     pub policy: Policy,
     pub presentation: PaneState,
 }
 
 impl AttachedPane {
-    pub fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
+    pub(crate) fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
         let policy = if matches!(show, Show::Newest)
             || (window.is_none() && matches!(show, Show::Focused))
         {
@@ -62,14 +65,14 @@ impl AttachedPane {
         }
     }
 
-    pub const fn window(&self) -> Option<WindowId> {
+    pub(crate) const fn window(&self) -> Option<WindowId> {
         match self.binding {
             Binding::Showing(window) => Some(window),
             Binding::Waiting(_) | Binding::Empty => None,
         }
     }
 
-    pub fn show(&mut self, window: WindowId) -> Option<String> {
+    pub(crate) fn show(&mut self, window: WindowId) -> Option<String> {
         let previous = std::mem::replace(&mut self.binding, Binding::Showing(window));
         self.presentation.mark_dirty();
         match previous {
@@ -78,24 +81,24 @@ impl AttachedPane {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.binding = Binding::Empty;
         self.presentation.mark_dirty();
     }
 }
 
 #[derive(Default)]
-pub struct Attachments {
+pub(crate) struct Attachments {
     pub panes: HashMap<PaneId, AttachedPane>,
     deciding: HashMap<WindowId, PaneId>,
 }
 
 impl Attachments {
-    pub fn first(&self) -> Option<PaneId> {
+    pub(crate) fn first(&self) -> Option<PaneId> {
         self.panes.keys().copied().min()
     }
 
-    pub fn first_window(&self) -> Option<WindowId> {
+    pub(crate) fn first_window(&self) -> Option<WindowId> {
         self.panes
             .iter()
             .filter_map(|(id, pane)| pane.window().map(|window| (*id, window)))
@@ -103,25 +106,25 @@ impl Attachments {
             .map(|(_, window)| window)
     }
 
-    pub fn showing(&self, window: WindowId) -> Vec<PaneId> {
+    pub(crate) fn showing(&self, window: WindowId) -> Vec<PaneId> {
         self.panes
             .iter()
             .filter_map(|(id, pane)| (pane.window() == Some(window)).then_some(*id))
             .collect()
     }
 
-    pub fn following(&self) -> Vec<PaneId> {
+    pub(crate) fn following(&self) -> Vec<PaneId> {
         self.panes
             .iter()
             .filter_map(|(id, pane)| (pane.policy == Policy::FollowNewest).then_some(*id))
             .collect()
     }
 
-    pub fn decide(&mut self, window: WindowId, pane: PaneId) -> bool {
+    pub(crate) fn decide(&mut self, window: WindowId, pane: PaneId) -> bool {
         self.deciding.insert(window, pane) != Some(pane)
     }
 
-    pub fn owner(&self, window: WindowId) -> Option<PaneId> {
+    pub(crate) fn owner(&self, window: WindowId) -> Option<PaneId> {
         self.deciding
             .get(&window)
             .copied()
@@ -139,24 +142,24 @@ impl Attachments {
             })
     }
 
-    pub fn size(&self, window: WindowId) -> Option<FrameSize> {
+    pub(crate) fn size(&self, window: WindowId) -> Option<FrameSize> {
         self.owner(window)
             .and_then(|id| self.panes.get(&id))
             .map(|pane| pane.presentation.size)
     }
 
-    pub fn visible(&self, window: WindowId) -> bool {
+    pub(crate) fn visible(&self, window: WindowId) -> bool {
         self.panes
             .values()
             .any(|pane| pane.window() == Some(window))
     }
 
-    pub fn remove(&mut self, pane: PaneId) -> Option<AttachedPane> {
+    pub(crate) fn remove(&mut self, pane: PaneId) -> Option<AttachedPane> {
         self.deciding.retain(|_, owner| *owner != pane);
         self.panes.remove(&pane)
     }
 
-    pub fn forget_window(&mut self, window: WindowId) {
+    pub(crate) fn forget_window(&mut self, window: WindowId) {
         self.deciding.remove(&window);
     }
 }

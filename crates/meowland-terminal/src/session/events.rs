@@ -2,16 +2,12 @@
 
 use meowland_core::Result;
 use meowland_input::{Event, keyboard};
-use meowland_protocol::{
-    self as protocol, Input, PaneAction, PaneToServer, Shortcut,
-    clipboard::{MAX_TEXT, Selection},
-};
-use meowland_terminal_clipboard::Action;
+use meowland_protocol::clipboard::{MAX_TEXT, Selection};
+use meowland_protocol::{self as protocol, Input, PaneAction, PaneToServer, Shortcut};
+use meowland_terminal_clipboard::{Action, Focus, Refresh};
 
-use super::{
-    TerminalSession,
-    terminal::{self, FALLBACK_CELL},
-};
+use super::TerminalSession;
+use super::terminal::{self, FALLBACK_CELL};
 
 impl TerminalSession {
     pub(super) fn send_event(&mut self, event: Event) -> Result<()> {
@@ -30,7 +26,7 @@ impl TerminalSession {
                         self.keyboard.intercept(code);
                     }
                     let defer = if pressed && keyboard::paste(code, modifiers) {
-                        self.clipboard.refresh(Selection::Clipboard, true)
+                        self.clipboard.refresh(Selection::Clipboard, Refresh::Paste)
                     } else {
                         None
                     };
@@ -44,13 +40,18 @@ impl TerminalSession {
                 }
             }
             Event::Focus(focused) => {
-                let preserve = self.clipboard.focus(focused);
+                let focus = if focused { Focus::Gained } else { Focus::Lost };
+                let preserve = self.clipboard.focus(focus);
                 if focused {
                     self.input_gate
                         .send(self.keyboard.enter(), None, &mut self.tx)?;
                 } else {
                     self.keyboard.reset();
-                    self.input_gate.reset(preserve);
+                    if preserve {
+                        self.input_gate.preserve_focus_loss();
+                    } else {
+                        self.input_gate.reset();
+                    }
                     self.tx.send(&PaneToServer::Action(PaneAction::Input(
                         Input::ResetKeyboard,
                     )))?;

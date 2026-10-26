@@ -1,75 +1,49 @@
 //! Render-thread ownership and direct requests to its single-owner state.
 
-use std::{io, sync::mpsc, thread};
+use std::sync::mpsc;
+use std::{io, thread};
 
 use calloop::channel;
+use calloop::ping::{Ping, PingSource, make_ping};
 use meowland_compositor::{Command, Compositor, Event, Runtime};
 use meowland_core::scale::UiScale;
 use meowland_protocol::REQUEST_TIMEOUT;
 use tokio::sync::{mpsc as asynchronous, oneshot};
+
+const QUEUE_CAPACITY: usize = 1024;
 
 enum Operation {
     Command(Command),
     Call(Box<dyn FnOnce(&mut Compositor) + Send>),
 }
 
-pub struct DisplayThread {
-    operations: channel::Sender<Operation>,
-    pub events: asynchronous::UnboundedReceiver<Event>,
+pub(crate) struct DisplayThread {
+    operations: channel::SyncSender<Operation>,
+    shutdown: Ping,
+    pub events: asynchronous::Receiver<Event>,
     pub display: String,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl DisplayThread {
-    pub fn start(scale: UiScale) -> io::Result<Self> {
+    pub(crate) fn start(scale: UiScale) -> io::Result<Self> {
         let display = format!("wayland-meowland-{}", std::process::id());
         let socket = display.clone();
-        let (operations, incoming) = channel::channel::<Operation>();
-        let (events_tx, events) = asynchronous::unbounded_channel();
+        let (operations, incoming) = channel::sync_channel(QUEUE_CAPACITY);
+        let (shutdown, stopping) = make_ping()?;
+        let (events_tx, events) = asynchronous::channel(QUEUE_CAPACITY);
         let (ready_tx, ready) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("meowland-wayland".into())
             .spawn(move || {
-                let mut runtime = match Runtime::new(&socket, scale) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
-                    }
-                };
-                if let Err(error) =
-                    runtime
-                        .handle()
-                        .insert_source(incoming, |event, (), compositor| match event {
-                            channel::Event::Msg(Operation::Command(command)) => {
-                                compositor.handle_command(command);
-                            }
-                            channel::Event::Msg(Operation::Call(operation)) => {
-                                operation(compositor);
-                            }
-                            channel::Event::Closed => compositor.handle_command(Command::Shutdown),
-                        })
-                {
-                    let _ = ready_tx.send(Err(io::Error::from(error.error)));
-                    return;
-                }
-                if ready_tx.send(Ok(())).is_err() {
-                    return;
-                }
-                while !runtime.compositor().stopped() {
-                    if let Err(error) = runtime.dispatch(None) {
-                        tracing::error!(%error, "compositor dispatch stopped");
-                        break;
-                    }
-                    for event in runtime.compositor().drain_events() {
-                        if events_tx.send(event).is_err() {
-                            return;
-                        }
-                    }
+                if let Err(error) = run(&socket, scale, incoming, stopping, &events_tx, &ready_tx) {
+                    tracing::error!(%error, "compositor thread stopped");
+                    let _ = ready_tx.send(Err(error));
                 }
             })?;
         let worker = Self {
             operations,
+            shutdown,
             events,
             display,
             thread: Some(thread),
@@ -80,22 +54,33 @@ impl DisplayThread {
         Ok(worker)
     }
 
-    pub fn execute(
+    fn queue(&self, operation: Operation) -> io::Result<()> {
+        self.operations.try_send(operation).map_err(|error| {
+            match error {
+                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                mpsc::TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
+            }
+            .into()
+        })
+    }
+
+    pub(crate) fn execute(
         &self,
         operation: impl FnOnce(&mut Compositor) + Send + 'static,
     ) -> io::Result<()> {
-        self.operations
-            .send(Operation::Call(Box::new(operation)))
-            .map_err(|_| io::ErrorKind::BrokenPipe.into())
+        self.queue(Operation::Call(Box::new(operation)))
     }
 
-    pub fn command(&self, command: Command) -> io::Result<()> {
-        self.operations
-            .send(Operation::Command(command))
-            .map_err(|_| io::ErrorKind::BrokenPipe.into())
+    pub(crate) fn command(&self, command: Command) -> io::Result<()> {
+        if matches!(command, Command::Shutdown) {
+            self.shutdown.ping();
+            Ok(())
+        } else {
+            self.queue(Operation::Command(command))
+        }
     }
 
-    pub fn call<T: Send + 'static>(
+    pub(crate) fn call<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Compositor) -> T + Send + 'static,
     ) -> impl Future<Output = io::Result<T>> + Send + 'static {
@@ -113,11 +98,12 @@ impl DisplayThread {
         }
     }
 
-    pub fn stop(&mut self) -> io::Result<()> {
-        let _ = self.command(Command::Shutdown);
+    pub(crate) async fn stop(&mut self) -> io::Result<()> {
+        self.shutdown.ping();
         if let Some(thread) = self.thread.take() {
-            thread
-                .join()
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .map_err(io::Error::other)?
                 .map_err(|_| io::Error::other("compositor thread panicked"))?;
         }
         Ok(())
@@ -126,8 +112,50 @@ impl DisplayThread {
 
 impl Drop for DisplayThread {
     fn drop(&mut self) {
-        if let Err(error) = self.stop() {
-            tracing::error!(%error, "cannot stop compositor");
+        self.shutdown.ping();
+    }
+}
+
+fn run(
+    socket: &str,
+    scale: UiScale,
+    incoming: channel::Channel<Operation>,
+    stopping: PingSource,
+    events: &asynchronous::Sender<Event>,
+    ready: &mpsc::Sender<io::Result<()>>,
+) -> io::Result<()> {
+    let mut runtime = Runtime::new(socket, scale)?;
+    runtime
+        .handle()
+        .insert_source(incoming, |event, (), compositor| match event {
+            channel::Event::Msg(Operation::Command(command)) => compositor.handle_command(command),
+            channel::Event::Msg(Operation::Call(operation)) => operation(compositor),
+            channel::Event::Closed => compositor.handle_command(Command::Shutdown),
+        })
+        .map_err(|error| io::Error::from(error.error))?;
+    runtime
+        .handle()
+        .insert_source(stopping, |(), (), compositor| {
+            compositor.handle_command(Command::Shutdown);
+        })
+        .map_err(|error| io::Error::from(error.error))?;
+    if ready.send(Ok(())).is_err() {
+        return Ok(());
+    }
+    while !runtime.compositor().stopped() {
+        runtime.dispatch(None)?;
+        for event in runtime.compositor().drain_events() {
+            match events.try_send(event) {
+                Ok(()) => {}
+                Err(asynchronous::error::TrySendError::Closed(_)) => return Ok(()),
+                Err(asynchronous::error::TrySendError::Full(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "compositor event queue exhausted",
+                    ));
+                }
+            }
         }
     }
+    Ok(())
 }

@@ -1,25 +1,25 @@
 //! Native-fence DMA-BUF submission and completion-gated CPU readback.
 
-use std::{ffi::OsStr, fs::OpenOptions, io, os::fd::OwnedFd, time::Duration};
+use std::error::Error as _;
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io;
+use std::os::fd::OwnedFd;
+use std::time::Duration;
 
 use meowland_core::pixels::FrameSize;
-use smithay::{
-    backend::{
-        allocator::{
-            Buffer, Format, Fourcc,
-            dmabuf::{Dmabuf, DmabufFlags},
-        },
-        drm::{DrmNode, NodeType},
-        egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError, fence::EGLFence},
-        renderer::{
-            Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter, TextureMapping,
-            gles::{
-                Capability, GlesError, GlesMapping, GlesRenderbuffer, GlesRenderer, GlesTexture,
-            },
-        },
-    },
-    utils::{Rectangle, Transform},
+use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+use smithay::backend::allocator::{Buffer, Format, Fourcc};
+use smithay::backend::drm::{DrmNode, NodeType};
+use smithay::backend::egl::fence::EGLFence;
+use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError};
+use smithay::backend::renderer::gles::{
+    Capability, GlesError, GlesMapping, GlesRenderbuffer, GlesRenderer, GlesTexture,
 };
+use smithay::backend::renderer::{
+    Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter, TextureMapping,
+};
+use smithay::utils::{Rectangle, Transform};
 use thiserror::Error;
 
 use super::snapshot::Snapshot;
@@ -53,6 +53,7 @@ enum BackendError {
     ReadbackLength,
 }
 
+/// DMA-BUF failure recording whether the client buffer can safely be released.
 #[derive(Debug, Error)]
 #[error("{source}")]
 pub struct SnapshotError {
@@ -69,18 +70,27 @@ impl SnapshotError {
         }
     }
 
+    /// Whether GPU work is absent or completed, so releasing the client buffer
+    /// is safe.
     #[must_use]
     pub const fn release_safe(&self) -> bool {
         self.release_safe
     }
 }
 
+/// Submitted GPU work and the native fence that gates its readback.
 #[derive(Debug)]
 pub struct Submission {
+    /// Wait for this native fence to become readable before completing the
+    /// readback.
     pub fd: OwnedFd,
+    /// Resources retained until the fence signals and completion maps the
+    /// pixels.
     pub readback: Readback,
 }
 
+/// Pending GPU pixels whose texture, target, and fence remain alive until
+/// completion.
 pub struct Readback {
     mapping: Result<GlesMapping, BackendError>,
     size: FrameSize,
@@ -90,6 +100,8 @@ pub struct Readback {
     _fence: EGLFence,
 }
 
+/// Thread-confined EGL renderer for importing DMA-BUFs and submitting fenced
+/// readbacks.
 pub struct DmabufBackend {
     renderer: GlesRenderer,
     target: GlesRenderbuffer,
@@ -116,6 +128,8 @@ impl std::fmt::Debug for Readback {
 }
 
 impl DmabufBackend {
+    /// Discover a usable EGL render device, honoring `MEOWLAND_RENDER_NODE` or
+    /// logging fallback.
     pub fn discover() -> Option<Self> {
         let selection = std::env::var_os("MEOWLAND_RENDER_NODE");
         if selection.as_deref() == Some(OsStr::new("off")) {
@@ -145,7 +159,11 @@ impl DmabufBackend {
         let _egl = match unsafe { libloading::Library::new("libEGL.so.1") } {
             Ok(library) => library,
             Err(error) => {
-                tracing::warn!(%error, "Cannot load EGL; using shm only");
+                tracing::warn!(
+                    %error,
+                    source = error.source().map(tracing::field::display),
+                    "Cannot load EGL; using shm only"
+                );
                 return None;
             }
         };
@@ -228,11 +246,13 @@ impl DmabufBackend {
         Ok(backend)
     }
 
+    /// DRM device number advertised with the supported DMA-BUF feedback.
     #[must_use]
     pub const fn device(&self) -> u64 {
         self.device
     }
 
+    /// Sampleable RGB32 formats and modifiers supported by this renderer.
     #[must_use]
     pub fn formats(&self) -> &[Format] {
         &self.formats
@@ -247,7 +267,11 @@ impl DmabufBackend {
         if size.w <= 0 || size.h <= 0 {
             return Err(SnapshotError::safe(BackendError::InvalidDimensions));
         }
-        let size = FrameSize::new(size.w as u32, size.h as u32)
+        let width = u32::try_from(size.w)
+            .map_err(|_| SnapshotError::safe(BackendError::InvalidDimensions))?;
+        let height = u32::try_from(size.h)
+            .map_err(|_| SnapshotError::safe(BackendError::InvalidDimensions))?;
+        let size = FrameSize::new(width, height)
             .ok_or_else(|| SnapshotError::safe(BackendError::SnapshotBounds))?;
         if !size.fits(bound) {
             return Err(SnapshotError::safe(BackendError::SnapshotBounds));
@@ -261,6 +285,8 @@ impl DmabufBackend {
         Ok(size)
     }
 
+    /// Check bounded dimensions, supported flags and format, and successful GPU
+    /// import.
     pub fn validate(&mut self, dmabuf: &Dmabuf) -> bool {
         self.dimensions(dmabuf, None).is_ok() && self.renderer.import_dmabuf(dmabuf, None).is_ok()
     }

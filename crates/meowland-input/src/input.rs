@@ -1,14 +1,13 @@
 //! Nonblocking terminal input with signed SGR pixel mouse decoding and
 //! `vtparse`.
 
-use std::{collections::VecDeque, io};
+use std::collections::VecDeque;
+use std::io;
 
 use meowland_core::asynchronous::Descriptor;
-use meowland_protocol::{
-    Input,
-    clipboard::MAX_TEXT,
-    modifiers::{ALT, CONTROL, HYPER, META, SUPER},
-};
+use meowland_protocol::Input;
+use meowland_protocol::clipboard::MAX_TEXT;
+use meowland_protocol::modifiers::{ALT, CONTROL, HYPER, META, SUPER};
 use rustix::fs::{Mode, OFlags, open};
 use tokio::io::AsyncReadExt;
 use vtparse::{CsiParam, VTActor, VTParser};
@@ -18,32 +17,51 @@ const MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const MAX_MOUSE: usize = 64;
 const PASTE_END: &[u8] = b"\x1b[201~";
 
+/// Key transition reported by the Kitty keyboard protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// Initial press, before any autorepeat events.
     Press,
+    /// Autorepeat while the key remains held.
     Repeat,
+    /// Release of a previously held key.
     Release,
 }
 
+/// Logical key identity and modifier state before translation to Linux input
+/// codes.
 #[derive(Clone, Copy, Debug)]
 pub struct Key {
+    /// Unicode code point or Kitty functional-key number.
     pub code: u32,
+    /// Modifier bits using [`meowland_protocol::modifiers`].
     pub modifiers: u8,
+    /// Press, repeat, or release transition.
     pub kind: Kind,
 }
 
+/// Decoded terminal event, with bounded text and control-sequence payloads.
 #[derive(Debug)]
 pub enum Event {
+    /// Kitty keyboard transition awaiting evdev translation.
     Key(Key),
+    /// Committed Unicode text without a usable Linux key code.
     Text(String),
+    /// Pixel-accurate pointer input, including signed drag coordinates.
     Pointer(Input),
+    /// Whether the terminal pane gained focus.
     Focus(bool),
+    /// Kernel-reported terminal size changed.
     Resize,
+    /// Completed bracketed paste containing valid UTF-8.
     Paste(String),
+    /// Kitty OSC 5522 metadata and optional payload.
     Clipboard(Vec<u8>),
+    /// Base64 payload from an OSC 52 text reply.
     ClipboardText(Vec<u8>),
 }
 
+/// Nonblocking terminal input descriptor with incremental, bounded VT decoding.
 pub struct Reader {
     fd: Descriptor,
     parser: Parser,
@@ -69,6 +87,7 @@ impl Reader {
         })
     }
 
+    /// Whether decoded events are ready without another descriptor read.
     #[must_use]
     pub fn pending(&self) -> bool {
         !self.parser.decoder.events.is_empty()
@@ -300,6 +319,7 @@ impl VTActor for Decoder {
     fn apc_dispatch(&mut self, _data: Vec<u8>) {}
 }
 
+/// Decode exactly one nonnegative CSI integer fitting in `u32`.
 #[must_use]
 pub fn number(params: &[CsiParam]) -> Option<u32> {
     match params {

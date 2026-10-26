@@ -20,7 +20,7 @@ use smithay::{
 
 use super::State;
 
-pub fn kde(display: &DisplayHandle) -> KdeDecorationState {
+pub(crate) fn kde(display: &DisplayHandle) -> KdeDecorationState {
     KdeDecorationState::new::<State>(display, KdeDefaultMode::Server)
 }
 

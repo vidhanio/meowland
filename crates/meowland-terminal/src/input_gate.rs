@@ -2,10 +2,11 @@
 
 use std::time::Instant;
 
-use meowland_protocol::{Input, PaneAction, PaneToServer, asynchronous::Outgoing};
+use meowland_protocol::asynchronous::Outgoing;
+use meowland_protocol::{Input, PaneAction, PaneToServer};
 
 #[derive(Default)]
-pub struct InputGate {
+pub(crate) struct InputGate {
     pending: Option<Deferred>,
 }
 
@@ -15,23 +16,23 @@ struct Deferred {
 }
 
 impl InputGate {
-    pub const fn deadline(&self) -> Option<Instant> {
+    pub(crate) const fn deadline(&self) -> Option<Instant> {
         match &self.pending {
             Some(pending) => Some(pending.deadline),
             None => None,
         }
     }
 
-    pub const fn blocked(&self) -> bool {
+    pub(crate) const fn blocked(&self) -> bool {
         self.pending.is_some()
     }
 
-    pub fn expired(&self) -> bool {
+    pub(crate) fn expired(&self) -> bool {
         self.deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    pub fn send(
+    pub(crate) fn send(
         &mut self,
         input: Input,
         defer: Option<Instant>,
@@ -55,19 +56,19 @@ impl InputGate {
         Ok(())
     }
 
-    pub fn reset(&mut self, preserve: bool) {
-        if preserve {
-            if let Some(pending) = &mut self.pending
-                && !matches!(pending.inputs.last(), Some(Input::ResetKeyboard))
-            {
-                pending.inputs.push(Input::ResetKeyboard);
-            }
-        } else {
-            self.pending = None;
+    pub(crate) fn reset(&mut self) {
+        self.pending = None;
+    }
+
+    pub(crate) fn preserve_focus_loss(&mut self) {
+        if let Some(pending) = &mut self.pending
+            && !matches!(pending.inputs.last(), Some(Input::ResetKeyboard))
+        {
+            pending.inputs.push(Input::ResetKeyboard);
         }
     }
 
-    pub fn flush(&mut self, tx: &mut Outgoing) -> std::io::Result<()> {
+    pub(crate) fn flush(&mut self, tx: &mut Outgoing) -> std::io::Result<()> {
         if let Some(pending) = self.pending.take() {
             for input in pending.inputs {
                 tx.send(&PaneToServer::Action(PaneAction::Input(input)))?;

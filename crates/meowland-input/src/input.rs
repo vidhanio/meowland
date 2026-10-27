@@ -13,7 +13,7 @@ use rustix::fs::{Mode, OFlags, open};
 use tokio::io::AsyncReadExt;
 use vtparse::{CsiParam, VTActor, VTParser};
 
-const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
+const MAX_CONTROL: usize = 64 * 1024;
 const MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const MAX_MOUSE: usize = 64;
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -58,8 +58,6 @@ pub enum Event {
     Paste(String),
     /// Kitty OSC 5522 metadata and optional payload.
     Clipboard(Vec<u8>),
-    /// Base64 payload from an OSC 52 text reply.
-    ClipboardText(Vec<u8>),
 }
 
 /// Nonblocking terminal input descriptor with incremental, bounded VT decoding.
@@ -288,9 +286,6 @@ impl VTActor for Decoder {
                 packet.extend_from_slice(payload);
             }
             self.events.push_back(Event::Clipboard(packet));
-        } else if let [b"52", b"c" | b"", payload] = params {
-            self.events
-                .push_back(Event::ClipboardText(payload.to_vec()));
         }
     }
 

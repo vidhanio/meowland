@@ -5,7 +5,7 @@ use std::time::Duration;
 use rustix::time::{ClockId, clock_gettime};
 use serde::{Deserialize, Serialize};
 
-/// Maximum UTF-8 text bytes accepted by bracketed paste and legacy OSC 52.
+/// Maximum UTF-8 text bytes accepted by bracketed paste.
 pub const MAX_TEXT: usize = 1024 * 1024;
 /// Maximum aggregate bytes across all MIME representations of a selection.
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -73,30 +73,6 @@ impl ClipboardData {
                 .is_some_and(|total| total <= MAX_BYTES)
             && self.items.iter().all(|item| valid_mime(&item.mime))
     }
-
-    /// UTF-8 plain text for legacy OSC 52, including Wayland's opaque alias.
-    #[must_use]
-    pub fn utf8_text(&self) -> Option<&[u8]> {
-        self.items
-            .iter()
-            .find(|item| {
-                is_utf8_text_mime(&item.mime)
-                    && item.data.len() <= MAX_TEXT
-                    && std::str::from_utf8(&item.data).is_ok()
-            })
-            .map(|item| item.data.as_slice())
-    }
-}
-
-fn is_utf8_text_mime(mime: &str) -> bool {
-    mime == "UTF8_STRING"
-        || mime.parse::<mime::Mime>().is_ok_and(|media| {
-            media.type_() == mime::TEXT
-                && media.subtype() == mime::PLAIN
-                && media
-                    .get_param(mime::CHARSET)
-                    .is_none_or(|charset| charset == mime::UTF_8)
-        })
 }
 
 /// Accept a bounded printable MIME type or opaque Wayland target, excluding the

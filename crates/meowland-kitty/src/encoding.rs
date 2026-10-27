@@ -12,7 +12,7 @@ const CHUNK: usize = 4096;
 const CHUNK_PAYLOAD: usize = CHUNK / 4 * 3;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Encoding {
+enum Encoding {
     Raw,
     Zlib,
 }
@@ -24,16 +24,12 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    pub(crate) fn prepare(&mut self, pixels: &[u8]) -> Encoding {
+    fn prepare(&mut self, pixels: &[u8]) -> Encoding {
         if self.compress(pixels) && self.compressed.len() * 4 <= pixels.len() * 3 {
             Encoding::Zlib
         } else {
             Encoding::Raw
         }
-    }
-
-    pub(crate) fn capacity(&self, pixels: &[u8], encoding: Encoding) -> usize {
-        encoded_capacity(self.payload(pixels, encoding).len())
     }
 
     fn payload<'a>(&'a self, pixels: &'a [u8], encoding: Encoding) -> &'a [u8] {
@@ -55,8 +51,7 @@ impl Encoder {
         self.write(out, id, size, pixels, placement, encoding);
     }
 
-    /// Write the most recently prepared image without repeating compression.
-    pub(crate) fn write(
+    fn write(
         &self,
         out: &mut Vec<u8>,
         id: u32,
@@ -86,10 +81,9 @@ impl Encoder {
                 }
                 out.push(b';');
                 first = false;
-            } else if more {
-                out.extend_from_slice(b"\x1b_Gm=1;");
             } else {
-                out.extend_from_slice(b"\x1b_Gm=0;");
+                out.extend_from_slice(placement.continuation());
+                out.extend_from_slice(if more { b"m=1;" } else { b"m=0;" });
             }
             out.extend_from_slice(&encoded_chunk[..bytes]);
             out.extend_from_slice(b"\x1b\\");

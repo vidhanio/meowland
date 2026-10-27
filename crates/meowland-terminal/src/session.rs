@@ -15,7 +15,7 @@ use meowland_protocol::{
     asynchronous::{Outgoing, Reader},
     clipboard::Selection,
 };
-use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
+use meowland_terminal_clipboard::{Clipboard, Refresh};
 use tokio::{
     net::unix::{OwnedReadHalf, OwnedWriteHalf},
     signal::unix::{Signal, SignalKind, signal},
@@ -104,7 +104,7 @@ impl TerminalSession {
             stdout: Descriptor::new(output::open()?.into())?,
             keyboard: Keyboard::default(),
             input_gate: InputGate::default(),
-            clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
+            clipboard: Clipboard::new()?,
             presentation: PanePresentation::new(cell, FrameTransport::Inline),
             cell,
             lifecycle: Lifecycle::Handshaking {
@@ -218,8 +218,7 @@ impl TerminalSession {
             }
             ServerToPane::ClipboardWrite { selection, data } => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.clipboard
-                        .copy(selection, data, self.presentation.buffer());
+                    self.clipboard.copy(selection, data);
                 } else if selection == Selection::Primary {
                     self.window.primary = Some(data);
                 } else {
@@ -283,22 +282,24 @@ impl TerminalSession {
             (Selection::Primary, primary),
         ] {
             if let Some(data) = data {
-                self.clipboard
-                    .copy(selection, data, self.presentation.buffer());
+                self.clipboard.copy(selection, data);
             }
         }
     }
 
     async fn start_presentation(&mut self) -> Result<()> {
         let mut mode = TerminalGuard::enter()?;
-        let Some((probe, shared)) =
+        let Some(probe) =
             terminal_probe(&mut self.input, &mut self.stdout, &mut self.termination).await?
         else {
             mode.restore()?;
             return self.close(None);
         };
-        if !probe.graphics {
+        if !probe.frame_edits {
             return Err(Error::GraphicsUnsupported);
+        }
+        if probe.clipboard.is_none() {
+            return Err(Error::ClipboardUnsupported);
         }
         if !probe.sgr_pixels {
             return Err(Error::PixelMouseUnsupported);
@@ -310,9 +311,8 @@ impl TerminalSession {
             return Err(Error::KeyboardUnsupported);
         }
         mode.enable_mouse()?;
-        if let Some(previous) = probe.clipboard {
-            mode.enable_clipboard(previous)?;
-        }
+        let previous = probe.clipboard.ok_or(Error::ClipboardUnsupported)?;
+        mode.enable_clipboard(previous)?;
         self.cell = probe.cell_width.zip(probe.cell_height).or(self.cell);
         let (width, height) = terminal::pane_pixels(
             probe.pixel_width.zip(probe.pixel_height),
@@ -320,7 +320,7 @@ impl TerminalSession {
             terminal::cells(),
             self.cell.unwrap_or(FALLBACK_CELL),
         );
-        let transport = if shared.is_some() {
+        let transport = if probe.shared_memory {
             FrameTransport::Shared
         } else {
             FrameTransport::Inline
@@ -328,11 +328,6 @@ impl TerminalSession {
         self.presentation = PanePresentation::new(self.cell, transport);
         self.tx
             .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
-        self.clipboard = Clipboard::new(if probe.clipboard.is_some() {
-            ClipboardProtocol::Kitty
-        } else {
-            ClipboardProtocol::Osc52
-        })?;
         let _ = self
             .clipboard
             .refresh(Selection::Clipboard, Refresh::Background);

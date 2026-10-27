@@ -1,5 +1,5 @@
-//! A bounded RGB Kitty consumer, including chunking, zlib, SHM, and patch
-//! placement.
+//! A bounded RGB Kitty consumer with chunking, zlib, SHM, placements, and
+//! in-place root-frame edits.
 
 use std::{collections::BTreeMap, fs::File, io::Read};
 
@@ -27,6 +27,8 @@ struct Transfer {
     image: Image,
     compressed: bool,
     transport: Transport,
+    edit: bool,
+    quiet: bool,
 }
 
 struct Control<'a>(BTreeMap<&'a str, &'a str>);
@@ -135,44 +137,18 @@ impl Graphics {
                 }
                 return Ok(None);
             }
-            Some("T") => {
-                if self.transfer.is_some() {
-                    return Err(fail("interleaved Kitty transfers"));
+            Some("f") if self.transfer.is_some() => {
+                let transfer = self.transfer.as_mut().expect("continuation has a transfer");
+                if !transfer.edit {
+                    return Err(fail("frame continuation interrupts an image transfer"));
                 }
-                if control.number("f", 0)? != 24 {
-                    return Err(fail("only RGB Kitty transfers are supported"));
-                }
-                let width = control.number("s", 0)?;
-                let height = control.number("v", 0)?;
-                let length = width
-                    .checked_mul(height)
-                    .and_then(|pixels| pixels.checked_mul(3))
-                    .filter(|length| *length > 0 && *length <= self.size.pixels() * 3)
-                    .ok_or_else(|| fail("invalid Kitty image dimensions"))?;
-                let image = Image {
-                    width,
-                    height,
-                    x: self.cursor.0,
-                    y: self.cursor.1,
-                    z: control.number("z", 0)?,
-                    pixels: Vec::new(),
-                };
-                let mut transfer = Transfer {
-                    id: u32::try_from(control.number("i", 0)?)?,
-                    image,
-                    compressed: control.get("o") == Some("z"),
-                    transport: if control.get("t") == Some("s") {
-                        Transport::Shared
-                    } else {
-                        Transport::Inline
-                    },
-                };
-                match control.get("t") {
-                    Some("s") => transfer.image.pixels = Self::read_shared(payload, length)?,
-                    None | Some("d") => transfer.image.pixels = STANDARD.decode(payload)?,
-                    _ => return Err(fail("unsupported Kitty transport")),
-                }
-                self.transfer = Some(transfer);
+                transfer
+                    .image
+                    .pixels
+                    .extend_from_slice(&STANDARD.decode(payload)?);
+            }
+            Some("T" | "t" | "f") => {
+                self.transfer = Some(self.start_transfer(&control, payload)?);
             }
             None if self.transfer.is_some() => {
                 let transfer = self.transfer.as_mut().expect("continuation has a transfer");
@@ -192,9 +168,65 @@ impl Graphics {
             return Err(fail("oversized Kitty payload"));
         }
         if control.number("m", 0)? == 0 {
+            let (id, quiet) = (transfer.id, transfer.quiet);
             self.finish(expected)?;
+            if !quiet {
+                return Ok(Some(format!("\x1b_Gi={id};OK\x1b\\").into_bytes()));
+            }
         }
         Ok(None)
+    }
+
+    fn start_transfer(&self, control: &Control<'_>, payload: &[u8]) -> Result<Transfer> {
+        if self.transfer.is_some() {
+            return Err(fail("interleaved Kitty transfers"));
+        }
+        if control.number("f", 0)? != 24 {
+            return Err(fail("only RGB Kitty transfers are supported"));
+        }
+        let width = control.number("s", 0)?;
+        let height = control.number("v", 0)?;
+        let length = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .filter(|length| *length > 0 && *length <= self.size.pixels() * 3)
+            .ok_or_else(|| fail("invalid Kitty image dimensions"))?;
+        let edit = control.get("a") == Some("f");
+        if edit && (control.number("r", 0)? != 1 || control.number("X", 1)? != 1) {
+            return Err(fail("only root-frame pixel replacement is supported"));
+        }
+        let pixels = match control.get("t") {
+            Some("s") => Self::read_shared(payload, length)?,
+            None | Some("d") => STANDARD.decode(payload)?,
+            _ => return Err(fail("unsupported Kitty transport")),
+        };
+        Ok(Transfer {
+            id: u32::try_from(control.number("i", 0)?)?,
+            image: Image {
+                width,
+                height,
+                x: if edit {
+                    control.number("x", 0)?
+                } else {
+                    self.cursor.0
+                },
+                y: if edit {
+                    control.number("y", 0)?
+                } else {
+                    self.cursor.1
+                },
+                z: control.number("z", 0)?,
+                pixels,
+            },
+            compressed: control.get("o") == Some("z"),
+            edit,
+            quiet: control.number("q", 0)? != 0,
+            transport: if control.get("t") == Some("s") {
+                Transport::Shared
+            } else {
+                Transport::Inline
+            },
+        })
     }
 
     fn finish(&mut self, expected: usize) -> Result<()> {
@@ -210,7 +242,24 @@ impl Graphics {
             return Err(fail("incomplete RGB image"));
         }
         self.uploaded = Some(transfer.transport);
-        self.images.insert(transfer.id, transfer.image);
+        if transfer.edit {
+            let destination = self
+                .images
+                .get_mut(&transfer.id)
+                .ok_or_else(|| fail("frame edit has no base image"))?;
+            let image = transfer.image;
+            if image.x + image.width > destination.width
+                || image.y + image.height > destination.height
+            {
+                return Err(fail("frame edit exceeds base image"));
+            }
+            for (row, pixels) in image.pixels.chunks_exact(image.width * 3).enumerate() {
+                let start = ((image.y + row) * destination.width + image.x) * 3;
+                destination.pixels[start..start + pixels.len()].copy_from_slice(pixels);
+            }
+        } else {
+            self.images.insert(transfer.id, transfer.image);
+        }
         if self.images.len() > 64 {
             return Err(fail("too many live Kitty images"));
         }

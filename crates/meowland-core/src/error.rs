@@ -33,9 +33,14 @@ pub enum Error {
     /// The terminal cannot report pixel-accurate pointer events.
     #[error("terminal does not support SGR pixel mouse reporting")]
     PixelMouseUnsupported,
-    /// The terminal cannot display Kitty image transfers.
-    #[error("terminal does not support kitty graphics")]
+    /// The terminal cannot edit Kitty graphics images in place.
+    #[error(
+        "terminal must support Kitty graphics with in-place frame updates (use Ghostty 1.4+ or current Kitty)"
+    )]
     GraphicsUnsupported,
+    /// The terminal cannot exchange MIME-aware clipboard selections.
+    #[error("terminal must support the Kitty clipboard protocol (OSC 5522)")]
+    ClipboardUnsupported,
     /// The terminal cannot report the required keyboard transitions.
     #[error(
         "terminal must support Kitty keyboard disambiguation, event types, and all-key reporting"

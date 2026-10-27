@@ -97,7 +97,7 @@ struct PendingFrame {
 impl PanePresentation {
     pub(crate) fn new(cell: Option<(u16, u16)>, transport: FrameTransport) -> Self {
         Self {
-            presenter: Presenter::new(cell, None),
+            presenter: Presenter::new(cell),
             stats: PaneStats::new(),
             pending: output::Output::default(),
             frame: None,
@@ -157,7 +157,7 @@ impl PanePresentation {
             bytes: self.pending.len(),
             accepted: outcome != PresentOutcome::NeedsKeyframe,
         });
-        self.schedule(outcome);
+        self.retry = None;
         self.finish(tx)
     }
 
@@ -223,24 +223,15 @@ impl PanePresentation {
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             let started = Instant::now();
-            let outcome = self.presenter.repaint_into(self.pending.buffer());
+            self.presenter.repaint_into(self.pending.buffer());
             if let Some(frame) = &mut self.frame {
                 frame.encoded += started.elapsed();
                 frame.bytes += self.pending.len();
             }
-            self.schedule(outcome);
+            self.retry = None;
             self.finish(tx)?;
         }
         Ok(())
-    }
-
-    const fn schedule(&mut self, outcome: PresentOutcome) {
-        self.retry = match outcome {
-            PresentOutcome::RetryAt(deadline) => Some(deadline),
-            PresentOutcome::Unchanged | PresentOutcome::Encoded | PresentOutcome::NeedsKeyframe => {
-                None
-            }
-        };
     }
 
     pub(crate) async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
@@ -266,11 +257,16 @@ impl PanePresentation {
                     Ok(band) => {
                         let started = Instant::now();
                         let outcome = self.presenter.present_into(band, self.pending.buffer());
+                        if outcome == PresentOutcome::NeedsKeyframe
+                            && let Some(frame) = &mut self.frame
+                        {
+                            frame.accepted = false;
+                        }
                         if let Some(frame) = &mut self.frame {
                             frame.bytes += self.pending.len();
                             frame.encoded += started.elapsed();
                         }
-                        self.schedule(outcome);
+                        self.retry = None;
                     }
                     Err(error) => {
                         tracing::warn!(%error, "unread shared frame could not be recovered");

@@ -1,10 +1,14 @@
 //! Terminal capability probe and reply decoding.
 
-use std::time::{Duration, Instant};
+use std::{
+    io::Write as _,
+    time::{Duration, Instant},
+};
 
-use meowland_core::{asynchronous::Descriptor, signals};
+use meowland_core::{asynchronous::Descriptor, pixels::FrameSize, signals};
 use meowland_input as input;
-use meowland_kitty::SharedMemory;
+use meowland_kitty::query_shared;
+use meowland_protocol::SharedObject;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
 use super::output;
@@ -13,8 +17,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Quiet period after device attributes, allowing late probe replies.
 const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
-const GRAPHICS_ID: u32 = 31;
-const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q\x1b_Ga=q,f=24,s=1,v=1,i=31;AAAA\x1b\\";
+const FRAME_EDIT_ID: u32 = 30;
+const SHARED_ID: u32 = 32;
+const FRAME_EDIT_QUERY: &[u8] = b"\x1b_Ga=t,f=24,s=1,v=1,i=30,q=2;AAAA\x1b\\\x1b_Ga=f,f=24,s=1,v=1,i=30,r=1;AAAA\x1b\\\x1b_Ga=d,d=I,i=30,q=2;\x1b\\";
+const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q";
 /// Query device attributes last so their reply starts the handshake's quiet
 /// window.
 const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?5522$p\x1b[?u\x1b[c";
@@ -26,7 +32,7 @@ pub(crate) struct ProbeInfo {
     pub pixel_height: Option<u32>,
     pub cell_width: Option<u16>,
     pub cell_height: Option<u16>,
-    pub graphics: bool,
+    pub frame_edits: bool,
     pub shared_memory: bool,
     pub sgr_pixels: bool,
     /// OSC 5522 support and the paste-notification mode's previous state.
@@ -42,7 +48,7 @@ impl ProbeInfo {
             width, height,
             cell = ?self.cell_width.zip(self.cell_height),
             terminal = ?self.name,
-            graphics = self.graphics,
+            frame_edits = self.frame_edits,
             shared_memory = self.shared_memory,
             sgr_pixels = self.sgr_pixels,
             keyboard_flags = ?self.keyboard_flags,
@@ -57,12 +63,12 @@ pub(crate) async fn terminal_probe(
     input: &mut input::Reader,
     output: &mut Descriptor,
     termination: &mut signals::Termination,
-) -> std::io::Result<Option<(ProbeInfo, Option<SharedMemory>)>> {
-    let slot = SharedMemory::new();
-    let shared_probe = slot.probe();
+) -> std::io::Result<Option<ProbeInfo>> {
+    let shared_probe = shared_probe();
     let mut pending = output::Output::default();
     pending.append(PROBE_QUERY);
-    if let Some(command) = &shared_probe {
+    pending.append(FRAME_EDIT_QUERY);
+    if let Some((_, command)) = &shared_probe {
         pending.append(command);
     }
     pending.append(PROBE_QUERY_TAIL);
@@ -90,13 +96,14 @@ pub(crate) async fn terminal_probe(
     }
     let mut probe = parser.finish();
     probe.shared_memory &= shared_probe.is_some();
-    let shared = if probe.shared_memory {
-        slot.clear();
-        Some(slot)
-    } else {
-        None
-    };
-    Ok(Some((probe, shared)))
+    Ok(Some(probe))
+}
+
+fn shared_probe() -> Option<(SharedObject, Vec<u8>)> {
+    let (object, mut file) = SharedObject::create(FrameSize::new(1, 1)?).ok()?;
+    file.write_all(&[0; 3]).ok()?;
+    let command = query_shared(object.frame(), SHARED_ID);
+    Some((object, command))
 }
 
 struct ProbeParser {
@@ -138,10 +145,10 @@ impl ProbeParser {
         match action {
             VTAction::ApcDispatch(data) => {
                 if let Some(body) = data.strip_prefix(b"G") {
-                    if let Some(ok) = kitty_reply(body, GRAPHICS_ID) {
-                        self.info.graphics = ok;
+                    if let Some(ok) = kitty_reply(body, FRAME_EDIT_ID) {
+                        self.info.frame_edits = ok;
                     }
-                    if let Some(ok) = kitty_reply(body, meowland_kitty::PROBE_ID) {
+                    if let Some(ok) = kitty_reply(body, SHARED_ID) {
                         self.info.shared_memory = ok;
                     }
                 }

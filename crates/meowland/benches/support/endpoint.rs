@@ -60,12 +60,6 @@ impl Decoder {
                 }
             }
             VTAction::CsiDispatch { params, byte, .. } => self.csi(&params, byte)?,
-            VTAction::OscDispatch(fields)
-                if fields.first().is_some_and(|field| field == b"52")
-                    && fields.last().is_some_and(|field| field == b"?") =>
-            {
-                self.reply(b"\x1b]52;c;\x1b\\")?;
-            }
             _ => {}
         }
         Ok(())
@@ -88,7 +82,7 @@ impl Decoder {
             b'c' => self.reply(b"\x1b[?1;2c")?,
             b'u' if private => self.reply(b"\x1b[?31u")?,
             b'p' if private && numbers == [1016] => self.reply(b"\x1b[?1016;2$y")?,
-            b'p' if private && numbers == [5522] => self.reply(b"\x1b[?5522;0$y")?,
+            b'p' if private && numbers == [5522] => self.reply(b"\x1b[?5522;2$y")?,
             b'H' => {
                 self.graphics.cursor = (
                     numbers.get(1).copied().unwrap_or(1).saturating_sub(1) * 10,

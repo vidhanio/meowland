@@ -1,6 +1,7 @@
 //! Surface traversal, hit testing, and frame composition.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use meowland_core::pixels::FrameSize;
 use smithay::desktop::{PopupKind, PopupManager};
@@ -14,6 +15,15 @@ use smithay::wayland::shell::xdg::SurfaceCachedState;
 
 use super::Snapshot;
 use super::geometry::{SurfaceGeometry, rounded, surface_geometry};
+
+/// Bound composition scratch space and batch sequential shared-object writes.
+const STRIP_ROWS: u32 = 16;
+
+struct Target<'a> {
+    pixels: &'a mut [u8],
+    width: u32,
+    rows: Range<u32>,
+}
 
 /// Scratch allocations owned by the compositor, not by any client or pane.
 #[derive(Default)]
@@ -74,14 +84,70 @@ impl Renderer {
                 snapshots,
                 surface,
                 *origin,
-                &mut self.pixels,
-                width,
-                height,
+                &mut Target {
+                    pixels: &mut self.pixels,
+                    width,
+                    rows: 0..height,
+                },
                 scale,
             );
         }
         self.stack.clear();
         &self.pixels
+    }
+
+    /// Compose bounded RGB strips directly into a caller-owned publication sink.
+    ///
+    /// The callback receives consecutive full-width rows in top-to-bottom order.
+    /// Scratch storage is reused and never grows to a full frame for this path.
+    ///
+    /// # Panics
+    /// Propagates panics from the publication callback.
+    pub fn render_rows(
+        &mut self,
+        root: Option<&WlSurface>,
+        snapshots: &HashMap<WlSurface, Snapshot>,
+        size: FrameSize,
+        scale: f64,
+        mut emit: impl FnMut(u32, &[u8]),
+    ) {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        if let Some(root) = root {
+            self.stack.rebuild(root);
+        } else {
+            self.stack.clear();
+        }
+        let (width, height) = (size.width(), size.height());
+        let covered = opaque_cover(snapshots, &self.stack.surfaces, width, height, scale);
+        let first = if covered {
+            self.stack.surfaces.len() - 1
+        } else {
+            0
+        };
+        for top in (0..height).step_by(usize::try_from(STRIP_ROWS).expect("strip rows fit usize")) {
+            let bottom = (top + STRIP_ROWS).min(height);
+            self.pixels.resize(
+                size.rgb_stride() * usize::try_from(bottom - top).expect("strip height fits usize"),
+                0,
+            );
+            if !covered {
+                self.pixels.fill(0);
+            }
+            let mut target = Target {
+                pixels: &mut self.pixels,
+                width,
+                rows: top..bottom,
+            };
+            for (surface, origin) in &self.stack.surfaces[first..] {
+                blit(snapshots, surface, *origin, &mut target, scale);
+            }
+            emit(top, &self.pixels);
+        }
+        self.stack.clear();
     }
 }
 
@@ -177,9 +243,7 @@ fn blit(
     snapshots: &HashMap<WlSurface, Snapshot>,
     surface: &WlSurface,
     origin: Point<i32, Logical>,
-    out: &mut [u8],
-    width: u32,
-    height: u32,
+    target: &mut Target<'_>,
     scale: f64,
 ) {
     let Some(snapshot) = snapshots.get(surface) else {
@@ -190,15 +254,15 @@ fn blit(
         return;
     };
     let clip_left = dst.left.max(0);
-    let clip_top = dst.top.max(0);
+    let clip_top = dst.top.max(coordinate(i64::from(target.rows.start)));
     let clip_right = dst
         .left
         .saturating_add(dst.width)
-        .min(coordinate(i64::from(width)));
+        .min(coordinate(i64::from(target.width)));
     let clip_bottom = dst
         .top
         .saturating_add(dst.height)
-        .min(coordinate(i64::from(height)));
+        .min(coordinate(i64::from(target.rows.end)));
     if clip_right <= clip_left || clip_bottom <= clip_top {
         return;
     }
@@ -207,13 +271,13 @@ fn blit(
         (clip_right - clip_left, clip_bottom - clip_top).into(),
     );
     if geometry.direct() && (scale - 1.0).abs() <= f64::EPSILON {
-        blit_unscaled(snapshot, dst.left, dst.top, clip, out, width);
+        blit_unscaled(snapshot, dst.left, dst.top, clip, target);
         return;
     }
     if snapshot.opaque {
-        blit_scaled::<true>(snapshot, &geometry, dst, clip, out, width);
+        blit_scaled::<true>(snapshot, &geometry, dst, clip, target);
     } else {
-        blit_scaled::<false>(snapshot, &geometry, dst, clip, out, width);
+        blit_scaled::<false>(snapshot, &geometry, dst, clip, target);
     }
 }
 
@@ -265,8 +329,7 @@ fn blit_scaled<const OPAQUE: bool>(
     geometry: &SurfaceGeometry,
     dst: Placement,
     clip: Rectangle<i32, Logical>,
-    out: &mut [u8],
-    width: u32,
+    target: &mut Target<'_>,
 ) {
     let stride = usize::try_from(snapshot.width).expect("validated snapshot width fits usize");
     let last_x = stride - 1;
@@ -274,7 +337,7 @@ fn blit_scaled<const OPAQUE: bool>(
         usize::try_from(snapshot.height).expect("validated snapshot height fits usize") - 1;
     let pixels = snapshot.pixels.as_chunks::<4>().0;
     let columns = usize::try_from(clip.size.w).expect("clipped width is positive");
-    let pane_stride = usize::try_from(width).expect("validated pane width fits usize");
+    let pane_stride = usize::try_from(target.width).expect("validated pane width fits usize");
     let clip_x = usize::try_from(clip.loc.x).expect("clipping removed negative x coordinates");
     let swapped = geometry.swapped();
     let mut source_columns = [0; 256];
@@ -302,9 +365,10 @@ fn blit_scaled<const OPAQUE: bool>(
             } else {
                 (pixel_index(geometry.raw_y(sample), last_y) * stride, 1)
             };
-            let row = usize::try_from(y).expect("clipping removed negative y coordinates");
+            let row = usize::try_from(y).expect("clipping removed negative y coordinates")
+                - usize::try_from(target.rows.start).expect("validated strip offset fits usize");
             let to = (row * pane_stride + clip_x + start) * 3;
-            let rgb_row = out[to..to + count * 3].as_chunks_mut::<3>().0;
+            let rgb_row = target.pixels[to..to + count * 3].as_chunks_mut::<3>().0;
             for (&column, rgb) in source_columns.iter().zip(rgb_row) {
                 let pixel = pixels[base + column * advance];
                 if OPAQUE {
@@ -323,13 +387,12 @@ fn blit_unscaled(
     left: i32,
     top: i32,
     clip: Rectangle<i32, Logical>,
-    out: &mut [u8],
-    width: u32,
+    target: &mut Target<'_>,
 ) {
     if snapshot.opaque {
-        blit_unscaled_inner::<true>(snapshot, left, top, clip, out, width);
+        blit_unscaled_inner::<true>(snapshot, left, top, clip, target);
     } else {
-        blit_unscaled_inner::<false>(snapshot, left, top, clip, out, width);
+        blit_unscaled_inner::<false>(snapshot, left, top, clip, target);
     }
 }
 
@@ -338,22 +401,22 @@ fn blit_unscaled_inner<const OPAQUE: bool>(
     left: i32,
     top: i32,
     clip: Rectangle<i32, Logical>,
-    out: &mut [u8],
-    width: u32,
+    target: &mut Target<'_>,
 ) {
     let columns = usize::try_from(clip.size.w).expect("clipped width is positive");
     let row_bytes = columns * 4;
     let stride = usize::try_from(snapshot.width).expect("validated snapshot width fits usize") * 4;
-    let pane_stride = usize::try_from(width).expect("validated pane width fits usize") * 3;
+    let pane_stride = usize::try_from(target.width).expect("validated pane width fits usize") * 3;
     let first = usize::try_from(clip.loc.x - left).expect("clipped source x is nonnegative");
     let first_row = usize::try_from(clip.loc.y - top).expect("clipped source y is nonnegative");
     let clip_x = usize::try_from(clip.loc.x).expect("clipped destination x is nonnegative");
-    let clip_y = usize::try_from(clip.loc.y).expect("clipped destination y is nonnegative");
+    let clip_y = usize::try_from(clip.loc.y).expect("clipped destination y is nonnegative")
+        - usize::try_from(target.rows.start).expect("validated strip offset fits usize");
     for row in 0..usize::try_from(clip.size.h).expect("clipped height is positive") {
         let from = (first_row + row) * stride + first * 4;
         let source = snapshot.pixels[from..from + row_bytes].as_chunks::<4>().0;
         let at = (clip_y + row) * pane_stride + clip_x * 3;
-        let dest = out[at..at + columns * 3].as_chunks_mut::<3>().0;
+        let dest = target.pixels[at..at + columns * 3].as_chunks_mut::<3>().0;
         for (pixel, rgb) in source.iter().zip(dest) {
             if OPAQUE {
                 rgb.copy_from_slice(&pixel[..3]);

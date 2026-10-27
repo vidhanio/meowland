@@ -4,4 +4,4 @@
 mod encoding;
 mod presenter;
 
-pub use presenter::{PROBE_ID, PresentOutcome, Presenter, SharedMemory};
+pub use presenter::{PROBE_ID, PresentOutcome, Presenter, SharedMemory, present_shared};

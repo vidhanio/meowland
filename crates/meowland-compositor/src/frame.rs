@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{FrameAck, FrameBand};
+use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
+
+mod shared;
 
 use super::{Event, FRAME_INTERVAL, ServerToPane, State};
 
@@ -23,6 +25,8 @@ pub(crate) struct PaneState {
     shown: Vec<u8>,
     /// None means the retained pixels are not a valid basis for a row diff.
     shown_size: Option<FrameSize>,
+    pub(super) transport: FrameTransport,
+    shared: Option<SharedObject>,
 }
 
 impl PaneState {
@@ -32,6 +36,8 @@ impl PaneState {
             presentation: Presentation::Clean,
             shown: Vec::new(),
             shown_size: None,
+            transport: FrameTransport::Inline,
+            shared: None,
         }
     }
 
@@ -42,10 +48,11 @@ impl PaneState {
         };
     }
 
-    const fn ack(&mut self, ack: FrameAck) {
+    fn ack(&mut self, ack: FrameAck) {
         let Presentation::InFlight { dirty } = self.presentation else {
             return;
         };
+        self.shared = None;
         let resync = matches!(ack, FrameAck::Resync);
         if resync {
             self.shown_size = None;
@@ -176,13 +183,24 @@ impl State {
                 .filter(|&id| self.catalog.drawable(id))
                 .and_then(|id| self.windows.get(&id))
                 .map(|window| window.surface.wl_surface());
-            let pixels = self.renderer.render_scaled(
-                root,
-                &self.surface_cache.snapshots,
-                entry.presentation.size,
-                self.scale.factor(),
-            );
-            if let Some(message) = entry.presentation.frame(pixels) {
+            let message = if entry.presentation.transport == FrameTransport::Shared {
+                shared::render(
+                    &mut entry.presentation,
+                    &mut self.renderer,
+                    root,
+                    &self.surface_cache.snapshots,
+                    self.scale.factor(),
+                )
+            } else {
+                let pixels = self.renderer.render_scaled(
+                    root,
+                    &self.surface_cache.snapshots,
+                    entry.presentation.size,
+                    self.scale.factor(),
+                );
+                entry.presentation.frame(pixels)
+            };
+            if let Some(message) = message {
                 self.events.push(Event { pane, message });
             }
         }

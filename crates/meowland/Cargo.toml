@@ -22,3 +22,17 @@ usage-rs = { workspace = true, features = [
   "diagnostics",
   "help",
 ] }
+
+[dev-dependencies]
+base64 = { workspace = true }
+flate2 = { workspace = true }
+pty-process = { workspace = true }
+rustix = { workspace = true, features = ["event", "fs", "shm", "termios", "time"] }
+tempfile = { workspace = true }
+vtparse = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }
+
+[[bench]]
+name = "suite"
+harness = false

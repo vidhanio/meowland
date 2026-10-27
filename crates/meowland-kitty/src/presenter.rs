@@ -11,7 +11,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use meowland_core::pixels::FrameSize;
 use meowland_core::timing::FRAME_INTERVAL;
-use meowland_protocol::FrameBand;
+use meowland_protocol::{FrameBand, SharedFrame as PublishedFrame};
 use rustix::fs::Mode;
 use rustix::shm;
 
@@ -202,10 +202,15 @@ impl Presenter {
             return false;
         }
         self.cell_size = cell_size;
+        self.invalidate();
+        true
+    }
+
+    /// Forget displayed placements without discarding retained pixel storage.
+    pub fn invalidate(&mut self) {
         self.base = None;
         self.patch_count = 0;
         self.display_current = false;
-        true
     }
 
     /// Retain a validated row band and encode its terminal update.
@@ -218,6 +223,27 @@ impl Presenter {
             self.display_current = false;
         }
         self.repaint_into(out)
+    }
+
+    /// Adopt a complete frame already displayed through an upstream transfer.
+    ///
+    /// Returns false for partial bands, leaving the presenter unchanged. This
+    /// restores the pixel basis lazily before patches or a grid-change repaint.
+    pub fn retain_frame(&mut self, band: FrameBand) -> bool {
+        if band.y() != 0 || band.rgb().len() != band.size().rgb_len() {
+            return false;
+        }
+        let (size, _, pixels) = band.into_parts();
+        self.image = Arc::new(pixels);
+        self.size = Some(size);
+        self.base = Some(Frame {
+            size,
+            pixels: Arc::clone(&self.image),
+        });
+        self.patch_count = 0;
+        self.display_current = true;
+        self.damage = 0..0;
+        true
     }
 
     /// Retry or invalidate terminal presentation without requesting pixels
@@ -571,6 +597,27 @@ fn move_cursor(out: &mut Vec<u8>, x: u32, y: u32, cell_size: Option<(u16, u16)>)
     let col = x / cell_w + 1;
     let row = y / cell_h + 1;
     write!(out, "\x1b[{row};{col}H").expect("writing to Vec cannot fail");
+}
+
+/// Encode a complete immutable object without reading or copying its pixels.
+///
+/// The caller must retain the object's producer guard until the terminal opens
+/// it, and must restore retained RGB pixels before using incremental patches.
+pub fn present_shared(frame: &PublishedFrame, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(b"\x1b[?2026h");
+    delete_all(out);
+    out.extend_from_slice(b"\x1b[2J\x1b[H\x1b_G");
+    transmit(
+        out,
+        SCREEN_ID,
+        frame.size().width(),
+        frame.size().height(),
+        Placement::Whole,
+    );
+    out.extend_from_slice(b",t=s;");
+    out.extend_from_slice(STANDARD.encode(frame.name()).as_bytes());
+    out.extend_from_slice(b"\x1b\\\x1b[?2026l");
 }
 
 fn delete_all(out: &mut Vec<u8>) {

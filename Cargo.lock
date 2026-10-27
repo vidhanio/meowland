@@ -199,21 +199,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "drm"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a41816e58f47f49acfd956651055ddcf137c4882c2098c30c448817af21183a"
-dependencies = [
- "bitflags",
- "bytemuck",
- "bytemuck_derive",
- "drm-ffi",
- "drm-fourcc",
- "libc",
- "rustix 1.1.5",
-]
-
-[[package]]
 name = "drm-ffi"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,28 +491,20 @@ dependencies = [
 name = "meowland"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "flate2",
  "meowland-core",
  "meowland-protocol",
  "meowland-server",
  "meowland-terminal",
+ "pty-process",
+ "rustix 1.1.5",
+ "tempfile",
  "tokio",
  "tracing-journald",
  "tracing-subscriber",
  "usage-rs",
-]
-
-[[package]]
-name = "meowland-bench"
-version = "0.1.0"
-dependencies = [
- "calloop",
- "drm 0.15.0",
- "memmap2",
- "meowland-compositor",
- "meowland-core",
- "meowland-kitty",
- "meowland-protocol",
- "rustix 1.1.5",
+ "vtparse",
  "wayland-client",
  "wayland-protocols",
 ]
@@ -583,6 +560,7 @@ dependencies = [
 name = "meowland-protocol"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "meowland-core",
  "mime",
  "postcard",
@@ -782,6 +760,15 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "pty-process"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f0cff49b5194f464ce14bfaef7d6dba180889934e9bfa37ca5f2528ea515c0b"
+dependencies = [
+ "rustix 1.1.5",
 ]
 
 [[package]]
@@ -1030,7 +1017,7 @@ dependencies = [
  "calloop",
  "cursor-icon",
  "downcast-rs",
- "drm 0.14.1",
+ "drm",
  "drm-ffi",
  "drm-fourcc",
  "drm-sys",

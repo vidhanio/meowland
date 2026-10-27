@@ -7,6 +7,7 @@ pub mod clipboard;
 mod frame;
 mod paths;
 mod protocol;
+mod shared;
 
 pub use frame::FrameBand;
 pub use paths::Paths;
@@ -16,3 +17,4 @@ pub use protocol::{
     ServerToPane, Shortcut, Show, WindowInfo, decode, modifiers, recv, sanitize,
     sanitize_with_limit, send,
 };
+pub use shared::{FrameTransport, SharedFrame, SharedObject};

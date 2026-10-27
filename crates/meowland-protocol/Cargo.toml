@@ -13,10 +13,11 @@ workspace = true
 async = ["dep:tokio"]
 
 [dependencies]
+getrandom = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "rt"] }
 meowland-core = { workspace = true }
 postcard = { workspace = true, features = ["use-std"] }
-rustix = { workspace = true, features = ["time"] }
+rustix = { workspace = true, features = ["time", "shm", "fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = { workspace = true }
 mime = { workspace = true }

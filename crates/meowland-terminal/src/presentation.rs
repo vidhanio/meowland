@@ -3,12 +3,17 @@
 use std::time::{Duration, Instant};
 
 use meowland_core::Result;
-use meowland_kitty::{PresentOutcome, Presenter, SharedMemory};
+use meowland_kitty::{PresentOutcome, Presenter, present_shared};
 use meowland_protocol::asynchronous::Outgoing;
-use meowland_protocol::{FrameAck, FrameBand, PaneAction, PaneToServer};
+use meowland_protocol::{
+    FrameAck, FrameBand, FrameTransport, PaneAction, PaneToServer, SharedFrame,
+};
 use tokio::io::AsyncWrite;
 
 use super::output;
+
+mod shared;
+use shared::{Consumption, SharedPresentation};
 
 /// Log pane throughput to the user journal once per second.
 struct PaneStats {
@@ -78,6 +83,8 @@ pub(crate) struct PanePresentation {
     pending: output::Output,
     frame: Option<PendingFrame>,
     retry: Option<Instant>,
+    shared_frame: Option<SharedPresentation>,
+    transport: FrameTransport,
 }
 
 struct PendingFrame {
@@ -88,13 +95,15 @@ struct PendingFrame {
 }
 
 impl PanePresentation {
-    pub(crate) fn new(cell: Option<(u16, u16)>, shared: Option<SharedMemory>) -> Self {
+    pub(crate) fn new(cell: Option<(u16, u16)>, transport: FrameTransport) -> Self {
         Self {
-            presenter: Presenter::new(cell, shared),
+            presenter: Presenter::new(cell, None),
             stats: PaneStats::new(),
             pending: output::Output::default(),
             frame: None,
             retry: None,
+            shared_frame: None,
+            transport,
         }
     }
 
@@ -112,7 +121,7 @@ impl PanePresentation {
     }
 
     pub(crate) fn set_cell_size(&mut self, cell: Option<(u16, u16)>) {
-        if self.presenter.set_cell_size(cell) {
+        if self.presenter.set_cell_size(cell) && self.shared_frame.is_none() {
             self.retry = Some(Instant::now());
         }
     }
@@ -127,6 +136,20 @@ impl PanePresentation {
             "previous frame must finish before accepting another band"
         );
         let started = Instant::now();
+        if band.y() == 0 && band.rgb().len() == band.size().rgb_len() {
+            self.shared_frame = None;
+        }
+        if let Some(shared) = self.shared_frame.take() {
+            match shared.into_band() {
+                Ok(previous) => {
+                    self.presenter.retain_frame(previous);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retained upstream frame could not be read");
+                    return self.reject_shared(tx);
+                }
+            }
+        }
         let outcome = self.presenter.present_into(band, self.pending.buffer());
         self.frame = Some(PendingFrame {
             encoded: started.elapsed(),
@@ -138,7 +161,63 @@ impl PanePresentation {
         self.finish(tx)
     }
 
+    pub(crate) fn draw_shared(&mut self, frame: SharedFrame, tx: &mut Outgoing) -> Result<()> {
+        debug_assert!(
+            !self.pending() && self.frame.is_none(),
+            "previous frame must finish before accepting another frame"
+        );
+        if self.transport != FrameTransport::Shared {
+            return self.reject_shared(tx);
+        }
+        let started = Instant::now();
+        let shared = match SharedPresentation::new(frame) {
+            Ok(shared) => shared,
+            Err(error) => {
+                tracing::warn!(%error, "upstream shared frame is unavailable; requesting RGB frames");
+                return self.reject_shared(tx);
+            }
+        };
+        self.presenter.invalidate();
+        present_shared(&shared.frame, self.pending.buffer());
+        self.shared_frame = Some(shared);
+        self.frame = Some(PendingFrame {
+            started,
+            encoded: started.elapsed(),
+            bytes: self.pending.len(),
+            accepted: true,
+        });
+        self.retry = Some(Instant::now());
+        self.finish(tx)
+    }
+
+    fn disable_shared(&mut self, tx: &mut Outgoing) -> Result<()> {
+        self.transport = FrameTransport::Inline;
+        tx.send(&PaneToServer::Action(PaneAction::FrameTransport(
+            FrameTransport::Inline,
+        )))?;
+        Ok(())
+    }
+
+    fn reject_shared(&mut self, tx: &mut Outgoing) -> Result<()> {
+        self.presenter.invalidate();
+        self.shared_frame = None;
+        self.retry = None;
+        self.disable_shared(tx)?;
+        tx.send(&PaneToServer::Action(PaneAction::Ack(FrameAck::Resync)))?;
+        Ok(())
+    }
+
     pub(crate) fn advance(&mut self, tx: &mut Outgoing) -> Result<()> {
+        if self
+            .shared_frame
+            .as_ref()
+            .is_some_and(|shared| !shared.consumed)
+        {
+            if !self.pending() {
+                self.finish(tx)?;
+            }
+            return Ok(());
+        }
         if self
             .deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -169,7 +248,48 @@ impl PanePresentation {
         Ok(())
     }
 
+    fn poll_shared(&mut self, tx: &mut Outgoing) -> Result<()> {
+        let Some(shared) = &mut self.shared_frame else {
+            return Ok(());
+        };
+        if shared.consumed || self.frame.is_none() {
+            return Ok(());
+        }
+        match shared.poll() {
+            Consumption::Waiting(deadline) => self.retry = Some(deadline),
+            Consumption::Complete => self.retry = None,
+            Consumption::Expired => {
+                tracing::warn!("upstream shared frame remained unread; using inline transport");
+                self.disable_shared(tx)?;
+                let shared = self.shared_frame.take().expect("unread frame is retained");
+                match shared.into_band() {
+                    Ok(band) => {
+                        let started = Instant::now();
+                        let outcome = self.presenter.present_into(band, self.pending.buffer());
+                        if let Some(frame) = &mut self.frame {
+                            frame.bytes += self.pending.len();
+                            frame.encoded += started.elapsed();
+                        }
+                        self.schedule(outcome);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "unread shared frame could not be recovered");
+                        self.retry = None;
+                        if let Some(frame) = &mut self.frame {
+                            frame.accepted = false;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(&mut self, tx: &mut Outgoing) -> Result<()> {
+        if self.pending() {
+            return Ok(());
+        }
+        self.poll_shared(tx)?;
         if self.pending() || self.retry.is_some() {
             return Ok(());
         }

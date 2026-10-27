@@ -221,6 +221,8 @@ pub enum PaneAction {
         #[serde(with = "serde_bytes")]
         data: Option<Vec<u8>>,
     },
+    /// Select pixel transport after terminal probing or shared-memory failure.
+    FrameTransport(crate::FrameTransport),
 }
 
 /// Server packets share one schema for owned frames and split frame headers.
@@ -263,6 +265,8 @@ pub enum PanePacket<F> {
     },
     /// Ring the terminal's audible or visual bell.
     Bell,
+    /// A complete immutable RGB object, requiring shared-memory negotiation.
+    SharedFrame(crate::SharedFrame),
 }
 
 /// Server packet carrying owned, validated RGB frame bands.

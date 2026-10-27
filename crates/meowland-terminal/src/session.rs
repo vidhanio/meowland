@@ -9,7 +9,9 @@ use meowland_input::keyboard::Keyboard;
 use meowland_input::{self as input};
 use meowland_protocol::asynchronous::{Outgoing, Reader};
 use meowland_protocol::clipboard::Selection;
-use meowland_protocol::{self as protocol, Hello, PaneAction, PaneToServer, ServerToPane, Show};
+use meowland_protocol::{
+    self as protocol, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane, Show,
+};
 use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -98,7 +100,7 @@ impl TerminalSession {
             keyboard: Keyboard::default(),
             input_gate: InputGate::default(),
             clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
-            presentation: PanePresentation::new(cell, None),
+            presentation: PanePresentation::new(cell, FrameTransport::Inline),
             cell,
             lifecycle: Lifecycle::Handshaking {
                 deadline: Instant::now() + protocol::REQUEST_TIMEOUT,
@@ -240,6 +242,9 @@ impl TerminalSession {
                     self.window.cursor = shape;
                 }
             }
+            ServerToPane::SharedFrame(frame) => {
+                self.presentation.draw_shared(frame, &mut self.tx)?;
+            }
             ServerToPane::Frame(band) => {
                 let starting = !matches!(self.lifecycle, Lifecycle::Active(_));
                 if starting {
@@ -310,7 +315,14 @@ impl TerminalSession {
             terminal::cells(),
             self.cell.unwrap_or(FALLBACK_CELL),
         );
-        self.presentation = PanePresentation::new(self.cell, shared);
+        let transport = if shared.is_some() {
+            FrameTransport::Shared
+        } else {
+            FrameTransport::Inline
+        };
+        self.presentation = PanePresentation::new(self.cell, transport);
+        self.tx
+            .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
         self.clipboard = Clipboard::new(if probe.clipboard.is_some() {
             ClipboardProtocol::Kitty
         } else {

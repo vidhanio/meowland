@@ -60,6 +60,12 @@ impl Decoder {
                 }
             }
             VTAction::CsiDispatch { params, byte, .. } => self.csi(&params, byte)?,
+            VTAction::OscDispatch(fields)
+                if fields.first().is_some_and(|field| field == b"52")
+                    && fields.last().is_some_and(|field| field == b"?") =>
+            {
+                self.reply(b"\x1b]52;c;\x1b\\")?;
+            }
             _ => {}
         }
         Ok(())

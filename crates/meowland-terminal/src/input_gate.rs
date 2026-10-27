@@ -59,6 +59,14 @@ impl InputGate {
         self.pending = None;
     }
 
+    pub(crate) fn preserve_focus_loss(&mut self) {
+        if let Some(pending) = &mut self.pending
+            && !matches!(pending.inputs.last(), Some(Input::ResetKeyboard))
+        {
+            pending.inputs.push(Input::ResetKeyboard);
+        }
+    }
+
     pub(crate) fn flush(&mut self, tx: &mut Outgoing) -> std::io::Result<()> {
         if let Some(pending) = self.pending.take() {
             for input in pending.inputs {

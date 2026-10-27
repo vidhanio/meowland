@@ -45,13 +45,17 @@ impl TerminalSession {
             }
             Event::Focus(focused) => {
                 let focus = if focused { Focus::Gained } else { Focus::Lost };
-                self.clipboard.focus(focus);
+                let preserve = self.clipboard.focus(focus);
                 if focused {
                     self.input_gate
                         .send(self.keyboard.enter(), None, &mut self.tx)?;
                 } else {
                     self.keyboard.reset();
-                    self.input_gate.reset();
+                    if preserve {
+                        self.input_gate.preserve_focus_loss();
+                    } else {
+                        self.input_gate.reset();
+                    }
                     self.tx.send(&PaneToServer::Action(PaneAction::Input(
                         Input::ResetKeyboard,
                     )))?;
@@ -80,6 +84,7 @@ impl TerminalSession {
                 }
             }
             Event::Clipboard(bytes) => self.clipboard.packet(&bytes),
+            Event::ClipboardText(bytes) => self.clipboard.text(&bytes),
         }
         Ok(())
     }

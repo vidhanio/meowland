@@ -38,9 +38,6 @@ pub enum Error {
         "terminal must support Kitty graphics with in-place frame updates (use Ghostty 1.4+ or current Kitty)"
     )]
     GraphicsUnsupported,
-    /// The terminal cannot exchange MIME-aware clipboard selections.
-    #[error("terminal must support the Kitty clipboard protocol (OSC 5522)")]
-    ClipboardUnsupported,
     /// The terminal cannot report the required keyboard transitions.
     #[error(
         "terminal must support Kitty keyboard disambiguation, event types, and all-key reporting"

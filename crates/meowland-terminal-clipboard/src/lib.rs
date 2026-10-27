@@ -1,7 +1,8 @@
-//! MIME-aware Kitty terminal clipboard transfers and deferred input actions.
+//! Capability-selected terminal clipboard transports and deferred input
+//! actions.
 
-mod action;
 mod clipboard;
+mod kitty;
+mod osc52;
 
-pub use action::{Action, Focus, Refresh};
-pub use clipboard::Clipboard;
+pub use clipboard::{Action, Clipboard, Focus, Protocol, Refresh};

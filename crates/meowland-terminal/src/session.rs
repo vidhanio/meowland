@@ -15,7 +15,7 @@ use meowland_protocol::{
     asynchronous::{Outgoing, Reader},
     clipboard::Selection,
 };
-use meowland_terminal_clipboard::{Clipboard, Refresh};
+use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
 use tokio::{
     net::unix::{OwnedReadHalf, OwnedWriteHalf},
     signal::unix::{Signal, SignalKind, signal},
@@ -104,7 +104,7 @@ impl TerminalSession {
             stdout: Descriptor::new(output::open()?.into())?,
             keyboard: Keyboard::default(),
             input_gate: InputGate::default(),
-            clipboard: Clipboard::new()?,
+            clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
             presentation: PanePresentation::new(cell, FrameTransport::Inline),
             cell,
             lifecycle: Lifecycle::Handshaking {
@@ -218,7 +218,8 @@ impl TerminalSession {
             }
             ServerToPane::ClipboardWrite { selection, data } => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.clipboard.copy(selection, data);
+                    self.clipboard
+                        .copy(selection, data, self.presentation.buffer());
                 } else if selection == Selection::Primary {
                     self.window.primary = Some(data);
                 } else {
@@ -282,7 +283,8 @@ impl TerminalSession {
             (Selection::Primary, primary),
         ] {
             if let Some(data) = data {
-                self.clipboard.copy(selection, data);
+                self.clipboard
+                    .copy(selection, data, self.presentation.buffer());
             }
         }
     }
@@ -298,9 +300,6 @@ impl TerminalSession {
         if !probe.frame_edits {
             return Err(Error::GraphicsUnsupported);
         }
-        if probe.clipboard.is_none() {
-            return Err(Error::ClipboardUnsupported);
-        }
         if !probe.sgr_pixels {
             return Err(Error::PixelMouseUnsupported);
         }
@@ -311,8 +310,9 @@ impl TerminalSession {
             return Err(Error::KeyboardUnsupported);
         }
         mode.enable_mouse()?;
-        let previous = probe.clipboard.ok_or(Error::ClipboardUnsupported)?;
-        mode.enable_clipboard(previous)?;
+        if let Some(previous) = probe.clipboard {
+            mode.enable_clipboard(previous)?;
+        }
         self.cell = probe.cell_width.zip(probe.cell_height).or(self.cell);
         let (width, height) = terminal::pane_pixels(
             probe.pixel_width.zip(probe.pixel_height),
@@ -328,6 +328,11 @@ impl TerminalSession {
         self.presentation = PanePresentation::new(self.cell, transport);
         self.tx
             .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
+        self.clipboard = Clipboard::new(if probe.clipboard.is_some() {
+            ClipboardProtocol::Kitty
+        } else {
+            ClipboardProtocol::Osc52
+        })?;
         let _ = self
             .clipboard
             .refresh(Selection::Clipboard, Refresh::Background);

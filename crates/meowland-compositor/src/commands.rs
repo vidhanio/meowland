@@ -1,6 +1,6 @@
 //! Pane commands and their Wayland side effects.
 
-use meowland_core::{pixels::FrameSize, timing::REFRESH_MILLIHZ};
+use meowland_core::pixels::FrameSize;
 use meowland_protocol::{Input, PaneAction, Shortcut, Show};
 use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
 
@@ -199,7 +199,7 @@ impl State {
                     .expect("validated frame height fits Wayland coordinates"),
             )
                 .into(),
-            refresh: REFRESH_MILLIHZ,
+            refresh: self.refresh_rate.millihertz(),
         };
         self.mode = self.logical_size(size.width(), size.height());
         for previous in self.output.modes() {

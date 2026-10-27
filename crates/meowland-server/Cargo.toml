@@ -16,7 +16,7 @@ calloop = { workspace = true }
 listenfd = { workspace = true }
 rustix = { workspace = true, features = ["net"] }
 sd-notify = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true, features = ["use-std"] }
 tokio = { workspace = true, features = [
   "io-util",

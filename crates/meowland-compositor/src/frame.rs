@@ -10,7 +10,7 @@ use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
 
 mod shared;
 
-use super::{Event, FRAME_INTERVAL, ServerToPane, State};
+use super::{Event, ServerToPane, State};
 
 /// Each pane owns its scheduling state. No separate dirty-pane index can drift
 /// out of sync with attachment, resizing, or acknowledgements.
@@ -136,8 +136,8 @@ impl State {
             .min()
     }
 
-    /// Pace visible clients at 120 Hz and hidden clients at one Hz,
-    /// independently of terminal acknowledgements.
+    /// Pace visible clients at the configured refresh rate and hidden clients
+    /// at one Hz, independently of terminal acknowledgements.
     pub(crate) fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed();
@@ -146,7 +146,7 @@ impl State {
                 continue;
             }
             let interval = if self.attachments.visible(id) && self.catalog.drawable(id) {
-                FRAME_INTERVAL
+                self.refresh_rate.interval()
             } else {
                 Duration::from_secs(1)
             };
@@ -164,7 +164,9 @@ impl State {
         if self.attachments.visible(window)
             && let Some(window) = self.windows.get_mut(&window)
         {
-            window.callback_due = window.callback_due.min(Instant::now() + FRAME_INTERVAL);
+            window.callback_due = window
+                .callback_due
+                .min(Instant::now() + self.refresh_rate.interval());
         }
     }
 

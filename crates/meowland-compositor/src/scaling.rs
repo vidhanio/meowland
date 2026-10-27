@@ -1,6 +1,6 @@
 //! Preferred fractional scale and physical-to-logical pane geometry.
 
-use meowland_core::{scale::UiScale, timing::REFRESH_MILLIHZ};
+use meowland_core::{scale::UiScale, timing::RefreshRate};
 use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::DisplayHandle,
@@ -17,10 +17,11 @@ use super::{State, WlSurface};
 pub(crate) fn output(
     display: &DisplayHandle,
     scale: UiScale,
+    refresh_rate: RefreshRate,
 ) -> (OutputManagerState, Output, Mode) {
     let mode = Mode {
         size: (1920, 1080).into(),
-        refresh: REFRESH_MILLIHZ,
+        refresh: refresh_rate.millihertz(),
     };
     let manager = OutputManagerState::new_with_xdg_output::<State>(display);
     let output = Output::new(

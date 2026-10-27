@@ -6,7 +6,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use calloop::LoopHandle;
-use meowland_core::{scale::UiScale, timing::FRAME_INTERVAL};
+use meowland_core::{scale::UiScale, timing::RefreshRate};
 use meowland_protocol::{ServerToPane, WindowInfo};
 use smithay::{
     delegate_dispatch2,
@@ -55,6 +55,7 @@ mod readback;
 mod runtime;
 mod scaling;
 mod seat;
+mod settings;
 mod shell;
 mod sources;
 mod text;
@@ -69,6 +70,7 @@ pub use commands::{CloseWindowError, Command};
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;
 pub use runtime::Runtime;
+pub use settings::{KeyboardSettings, Settings};
 
 /// An owned notification ready for delivery to one terminal pane.
 #[derive(Debug)]
@@ -103,6 +105,7 @@ pub struct Compositor {
     _viewporter: ViewporterState,
     _fractional_scale: FractionalScaleManagerState,
     scale: UiScale,
+    refresh_rate: RefreshRate,
     _single_pixel_buffer: SinglePixelBufferState,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
@@ -153,13 +156,15 @@ impl State {
     fn new(
         display_handle: DisplayHandle,
         handle: LoopHandle<'static, Self>,
-        scale: UiScale,
+        settings: &Settings,
     ) -> Self {
+        let scale = settings.scale;
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
         let pointer = Some(seat.add_pointer());
         let text_input = text::manager(&display_handle, &seat);
-        let (output_manager, output, mode) = scaling::output(&display_handle, scale);
+        let (output_manager, output, mode) =
+            scaling::output(&display_handle, scale, settings.refresh_rate);
         let primary_selection = PrimarySelectionState::new::<Self>(&display_handle);
         let data_control =
             WlrDataControlState::new::<Self, _>(&display_handle, Some(&primary_selection), |_| {
@@ -194,6 +199,7 @@ impl State {
             _viewporter: ViewporterState::new::<Self>(&display_handle),
             _fractional_scale: FractionalScaleManagerState::new::<Self>(&display_handle),
             scale,
+            refresh_rate: settings.refresh_rate,
             _single_pixel_buffer: SinglePixelBufferState::new::<Self>(&display_handle),
             _output_manager: output_manager,
             data_device: DataDeviceState::new::<Self>(&display_handle),

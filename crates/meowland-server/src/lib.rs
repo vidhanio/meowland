@@ -3,7 +3,7 @@
 use std::{collections::HashMap, io};
 
 use meowland_compositor::{Command, Event, PaneId};
-use meowland_core::{Result, scale::UiScale};
+use meowland_core::{Error, Result};
 use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -12,6 +12,7 @@ use tokio::{
 
 mod actor;
 mod compositor;
+mod configuration;
 mod control;
 mod lifecycle;
 mod process;
@@ -19,6 +20,7 @@ mod sockets;
 mod transport;
 
 use compositor::DisplayThread;
+pub use configuration::{Config, KeyboardConfig, OutputConfig};
 use lifecycle::Shutdown;
 use sockets::Listeners;
 use transport::PaneTransport;
@@ -48,15 +50,7 @@ struct Server {
     shutdown: Shutdown,
 }
 
-/// Run the compositor server with default UI scaling.
-///
-/// # Errors
-/// Returns an error if startup, socket I/O or compositor dispatch fails.
-pub async fn serve(paths: &Paths) -> Result<()> {
-    serve_scaled(paths, UiScale::default()).await
-}
-
-/// Run the server with a shared UI scale for all terminal panes.
+/// Run the server with caller-supplied output and keyboard configuration.
 ///
 /// Binds the supplied paths unless listeners are provided by socket activation.
 /// Shutdown gives clients a bounded Wayland-close grace period. With the
@@ -65,9 +59,13 @@ pub async fn serve(paths: &Paths) -> Result<()> {
 /// closure.
 ///
 /// # Errors
-/// Returns an error if startup, socket I/O or compositor dispatch fails.
-pub async fn serve_scaled(paths: &Paths, scale: UiScale) -> Result<()> {
-    actor::serve(paths, scale).await
+/// Returns an error if configuration validation, startup, socket I/O, or
+/// compositor dispatch fails. Configuration is validated before sockets bind.
+pub async fn serve(paths: &Paths, config: Config) -> Result<()> {
+    let settings = config
+        .into_settings()
+        .map_err(|error| Error::io("validating configuration", error))?;
+    actor::serve(paths, settings).await
 }
 
 fn notify(state: &[sd_notify::NotifyState<'_>]) {

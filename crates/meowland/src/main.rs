@@ -1,6 +1,7 @@
 //! Command-line entry point for the compositor server and terminal-pane client.
 
 mod cli;
+mod configuration;
 
 use std::io::{self, Write};
 

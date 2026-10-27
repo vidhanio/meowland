@@ -2,10 +2,9 @@
 
 use std::{collections::HashMap, io, time::Instant};
 
-use meowland_compositor::PaneId;
+use meowland_compositor::{PaneId, Settings};
 use meowland_core::{
     Result,
-    scale::UiScale,
     signals::{Termination, TerminationSignal},
 };
 use meowland_protocol::Paths;
@@ -19,11 +18,11 @@ use super::{
     transport::{self, ConnectionKind},
 };
 
-pub(crate) async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
+pub(crate) async fn serve(paths: &Paths, settings: Settings) -> Result<()> {
     let listeners = sockets::listeners(paths)?;
     let termination = Termination::new()?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
-    let compositor = tokio::task::spawn_blocking(move || DisplayThread::start(scale))
+    let compositor = tokio::task::spawn_blocking(move || DisplayThread::start(&settings))
         .await
         .map_err(io::Error::other)??;
     let (incoming, messages) = mpsc::channel(MAX_CONNECTIONS);

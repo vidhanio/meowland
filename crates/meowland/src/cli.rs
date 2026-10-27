@@ -3,10 +3,11 @@ use std::{
     ffi::OsString,
     io::{self, IsTerminal, Write},
     os::unix::net::UnixStream,
+    path::PathBuf,
     time::Duration,
 };
 
-use meowland_core::{Error, Result, scale::UiScale};
+use meowland_core::{Error, Result};
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowInfo,
 };
@@ -40,9 +41,9 @@ enum Commands {
 
 #[derive(Args)]
 struct ServerArgs {
-    /// UI scale for all panes (0.5–4), rounded to the nearest 1/120.
-    #[usage(long, default = "1")]
-    scale: UiScale,
+    /// Read this TOML file instead of `$XDG_CONFIG_HOME/meowland/config.toml`.
+    #[usage(long, short = 'c')]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -183,7 +184,8 @@ pub(crate) fn start() -> Result<()> {
     match command {
         Commands::Server(args) => {
             let paths = Paths::discover()?;
-            run_async(meowland_server::serve_scaled(&paths, args.scale))
+            let config = crate::configuration::load(args.config.as_deref())?;
+            run_async(meowland_server::serve(&paths, config))
         }
         Commands::List => {
             let paths = Paths::discover()?;

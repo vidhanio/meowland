@@ -6,8 +6,7 @@ use calloop::{
     channel,
     ping::{Ping, PingSource, make_ping},
 };
-use meowland_compositor::{Command, Compositor, Event, Runtime};
-use meowland_core::scale::UiScale;
+use meowland_compositor::{Command, Compositor, Event, Runtime, Settings};
 use meowland_protocol::REQUEST_TIMEOUT;
 use tokio::sync::{mpsc as asynchronous, oneshot};
 
@@ -27,7 +26,8 @@ pub(crate) struct DisplayThread {
 }
 
 impl DisplayThread {
-    pub(crate) fn start(scale: UiScale) -> io::Result<Self> {
+    pub(crate) fn start(settings: &Settings) -> io::Result<Self> {
+        let settings = settings.clone();
         let display = format!("wayland-meowland-{}", std::process::id());
         let socket = display.clone();
         let (operations, incoming) = channel::sync_channel(QUEUE_CAPACITY);
@@ -37,7 +37,9 @@ impl DisplayThread {
         let thread = thread::Builder::new()
             .name("meowland-wayland".into())
             .spawn(move || {
-                if let Err(error) = run(&socket, scale, incoming, stopping, &events_tx, &ready_tx) {
+                if let Err(error) = run(
+                    &socket, &settings, incoming, stopping, &events_tx, &ready_tx,
+                ) {
                     tracing::error!(%error, "compositor thread stopped");
                     let _ = ready_tx.send(Err(error));
                 }
@@ -119,13 +121,13 @@ impl Drop for DisplayThread {
 
 fn run(
     socket: &str,
-    scale: UiScale,
+    settings: &Settings,
     incoming: channel::Channel<Operation>,
     stopping: PingSource,
     events: &asynchronous::Sender<Event>,
     ready: &mpsc::Sender<io::Result<()>>,
 ) -> io::Result<()> {
-    let mut runtime = Runtime::new(socket, scale)?;
+    let mut runtime = Runtime::with_settings(socket, settings)?;
     runtime
         .handle()
         .insert_source(incoming, |event, (), compositor| match event {

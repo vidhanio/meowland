@@ -17,7 +17,7 @@ use smithay::{
     wayland::compositor::CompositorClientState,
 };
 
-use super::State;
+use super::{Settings, State};
 
 #[derive(Default)]
 pub(crate) struct ClientState {
@@ -45,17 +45,39 @@ impl Runtime {
     /// Returns an error if the display, socket, event sources or keymap cannot
     /// start.
     pub fn new(name: &str, scale: UiScale) -> io::Result<Self> {
+        let settings = Settings {
+            scale,
+            ..Settings::default()
+        };
+        Self::with_settings(name, &settings)
+    }
+
+    /// Bind a Wayland socket with server-owned output and keyboard settings.
+    ///
+    /// # Errors
+    /// Returns an error if repeat timings are negative or compositor startup
+    /// fails.
+    pub fn with_settings(name: &str, settings: &Settings) -> io::Result<Self> {
+        if settings.keyboard.repeat_delay < 0 || settings.keyboard.repeat_rate < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "keyboard repeat delay and rate must be nonnegative",
+            ));
+        }
         let display = Display::<State>::new().map_err(io::Error::other)?;
         let event_loop = EventLoop::<State>::try_new()?;
-        let mut state = State::new(display.handle(), event_loop.handle(), scale);
+        let mut state = State::new(display.handle(), event_loop.handle(), settings);
+        let keyboard = &settings.keyboard;
         let keymap = XkbConfig {
-            layout: "us",
+            layout: &keyboard.layout,
+            variant: &keyboard.variant,
+            options: (!keyboard.options.is_empty()).then(|| keyboard.options.clone()),
             ..XkbConfig::default()
         };
         state.keyboard = Some(
             state
                 .seat
-                .add_keyboard(keymap, 600, 25)
+                .add_keyboard(keymap, keyboard.repeat_delay, keyboard.repeat_rate)
                 .map_err(io::Error::other)?,
         );
         let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;

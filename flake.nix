@@ -29,64 +29,106 @@
             ...
           }:
           let
-            cfg = config.programs.meowland;
+            serviceCfg = config.services.meowland;
+            programCfg = config.programs.meowland;
+            format = pkgs.formats.toml { };
+            packageOption =
+              lib.mkPackageOption {
+                meowland = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+              } "meowland" { }
+              // {
+                defaultText = lib.literalExpression "inputs.meowland.packages.\${pkgs.stdenv.hostPlatform.system}.default";
+              };
           in
           {
-            options.programs.meowland = {
-              enable = lib.mkEnableOption "meowland";
-
-              package = lib.mkOption {
-                type = lib.types.package;
-                default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-                description = "Package to install for Meowland.";
+            options = {
+              programs.meowland = {
+                enable = lib.mkEnableOption "Meowland, a terminal Wayland compositor";
+                package = packageOption;
               };
 
-              scale = lib.mkOption {
-                type = lib.types.numbers.between 0.5 4.0;
-                default = 1.0;
-                description = "UI scale shared by all Meowland terminal panes.";
+              services.meowland = {
+                enable = lib.mkEnableOption "the socket-activated Meowland compositor service";
+                package = packageOption;
+                settings = lib.mkOption {
+                  inherit (format) type;
+                  default = { };
+                  example = {
+                    output = {
+                      scale = 1.5;
+                      refresh_rate = 60;
+                    };
+                    keyboard = {
+                      layout = "us";
+                      repeat_delay = 600;
+                      repeat_rate = 25;
+                    };
+                  };
+                  description = ''
+                    Configuration written to
+                    {file}`$XDG_CONFIG_HOME/meowland/config.toml`.
+
+                    Output settings are `scale` (0.5–4) and `refresh_rate`
+                    (1–1000 Hz). Keyboard settings are the XKB `layout`,
+                    `variant`, and `options` strings, plus `repeat_delay`
+                    in milliseconds and `repeat_rate` in events per second
+                    (zero disables repeat). Unspecified settings use Meowland's
+                    defaults. Changes take effect when the service restarts.
+                  '';
+                };
               };
             };
 
-            config = lib.mkIf cfg.enable {
-              home.packages = [ cfg.package ];
+            config = lib.mkMerge [
+              (lib.mkIf programCfg.enable {
+                home.packages = [ programCfg.package ];
+              })
+              (lib.mkIf serviceCfg.enable {
+                assertions = [
+                  (lib.hm.assertions.assertPlatform "services.meowland" pkgs lib.platforms.linux)
+                ];
 
-              systemd.user.services.meowland = {
-                Unit = {
-                  Description = "meowland Wayland compositor";
-                  Requires = [ "meowland.socket" ];
-                  After = [ "meowland.socket" ];
+                xdg.configFile."meowland/config.toml".source =
+                  format.generate "meowland-config.toml" serviceCfg.settings;
+
+                systemd.user.services.meowland = {
+                  Unit = {
+                    Description = "meowland Wayland compositor";
+                    Requires = [ "meowland.socket" ];
+                    After = [ "meowland.socket" ];
+                    X-Restart-Triggers = [ "${config.xdg.configFile."meowland/config.toml".source}" ];
+                  };
+
+                  Service = {
+                    Type = "notify";
+                    NotifyAccess = "main";
+                    KillMode = "mixed";
+                    TimeoutStopSec = "5s";
+                    ExecStart = "${lib.getExe serviceCfg.package} server";
+                    Restart = "on-failure";
+                    RestartSec = "1s";
+                    UMask = "0077";
+                  };
+
+                  Install.Also = [ "meowland.socket" ];
                 };
 
-                Service = {
-                  Type = "notify";
-                  NotifyAccess = "main";
-                  KillMode = "mixed";
-                  TimeoutStopSec = "5s";
-                  ExecStart = "${lib.getExe cfg.package} server --scale ${toString cfg.scale}";
-                  Restart = "on-failure";
-                  RestartSec = "1s";
-                  UMask = "0077";
+                systemd.user.sockets.meowland = {
+                  Unit.Description = "meowland control and pane sockets";
+
+                  Socket = {
+                    ListenStream = [
+                      "%t/meowland-control.sock"
+                      "%t/meowland-pane.sock"
+                    ];
+                    SocketMode = "0600";
+                    RemoveOnStop = true;
+                  };
+
+                  Install.WantedBy = [ "sockets.target" ];
                 };
-
-                Install.Also = [ "meowland.socket" ];
-              };
-
-              systemd.user.sockets.meowland = {
-                Unit.Description = "meowland control and pane sockets";
-
-                Socket = {
-                  ListenStream = [
-                    "%t/meowland-control.sock"
-                    "%t/meowland-pane.sock"
-                  ];
-                  SocketMode = "0600";
-                  RemoveOnStop = true;
-                };
-
-                Install.WantedBy = [ "sockets.target" ];
-              };
-            };
+              })
+            ];
           };
 
         perSystem =

@@ -1,17 +1,25 @@
 //! Connection tasks and byte-accounted, ordered pane output.
 
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use meowland_compositor::PaneId;
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::asynchronous::{Outgoing, Reader};
-use meowland_protocol::{self as protocol, ControlRequest, PaneToServer, ServerToPane};
+use meowland_protocol::{
+    self as protocol, ControlRequest, PaneToServer, ServerToPane,
+    asynchronous::{Outgoing, Reader},
+};
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWrite};
-use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    io::{AsyncReadExt, AsyncWrite},
+    net::UnixStream,
+    sync::{mpsc, oneshot},
+};
 
 use super::{Incoming, IncomingSender};
 

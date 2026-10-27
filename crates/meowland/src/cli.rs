@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::io::{self, IsTerminal, Write};
-use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    io::{self, IsTerminal, Write},
+    os::unix::net::UnixStream,
+    time::Duration,
+};
 
-use meowland_core::scale::UiScale;
-use meowland_core::{Error, Result};
+use meowland_core::{Error, Result, scale::UiScale};
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowInfo,
 };

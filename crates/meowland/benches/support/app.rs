@@ -1,28 +1,34 @@
-//! A real Wayland workload client with explicit input expectations and frame identities.
+//! A real Wayland workload client with explicit input expectations and frame
+//! identities.
 
-use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{Read, Seek, Write};
-use std::net::Shutdown;
-use std::os::fd::AsFd;
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-
-use rustix::event::{PollFd, PollFlags, poll};
-use rustix::fs::{MemfdFlags, memfd_create};
-use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_surface,
+use std::{
+    collections::VecDeque,
+    fs::File,
+    io::{Read, Seek, Write},
+    net::Shutdown,
+    os::{fd::AsFd, unix::net::UnixStream},
+    path::Path,
+    sync::mpsc,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
-use wayland_client::{Connection, EventQueue};
+
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    fs::{MemfdFlags, memfd_create},
+};
+use wayland_client::{
+    Connection, EventQueue,
+    globals::registry_queue_init,
+    protocol::{wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_seat, wl_shm, wl_surface},
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use super::config::Size;
-use super::fixture::{APP_ID, Fixture, LOAD_BIT, Pattern};
-use super::record::Event;
+use super::{
+    config::Size,
+    fixture::{APP_ID, Fixture, LOAD_BIT, Pattern},
+    record::Event,
+};
 use crate::{Result, fail};
 
 mod dispatch;

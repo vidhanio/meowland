@@ -1,11 +1,12 @@
 //! On-demand OSC 52 text reads with bounded snapshots and uncorrelated-reply
 //! draining.
 
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use meowland_protocol::clipboard::{ClipboardData, Deadline, MAX_TEXT, Selection, TEXT_MIMES};
 
 use super::{Action, Refresh};

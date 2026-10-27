@@ -1,14 +1,17 @@
 //! Committed text delivery through focused text-input clients or the keyboard
 //! fallback.
 
-use smithay::backend::input::InputTime;
-use smithay::input::Seat;
-use smithay::input::keyboard::xkb;
-use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
-    ContentHint, ContentPurpose,
+use smithay::{
+    backend::input::InputTime,
+    input::{Seat, keyboard::xkb},
+    reexports::{
+        wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
+            ContentHint, ContentPurpose,
+        },
+        wayland_server::DisplayHandle,
+    },
+    wayland::text_input::{TextInputActivation, TextInputManagerState, TextInputSeat},
 };
-use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::wayland::text_input::{TextInputActivation, TextInputManagerState, TextInputSeat};
 
 use super::State;
 

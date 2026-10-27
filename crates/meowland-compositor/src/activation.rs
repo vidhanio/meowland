@@ -3,10 +3,11 @@
 
 use std::time::{Duration, Instant};
 
-use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::wayland::xdg_activation::{
-    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+use smithay::{
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    wayland::xdg_activation::{
+        XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+    },
 };
 
 use super::{Binding, Selection, ServerToPane, State, WindowId};

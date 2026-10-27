@@ -1,8 +1,7 @@
 //! Validated RGB bands and their explicit metadata/payload wire layout.
 
 use meowland_core::pixels::FrameSize;
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 /// Nonempty, whole RGB rows within a validated full-frame size.
 #[derive(Clone, Debug)]

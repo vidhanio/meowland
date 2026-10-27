@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 
-use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::wayland::foreign_toplevel_list::{
-    ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+use smithay::{
+    reexports::wayland_server::DisplayHandle,
+    wayland::foreign_toplevel_list::{
+        ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+    },
 };
 
 use super::{State, WindowId};

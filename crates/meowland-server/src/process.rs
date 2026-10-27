@@ -1,8 +1,6 @@
 //! Application launch and asynchronous direct-child reaping.
 
-use std::ffi::OsString;
-use std::path::Path;
-use std::process::Stdio;
+use std::{ffi::OsString, path::Path, process::Stdio};
 
 use meowland_core::{Error, Result};
 use tokio::process::{Child, Command};

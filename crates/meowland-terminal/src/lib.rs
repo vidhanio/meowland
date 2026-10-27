@@ -3,8 +3,7 @@
 use std::path::Path;
 
 use meowland_core::{Error, Result};
-use meowland_protocol::Show;
-use meowland_protocol::asynchronous::Reader;
+use meowland_protocol::{Show, asynchronous::Reader};
 
 mod input_gate;
 mod output;

@@ -2,8 +2,7 @@
 
 use std::time::Instant;
 
-use meowland_protocol::asynchronous::Outgoing;
-use meowland_protocol::{Input, PaneAction, PaneToServer};
+use meowland_protocol::{Input, PaneAction, PaneToServer, asynchronous::Outgoing};
 
 #[derive(Default)]
 pub(crate) struct InputGate {

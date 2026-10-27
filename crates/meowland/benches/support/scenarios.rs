@@ -1,13 +1,18 @@
-//! Non-overlapping workload definitions and identity-matched measurement boundaries.
+//! Non-overlapping workload definitions and identity-matched measurement
+//! boundaries.
 
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
-use super::app::{Command, Input};
-use super::config::{Options, Size, Transport};
-use super::fixture::Pattern;
-use super::process::Session;
-use super::record::Row;
+use super::{
+    app::{Command, Input},
+    config::{Options, Size, Transport},
+    fixture::Pattern,
+    process::Session,
+    record::Row,
+};
 use crate::{Result, fail};
 
 const PERIOD: Duration = Duration::from_nanos(1_000_000_000 / 120);

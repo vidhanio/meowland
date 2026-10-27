@@ -1,7 +1,6 @@
 //! Validated compositor UI scale in Wayland's 120ths of a logical pixel.
 
-use std::str::FromStr;
-use std::{fmt, io};
+use std::{fmt, io, str::FromStr};
 
 /// A server-wide UI scale shared by every pane, between 0.5 and 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

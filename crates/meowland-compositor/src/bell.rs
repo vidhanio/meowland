@@ -2,8 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::wayland::xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState};
+use smithay::{
+    reexports::wayland_server::DisplayHandle,
+    wayland::xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState},
+};
 
 use super::{ServerToPane, State, WlSurface};
 

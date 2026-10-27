@@ -1,13 +1,14 @@
 //! Nonblocking terminal input with signed SGR pixel mouse decoding and
 //! `vtparse`.
 
-use std::collections::VecDeque;
-use std::io;
+use std::{collections::VecDeque, io};
 
 use meowland_core::asynchronous::Descriptor;
-use meowland_protocol::Input;
-use meowland_protocol::clipboard::MAX_TEXT;
-use meowland_protocol::modifiers::{ALT, CONTROL, HYPER, META, SUPER};
+use meowland_protocol::{
+    Input,
+    clipboard::MAX_TEXT,
+    modifiers::{ALT, CONTROL, HYPER, META, SUPER},
+};
 use rustix::fs::{Mode, OFlags, open};
 use tokio::io::AsyncReadExt;
 use vtparse::{CsiParam, VTActor, VTParser};

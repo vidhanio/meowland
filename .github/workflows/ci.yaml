@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   - push
@@ -10,94 +10,94 @@ permissions:
 
 jobs:
   check:
-    name: check
+    name: Check
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: checkout
+      - name: Check out source
         uses: actions/checkout@v6
 
-      - name: install libraries
+      - name: Install libraries
         run: sudo apt-get update && sudo apt-get install --yes libxkbcommon-dev pkg-config
 
-      - name: install rust
-        uses: dtolnay/rust-toolchain@1.99.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy, rustfmt
 
-      - name: cache dependencies
+      - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: check formatting
+      - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: check code
+      - name: Check code
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-      - name: check optional runtime features
+      - name: Check optional runtime features
         run: |
           cargo check --locked -p meowland-core --no-default-features
           cargo check --locked -p meowland-protocol --no-default-features
 
-      - name: run tests
+      - name: Run tests
         run: cargo test --locked --workspace --all-features
 
-      - name: check documentation
+      - name: Check documentation
         run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
   dependencies:
-    name: check dependencies
+    name: Check dependencies
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
+      - name: Check out source
         uses: actions/checkout@v6
 
-      - name: install audit tools
+      - name: Install audit tools
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny,cargo-machete
 
-      - name: audit vulnerabilities
+      - name: Audit vulnerabilities
         run: cargo audit --deny warnings
 
-      - name: check licenses and sources
+      - name: Check licenses and sources
         run: cargo deny --locked check
 
-      - name: check unused dependencies
+      - name: Check unused dependencies
         run: cargo machete --with-metadata
 
   check-nix:
-    name: check nix
+    name: Check Nix
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: checkout
+      - name: Check out source
         uses: actions/checkout@v6
 
-      - name: setup nix
+      - name: Set up Nix
         uses: ./.github/actions/setup-nix
 
-      - name: check flake
+      - name: Check flake
         run: nix flake check
 
   build:
-    name: build
+    name: Build
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: checkout
+      - name: Check out source
         uses: actions/checkout@v6
 
-      - name: setup nix
+      - name: Set up Nix
         uses: ./.github/actions/setup-nix
 
-      - name: build the compositor
+      - name: Build the compositor
         run: nix build .#default
 
-      - name: smoke test the binary
+      - name: Smoke-test the binary
         run: ./result/bin/meowland --help

@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
-use std::io::Write;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    time::{Duration, Instant},
+};
 
 use super::config::Transport;
 use crate::{Result, fail};

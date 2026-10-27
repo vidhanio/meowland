@@ -1,9 +1,7 @@
-//! Streaming composition with lazy whole-frame SHM publication and row-band fallback.
+//! Streaming composition with lazy whole-frame SHM publication and row-band
+//! fallback.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
-use std::ops::Range;
+use std::{collections::HashMap, fs::File, io::Write, ops::Range};
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameBand, FrameTransport, ServerToPane, SharedObject};

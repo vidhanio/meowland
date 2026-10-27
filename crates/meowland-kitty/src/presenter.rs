@@ -1,19 +1,20 @@
 //! Encode RGB frames for the kitty graphics protocol.
 
-use std::fs::File;
-use std::io::{self, Write};
-use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    fs::File,
+    io::{self, Write},
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-use meowland_core::pixels::FrameSize;
-use meowland_core::timing::FRAME_INTERVAL;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use meowland_core::{pixels::FrameSize, timing::FRAME_INTERVAL};
 use meowland_protocol::{FrameBand, SharedFrame as PublishedFrame};
-use rustix::fs::Mode;
-use rustix::shm;
+use rustix::{fs::Mode, shm};
 
 use crate::encoding::{Encoder, Encoding};
 

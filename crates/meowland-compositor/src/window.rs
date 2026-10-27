@@ -2,9 +2,13 @@
 
 use std::time::Duration;
 
-use smithay::desktop::utils::{send_frames_surface_tree, with_surfaces_surface_tree};
-use smithay::desktop::{PopupManager, PopupUngrabStrategy};
-use smithay::output::Output;
+use smithay::{
+    desktop::{
+        PopupManager, PopupUngrabStrategy,
+        utils::{send_frames_surface_tree, with_surfaces_surface_tree},
+    },
+    output::Output,
+};
 
 use super::{Policy, ServerToPane, State, Window, WindowId, WlSurface, input};
 

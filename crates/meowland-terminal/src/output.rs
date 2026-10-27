@@ -1,6 +1,5 @@
 //! Ordered, resumable terminal writes with a bounded per-turn budget.
-use std::fs::File;
-use std::io;
+use std::{fs::File, io};
 
 use rustix::fs::{self, Mode, OFlags};
 use tokio::io::{AsyncWrite, AsyncWriteExt};

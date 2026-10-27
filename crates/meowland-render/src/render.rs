@@ -1,20 +1,25 @@
 //! Surface traversal, hit testing, and frame composition.
 
-use std::collections::HashMap;
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use meowland_core::pixels::FrameSize;
-use smithay::desktop::{PopupKind, PopupManager};
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Size};
-use smithay::wayland::compositor::{
-    SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
-    with_surface_tree_upward,
+use smithay::{
+    desktop::{PopupKind, PopupManager},
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Point, Rectangle, Size},
+    wayland::{
+        compositor::{
+            SubsurfaceCachedState, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
+            with_surface_tree_upward,
+        },
+        shell::xdg::SurfaceCachedState,
+    },
 };
-use smithay::wayland::shell::xdg::SurfaceCachedState;
 
-use super::Snapshot;
-use super::geometry::{SurfaceGeometry, rounded, surface_geometry};
+use super::{
+    Snapshot,
+    geometry::{SurfaceGeometry, rounded, surface_geometry},
+};
 
 /// Bound composition scratch space and batch sequential shared-object writes.
 const STRIP_ROWS: u32 = 16;
@@ -96,10 +101,12 @@ impl Renderer {
         &self.pixels
     }
 
-    /// Compose bounded RGB strips directly into a caller-owned publication sink.
+    /// Compose bounded RGB strips directly into a caller-owned publication
+    /// sink.
     ///
-    /// The callback receives consecutive full-width rows in top-to-bottom order.
-    /// Scratch storage is reused and never grows to a full frame for this path.
+    /// The callback receives consecutive full-width rows in top-to-bottom
+    /// order. Scratch storage is reused and never grows to a full frame for
+    /// this path.
     ///
     /// # Panics
     /// Propagates panics from the publication callback.

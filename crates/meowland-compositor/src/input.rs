@@ -3,12 +3,15 @@
 use std::collections::{HashSet, VecDeque};
 
 use meowland_protocol::{Input, KEY_V, modifiers};
-use smithay::backend::input::{Axis, AxisSource, ButtonState, InputTime, KeyState, Keycode};
-use smithay::input::keyboard::{KeyboardHandle, ModifiersState};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle};
-use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::backend::ClientId;
-use smithay::utils::{Point, SERIAL_COUNTER, Serial};
+use smithay::{
+    backend::input::{Axis, AxisSource, ButtonState, InputTime, KeyState, Keycode},
+    input::{
+        keyboard::{KeyboardHandle, ModifiersState},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
+    },
+    reexports::wayland_server::{Resource, backend::ClientId},
+    utils::{Point, SERIAL_COUNTER, Serial},
+};
 
 use super::{AttachedPane, PaneId, State, WindowId, WlSurface, text};
 

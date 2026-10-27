@@ -1,7 +1,9 @@
 //! Independent Wayland callback clock and single-in-flight pane frames.
 
-use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};

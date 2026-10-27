@@ -1,27 +1,32 @@
 //! Async scheduling and explicit lifecycle for one terminal attachment.
 
-use std::io::{self, Write};
-use std::time::{Duration, Instant};
+use std::{
+    io::{self, Write},
+    time::{Duration, Instant},
+};
 
-use meowland_core::asynchronous::Descriptor;
-use meowland_core::{Error, Result, signals};
-use meowland_input::keyboard::Keyboard;
-use meowland_input::{self as input};
-use meowland_protocol::asynchronous::{Outgoing, Reader};
-use meowland_protocol::clipboard::Selection;
+use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
+use meowland_input::{
+    keyboard::Keyboard,
+    {self as input},
+};
 use meowland_protocol::{
     self as protocol, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane, Show,
+    asynchronous::{Outgoing, Reader},
+    clipboard::Selection,
 };
 use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::{
+    net::unix::{OwnedReadHalf, OwnedWriteHalf},
+    signal::unix::{Signal, SignalKind, signal},
+};
 
-use super::input_gate::InputGate;
-use super::output;
-use super::presentation::PanePresentation;
-use super::probe::terminal_probe;
-use super::terminal::{
-    self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes,
+use super::{
+    input_gate::InputGate,
+    output,
+    presentation::PanePresentation,
+    probe::terminal_probe,
+    terminal::{self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes},
 };
 
 mod events;

@@ -1,8 +1,6 @@
 //! Nonblocking control requests and actor-owned process launches.
 
-use std::ffi::OsString;
-use std::io;
-use std::path::PathBuf;
+use std::{ffi::OsString, io, path::PathBuf};
 
 use meowland_protocol::{ControlRequest, ControlResponse};
 use tokio::sync::oneshot;

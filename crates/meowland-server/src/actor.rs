@@ -1,22 +1,23 @@
 //! A single I/O owner for connections, child processes and shutdown.
 
-use std::collections::HashMap;
-use std::io;
-use std::time::Instant;
+use std::{collections::HashMap, io, time::Instant};
 
 use meowland_compositor::PaneId;
-use meowland_core::Result;
-use meowland_core::scale::UiScale;
-use meowland_core::signals::{Termination, TerminationSignal};
+use meowland_core::{
+    Result,
+    scale::UiScale,
+    signals::{Termination, TerminationSignal},
+};
 use meowland_protocol::Paths;
-use tokio::net::UnixStream;
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::{net::UnixStream, sync::mpsc, task::JoinSet};
 
-use super::compositor::DisplayThread;
-use super::lifecycle::Shutdown;
-use super::transport::{self, ConnectionKind};
-use super::{MAX_CONNECTIONS, Server, notify, sockets};
+use super::{
+    MAX_CONNECTIONS, Server,
+    compositor::DisplayThread,
+    lifecycle::Shutdown,
+    notify, sockets,
+    transport::{self, ConnectionKind},
+};
 
 pub(crate) async fn serve(paths: &Paths, scale: UiScale) -> Result<()> {
     let listeners = sockets::listeners(paths)?;

@@ -1,8 +1,7 @@
 //! Capability-selected terminal clipboard transports and deferred input
 //! actions.
 
-use std::io;
-use std::time::Instant;
+use std::{io, time::Instant};
 
 use meowland_protocol::clipboard::{ClipboardData, Deadline, Selection};
 

@@ -1,15 +1,15 @@
-name: setup nix
-description: install nix and cache the nix store
+name: Set up Nix
+description: Install Nix and cache the Nix store
 runs:
   using: composite
   steps:
-    - name: free disk space
+    - name: Free disk space
       uses: wimpysworld/nothing-but-nix@v9
 
-    - name: install nix
+    - name: Install Nix
       uses: cachix/install-nix-action@v31
 
-    - name: restore nix store
+    - name: Restore Nix store
       uses: nix-community/cache-nix-action@v7
       with:
         primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}

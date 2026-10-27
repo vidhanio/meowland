@@ -1,4 +1,5 @@
-//! End-to-end benchmarks using real server/pane processes and a headless PTY terminal.
+//! End-to-end benchmarks using real server/pane processes and a headless PTY
+//! terminal.
 //!
 //! There is no direct compositor or pane-protocol injection. Frame IDs survive
 //! Wayland composition and Kitty placement; input samples require matching
@@ -7,9 +8,9 @@
 
 mod support;
 
-use support::{config, scenarios};
-
 use std::io::Write;
+
+use support::{config, scenarios};
 
 pub(crate) type Error = Box<dyn std::error::Error + Send + Sync>;
 pub(crate) type Result<T> = std::result::Result<T, Error>;

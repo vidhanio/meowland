@@ -1,13 +1,14 @@
-use wayland_client::globals::GlobalListContents;
-use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface,
+use wayland_client::{
+    Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
+    globals::GlobalListContents,
+    protocol::{
+        wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
+    },
 };
-use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use super::super::record::Event;
-use super::{Input, Phase, State};
+use super::{super::record::Event, Input, Phase, State};
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(

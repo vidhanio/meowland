@@ -1,30 +1,32 @@
 //! Readiness-driven Wayland selection exports and terminal-backed deliveries.
 
-use std::collections::{HashMap, VecDeque};
-use std::io;
-use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    io,
+    os::fd::OwnedFd,
+    sync::Arc,
+};
 
-use calloop::generic::Generic;
-use calloop::timer::{TimeoutAction, Timer};
-use calloop::{Interest, Mode, PostAction};
+use calloop::{
+    Interest, Mode, PostAction,
+    generic::Generic,
+    timer::{TimeoutAction, Timer},
+};
 use meowland_protocol::clipboard::{
     ClipboardData, Deadline, Item, MAX_BYTES, Selection as ClipboardSelection, TRANSFER_TIMEOUT,
     mime_types,
 };
-use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use rustix::io::Errno;
-use smithay::wayland::selection::data_device::{
-    request_data_device_client_selection, set_data_device_selection,
+use rustix::{
+    fs::{OFlags, fcntl_getfl, fcntl_setfl},
+    io::Errno,
 };
-use smithay::wayland::selection::primary_selection::{
-    request_primary_client_selection, set_primary_selection,
+use smithay::wayland::selection::{
+    SelectionSource, SelectionTarget,
+    data_device::{request_data_device_client_selection, set_data_device_selection},
+    primary_selection::{request_primary_client_selection, set_primary_selection},
 };
-use smithay::wayland::selection::{SelectionSource, SelectionTarget};
 
-use super::input::paste_action;
-use super::sources::Sources;
-use super::{PaneId, ServerToPane, State};
+use super::{PaneId, ServerToPane, State, input::paste_action, sources::Sources};
 
 #[derive(Clone, Debug)]
 pub enum Source {

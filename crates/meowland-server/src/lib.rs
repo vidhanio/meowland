@@ -1,14 +1,14 @@
 //! Socket I/O and process ownership, with rendering isolated on its own thread.
 
-use std::collections::HashMap;
-use std::io;
+use std::{collections::HashMap, io};
 
 use meowland_compositor::{Command, Event, PaneId};
-use meowland_core::Result;
-use meowland_core::scale::UiScale;
+use meowland_core::{Result, scale::UiScale};
 use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::{AbortHandle, JoinSet},
+};
 
 mod actor;
 mod compositor;

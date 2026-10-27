@@ -1,9 +1,13 @@
 //! Standalone and systemd-activated Unix sockets with identity-checked cleanup.
 
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::{
+    fs, io,
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        net::{UnixListener as StdListener, UnixStream as StdStream},
+    },
+    path::{Path, PathBuf},
+};
 
 use meowland_core::{Error, Result};
 use meowland_protocol::Paths;

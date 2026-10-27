@@ -96,7 +96,8 @@ impl Snapshot {
         for (y, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
             for (x, out_pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let pixel = source.wrapping_add(y * stride + x * 4);
-                // SAFETY: The caller checked all four bytes against the live mapping.
+                // SAFETY: The caller checked all four bytes against the live
+                // mapping.
                 let pixel = unsafe { read_pixel(pixel) };
                 let alpha = if XRGB { 255 } else { pixel[3] };
                 *out_pixel = [pixel[2], pixel[1], pixel[0], alpha];
@@ -121,12 +122,14 @@ unsafe fn read_pixel(source: *const u8) -> [u8; 4] {
     )]
     let aligned = source.cast::<u32>();
     if aligned.is_aligned() {
-        // SAFETY: Alignment is checked and the caller guarantees four readable bytes.
+        // SAFETY: Alignment is checked and the caller guarantees four readable
+        // bytes.
         unsafe { aligned.read_volatile() }.to_ne_bytes()
     } else {
         std::array::from_fn(|channel| {
             let component = source.wrapping_add(channel);
-            // SAFETY: Each byte lies within the caller's readable pixel; u8 needs no alignment.
+            // SAFETY: Each byte lies within the caller's readable pixel; u8
+            // needs no alignment.
             unsafe { component.read_volatile() }
         })
     }

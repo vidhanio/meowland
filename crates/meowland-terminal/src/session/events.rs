@@ -2,12 +2,16 @@
 
 use meowland_core::Result;
 use meowland_input::{Event, keyboard};
-use meowland_protocol::clipboard::{MAX_TEXT, Selection};
-use meowland_protocol::{self as protocol, Input, PaneAction, PaneToServer, Shortcut};
+use meowland_protocol::{
+    self as protocol, Input, PaneAction, PaneToServer, Shortcut,
+    clipboard::{MAX_TEXT, Selection},
+};
 use meowland_terminal_clipboard::{Action, Focus, Refresh};
 
-use super::TerminalSession;
-use super::terminal::{self, FALLBACK_CELL};
+use super::{
+    TerminalSession,
+    terminal::{self, FALLBACK_CELL},
+};
 
 impl TerminalSession {
     pub(super) fn send_event(&mut self, event: Event) -> Result<()> {

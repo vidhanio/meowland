@@ -2,8 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use meowland_core::asynchronous::Descriptor;
-use meowland_core::signals;
+use meowland_core::{asynchronous::Descriptor, signals};
 use meowland_input as input;
 use meowland_kitty::SharedMemory;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};

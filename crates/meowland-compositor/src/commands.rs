@@ -1,13 +1,10 @@
 //! Pane commands and their Wayland side effects.
 
-use meowland_core::pixels::FrameSize;
-use meowland_core::timing::REFRESH_MILLIHZ;
+use meowland_core::{pixels::FrameSize, timing::REFRESH_MILLIHZ};
 use meowland_protocol::{Input, PaneAction, Shortcut, Show};
-use smithay::output::Mode;
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
 
-use super::input::pane_input;
-use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard};
+use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input::pane_input};
 
 /// The requested selector did not identify a mapped window to close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

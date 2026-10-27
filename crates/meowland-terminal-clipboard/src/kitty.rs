@@ -1,11 +1,12 @@
 //! Kitty OSC 5522 selection offers, permission-aware reads, and copy writes.
 
-use std::collections::{HashMap, VecDeque};
-use std::io;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    io,
+    time::{Duration, Instant},
+};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use meowland_protocol::clipboard::{
     ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, Selection, TRANSFER_TIMEOUT, mime_types,
 };

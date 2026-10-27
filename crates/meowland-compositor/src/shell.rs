@@ -2,18 +2,21 @@
 
 use std::time::Instant;
 
-use smithay::desktop::{
-    PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
-    find_popup_root_surface, get_popup_toplevel_coords,
-};
-use smithay::input::Seat;
-use smithay::input::pointer::Focus;
-use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
-use smithay::utils::{Logical, Rectangle, Serial};
-use smithay::wayland::compositor::with_states;
-use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-    XdgToplevelSurfaceData,
+use smithay::{
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
+        find_popup_root_surface, get_popup_toplevel_coords,
+    },
+    input::{Seat, pointer::Focus},
+    reexports::wayland_server::protocol::wl_seat::WlSeat,
+    utils::{Logical, Rectangle, Serial},
+    wayland::{
+        compositor::with_states,
+        shell::xdg::{
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            XdgToplevelSurfaceData,
+        },
+    },
 };
 
 use super::{State, Window, WlSurface, input, render};

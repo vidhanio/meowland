@@ -1,10 +1,14 @@
 //! Buffer-to-surface coordinate geometry for scale, transform, and viewport
 //! state.
 
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
-use smithay::wayland::compositor::{SurfaceAttributes, with_states};
-use smithay::wayland::viewporter::ViewportCachedState;
+use smithay::{
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    utils::{Logical, Point, Rectangle, Size, Transform},
+    wayland::{
+        compositor::{SurfaceAttributes, with_states},
+        viewporter::ViewportCachedState,
+    },
+};
 
 use super::Snapshot;
 

@@ -1,17 +1,22 @@
-//! Isolated real server/pane processes, bounded waits, and deterministic cleanup.
+//! Isolated real server/pane processes, bounded waits, and deterministic
+//! cleanup.
 
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    fs::{self, File},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
-use super::app::{App, Command as AppCommand};
-use super::config::{Options, Size};
-use super::endpoint::Terminal;
-use super::fixture::{APP_ID, Pattern};
-use super::record::{Event, Record};
+use super::{
+    app::{App, Command as AppCommand},
+    config::{Options, Size},
+    endpoint::Terminal,
+    fixture::{APP_ID, Pattern},
+    record::{Event, Record},
+};
 use crate::{Result, fail};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,6 +36,7 @@ impl Process {
         }
         Ok(())
     }
+
     fn diagnostics(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }

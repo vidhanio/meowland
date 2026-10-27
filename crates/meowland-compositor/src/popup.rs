@@ -1,8 +1,8 @@
 //! Popup-grab lifetime and focus restoration.
 
-use smithay::backend::input::InputTime;
-use smithay::reexports::wayland_server::Resource;
-use smithay::utils::SERIAL_COUNTER;
+use smithay::{
+    backend::input::InputTime, reexports::wayland_server::Resource, utils::SERIAL_COUNTER,
+};
 
 use super::State;
 

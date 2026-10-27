@@ -1,25 +1,25 @@
 //! Native-fence DMA-BUF submission and completion-gated CPU readback.
 
-use std::error::Error as _;
-use std::ffi::OsStr;
-use std::fs::OpenOptions;
-use std::io;
-use std::os::fd::OwnedFd;
-use std::time::Duration;
+use std::{error::Error as _, ffi::OsStr, fs::OpenOptions, io, os::fd::OwnedFd, time::Duration};
 
 use meowland_core::pixels::FrameSize;
-use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
-use smithay::backend::allocator::{Buffer, Format, Fourcc};
-use smithay::backend::drm::{DrmNode, NodeType};
-use smithay::backend::egl::fence::EGLFence;
-use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError};
-use smithay::backend::renderer::gles::{
-    Capability, GlesError, GlesMapping, GlesRenderbuffer, GlesRenderer, GlesTexture,
+use smithay::{
+    backend::{
+        allocator::{
+            Buffer, Format, Fourcc,
+            dmabuf::{Dmabuf, DmabufFlags},
+        },
+        drm::{DrmNode, NodeType},
+        egl::{EGLContext, EGLDevice, EGLDisplay, Error as EglError, fence::EGLFence},
+        renderer::{
+            Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter, TextureMapping,
+            gles::{
+                Capability, GlesError, GlesMapping, GlesRenderbuffer, GlesRenderer, GlesTexture,
+            },
+        },
+    },
+    utils::{Rectangle, Transform},
 };
-use smithay::backend::renderer::{
-    Bind, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter, TextureMapping,
-};
-use smithay::utils::{Rectangle, Transform};
 use thiserror::Error;
 
 use super::snapshot::Snapshot;

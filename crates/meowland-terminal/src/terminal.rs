@@ -2,8 +2,10 @@
 
 use std::io::{self, Write};
 
-use crossterm::event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crossterm::{execute, terminal};
+use crossterm::{
+    event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    execute, terminal,
+};
 use meowland_protocol as protocol;
 
 /// Cell size assumed when the terminal reports none.

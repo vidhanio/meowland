@@ -1,10 +1,12 @@
 //! Length-prefixed Postcard messages for control and pane sockets.
 
-use std::cell::RefCell;
-use std::ffi::OsString;
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{
+    cell::RefCell,
+    ffi::OsString,
+    io::{self, Read, Write},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 

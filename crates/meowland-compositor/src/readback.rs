@@ -1,25 +1,31 @@
 //! Commit-blocked DMA-BUF acquire, submission, and readback completion.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak as SyncWeak};
-
-use calloop::generic::Generic;
-use calloop::{Interest, Mode, PostAction};
-use meowland_core::pixels::FrameSize;
-use meowland_render::{Readback, Submission, source_bound};
-use smithay::backend::allocator::Buffer;
-use smithay::backend::allocator::dmabuf::{AlreadyReady, Dmabuf, DmabufBlocker};
-use smithay::reexports::wayland_server::backend::ObjectId;
-use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource, Weak};
-use smithay::utils::Transform;
-use smithay::wayland::compositor::{
-    Blocker, BlockerState, Cacheable, SurfaceAttributes, add_blocker, with_states,
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, Weak as SyncWeak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
-use super::sources::Sources;
-use super::{ClientState, Snapshot, State, WlSurface};
+use calloop::{Interest, Mode, PostAction, generic::Generic};
+use meowland_core::pixels::FrameSize;
+use meowland_render::{Readback, Submission, source_bound};
+use smithay::{
+    backend::allocator::{
+        Buffer,
+        dmabuf::{AlreadyReady, Dmabuf, DmabufBlocker},
+    },
+    reexports::wayland_server::{
+        Client, DisplayHandle, Resource, Weak, backend::ObjectId, protocol::wl_buffer::WlBuffer,
+    },
+    utils::Transform,
+    wayland::compositor::{
+        Blocker, BlockerState, Cacheable, SurfaceAttributes, add_blocker, with_states,
+    },
+};
+
+use super::{ClientState, Snapshot, State, WlSurface, sources::Sources};
 
 const MAX_PENDING: usize = 32;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;

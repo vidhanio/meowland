@@ -1,17 +1,16 @@
-//! A bounded RGB Kitty consumer, including chunking, zlib, SHM, and patch placement.
+//! A bounded RGB Kitty consumer, including chunking, zlib, SHM, and patch
+//! placement.
 
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Read;
+use std::{collections::BTreeMap, fs::File, io::Read};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::read::ZlibDecoder;
-use rustix::fs::Mode;
-use rustix::shm;
+use rustix::{fs::Mode, shm};
 
-use super::config::{Size, Transport};
-use super::fixture;
+use super::{
+    config::{Size, Transport},
+    fixture,
+};
 use crate::{Result, fail};
 
 struct Image {
@@ -44,9 +43,11 @@ impl<'a> Control<'a> {
         }
         Ok(Self(fields))
     }
+
     fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).copied()
     }
+
     fn number(&self, key: &str, default: usize) -> Result<usize> {
         self.get(key)
             .map_or(Ok(default), |value| Ok(value.parse()?))

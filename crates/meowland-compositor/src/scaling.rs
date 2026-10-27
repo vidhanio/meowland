@@ -1,13 +1,16 @@
 //! Preferred fractional scale and physical-to-logical pane geometry.
 
-use meowland_core::scale::UiScale;
-use meowland_core::timing::REFRESH_MILLIHZ;
-use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::utils::{Logical, Size};
-use smithay::wayland::compositor::with_states;
-use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
-use smithay::wayland::output::OutputManagerState;
+use meowland_core::{scale::UiScale, timing::REFRESH_MILLIHZ};
+use smithay::{
+    output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
+    reexports::wayland_server::DisplayHandle,
+    utils::{Logical, Size},
+    wayland::{
+        compositor::with_states,
+        fractional_scale::{FractionalScaleHandler, with_fractional_scale},
+        output::OutputManagerState,
+    },
+};
 
 use super::{State, WlSurface};
 

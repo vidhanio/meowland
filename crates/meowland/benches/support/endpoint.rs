@@ -1,21 +1,30 @@
 //! PTY terminal emulation for capability replies and graphics consumption.
 
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    os::fd::OwnedFd,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use pty_process::blocking::{self, Pts};
-use rustix::event::{PollFd, PollFlags, poll};
-use rustix::termios::{self, OptionalActions};
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    termios::{self, OptionalActions},
+};
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
-use super::config::{Size, Transport};
-use super::graphics::Graphics;
-use super::record::Event;
+use super::{
+    config::{Size, Transport},
+    graphics::Graphics,
+    record::Event,
+};
 use crate::{Result, fail};
 
 pub(crate) struct Terminal {

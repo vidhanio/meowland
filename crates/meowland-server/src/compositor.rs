@@ -1,10 +1,11 @@
 //! Render-thread ownership and direct requests to its single-owner state.
 
-use std::sync::mpsc;
-use std::{io, thread};
+use std::{io, sync::mpsc, thread};
 
-use calloop::channel;
-use calloop::ping::{Ping, PingSource, make_ping};
+use calloop::{
+    channel,
+    ping::{Ping, PingSource, make_ping},
+};
 use meowland_compositor::{Command, Compositor, Event, Runtime};
 use meowland_core::scale::UiScale;
 use meowland_protocol::REQUEST_TIMEOUT;

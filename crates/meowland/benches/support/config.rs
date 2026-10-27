@@ -1,6 +1,4 @@
-use std::path::PathBuf;
-use std::time::Duration;
-use std::{env, io};
+use std::{env, io, path::PathBuf, time::Duration};
 
 use usage_rs::{Cli, ValueEnum};
 
@@ -21,6 +19,7 @@ impl Size {
         width: 3840,
         height: 2160,
     };
+
     pub(crate) const fn pixels(self) -> usize {
         self.width * self.height
     }
@@ -38,7 +37,8 @@ pub(crate) enum Transport {
     after_help = "Run: cargo bench -p meowland --bench suite -- [options]\n\nBoundary: real Wayland client -> server -> pane -> PTY -> headless Kitty consumer.\nInput starts at PTY injection; GPU upload, physical display, and hardware input are excluded.\nThroughput is offered at 120 Hz; skipped frame IDs are reported, never reassigned.\nEach operation has a 10-second timeout."
 )]
 struct Args {
-    /// Real server/pane executable; defaults to `MEOWLAND_BENCH_BINARY` or the Cargo-built binary.
+    /// Real server/pane executable; defaults to `MEOWLAND_BENCH_BINARY` or the
+    /// Cargo-built binary.
     #[usage(long)]
     binary: Option<PathBuf>,
     /// Use 12 samples, 3 warmups, and 1 run unless explicitly overridden.

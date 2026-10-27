@@ -2,26 +2,28 @@
 
 use std::collections::HashMap;
 
-use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::desktop::PopupManager;
-use smithay::reexports::wayland_server::Client;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_output};
-use smithay::utils::{Logical, Rectangle, Size, Transform};
-use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{
-    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-    add_pre_commit_hook, get_children, get_parent, with_states,
+use smithay::{
+    backend::allocator::dmabuf::Dmabuf,
+    desktop::PopupManager,
+    reexports::wayland_server::{
+        Client,
+        protocol::{wl_buffer, wl_output, wl_surface::WlSurface},
+    },
+    utils::{Logical, Rectangle, Size, Transform},
+    wayland::{
+        buffer::BufferHandler,
+        compositor::{
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, add_pre_commit_hook, get_children, get_parent, with_states,
+        },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
+        shm::{ShmHandler, ShmState, with_buffer_contents},
+        single_pixel_buffer::get_single_pixel_buffer,
+        viewporter::ViewportCachedState,
+    },
 };
-use smithay::wayland::dmabuf::{
-    DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
-};
-use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
-use smithay::wayland::single_pixel_buffer::get_single_pixel_buffer;
-use smithay::wayland::viewporter::ViewportCachedState;
 
-use super::runtime::ClientState;
-use super::{Snapshot, State, WindowId, readback, render};
+use super::{Snapshot, State, WindowId, readback, render, runtime::ClientState};
 
 #[derive(Default)]
 pub(crate) struct SurfaceCache {

@@ -1,28 +1,37 @@
 //! Seat focus, cursor delivery, and selection protocol integration.
 
-use smithay::backend::input::InputTime;
-use smithay::input::dnd::DndGrabHandler;
-use smithay::input::pointer::{CursorIcon, CursorImageStatus, MotionEvent, PointerHandle};
-use smithay::input::tablet::TabletSeatHandler;
-use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::SERIAL_COUNTER;
-use smithay::wayland::output::OutputHandler;
-use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
-use smithay::wayland::selection::data_device::{
-    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
+use smithay::{
+    backend::input::InputTime,
+    input::{
+        Seat, SeatHandler, SeatState,
+        dnd::DndGrabHandler,
+        pointer::{CursorIcon, CursorImageStatus, MotionEvent, PointerHandle},
+        tablet::TabletSeatHandler,
+    },
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    utils::SERIAL_COUNTER,
+    wayland::{
+        output::OutputHandler,
+        pointer_constraints::PointerConstraintsHandler,
+        selection::{
+            SelectionHandler, SelectionSource, SelectionTarget,
+            data_device::{
+                DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
+            },
+            ext_data_control::{
+                DataControlHandler as ExtDataControlHandler,
+                DataControlState as ExtDataControlState,
+            },
+            primary_selection::{
+                PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+            },
+            wlr_data_control::{
+                DataControlHandler as WlrDataControlHandler,
+                DataControlState as WlrDataControlState,
+            },
+        },
+    },
 };
-use smithay::wayland::selection::ext_data_control::{
-    DataControlHandler as ExtDataControlHandler, DataControlState as ExtDataControlState,
-};
-use smithay::wayland::selection::primary_selection::{
-    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
-};
-use smithay::wayland::selection::wlr_data_control::{
-    DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
-};
-use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 
 use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input};
 

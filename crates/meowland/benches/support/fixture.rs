@@ -62,7 +62,8 @@ impl Fixture {
         }
     }
 
-    /// Varies every noise pixel by commit sequence, so coalescing cannot turn full frames into marker-only updates.
+    /// Varies every noise pixel by commit sequence, so coalescing cannot turn
+    /// full frames into marker-only updates.
     pub(crate) fn paint(&self, id: u64, content: u64, pixels: &mut [u8]) {
         if matches!(self.pattern, Pattern::Noise) {
             let [b, g, r, ..] = content.to_le_bytes();

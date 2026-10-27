@@ -2,10 +2,8 @@
 
 use std::io::Write;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use flate2::{Compression, write::ZlibEncoder};
 
 use crate::presenter::{Placement, transmit};
 

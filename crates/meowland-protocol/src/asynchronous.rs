@@ -1,14 +1,14 @@
 //! Cancellation-safe framing and bounded outgoing bytes for async transports.
 
-use std::collections::VecDeque;
-use std::io;
+use std::{collections::VecDeque, io};
 
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::protocol::{HEADER, decode, message_size};
-use crate::{MAX_MESSAGE, PanePacket, ServerToPane};
+use crate::{
+    MAX_MESSAGE, PanePacket, ServerToPane,
+    protocol::{HEADER, decode, message_size},
+};
 const IO_BUDGET: usize = 64 * 1024;
 
 /// A bounded packet reader retaining progress between readiness turns.

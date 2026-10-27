@@ -1,13 +1,14 @@
 //! Async readiness for exclusively owned, nonblocking file descriptors.
 
-use std::io;
-use std::os::fd::OwnedFd;
-use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::{
+    io,
+    os::fd::OwnedFd,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
 
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
 /// An owned descriptor registered with the current Tokio reactor.
 #[derive(Debug)]

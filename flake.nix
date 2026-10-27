@@ -98,16 +98,7 @@
             ...
           }:
           let
-            rustToolchain =
-              p:
-              p.rust-bin.stable."1.99.0".default.override {
-                extensions = [
-                  "rust-src"
-                  "rust-analyzer"
-                  "clippy"
-                  "rustfmt"
-                ];
-              };
+            rustToolchain = p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
             craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
 
             src = pkgs.lib.cleanSourceWith {

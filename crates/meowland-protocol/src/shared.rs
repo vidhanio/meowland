@@ -1,13 +1,10 @@
 //! Immutable shared-frame descriptors and producer-owned object cleanup.
 
-use std::fs::File;
-use std::io;
+use std::{fs::File, io};
 
 use meowland_core::pixels::FrameSize;
-use rustix::fs::Mode;
-use rustix::shm;
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use rustix::{fs::Mode, shm};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 /// Pixel transport selected after probing the terminal's shared-memory support.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -53,7 +50,8 @@ impl SharedFrame {
     /// Open a published object and validate its complete RGB length.
     ///
     /// # Errors
-    /// Returns an error if the object is missing, inaccessible, or incorrectly sized.
+    /// Returns an error if the object is missing, inaccessible, or incorrectly
+    /// sized.
     pub fn open(&self) -> io::Result<File> {
         let file = File::from(shm::open(
             self.name().as_str(),
@@ -74,7 +72,8 @@ impl SharedFrame {
     /// An unlinked object can still have live readers; it must never be reused.
     ///
     /// # Errors
-    /// Returns an error if checking the object's name fails for reasons other than absence.
+    /// Returns an error if checking the object's name fails for reasons other
+    /// than absence.
     pub fn exists(&self) -> io::Result<bool> {
         match shm::open(self.name().as_str(), shm::OFlags::RDONLY, Mode::empty()) {
             Ok(_) => Ok(true),
@@ -129,10 +128,12 @@ impl SharedObject {
     /// Create a fresh object for sequential RGB writes, without mapping it.
     ///
     /// Publish the descriptor only after writing exactly one complete frame.
-    /// Keep this guard until the consumer acknowledges or abandons the transfer.
+    /// Keep this guard until the consumer acknowledges or abandons the
+    /// transfer.
     ///
     /// # Errors
-    /// Returns an error if generating a random name or creating the object fails.
+    /// Returns an error if generating a random name or creating the object
+    /// fails.
     pub fn create(size: FrameSize) -> io::Result<(Self, File)> {
         let mut token = [0; 16];
         getrandom::fill(&mut token).map_err(io::Error::other)?;

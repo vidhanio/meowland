@@ -1,7 +1,6 @@
 //! Validated dimensions shared by surface snapshots and terminal frames.
 
-use std::num::NonZeroU16;
-use std::ops::Range;
+use std::{num::NonZeroU16, ops::Range};
 
 /// Maximum supported width or height; bounds per-row work and graphics
 /// allocations.

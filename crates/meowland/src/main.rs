@@ -4,9 +4,7 @@ mod cli;
 
 use std::io::{self, Write};
 
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone, Copy)]
 enum LogDestination {

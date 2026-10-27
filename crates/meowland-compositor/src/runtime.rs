@@ -1,16 +1,21 @@
 //! Wayland client acceptance and compositor event-loop ownership.
 
-use std::io;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use calloop::generic::Generic;
-use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
+use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction, generic::Generic};
 use meowland_core::scale::UiScale;
-use smithay::input::keyboard::XkbConfig;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::{Display, ListeningSocket};
-use smithay::wayland::compositor::CompositorClientState;
+use smithay::{
+    input::keyboard::XkbConfig,
+    reexports::wayland_server::{
+        Display, ListeningSocket,
+        backend::{ClientData, ClientId, DisconnectReason},
+    },
+    wayland::compositor::CompositorClientState,
+};
 
 use super::State;
 

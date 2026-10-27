@@ -1,8 +1,10 @@
 //! Retained read handles and consumption deadlines for upstream RGB objects.
 
-use std::fs::File;
-use std::io::{self, Read};
-use std::time::{Duration, Instant};
+use std::{
+    fs::File,
+    io::{self, Read},
+    time::{Duration, Instant},
+};
 
 use meowland_protocol::{FrameBand, SharedFrame};
 

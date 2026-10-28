@@ -1,17 +1,17 @@
 //! Operation-owned readiness and deadline registrations.
 
-use calloop::{LoopHandle, RegistrationToken};
+use calloop::RegistrationToken;
 
-use super::State;
+use super::CompositorHandle;
 
 pub(crate) struct Sources {
-    handle: LoopHandle<'static, State>,
+    handle: CompositorHandle,
     pub io: Option<RegistrationToken>,
     pub timer: Option<RegistrationToken>,
 }
 
 impl Sources {
-    pub(crate) fn new(handle: &LoopHandle<'static, State>) -> Self {
+    pub(crate) fn new(handle: &CompositorHandle) -> Self {
         Self {
             handle: handle.clone(),
             io: None,

@@ -9,11 +9,11 @@ publish.workspace = true
 workspace = true
 
 [features]
-async = ["dep:tokio"]
+async = ["dep:futures"]
 
 [dependencies]
 getrandom = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["io-util", "rt"] }
+futures = { workspace = true, optional = true }
 meowland-core = { workspace = true }
 postcard = { workspace = true, features = ["use-std"] }
 rustix = { workspace = true, features = ["time", "shm", "fs"] }

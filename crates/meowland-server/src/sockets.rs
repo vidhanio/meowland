@@ -2,16 +2,18 @@
 
 use std::{
     fs, io,
-    os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
-        net::{UnixListener as StdListener, UnixStream as StdStream},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::{
+            fs::{FileTypeExt, MetadataExt, PermissionsExt},
+            net::{UnixListener as StdListener, UnixStream as StdStream},
+        },
     },
     path::{Path, PathBuf},
 };
 
 use meowland_core::{Error, Result};
 use meowland_protocol::Paths;
-use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SocketIdentity {
@@ -43,7 +45,7 @@ impl Drop for SocketPath {
 }
 
 pub(crate) struct BoundSocket {
-    listener: UnixListener,
+    listener: StdListener,
     _path: Option<SocketPath>,
 }
 
@@ -82,7 +84,7 @@ pub(crate) fn listeners(paths: &Paths) -> Result<Listeners> {
         }
         listener.set_nonblocking(true)?;
         *slot = Some(BoundSocket {
-            listener: UnixListener::from_std(listener)?,
+            listener,
             _path: None,
         });
     }
@@ -92,10 +94,17 @@ pub(crate) fn listeners(paths: &Paths) -> Result<Listeners> {
     }
 }
 
-pub(crate) async fn accept(socket: Option<&BoundSocket>) -> io::Result<UnixStream> {
-    match socket {
-        Some(socket) => socket.listener.accept().await.map(|(stream, _)| stream),
-        None => std::future::pending().await,
+impl BoundSocket {
+    pub(crate) fn accept(&self) -> io::Result<StdStream> {
+        let (stream, _) = self.listener.accept()?;
+        stream.set_nonblocking(true)?;
+        Ok(stream)
+    }
+}
+
+impl AsFd for BoundSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.listener.as_fd()
     }
 }
 
@@ -144,7 +153,7 @@ fn own_socket(path: &Path, listener: StdListener) -> Result<BoundSocket> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     Ok(BoundSocket {
-        listener: UnixListener::from_std(listener)?,
+        listener,
         _path: Some(owned_path),
     })
 }

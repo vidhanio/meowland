@@ -185,7 +185,7 @@ pub(crate) fn start() -> Result<()> {
         Commands::Server(args) => {
             let paths = Paths::discover()?;
             let config = crate::configuration::load(args.config.as_deref())?;
-            run_async(meowland_server::serve(&paths, config))
+            meowland_server::serve(&paths, config)
         }
         Commands::List => {
             let paths = Paths::discover()?;
@@ -218,14 +218,14 @@ pub(crate) fn start() -> Result<()> {
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 let show = app_id.map_or(Show::Activation(token), Show::AppId);
-                run_async(terminal::attach(&paths.pane, show))
+                terminal::attach(&paths.pane, show)
             } else {
                 Ok(())
             }
         }
         Commands::Attach(AttachArgs { window }) => {
             let paths = Paths::discover()?;
-            run_async(terminal::attach(&paths.pane, window_target(window)))
+            terminal::attach(&paths.pane, window_target(window))
         }
         Commands::Kill(args) => {
             let paths = Paths::discover()?;
@@ -241,13 +241,6 @@ pub(crate) fn start() -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn run_async(operation: impl Future<Output = Result<()>>) -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(operation)
 }
 
 fn list(paths: &Paths) -> Result<Vec<WindowInfo>> {

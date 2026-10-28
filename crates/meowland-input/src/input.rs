@@ -3,6 +3,8 @@
 
 use std::{collections::VecDeque, io};
 
+use calloop::LoopHandle;
+use futures::io::AsyncReadExt;
 use meowland_core::asynchronous::Descriptor;
 use meowland_protocol::{
     Input,
@@ -10,7 +12,6 @@ use meowland_protocol::{
     modifiers::{ALT, CONTROL, HYPER, META, SUPER},
 };
 use rustix::fs::{Mode, OFlags, open};
-use tokio::io::AsyncReadExt;
 use vtparse::{CsiParam, VTActor, VTParser};
 
 const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
@@ -74,13 +75,13 @@ impl Reader {
     ///
     /// # Errors
     /// Returns an error if opening, registering, or watching input fails.
-    pub fn new() -> io::Result<Self> {
+    pub fn new<D>(handle: &LoopHandle<'static, D>) -> io::Result<Self> {
         let fd = open(
             "/proc/self/fd/0",
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
             Mode::empty(),
         )?;
-        let fd = Descriptor::new(fd)?;
+        let fd = Descriptor::new(fd, handle)?;
         Ok(Self {
             fd,
             parser: Parser::new(),
@@ -103,6 +104,10 @@ impl Reader {
     ///
     /// # Errors
     /// Returns an error on EOF or input failure.
+    #[expect(
+        clippy::future_not_send,
+        reason = "terminal input belongs to the calloop owner thread"
+    )]
     pub async fn read_ready(&mut self) -> io::Result<()> {
         if !self.parser.decoder.events.is_empty() {
             return Ok(());
@@ -121,6 +126,10 @@ impl Reader {
     ///
     /// # Errors
     /// Returns an error if terminal input fails.
+    #[expect(
+        clippy::future_not_send,
+        reason = "terminal input belongs to the calloop owner thread"
+    )]
     pub async fn read_raw(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.fd.read(bytes).await
     }

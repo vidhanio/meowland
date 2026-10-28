@@ -37,7 +37,6 @@ meowland-core = { workspace = true }
 meowland-protocol = { workspace = true }
 meowland-server = { workspace = true }
 meowland-terminal = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time"] }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 usage-rs = { workspace = true, features = [

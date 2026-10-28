@@ -2,13 +2,13 @@
 
 use std::time::{Duration, Instant};
 
+use futures::io::AsyncWrite;
 use meowland_core::{Result, latency::Latency};
 use meowland_kitty::{PresentOutcome, Presenter, present_shared};
 use meowland_protocol::{
     FrameAck, FrameBand, FrameTransport, PaneAction, PaneToServer, SharedFrame,
     asynchronous::Outgoing,
 };
-use tokio::io::AsyncWrite;
 
 use super::output;
 

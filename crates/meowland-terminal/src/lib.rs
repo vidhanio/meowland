@@ -2,7 +2,11 @@
 
 use std::path::Path;
 
-use meowland_core::{Error, Result};
+use calloop::{Dispatcher, EventLoop, futures::executor};
+use meowland_core::{
+    Error, Result,
+    asynchronous::{connect, timeout},
+};
 use meowland_protocol::{Show, asynchronous::Reader};
 
 mod input_gate;
@@ -21,20 +25,54 @@ mod terminal;
 /// # Errors
 /// Returns an error if the terminal cannot be configured or the pane connection
 /// fails. Server-initiated release restores the terminal and returns `Ok`.
-pub async fn attach(socket: &Path, show: Show) -> Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .map_err(|error| {
-            Error::io(
-                format!(
-                    "could not reach the pane socket {} (is the server running?)",
-                    socket.display()
-                ),
-                error,
+pub fn attach(socket: &Path, show: Show) -> Result<()> {
+    let mut event_loop = EventLoop::<()>::try_new().map_err(std::io::Error::from)?;
+    let handle = event_loop.handle();
+    let (executor, scheduler) = executor().map_err(std::io::Error::from)?;
+    let (finished, result) = std::sync::mpsc::sync_channel(1);
+    let executor = Dispatcher::new(executor, move |result, (), ()| {
+        let _ = finished.send(result);
+    });
+    let token = handle
+        .register_dispatcher(executor.clone())
+        .map_err(std::io::Error::from)?;
+    let io_handle = handle.clone();
+    let socket = socket.to_owned();
+    scheduler
+        .schedule(async move {
+            let handle = io_handle;
+            let mut stream = timeout(
+                &handle,
+                meowland_protocol::REQUEST_TIMEOUT,
+                connect(&handle, &socket),
             )
-        })?;
-    let (reader, writer) = stream.into_split();
-    session::TerminalSession::new(Reader::new(reader), writer, show)?
-        .run()
-        .await
+            .await
+            .map_err(|error| {
+                Error::io(
+                    format!(
+                        "could not reach the pane socket {} (is the server running?)",
+                        socket.display()
+                    ),
+                    error,
+                )
+            })?;
+            let writer = handle
+                .adapt_io(stream.get_mut().try_clone()?)
+                .map_err(std::io::Error::from)?;
+            session::TerminalSession::new(Reader::new(stream), writer, show, handle)?
+                .run()
+                .await
+        })
+        .map_err(std::io::Error::other)?;
+    let outcome = (|| loop {
+        event_loop
+            .dispatch(None, &mut ())
+            .map_err(std::io::Error::from)?;
+        if let Ok(result) = result.try_recv() {
+            return result;
+        }
+    })();
+    handle.remove(token);
+    drop(executor);
+    outcome
 }

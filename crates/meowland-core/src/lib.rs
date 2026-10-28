@@ -4,6 +4,7 @@
 pub mod asynchronous;
 
 mod error;
+pub mod future;
 pub mod latency;
 pub mod pixels;
 pub mod scale;

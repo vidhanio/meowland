@@ -5,7 +5,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use meowland_core::{asynchronous::Descriptor, pixels::FrameSize, signals};
+use calloop::LoopHandle;
+use futures::FutureExt;
+use meowland_core::{
+    asynchronous::{Descriptor, sleep_until, when},
+    pixels::FrameSize,
+    signals,
+};
 use meowland_input as input;
 use meowland_kitty::query_shared;
 use meowland_protocol::SharedObject;
@@ -59,10 +65,15 @@ impl ProbeInfo {
 }
 
 /// Probe through the presentation descriptors, returning `None` on termination.
+#[expect(
+    clippy::future_not_send,
+    reason = "terminal probing runs on calloop's local executor"
+)]
 pub(crate) async fn terminal_probe(
     input: &mut input::Reader,
     output: &mut Descriptor,
     termination: &mut signals::Termination,
+    handle: &LoopHandle<'static, ()>,
 ) -> std::io::Result<Option<ProbeInfo>> {
     let shared_probe = shared_probe();
     let mut pending = output::Output::default();
@@ -78,11 +89,12 @@ pub(crate) async fn terminal_probe(
     let mut quiet_deadline = None;
     loop {
         let mut buffer = [0; 1024];
-        tokio::select! {
-            _ = termination.recv() => return Ok(None),
-            () = tokio::time::sleep_until(quiet_deadline.unwrap_or(deadline).into()) => break,
-            result = pending.drain(output), if pending.pending() => result?,
-            result = input.read_raw(&mut buffer), if !pending.pending() => {
+        let writing = pending.pending();
+        futures::select! {
+            _ = termination.recv().fuse() => return Ok(None),
+            result = sleep_until(handle, Some(quiet_deadline.unwrap_or(deadline))).fuse() => { result?; break; },
+            result = when(writing.then(|| pending.drain(output))).fuse() => result?,
+            result = when((!writing).then(|| input.read_raw(&mut buffer))).fuse() => {
                 let read = result?;
                 if read == 0 { break; }
                 parser.parse(&buffer[..read]);

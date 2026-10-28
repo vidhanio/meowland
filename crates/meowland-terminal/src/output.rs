@@ -1,8 +1,8 @@
 //! Ordered, resumable terminal writes with a bounded per-turn budget.
 use std::{fs::File, io};
 
+use futures::io::{AsyncWrite, AsyncWriteExt};
 use rustix::fs::{self, Mode, OFlags};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Most bytes written to the terminal in one scheduling turn.
 const WRITE_BUDGET: usize = 64 * 1024;

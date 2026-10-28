@@ -1,27 +1,22 @@
-//! Connection tasks and byte-accounted, ordered pane output.
+//! Local socket conversations with ordered, byte-accounted pane output.
 
-use std::{
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+use std::{cell::Cell, io, os::unix::net::UnixStream, rc::Rc};
+
+use calloop::LoopHandle;
+use futures::{
+    FutureExt, SinkExt, StreamExt,
+    channel::{mpsc, oneshot},
+    io::{AsyncReadExt, AsyncWrite},
 };
-
 use meowland_compositor::PaneId;
-use meowland_core::pixels::FrameSize;
+use meowland_core::{asynchronous::timeout, pixels::FrameSize};
 use meowland_protocol::{
     self as protocol, ControlRequest, PaneToServer, ServerToPane,
     asynchronous::{Outgoing, Reader},
 };
 use serde::Serialize;
-use tokio::{
-    io::{AsyncReadExt, AsyncWrite},
-    net::UnixStream,
-    sync::{mpsc, oneshot},
-};
 
-use super::{Incoming, IncomingSender};
+use super::{Incoming, IncomingSender, Server};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ConnectionKind {
@@ -29,22 +24,37 @@ pub(crate) enum ConnectionKind {
     Pane,
 }
 
+#[expect(
+    clippy::future_not_send,
+    reason = "socket conversations run on calloop's local executor"
+)]
 pub(crate) async fn connection(
     socket: UnixStream,
     kind: ConnectionKind,
     id: PaneId,
     incoming: IncomingSender,
+    handle: LoopHandle<'static, Server>,
 ) -> io::Result<()> {
+    let reader = handle.adapt_io(socket.try_clone()?)?;
+    let writer = handle.adapt_io(socket)?;
     match kind {
         ConnectionKind::Control => {
-            tokio::time::timeout(protocol::REQUEST_TIMEOUT, control(socket, incoming)).await?
+            timeout(
+                &handle,
+                protocol::REQUEST_TIMEOUT,
+                control(reader, writer, incoming),
+            )
+            .await
         }
-        ConnectionKind::Pane => pane(socket, id, incoming).await,
+        ConnectionKind::Pane => pane(reader, writer, id, incoming, &handle).await,
     }
 }
 
-async fn control(socket: UnixStream, incoming: IncomingSender) -> io::Result<()> {
-    let (mut reader, mut writer) = socket.into_split();
+async fn control(
+    mut reader: impl futures::io::AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+    mut incoming: IncomingSender,
+) -> io::Result<()> {
     let request: ControlRequest = Reader::new(&mut reader).read().await?;
     let (reply, answer) = oneshot::channel();
     incoming
@@ -52,9 +62,9 @@ async fn control(socket: UnixStream, incoming: IncomingSender) -> io::Result<()>
         .await
         .map_err(io::Error::other)?;
     let mut eof = [0];
-    let response = tokio::select! {
-        result = answer => result.map_err(io::Error::other)?,
-        result = reader.read(&mut eof) => {
+    let response = futures::select! {
+        result = answer.fuse() => result.map_err(io::Error::other)?,
+        result = reader.read(&mut eof).fuse() => {
             result?;
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -62,18 +72,22 @@ async fn control(socket: UnixStream, incoming: IncomingSender) -> io::Result<()>
     send(&mut writer, &response).await
 }
 
-async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::Result<()> {
-    let (reader, mut writer) = socket.into_split();
+async fn pane(
+    reader: impl futures::io::AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+    id: PaneId,
+    mut incoming: IncomingSender,
+    handle: &LoopHandle<'static, Server>,
+) -> io::Result<()> {
     let mut reader = Reader::new(reader);
-    let hello = match tokio::time::timeout(protocol::REQUEST_TIMEOUT, reader.read()).await {
-        Ok(Ok(PaneToServer::Hello(hello)))
-            if FrameSize::new(hello.width, hello.height).is_some() =>
-        {
+    let hello = match timeout(handle, protocol::REQUEST_TIMEOUT, reader.read()).await {
+        Ok(PaneToServer::Hello(hello)) if FrameSize::new(hello.width, hello.height).is_some() => {
             hello
         }
         _ => {
             let reason = "invalid or timed-out pane hello";
-            let _ = tokio::time::timeout(
+            let _ = timeout(
+                handle,
                 protocol::REQUEST_TIMEOUT,
                 send(&mut writer, &ServerToPane::Reject(reason.into())),
             )
@@ -81,12 +95,12 @@ async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::R
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
     };
-    let (sender, messages) = mpsc::unbounded_channel();
+    let (sender, messages) = mpsc::unbounded();
     let (release, reason) = oneshot::channel();
     let output = PaneTransport {
         sender: Some(sender),
         release: Some(release),
-        bytes: Arc::new(AtomicUsize::new(0)),
+        bytes: Rc::new(Cell::new(0)),
     };
     incoming
         .send(Incoming::Attach(id, hello, output))
@@ -106,26 +120,26 @@ async fn pane(socket: UnixStream, id: PaneId, incoming: IncomingSender) -> io::R
                 .map_err(io::Error::other)?;
         }
     };
-    tokio::select! {
-        result = receiving => result,
-        result = pane_writer(&mut writer, messages, reason) => result,
+    futures::select! {
+        result = receiving.fuse() => result,
+        result = pane_writer(&mut writer, messages, reason).fuse() => result,
     }
 }
 
 pub(crate) struct PaneTransport {
     sender: Option<mpsc::UnboundedSender<Queued>>,
     release: Option<oneshot::Sender<String>>,
-    bytes: Arc<AtomicUsize>,
+    bytes: Rc<Cell<usize>>,
 }
 
 struct Reservation {
-    total: Arc<AtomicUsize>,
+    total: Rc<Cell<usize>>,
     bytes: usize,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.total.set(self.total.get() - self.bytes);
     }
 }
 
@@ -148,24 +162,24 @@ impl PaneTransport {
         };
         let bytes = size + std::mem::size_of::<Queued>();
         let limit = protocol::MAX_MESSAGE + std::mem::size_of::<Queued>();
-        if size > protocol::MAX_MESSAGE
-            || self
-                .bytes
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                    total.checked_add(bytes).filter(|&total| total <= limit)
-                })
-                .is_err()
-        {
+        let Some(total) = self
+            .bytes
+            .get()
+            .checked_add(bytes)
+            .filter(|&total| total <= limit && size <= protocol::MAX_MESSAGE)
+        else {
             return false;
-        }
-        let queued = Queued {
-            message,
-            _reservation: Reservation {
-                total: Arc::clone(&self.bytes),
-                bytes,
-            },
         };
-        sender.send(queued).is_ok()
+        self.bytes.set(total);
+        sender
+            .unbounded_send(Queued {
+                message,
+                _reservation: Reservation {
+                    total: Rc::clone(&self.bytes),
+                    bytes,
+                },
+            })
+            .is_ok()
     }
 
     pub(crate) fn release(&mut self, reason: String) {
@@ -177,14 +191,14 @@ impl PaneTransport {
 }
 
 async fn pane_writer(
-    writer: &mut (impl AsyncWrite + Unpin + Send),
+    writer: &mut (impl AsyncWrite + Unpin),
     mut messages: mpsc::UnboundedReceiver<Queued>,
     reason: oneshot::Receiver<String>,
 ) -> io::Result<()> {
     while let Some(Queued {
         message,
         _reservation,
-    }) = messages.recv().await
+    }) = messages.next().await
     {
         let mut outgoing = Outgoing::default();
         outgoing.send_pane(message)?;
@@ -196,10 +210,7 @@ async fn pane_writer(
     Ok(())
 }
 
-async fn send(
-    writer: &mut (impl AsyncWrite + Unpin + Send),
-    message: &(impl Serialize + Sync),
-) -> io::Result<()> {
+async fn send(writer: &mut (impl AsyncWrite + Unpin), message: &impl Serialize) -> io::Result<()> {
     let mut outgoing = Outgoing::default();
     outgoing.send(message)?;
     outgoing.flush_to(writer).await

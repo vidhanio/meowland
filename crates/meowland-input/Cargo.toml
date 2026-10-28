@@ -12,6 +12,7 @@ workspace = true
 meowland-core = { workspace = true, features = ["async"] }
 meowland-protocol = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
-tokio = { workspace = true, features = ["io-util"] }
+futures = { workspace = true }
+calloop = { workspace = true }
 vtparse = { workspace = true }
 tracing = { workspace = true }

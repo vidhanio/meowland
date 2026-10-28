@@ -289,6 +289,11 @@ def gpu_requirement(case):
     return "no integrated/discrete Vulkan GPU discovered; software fallback is not a GPU benchmark"
 
 
+def file_hash(path):
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
 def metadata(args):
     root = Path(__file__).resolve().parent.parent
     binary = Path(os.environ["MEOWLAND_BENCH_BINARY"])
@@ -307,10 +312,8 @@ def metadata(args):
         "dirty": bool(
             command_output(["git", "-C", str(root), "status", "--porcelain"])
         ),
-        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "workload_sha256": hashlib.sha256(
-            Path(os.environ["MEOWLAND_BENCH_WORKLOAD"]).read_bytes()
-        ).hexdigest(),
+        "binary_sha256": file_hash(binary),
+        "workload_sha256": file_hash(Path(os.environ["MEOWLAND_BENCH_WORKLOAD"])),
         "platform": platform.platform(),
         "machine": platform.machine(),
         "python": platform.python_version(),

@@ -2,8 +2,8 @@
 
 use std::{collections::VecDeque, io};
 
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     MAX_MESSAGE, PanePacket, ServerToPane,
@@ -45,7 +45,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
             if let Some(message) = self.read_chunk().await? {
                 return Ok(message);
             }
-            tokio::task::yield_now().await;
+            meowland_core::future::yield_now().await;
         }
     }
 
@@ -188,6 +188,7 @@ impl Outgoing {
     pub async fn flush_to(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         while self.pending() {
             self.write_ready(writer).await?;
+            meowland_core::future::yield_now().await;
         }
         writer.flush().await
     }

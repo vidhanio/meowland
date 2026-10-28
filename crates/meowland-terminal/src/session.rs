@@ -2,10 +2,18 @@
 
 use std::{
     io::{self, Write},
+    os::unix::net::UnixStream,
     time::{Duration, Instant},
 };
 
-use meowland_core::{Error, Result, asynchronous::Descriptor, signals};
+use calloop::{LoopHandle, io::Async, signals::Signal as UnixSignal};
+use futures::FutureExt;
+use meowland_core::{
+    Error, Result,
+    asynchronous::{Descriptor, sleep_until, when},
+    future::yield_now,
+    signals,
+};
 use meowland_input::{
     keyboard::Keyboard,
     {self as input},
@@ -16,10 +24,7 @@ use meowland_protocol::{
     clipboard::Selection,
 };
 use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
-use tokio::{
-    net::unix::{OwnedReadHalf, OwnedWriteHalf},
-    signal::unix::{Signal, SignalKind, signal},
-};
+type Socket = Async<'static, UnixStream>;
 
 use super::{
     input_gate::InputGate,
@@ -60,8 +65,9 @@ enum Ready {
 }
 
 pub(crate) struct TerminalSession {
-    receiver: Reader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    receiver: Reader<Socket>,
+    writer: Socket,
+    handle: LoopHandle<'static, ()>,
     tx: Outgoing,
     input: input::Reader,
     stdout: Descriptor,
@@ -72,24 +78,25 @@ pub(crate) struct TerminalSession {
     cell: Option<(u16, u16)>,
     lifecycle: Lifecycle,
     termination: signals::Termination,
-    resize: Signal,
+    resize: signals::Signal,
     window: PendingWindow,
 }
 
 impl TerminalSession {
     pub(crate) fn new(
-        receiver: Reader<OwnedReadHalf>,
-        writer: OwnedWriteHalf,
+        receiver: Reader<Socket>,
+        writer: Socket,
         show: Show,
+        handle: LoopHandle<'static, ()>,
     ) -> Result<Self> {
         let cells = terminal::cells();
         let pixels = terminal::window_pixels();
         let cell = terminal::derived_cell(pixels, cells);
         let (width, height) =
             terminal::pane_pixels(None, pixels, cells, cell.unwrap_or(FALLBACK_CELL));
-        let termination = signals::Termination::new()?;
-        let resize = signal(SignalKind::window_change())?;
-        let input = input::Reader::new()?;
+        let termination = signals::Termination::new(&handle)?;
+        let resize = signals::Signal::new(&handle, &[UnixSignal::SIGWINCH])?;
+        let input = input::Reader::new(&handle)?;
         let mut tx = Outgoing::default();
         tx.send(&PaneToServer::Hello(Hello {
             width,
@@ -101,7 +108,8 @@ impl TerminalSession {
             writer,
             tx,
             input,
-            stdout: Descriptor::new(output::open()?.into())?,
+            stdout: Descriptor::new(output::open()?.into(), &handle)?,
+            handle,
             keyboard: Keyboard::default(),
             input_gate: InputGate::default(),
             clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
@@ -116,6 +124,10 @@ impl TerminalSession {
         })
     }
 
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
     pub(crate) async fn run(mut self) -> Result<()> {
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             self.prepare_pending_work()?;
@@ -123,15 +135,16 @@ impl TerminalSession {
             let pending_output = active && self.presentation.pending();
             let pending_input = self.input.pending();
             let deadline = self.next_deadline();
-            let ready = tokio::select! {
-                _ = self.termination.recv() => Ready::Terminate,
-                _ = self.resize.recv() => Ready::Resize,
-                () = wait_deadline(deadline) => Ready::Deadline,
-                result = self.presentation.drain(&mut self.stdout), if pending_output => Ready::Output(result),
-                result = self.receiver.read(), if !pending_output && !self.tx.pending() => Ready::Server(result),
-                result = self.tx.write_ready(&mut self.writer), if self.tx.pending() => Ready::Transmit(result),
-                result = self.input.read_ready(), if active && !pending_input && !self.tx.pending() => Ready::Input(result),
-                () = tokio::task::yield_now(), if pending_input && !self.tx.pending() => Ready::BufferedInput,
+            let pending_tx = self.tx.pending();
+            let ready = futures::select! {
+                _ = self.termination.recv().fuse() => Ready::Terminate,
+                _ = self.resize.recv().fuse() => Ready::Resize,
+                result = sleep_until(&self.handle, deadline).fuse() => { result?; Ready::Deadline },
+                result = when(pending_output.then(|| self.presentation.drain(&mut self.stdout))).fuse() => Ready::Output(result),
+                result = when((!pending_output && !pending_tx).then(|| self.receiver.read())).fuse() => Ready::Server(result),
+                result = when(pending_tx.then(|| self.tx.write_ready(&mut self.writer))).fuse() => Ready::Transmit(result),
+                result = when((active && !pending_input && !pending_tx).then(|| self.input.read_ready())).fuse() => Ready::Input(result),
+                () = when((pending_input && !pending_tx).then(yield_now)).fuse() => Ready::BufferedInput,
             };
             match ready {
                 Ready::Terminate => return self.close(None),
@@ -152,17 +165,22 @@ impl TerminalSession {
             if !matches!(self.lifecycle, Lifecycle::Closed) && !self.tx.pending() {
                 self.handle_terminal_events()?;
             }
+            yield_now().await;
         }
         Ok(())
     }
 
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
     async fn finish_after_write_error(&mut self, error: io::Error) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            tokio::select! {
-                _ = self.termination.recv() => return self.close(None),
-                () = tokio::time::sleep_until(deadline.into()) => return Err(error.into()),
-                result = self.receiver.read::<ServerToPane>() => match result {
+            futures::select! {
+                _ = self.termination.recv().fuse() => return self.close(None),
+                result = sleep_until(&self.handle, Some(deadline)).fuse() => { result?; return Err(error.into()); },
+                result = self.receiver.read::<ServerToPane>().fuse() => match result {
                     Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)),
                     Err(_) => return Err(error.into()),
                     Ok(_) => {}
@@ -197,6 +215,10 @@ impl TerminalSession {
             .min()
     }
 
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
     async fn handle_server_message(&mut self, message: ServerToPane) -> Result<()> {
         match message {
             ServerToPane::HelloOk => {
@@ -289,10 +311,19 @@ impl TerminalSession {
         }
     }
 
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
     async fn start_presentation(&mut self) -> Result<()> {
         let mut mode = TerminalGuard::enter()?;
-        let Some(probe) =
-            terminal_probe(&mut self.input, &mut self.stdout, &mut self.termination).await?
+        let Some(probe) = terminal_probe(
+            &mut self.input,
+            &mut self.stdout,
+            &mut self.termination,
+            &self.handle,
+        )
+        .await?
         else {
             mode.restore()?;
             return self.close(None);
@@ -374,13 +405,5 @@ impl TerminalSession {
         restored?;
         printed?;
         Ok(())
-    }
-}
-
-async fn wait_deadline(deadline: Option<Instant>) {
-    if let Some(deadline) = deadline {
-        tokio::time::sleep_until(deadline.into()).await;
-    } else {
-        std::future::pending::<()>().await;
     }
 }

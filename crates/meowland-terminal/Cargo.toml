@@ -13,14 +13,8 @@ meowland-input = { workspace = true }
 meowland-terminal-clipboard = { workspace = true }
 meowland-core = { workspace = true, features = ["async"] }
 meowland-protocol = { workspace = true, features = ["async"] }
-tokio = { workspace = true, features = [
-  "io-util",
-  "macros",
-  "net",
-  "rt",
-  "signal",
-  "time",
-] }
+calloop = { workspace = true }
+futures = { workspace = true }
 meowland-kitty = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
 rustix = { workspace = true, features = ["fs"] }

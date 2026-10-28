@@ -5,7 +5,6 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use calloop::LoopHandle;
 use meowland_core::{scale::UiScale, timing::RefreshRate};
 use meowland_protocol::{ServerToPane, WindowInfo};
 use smithay::{
@@ -47,6 +46,7 @@ mod catalog;
 mod clipboard;
 mod commands;
 mod decoration;
+mod event_loop;
 mod frame;
 mod input;
 mod panes;
@@ -67,6 +67,7 @@ use attachment::{AttachedPane, Attachments, Binding, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
 pub use commands::{CloseWindowError, Command};
+pub use event_loop::CompositorHandle;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;
 pub use runtime::Runtime;
@@ -91,7 +92,7 @@ struct Window {
 /// Single-owner Wayland state, also available to host event sources.
 pub struct Compositor {
     display: DisplayHandle,
-    handle: LoopHandle<'static, Self>,
+    handle: CompositorHandle,
     surfaces: CompositorState,
     shm: ShmState,
     dmabuf: DmabufState,
@@ -153,11 +154,7 @@ impl std::fmt::Debug for Compositor {
 }
 
 impl State {
-    fn new(
-        display_handle: DisplayHandle,
-        handle: LoopHandle<'static, Self>,
-        settings: &Settings,
-    ) -> Self {
+    fn new(display_handle: DisplayHandle, handle: CompositorHandle, settings: &Settings) -> Self {
         let scale = settings.scale;
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");

@@ -1,17 +1,20 @@
-//! Socket I/O and process ownership, with rendering isolated on its own thread.
+//! One calloop owner for Wayland, sockets, application processes, and shutdown.
 
-use std::{collections::HashMap, io};
+use std::{collections::HashMap, io, process::Child};
 
-use meowland_compositor::{Command, Event, PaneId};
+use calloop::{
+    Dispatcher, LoopHandle, RegistrationToken,
+    futures::{Executor, Scheduler},
+};
+use futures::{
+    channel::{mpsc, oneshot},
+    future::AbortHandle,
+};
+use meowland_compositor::{Command, Compositor, Event, PaneId, Runtime};
 use meowland_core::{Error, Result};
 use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::{AbortHandle, JoinSet},
-};
 
 mod actor;
-mod compositor;
 mod configuration;
 mod control;
 mod lifecycle;
@@ -19,10 +22,8 @@ mod process;
 mod sockets;
 mod transport;
 
-use compositor::DisplayThread;
 pub use configuration::{Config, KeyboardConfig, OutputConfig};
 use lifecycle::Shutdown;
-use sockets::Listeners;
 use transport::PaneTransport;
 
 /// One socket budget, with the last slot reserved for control traffic.
@@ -36,21 +37,37 @@ enum Incoming {
     PaneMessage(PaneId, PaneAction),
 }
 
-struct Server {
-    compositor: DisplayThread,
-    incoming: IncomingSender,
-    messages: mpsc::Receiver<Incoming>,
-    listeners: Option<Listeners>,
-    connections: HashMap<PaneId, AbortHandle>,
-    tasks: JoinSet<(PaneId, io::Result<()>)>,
-    controls: JoinSet<control::Completion>,
-    panes: HashMap<PaneId, PaneTransport>,
-    next_connection: u64,
-    children: JoinSet<()>,
-    shutdown: Shutdown,
+enum Completion {
+    Incoming(Option<Incoming>, mpsc::Receiver<Incoming>),
+    Connection(PaneId, io::Result<()>),
 }
 
-/// Run the server with caller-supplied output and keyboard configuration.
+struct Listener {
+    token: RegistrationToken,
+    enabled: bool,
+}
+
+struct Server {
+    compositor: Compositor,
+    wayland: Runtime,
+    display: String,
+    handle: LoopHandle<'static, Self>,
+    scheduler: Scheduler<Completion>,
+    executor: Option<(
+        RegistrationToken,
+        Dispatcher<'static, Executor<Completion>, Self>,
+    )>,
+    incoming: IncomingSender,
+    listeners: Vec<Listener>,
+    connections: HashMap<PaneId, AbortHandle>,
+    panes: HashMap<PaneId, PaneTransport>,
+    next_connection: u64,
+    children: Vec<Child>,
+    shutdown: Shutdown,
+    error: Option<io::Error>,
+}
+
+/// Run the single-owner server with output and keyboard configuration.
 ///
 /// Binds the supplied paths unless listeners are provided by socket activation.
 /// Shutdown gives clients a bounded Wayland-close grace period. With the
@@ -59,13 +76,13 @@ struct Server {
 /// closure.
 ///
 /// # Errors
-/// Returns an error if configuration validation, startup, socket I/O, or
-/// compositor dispatch fails. Configuration is validated before sockets bind.
-pub async fn serve(paths: &Paths, config: Config) -> Result<()> {
+/// Returns an error if validation, startup, socket I/O, or dispatch fails.
+/// Configuration is validated before sockets bind.
+pub fn serve(paths: &Paths, config: Config) -> Result<()> {
     let settings = config
         .into_settings()
         .map_err(|error| Error::io("validating configuration", error))?;
-    actor::serve(paths, settings).await
+    actor::serve(paths, &settings)
 }
 
 fn notify(state: &[sd_notify::NotifyState<'_>]) {
@@ -77,7 +94,7 @@ fn notify(state: &[sd_notify::NotifyState<'_>]) {
 impl Server {
     fn incoming(&mut self, message: Incoming) {
         match message {
-            Incoming::Control(request, reply) => self.start_control(request, reply),
+            Incoming::Control(request, reply) => self.control(request, reply),
             Incoming::Attach(id, hello, pane) => {
                 if self.shutdown.running() && self.connections.contains_key(&id) {
                     self.panes.insert(id, pane);
@@ -125,10 +142,7 @@ impl Server {
     }
 
     fn send_command(&mut self, command: Command) {
-        if let Err(error) = self.compositor.command(command) {
-            tracing::error!(%error, "compositor command queue unavailable");
-            self.begin_shutdown();
-        }
+        self.compositor.handle_command(command);
     }
 
     fn pane_gone(&mut self, id: PaneId) {
@@ -148,8 +162,12 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.controls.abort_all();
-        self.tasks.abort_all();
-        self.children.abort_all();
+        for task in self.connections.values() {
+            task.abort();
+        }
+        if let Some((token, executor)) = self.executor.take() {
+            self.handle.remove(token);
+            drop(executor);
+        }
     }
 }

@@ -312,7 +312,7 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
                     TimeoutAction::Drop
                 },
             )
-            .map_err(|error| io::Error::other(error.error))?,
+            .map_err(io::Error::other)?,
     );
     match target {
         SelectionTarget::Clipboard => {
@@ -403,7 +403,7 @@ fn delivery_timer(state: &State, request: u64, deadline: Deadline) -> io::Result
                     TimeoutAction::Drop
                 },
             )
-            .map_err(|error| io::Error::other(error.error))?,
+            .map_err(io::Error::other)?,
     );
     Ok(sources)
 }

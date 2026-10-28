@@ -43,8 +43,10 @@ impl Server {
             sd_notify::NotifyState::Stopping,
             sd_notify::NotifyState::Status("Closing windows and releasing panes"),
         ]);
-        self.listeners.take();
-        let _ = self.compositor.command(Command::CloseAll);
+        for listener in self.listeners.drain(..) {
+            self.handle.remove(listener.token);
+        }
+        self.compositor.handle_command(Command::CloseAll);
         for pane in self.panes.values_mut() {
             pane.release("server stopped".into());
         }

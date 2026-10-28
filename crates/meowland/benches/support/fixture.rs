@@ -62,6 +62,13 @@ impl Fixture {
         }
     }
 
+    pub(crate) fn damage(&self) -> Vec<(usize, usize, usize, usize)> {
+        match self.pattern {
+            Pattern::Noise => vec![(0, 0, self.size.width, self.size.height)],
+            Pattern::Damage => vec![(0, 0, 16, 1), (80, 100, 40, 20)],
+        }
+    }
+
     /// Varies every noise pixel by commit sequence, so coalescing cannot turn
     /// full frames into marker-only updates.
     pub(crate) fn paint(&self, id: u64, content: u64, pixels: &mut [u8]) {

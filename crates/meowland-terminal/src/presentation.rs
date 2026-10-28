@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use meowland_core::Result;
+use meowland_core::{Result, latency::Latency};
 use meowland_kitty::{PresentOutcome, Presenter, present_shared};
 use meowland_protocol::{
     FrameAck, FrameBand, FrameTransport, PaneAction, PaneToServer, SharedFrame,
@@ -21,9 +21,11 @@ struct PaneStats {
     frames: u32,
     drawn: u32,
     bytes: u64,
-    encoded: Duration,
-    written: Duration,
-    dropped: u32,
+    encoded: Latency,
+    written: Latency,
+    retained: Latency,
+    completion_wait: Latency,
+    resyncs: u32,
 }
 
 impl PaneStats {
@@ -33,9 +35,11 @@ impl PaneStats {
             frames: 0,
             drawn: 0,
             bytes: 0,
-            encoded: Duration::ZERO,
-            written: Duration::ZERO,
-            dropped: 0,
+            encoded: Latency::default(),
+            written: Latency::default(),
+            retained: Latency::default(),
+            completion_wait: Latency::default(),
+            resyncs: 0,
         }
     }
 
@@ -44,13 +48,20 @@ impl PaneStats {
         clippy::cast_precision_loss,
         reason = "throughput is approximate telemetry; byte accounting itself remains integer-valued"
     )]
-    fn frame(&mut self, bytes: usize, ack: FrameAck, encoded: Duration, written: Duration) {
+    fn frame(&mut self, frame: &PendingFrame, ack: FrameAck) {
         self.frames += 1;
-        self.drawn += u32::from(bytes > 0);
-        self.dropped += u32::from(ack == FrameAck::Resync);
-        self.bytes += u64::try_from(bytes).expect("encoded frame length fits u64");
-        self.encoded += encoded;
-        self.written += written;
+        self.drawn += u32::from(frame.bytes > 0);
+        self.resyncs += u32::from(ack == FrameAck::Resync);
+        self.bytes += u64::try_from(frame.bytes).expect("encoded frame length fits u64");
+        let retained = frame.started.elapsed();
+        self.encoded.record(frame.encoded);
+        self.written.record(frame.written);
+        self.retained.record(retained);
+        self.completion_wait.record(
+            retained
+                .saturating_sub(frame.encoded)
+                .saturating_sub(frame.written),
+        );
         let elapsed = self.window.elapsed();
         if elapsed < Duration::from_secs(1) {
             return;
@@ -59,19 +70,19 @@ impl PaneStats {
         let frames = std::mem::take(&mut self.frames);
         let drawn = std::mem::take(&mut self.drawn);
         let bytes = std::mem::take(&mut self.bytes);
-        let encoded = std::mem::take(&mut self.encoded);
-        let written = std::mem::take(&mut self.written);
-        let dropped = std::mem::take(&mut self.dropped);
+        let resyncs = std::mem::take(&mut self.resyncs);
         self.window = Instant::now();
         tracing::info!(
             fps = f64::from(frames) / elapsed,
             drawn,
-            dropped,
-            unchanged = frames.saturating_sub(drawn).saturating_sub(dropped),
+            resyncs,
+            unchanged = frames.saturating_sub(drawn).saturating_sub(resyncs),
             mb_per_second = bytes as f64 / elapsed / 1e6,
-            encode_ms = encoded.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
-            write_ms = written.as_secs_f64() * 1000.0 / f64::from(frames.max(1)),
-            "pane throughput"
+            encode_us = ?self.encoded.summarize(),
+            write_us = ?self.written.summarize(),
+            retention_us = ?self.retained.summarize(),
+            completion_wait_us = ?self.completion_wait.summarize(),
+            "pane throughput and retention latency; excludes display presentation"
         );
     }
 }
@@ -90,6 +101,8 @@ pub(crate) struct PanePresentation {
 struct PendingFrame {
     started: Instant,
     encoded: Duration,
+    written: Duration,
+    write_started: Option<Instant>,
     bytes: usize,
     accepted: bool,
 }
@@ -153,6 +166,8 @@ impl PanePresentation {
         let outcome = self.presenter.present_into(band, self.pending.buffer());
         self.frame = Some(PendingFrame {
             encoded: started.elapsed(),
+            written: Duration::ZERO,
+            write_started: None,
             started,
             bytes: self.pending.len(),
             accepted: outcome != PresentOutcome::NeedsKeyframe,
@@ -183,6 +198,8 @@ impl PanePresentation {
         self.frame = Some(PendingFrame {
             started,
             encoded: started.elapsed(),
+            written: Duration::ZERO,
+            write_started: None,
             bytes: self.pending.len(),
             accepted: true,
         });
@@ -235,7 +252,16 @@ impl PanePresentation {
     }
 
     pub(crate) async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        if let Some(frame) = &mut self.frame {
+            frame.write_started.get_or_insert_with(Instant::now);
+        }
         self.pending.drain(stdout).await?;
+        if !self.pending()
+            && let Some(frame) = &mut self.frame
+            && let Some(started) = frame.write_started.take()
+        {
+            frame.written += started.elapsed();
+        }
         Ok(())
     }
 
@@ -297,8 +323,7 @@ impl PanePresentation {
         } else {
             FrameAck::Resync
         };
-        self.stats
-            .frame(frame.bytes, ack, frame.encoded, frame.started.elapsed());
+        self.stats.frame(&frame, ack);
         tx.send(&PaneToServer::Action(PaneAction::Ack(ack)))?;
         Ok(())
     }

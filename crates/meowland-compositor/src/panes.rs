@@ -79,6 +79,9 @@ impl State {
         let Some(entry) = self.attachments.panes.get_mut(&pane) else {
             return;
         };
+        if entry.presentation.size == size {
+            return;
+        }
         entry.presentation.size = size;
         entry.presentation.mark_dirty();
         if let Some(window) = entry.window() {

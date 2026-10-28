@@ -1,114 +1,195 @@
-//! Independent Wayland callback clock and single-in-flight pane frames.
+//! Independent Wayland callback clocks and damage-aware retained pane frames.
 
-use std::{
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use meowland_core::pixels::FrameSize;
+use meowland_core::{latency::Latency, pixels::FrameSize};
 use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
+use meowland_render::{Renderer, Scene, Snapshot, SurfaceDamage};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-mod shared;
+use super::{Event, PaneId, ServerToPane, State};
 
-use super::{Event, ServerToPane, State};
+mod publication;
 
-/// Each pane owns its scheduling state. No separate dirty-pane index can drift
-/// out of sync with attachment, resizing, or acknowledgements.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use publication::Publication;
+
+#[derive(Clone, Copy, Debug)]
 enum Presentation {
     Clean,
     Dirty,
-    InFlight { dirty: bool },
+    InFlight { changed: Instant, sent: Instant },
+}
+
+struct FrameStats {
+    window: Instant,
+    frames: u32,
+    render: Latency,
+    publish: Latency,
+    change_to_render: Latency,
+    send_to_ack: Latency,
+    change_to_ack: Latency,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            window: Instant::now(),
+            frames: 0,
+            render: Latency::default(),
+            publish: Latency::default(),
+            change_to_render: Latency::default(),
+            send_to_ack: Latency::default(),
+            change_to_ack: Latency::default(),
+        }
+    }
+
+    fn ack(&mut self, pane: PaneId, changed: Instant, sent: Instant) {
+        let now = Instant::now();
+        self.send_to_ack.record(now.saturating_duration_since(sent));
+        self.change_to_ack
+            .record(now.saturating_duration_since(changed));
+        self.frames += 1;
+        if now.duration_since(self.window) >= Duration::from_secs(1) {
+            tracing::debug!(
+                ?pane,
+                frames = self.frames,
+                render_us = ?self.render.summarize(),
+                publish_us = ?self.publish.summarize(),
+                change_to_render_us = ?self.change_to_render.summarize(),
+                send_to_ack_us = ?self.send_to_ack.summarize(),
+                change_to_ack_us = ?self.change_to_ack.summarize(),
+                "pane latency; acknowledgement measures retention, not display presentation"
+            );
+            self.frames = 0;
+            self.window = now;
+        }
+    }
 }
 
 pub(crate) struct PaneState {
     pub size: FrameSize,
     presentation: Presentation,
-    shown: Vec<u8>,
-    /// None means the retained pixels are not a valid basis for a row diff.
-    shown_size: Option<FrameSize>,
+    changed: Option<Instant>,
+    scene: Scene,
+    sent_size: Option<FrameSize>,
     pub(super) transport: FrameTransport,
     shared: Option<SharedObject>,
+    stats: FrameStats,
 }
 
 impl PaneState {
-    pub(crate) const fn new(size: FrameSize) -> Self {
+    pub(crate) fn new(size: FrameSize) -> Self {
         Self {
             size,
             presentation: Presentation::Clean,
-            shown: Vec::new(),
-            shown_size: None,
+            changed: None,
+            scene: Scene::default(),
+            sent_size: None,
             transport: FrameTransport::Inline,
             shared: None,
+            stats: FrameStats::new(),
         }
     }
 
-    pub(crate) const fn mark_dirty(&mut self) {
-        self.presentation = match self.presentation {
-            Presentation::InFlight { .. } => Presentation::InFlight { dirty: true },
-            Presentation::Clean | Presentation::Dirty => Presentation::Dirty,
-        };
+    fn schedule(&mut self, changed: Instant) {
+        self.changed = Some(
+            self.changed
+                .map_or(changed, |previous| previous.min(changed)),
+        );
+        if !matches!(self.presentation, Presentation::InFlight { .. }) {
+            self.presentation = Presentation::Dirty;
+        }
     }
 
-    fn ack(&mut self, ack: FrameAck) {
-        let Presentation::InFlight { dirty } = self.presentation else {
+    pub(crate) fn mark_dirty(&mut self) {
+        self.scene.invalidate();
+        self.schedule(Instant::now());
+    }
+
+    pub(crate) fn damage(&mut self, surface: &WlSurface, damage: SurfaceDamage, changed: Instant) {
+        self.scene.damage(surface, damage);
+        self.schedule(changed);
+    }
+
+    fn ack(&mut self, pane: PaneId, ack: FrameAck) {
+        let Presentation::InFlight { changed, sent } = self.presentation else {
             return;
         };
+        self.stats.ack(pane, changed, sent);
         self.shared = None;
-        let resync = matches!(ack, FrameAck::Resync);
-        if resync {
-            self.shown_size = None;
-        }
-        self.presentation = if dirty || resync {
-            Presentation::Dirty
-        } else {
-            Presentation::Clean
-        };
-    }
-
-    fn due(&self) -> bool {
-        self.presentation == Presentation::Dirty
-    }
-
-    /// Record exactly the pixels sent, not a newer commit or an unacknowledged
-    /// assumption. The allocation crossing threads is only the changed band.
-    fn frame(&mut self, pixels: &[u8]) -> Option<ServerToPane> {
         self.presentation = Presentation::Clean;
-        let stride = self.size.rgb_stride();
-        let rows = if self.shown_size == Some(self.size) {
-            self.changed_rows(pixels, stride)?
+        if ack == FrameAck::Resync {
+            self.sent_size = None;
+            self.mark_dirty();
+        } else if self.changed.is_some() {
+            self.presentation = Presentation::Dirty;
+        }
+    }
+
+    const fn due(&self) -> bool {
+        matches!(self.presentation, Presentation::Dirty)
+    }
+
+    fn frame(
+        &mut self,
+        renderer: &mut Renderer,
+        root: Option<&WlSurface>,
+        snapshots: &std::collections::HashMap<WlSurface, Snapshot>,
+        scale: f64,
+    ) -> Option<ServerToPane> {
+        let started = Instant::now();
+        let changed = self.changed.take().unwrap_or(started);
+        self.presentation = Presentation::Clean;
+        let mut publication = Publication::new(self.size, self.transport, self.sent_size);
+        let rows = renderer.update(
+            &mut self.scene,
+            root,
+            snapshots,
+            self.size,
+            scale,
+            |changed, ready| publication.rows(changed, ready),
+        );
+        let rows = if self.sent_size == Some(self.size) {
+            rows?
         } else {
-            0..pixels.len() / stride
+            0..usize::try_from(self.size.height()).expect("validated height fits usize")
         };
-        let bytes = rows.start * stride..rows.end * stride;
-        self.shown.resize(pixels.len(), 0);
-        self.shown[bytes.clone()].copy_from_slice(&pixels[bytes.clone()]);
-        self.shown_size = Some(self.size);
-        self.presentation = Presentation::InFlight { dirty: false };
-        Some(ServerToPane::Frame(
+        self.stats
+            .render
+            .record(started.elapsed().saturating_sub(publication.elapsed));
+        self.stats
+            .change_to_render
+            .record(started.saturating_duration_since(changed));
+        self.sent_size = Some(self.size);
+        let publishing = Instant::now();
+        let streamed = publication.elapsed;
+        let object = publication.finish(self.scene.pixels());
+        self.transport = publication.transport;
+        let message = if let Some(object) = object {
+            let frame = *object.frame();
+            self.shared = Some(object);
+            ServerToPane::SharedFrame(frame)
+        } else {
+            self.band(rows)
+        };
+        self.stats.publish.record(streamed + publishing.elapsed());
+        self.presentation = Presentation::InFlight {
+            changed,
+            sent: Instant::now(),
+        };
+        Some(message)
+    }
+
+    fn band(&self, rows: std::ops::Range<usize>) -> ServerToPane {
+        let bytes = rows.start * self.size.rgb_stride()..rows.end * self.size.rgb_stride();
+        ServerToPane::Frame(
             FrameBand::new(
                 self.size,
-                u32::try_from(rows.start).expect("row offset fits validated frame height"),
-                pixels[bytes].to_vec(),
+                u32::try_from(rows.start).expect("row offset fits validated height"),
+                self.scene.pixels()[bytes].to_vec(),
             )
             .expect("composed row band fits its frame"),
-        ))
-    }
-
-    fn changed_rows(&self, pixels: &[u8], stride: usize) -> Option<Range<usize>> {
-        if self.shown.len() != pixels.len() {
-            return Some(0..pixels.len() / stride);
-        }
-        let differs = |(old, new): (&[u8], &[u8])| old != new;
-        let mut rows = self
-            .shown
-            .chunks_exact(stride)
-            .zip(pixels.chunks_exact(stride));
-        let first = rows.position(differs)?;
-        let end = rows
-            .rposition(differs)
-            .map_or(first + 1, |last| first + last + 2);
-        Some(first..end)
+        )
     }
 }
 
@@ -137,7 +218,7 @@ impl State {
     }
 
     /// Pace visible clients at the configured refresh rate and hidden clients
-    /// at one Hz, independently of terminal acknowledgements.
+    /// at one Hz.
     pub(crate) fn frame_callbacks(&mut self) {
         let now = Instant::now();
         let time = self.started.elapsed();
@@ -172,11 +253,10 @@ impl State {
 
     pub(crate) fn pane_ack(&mut self, pane: super::PaneId, ack: FrameAck) {
         if let Some(entry) = self.attachments.panes.get_mut(&pane) {
-            entry.presentation.ack(ack);
+            entry.presentation.ack(pane, ack);
         }
     }
 
-    /// Borrow disjoint fields instead of allocating a list of due pane IDs.
     pub(crate) fn dispatch_frames(&mut self) {
         for (&pane, entry) in &mut self.attachments.panes {
             if !entry.presentation.due() {
@@ -187,24 +267,12 @@ impl State {
                 .filter(|&id| self.catalog.drawable(id))
                 .and_then(|id| self.windows.get(&id))
                 .map(|window| window.surface.wl_surface());
-            let message = if entry.presentation.transport == FrameTransport::Shared {
-                shared::render(
-                    &mut entry.presentation,
-                    &mut self.renderer,
-                    root,
-                    &self.surface_cache.snapshots,
-                    self.scale.factor(),
-                )
-            } else {
-                let pixels = self.renderer.render_scaled(
-                    root,
-                    &self.surface_cache.snapshots,
-                    entry.presentation.size,
-                    self.scale.factor(),
-                );
-                entry.presentation.frame(pixels)
-            };
-            if let Some(message) = message {
+            if let Some(message) = entry.presentation.frame(
+                &mut self.renderer,
+                root,
+                &self.surface_cache.snapshots,
+                self.scale.factor(),
+            ) {
                 self.events.push(Event { pane, message });
             }
         }

@@ -72,7 +72,6 @@ enum Phase {
 }
 
 struct State {
-    size: Size,
     fixture: Fixture,
     pixels: Vec<u8>,
     buffers: Vec<Buffer>,
@@ -156,12 +155,14 @@ impl State {
         buffer.file.write_all(&self.pixels)?;
         buffer.released = false;
         self.surface.attach(Some(&buffer.proxy), 0, 0);
-        self.surface.damage_buffer(
-            0,
-            0,
-            i32::try_from(self.size.width)?,
-            i32::try_from(self.size.height)?,
-        );
+        for (x, y, width, height) in self.fixture.damage() {
+            self.surface.damage_buffer(
+                i32::try_from(x)?,
+                i32::try_from(y)?,
+                i32::try_from(width)?,
+                i32::try_from(height)?,
+            );
+        }
         let at = Instant::now();
         self.surface.commit();
         if id & LOAD_BIT == 0 {
@@ -237,7 +238,6 @@ fn connect(
         });
     }
     let state = State {
-        size,
         fixture: Fixture::new(size, pattern),
         pixels: vec![0; size.pixels() * 4],
         buffers,

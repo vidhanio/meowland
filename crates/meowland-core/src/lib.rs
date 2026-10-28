@@ -4,6 +4,7 @@
 pub mod asynchronous;
 
 mod error;
+pub mod latency;
 pub mod pixels;
 pub mod scale;
 #[cfg(feature = "async")]

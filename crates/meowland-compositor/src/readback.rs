@@ -6,16 +6,14 @@ use std::{
         Arc, Mutex, Weak as SyncWeak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use calloop::{Interest, Mode, PostAction, generic::Generic};
-use meowland_core::pixels::FrameSize;
+use meowland_core::{latency::Latency, pixels::FrameSize};
 use meowland_render::{Readback, Submission, source_bound};
 use smithay::{
-    backend::allocator::{
-        Buffer,
-        dmabuf::{AlreadyReady, Dmabuf, DmabufBlocker},
-    },
+    backend::allocator::{Buffer, dmabuf::Dmabuf},
     reexports::wayland_server::{
         Client, DisplayHandle, Resource, Weak, backend::ObjectId, protocol::wl_buffer::WlBuffer,
     },
@@ -26,6 +24,8 @@ use smithay::{
 };
 
 use super::{ClientState, Snapshot, State, WlSurface, sources::Sources};
+
+mod fences;
 
 const MAX_PENDING: usize = 32;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
@@ -80,6 +80,7 @@ impl Drop for Reservation {
 
 #[derive(Debug)]
 struct Slot {
+    started: Instant,
     snapshot: Mutex<Option<Snapshot>>,
     _reservation: Reservation,
 }
@@ -109,6 +110,18 @@ pub(crate) fn clear(surface: &WlSurface) {
             slot: None,
         };
     });
+}
+
+pub(crate) fn prepared_at(surface: &WlSurface) -> Option<Instant> {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<PreparedSnapshot>()
+            .current()
+            .slot
+            .as_ref()
+            .map(|slot| slot.started)
+    })
 }
 
 pub(crate) fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
@@ -152,22 +165,6 @@ impl Blocker for BufferBlocker {
     }
 }
 
-#[derive(Debug)]
-struct AcquireBlocker {
-    blocker: DmabufBlocker,
-    cancelled: Arc<AtomicBool>,
-}
-
-impl Blocker for AcquireBlocker {
-    fn state(&self) -> BlockerState {
-        if self.cancelled.load(Ordering::Acquire) {
-            BlockerState::Released
-        } else {
-            self.blocker.state()
-        }
-    }
-}
-
 struct BufferUse {
     readers: Arc<BufferReaders>,
     submitted: bool,
@@ -185,7 +182,10 @@ impl Drop for BufferUse {
 
 enum Phase {
     Acquiring(Dmabuf),
-    Reading(Readback),
+    Reading {
+        readback: Readback,
+        submitted: Instant,
+    },
 }
 
 struct Operation {
@@ -193,9 +193,10 @@ struct Operation {
     client: Client,
     slot: Arc<Slot>,
     buffer: BufferUse,
-    acquire_cancelled: Arc<AtomicBool>,
     phase: Phase,
     sources: Sources,
+    acquire_sources: Vec<Sources>,
+    acquire_pending: usize,
     bound: Option<(u32, u32)>,
 }
 
@@ -205,6 +206,49 @@ pub(crate) struct Readbacks {
     operations: HashMap<u64, Operation>,
     buffers: HashMap<ObjectId, SyncWeak<BufferReaders>>,
     budget: Arc<Budget>,
+    stats: ReadbackStats,
+}
+
+struct ReadbackStats {
+    window: Instant,
+    completed: u32,
+    acquire: Latency,
+    readback: Latency,
+    copy: Latency,
+}
+
+impl Default for ReadbackStats {
+    fn default() -> Self {
+        Self {
+            window: Instant::now(),
+            completed: 0,
+            acquire: Latency::default(),
+            readback: Latency::default(),
+            copy: Latency::default(),
+        }
+    }
+}
+
+impl ReadbackStats {
+    fn complete(&mut self, started: Instant, submitted: Instant, ready: Instant) {
+        self.acquire
+            .record(submitted.saturating_duration_since(started));
+        self.readback
+            .record(ready.saturating_duration_since(submitted));
+        self.copy.record(ready.elapsed());
+        self.completed += 1;
+        if self.window.elapsed() >= Duration::from_secs(1) {
+            tracing::debug!(
+                completed = self.completed,
+                acquire_us = ?self.acquire.summarize(),
+                readback_us = ?self.readback.summarize(),
+                copy_us = ?self.copy.summarize(),
+                "DMA-BUF latency"
+            );
+            self.completed = 0;
+            self.window = Instant::now();
+        }
+    }
 }
 
 impl Readbacks {
@@ -221,7 +265,8 @@ impl Readbacks {
     }
 }
 
-pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf: Dmabuf) {
+pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf: &Dmabuf) {
+    let started = Instant::now();
     let Some(client) = surface.client() else {
         return;
     };
@@ -254,6 +299,7 @@ pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer,
     let bound = source_bound(state.pane_bound(surface), scale, transform);
     readers.pending.fetch_add(1, Ordering::AcqRel);
     let slot = Arc::new(Slot {
+        started,
         snapshot: Mutex::new(None),
         _reservation: reservation,
     });
@@ -262,8 +308,6 @@ pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer,
     });
     state.readbacks.next += 1;
     let id = state.readbacks.next;
-    let acquire = dmabuf.generate_blocker(Interest::READ);
-    let acquire_cancelled = Arc::new(AtomicBool::new(false));
     state.readbacks.operations.insert(
         id,
         Operation {
@@ -275,47 +319,14 @@ pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer,
                 submitted: false,
                 finished: false,
             },
-            acquire_cancelled: Arc::clone(&acquire_cancelled),
-            phase: Phase::Acquiring(dmabuf),
+            phase: Phase::Acquiring(dmabuf.clone()),
             sources: Sources::new(&state.handle),
+            acquire_sources: Vec::new(),
+            acquire_pending: 0,
             bound,
         },
     );
-    match acquire {
-        Ok((blocker, source)) => {
-            match state.handle.insert_source(source, move |(), _, state| {
-                if let Some(operation) = state.readbacks.operations.get_mut(&id) {
-                    operation.sources.io = None;
-                }
-                submit(state, id);
-                Ok(())
-            }) {
-                Ok(token) => {
-                    state
-                        .readbacks
-                        .operations
-                        .get_mut(&id)
-                        .expect(
-                            "operation remains registered while its acquire source is installed",
-                        )
-                        .sources
-                        .io = Some(token);
-                    add_blocker(
-                        surface,
-                        AcquireBlocker {
-                            blocker,
-                            cancelled: acquire_cancelled,
-                        },
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "Cannot register DMA-BUF acquire readiness");
-                    state.readbacks.operations.remove(&id);
-                }
-            }
-        }
-        Err(AlreadyReady) => submit(state, id),
-    }
+    fences::watch(state, id, dmabuf);
 }
 
 fn submit(state: &mut State, id: u64) {
@@ -337,11 +348,16 @@ fn submit(state: &mut State, id: u64) {
         notify(state, &client);
         return;
     };
+    operation.acquire_sources.clear();
+    let submitted = Instant::now();
     operation.buffer.submitted = true;
     let submission = gpu.submit(dmabuf, operation.bound);
     match submission {
         Ok(Submission { fd, readback }) => {
-            operation.phase = Phase::Reading(readback);
+            operation.phase = Phase::Reading {
+                readback,
+                submitted,
+            };
             match state.handle.insert_source(
                 Generic::new(fd, Interest::READ, Mode::Level),
                 move |_, _, state| {
@@ -377,7 +393,12 @@ fn complete(state: &mut State, id: u64) {
         return;
     };
     operation.sources.io = None;
-    let Phase::Reading(readback) = operation.phase else {
+    let ready = Instant::now();
+    let Phase::Reading {
+        readback,
+        submitted,
+    } = operation.phase
+    else {
         unreachable!();
     };
     operation.buffer.finished = true;
@@ -395,6 +416,10 @@ fn complete(state: &mut State, id: u64) {
             Err(error) => tracing::warn!(%error, "DMA-BUF readback failed"),
         }
     }
+    state
+        .readbacks
+        .stats
+        .complete(operation.slot.started, submitted, ready);
     let client = operation.client;
     drop(operation.buffer);
     drop(operation.sources);
@@ -407,7 +432,6 @@ pub(crate) fn destroyed(state: &mut State, surface: &WlSurface) {
         if operation.surface == surface.downgrade()
             && matches!(operation.phase, Phase::Acquiring(_))
         {
-            operation.acquire_cancelled.store(true, Ordering::Release);
             clients.push(operation.client.clone());
             false
         } else {

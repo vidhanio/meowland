@@ -1,25 +1,23 @@
 //! Surface commits, copied snapshots, and buffer protocol handling.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
-    desktop::PopupManager,
     reexports::wayland_server::{
         Client,
-        protocol::{wl_buffer, wl_output, wl_surface::WlSurface},
+        protocol::{wl_buffer, wl_surface::WlSurface},
     },
-    utils::{Logical, Rectangle, Size, Transform},
+    utils::Transform,
     wayland::{
         buffer::BufferHandler,
         compositor::{
             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-            SurfaceAttributes, add_pre_commit_hook, get_children, get_parent, with_states,
+            SurfaceAttributes, add_pre_commit_hook, with_states,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         shm::{ShmHandler, ShmState, with_buffer_contents},
         single_pixel_buffer::get_single_pixel_buffer,
-        viewporter::ViewportCachedState,
     },
 };
 
@@ -28,14 +26,12 @@ use super::{Snapshot, State, WindowId, readback, render, runtime::ClientState};
 #[derive(Default)]
 pub(crate) struct SurfaceCache {
     pub snapshots: HashMap<WlSurface, Snapshot>,
-    geometry: HashMap<WlSurface, Geometry>,
     pub owners: HashMap<WlSurface, WindowId>,
 }
 
 impl SurfaceCache {
     fn remove(&mut self, surface: &WlSurface) {
         self.snapshots.remove(surface);
-        self.geometry.remove(surface);
         self.owners.remove(surface);
     }
 
@@ -48,23 +44,6 @@ impl SurfaceCache {
         for surface in surfaces {
             self.remove(&surface);
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) struct Geometry {
-    source: Option<Rectangle<f64, Logical>>,
-    destination: Option<Size<i32, Logical>>,
-    scale: i32,
-    transform: wl_output::Transform,
-}
-
-impl Geometry {
-    fn is_default(self) -> bool {
-        self.source.is_none()
-            && self.destination.is_none()
-            && self.scale == 1
-            && self.transform == wl_output::Transform::Normal
     }
 }
 
@@ -124,7 +103,7 @@ impl CompositorHandler for State {
             match assignment {
                 Some(BufferAssignment::NewBuffer(buffer)) => {
                     if let Ok(dmabuf) = get_dmabuf(&buffer) {
-                        readback::prepare(state, surface, &buffer, dmabuf.clone());
+                        readback::prepare(state, surface, &buffer, dmabuf);
                     } else {
                         readback::clear(surface);
                     }
@@ -144,34 +123,19 @@ impl CompositorHandler for State {
         if let Some(window) = self.window_for_surface(surface) {
             self.surface_cache.owners.insert(surface.clone(), window);
         }
-        let (assignment, damaged, geometry, callbacks) = with_states(surface, |states| {
-            let (assignment, damaged, scale, transform, callbacks) = {
-                let mut cached = states.cached_state.get::<SurfaceAttributes>();
-                let current = cached.current();
-                let damaged = !current.damage.is_empty();
-                current.damage.clear();
-                (
-                    current.buffer.take(),
-                    damaged,
-                    current.buffer_scale,
-                    current.buffer_transform,
-                    !current.frame_callbacks.is_empty(),
-                )
-            };
-            let mut viewport = states.cached_state.get::<ViewportCachedState>();
-            let current = viewport.current();
+        let changed = readback::prepared_at(surface).unwrap_or_else(Instant::now);
+        let (assignment, damage, scale, transform, callbacks) = with_states(surface, |states| {
+            let mut cached = states.cached_state.get::<SurfaceAttributes>();
+            let current = cached.current();
             (
-                assignment,
-                damaged,
-                Geometry {
-                    source: current.src,
-                    destination: current.dst,
-                    scale,
-                    transform,
-                },
-                callbacks,
+                current.buffer.take(),
+                std::mem::take(&mut current.damage),
+                current.buffer_scale,
+                Transform::from(current.buffer_transform),
+                !current.frame_callbacks.is_empty(),
             )
         });
+        let new_buffer = matches!(assignment, Some(BufferAssignment::NewBuffer(_)));
         if callbacks
             && let Some(window) = self
                 .window_for_surface(surface)
@@ -179,28 +143,9 @@ impl CompositorHandler for State {
         {
             window.callback_pending = true;
         }
-        let geometry_changed = if geometry.is_default() {
-            self.surface_cache.geometry.remove(surface).is_some()
-        } else {
-            self.surface_cache
-                .geometry
-                .insert(surface.clone(), geometry)
-                != Some(geometry)
-        };
-        let visual_change = assignment.is_some()
-            || damaged
-            || geometry_changed
-            || get_parent(surface).is_some()
-            || !get_children(surface).is_empty()
-            || self.popups.find_popup(surface).is_some()
-            || PopupManager::popups_for_surface(surface).next().is_some();
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
-                let bound = render::source_bound(
-                    self.pane_bound(surface),
-                    geometry.scale,
-                    Transform::from(geometry.transform),
-                );
+                let bound = render::source_bound(self.pane_bound(surface), scale, transform);
                 let mut previous = self.surface_cache.snapshots.remove(surface);
                 let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
@@ -237,8 +182,22 @@ impl CompositorHandler for State {
             if self.attachments.visible(window) && self.catalog.drawable(window) {
                 self.output.enter(surface);
             }
-            if visual_change {
-                self.touch(window);
+            let damage = self
+                .surface_cache
+                .snapshots
+                .get(surface)
+                .map_or_default(|snapshot| {
+                    let geometry = render::surface_geometry(surface, snapshot);
+                    if new_buffer && damage.is_empty() {
+                        render::SurfaceDamage::full(&geometry)
+                    } else {
+                        render::SurfaceDamage::new(&damage, &geometry)
+                    }
+                });
+            for entry in self.attachments.panes.values_mut() {
+                if entry.window() == Some(window) {
+                    entry.presentation.damage(surface, damage, changed);
+                }
             }
         }
     }

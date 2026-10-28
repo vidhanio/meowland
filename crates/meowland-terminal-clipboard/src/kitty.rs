@@ -100,7 +100,8 @@ struct Operation {
     cancelled: bool,
 }
 
-/// Bounded OSC 5522 selections with serialized requests and session credentials.
+/// Bounded OSC 5522 selections with serialized requests and session
+/// credentials.
 pub(crate) struct Clipboard {
     password: String,
     focused: bool,
@@ -124,7 +125,8 @@ impl std::fmt::Debug for Clipboard {
 }
 
 impl Clipboard {
-    /// Create clipboard state with secure credentials for terminal permission grants.
+    /// Create clipboard state with secure credentials for terminal permission
+    /// grants.
     ///
     /// # Errors
     /// Returns an error if secure request credentials cannot be generated.
@@ -178,7 +180,8 @@ impl Clipboard {
         })
     }
 
-    /// Queue a representation read from a previously advertised selection offer.
+    /// Queue a representation read from a previously advertised selection
+    /// offer.
     pub(crate) fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
         let selection = self
             .offers
@@ -246,7 +249,8 @@ impl Clipboard {
         }
     }
 
-    /// Queue bounded MIME-aware clipboard contents for the selected destination.
+    /// Queue bounded MIME-aware clipboard contents for the selected
+    /// destination.
     pub(crate) fn copy(&mut self, selection: Selection, data: ClipboardData) {
         if !data.valid() {
             return;

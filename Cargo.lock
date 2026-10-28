@@ -533,22 +533,17 @@ dependencies = [
 name = "meowland"
 version = "0.1.0"
 dependencies = [
- "base64",
  "config",
  "dirs",
- "flate2",
  "meowland-core",
  "meowland-protocol",
  "meowland-server",
  "meowland-terminal",
- "pty-process",
  "rustix 1.1.5",
- "tempfile",
  "tokio",
  "tracing-journald",
  "tracing-subscriber",
  "usage-rs",
- "vtparse",
  "wayland-client",
  "wayland-protocols",
 ]
@@ -814,15 +809,6 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "pty-process"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f0cff49b5194f464ce14bfaef7d6dba180889934e9bfa37ca5f2528ea515c0b"
-dependencies = [
- "rustix 1.1.5",
 ]
 
 [[package]]

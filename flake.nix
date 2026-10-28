@@ -186,6 +186,7 @@
               // {
                 inherit cargoArtifacts;
                 doCheck = false;
+                cargoExtraArgs = "--locked -p meowland --bin meowland";
                 meta.mainProgram = "meowland";
 
                 nativeBuildInputs = nativeBuildInputs ++ [
@@ -262,6 +263,7 @@
                 pkgs.cargo-deny
                 pkgs.cargo-edit
                 pkgs.cargo-machete
+                pkgs.python3
               ];
 
               inherit buildInputs nativeBuildInputs;
@@ -277,6 +279,7 @@
                   package = rustToolchain pkgs;
                 };
                 taplo.enable = true;
+                ruff-format.enable = true;
               };
             };
           };

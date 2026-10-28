@@ -1,5 +1,6 @@
 [package]
 name = "meowland"
+default-run = "meowland"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +9,28 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+benchmarks = ["dep:rustix", "dep:wayland-client", "dep:wayland-protocols"]
+
+[[bin]]
+name = "meowland-workload"
+path = "benchmarks/workload/main.rs"
+required-features = ["benchmarks"]
+
+[[bench]]
+name = "suite"
+path = "benchmarks/suite.rs"
+harness = false
+required-features = ["benchmarks"]
+
 [dependencies]
+rustix = { workspace = true, optional = true, features = [
+  "event",
+  "fs",
+  "time",
+] }
+wayland-client = { workspace = true, optional = true }
+wayland-protocols = { workspace = true, optional = true, features = ["client"] }
 config = { workspace = true }
 dirs = { workspace = true }
 meowland-core = { workspace = true }
@@ -23,23 +45,3 @@ usage-rs = { workspace = true, features = [
   "diagnostics",
   "help",
 ] }
-
-[dev-dependencies]
-base64 = { workspace = true }
-flate2 = { workspace = true }
-pty-process = { workspace = true }
-rustix = { workspace = true, features = [
-  "event",
-  "fs",
-  "shm",
-  "termios",
-  "time",
-] }
-tempfile = { workspace = true }
-vtparse = { workspace = true }
-wayland-client = { workspace = true }
-wayland-protocols = { workspace = true, features = ["client"] }
-
-[[bench]]
-name = "suite"
-harness = false

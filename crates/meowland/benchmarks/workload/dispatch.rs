@@ -2,13 +2,13 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     globals::GlobalListContents,
     protocol::{
-        wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+        wl_surface,
     },
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use super::{super::record::Event, Input, Phase, State};
+use super::{Phase, State};
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
@@ -102,13 +102,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         if let wl_seat::Event::Capabilities {
             capabilities: WEnum::Value(capabilities),
         } = event
+            && capabilities.contains(wl_seat::Capability::Keyboard)
+            && state.keyboard.is_none()
         {
-            if capabilities.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
-                state.keyboard = Some(seat.get_keyboard(qh, ()));
-            }
-            if capabilities.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-                state.pointer = Some(seat.get_pointer(qh, ()));
-            }
+            state.keyboard = Some(seat.get_keyboard(qh, ()));
         }
     }
 }
@@ -127,48 +124,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 key,
                 state: WEnum::Value(wl_keyboard::KeyState::Pressed),
                 ..
-            } => state.input(Input::Key(key)),
-            wl_keyboard::Event::Key {
-                key,
-                state: WEnum::Value(wl_keyboard::KeyState::Released),
-                ..
-            } => state.input(Input::Release(key)),
+            } => state.input(key),
             wl_keyboard::Event::Enter { .. } if !state.ready => {
                 state.ready = true;
-                state.event(Event::Ready);
+                state.event("ready", 0);
             }
             _ => {}
-        }
-    }
-}
-
-impl Dispatch<wl_pointer::WlPointer, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        (): &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let (wl_pointer::Event::Enter {
-            surface_x: x,
-            surface_y: y,
-            ..
-        }
-        | wl_pointer::Event::Motion {
-            surface_x: x,
-            surface_y: y,
-            ..
-        }) = event
-        else {
-            return;
-        };
-        if let Some((_, expected @ Input::Pointer(px, py))) = state.expectation
-            && (x - f64::from(px)).abs() < 0.01
-            && (y - f64::from(py)).abs() < 0.01
-        {
-            state.input(expected);
         }
     }
 }

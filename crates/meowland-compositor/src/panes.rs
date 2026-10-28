@@ -19,22 +19,12 @@ impl State {
         self.attachments.showing(window)
     }
 
-    /// The lowest-numbered pane sets the output mode seen by clients.
-    fn insert_pane(&mut self, pane: PaneId, entry: AttachedPane) {
-        let size = entry.presentation.size;
-        self.attachments.panes.insert(pane, entry);
-        if self.attachments.first() == Some(pane) {
-            self.configure_output(size);
-        }
-    }
-
-    /// Remove every pane-keyed entry, restoring the remaining output mode and
-    /// window size owner.
+    /// Remove every pane-keyed entry and restore the remaining window size
+    /// owner.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
         if self.keyboard_state.owner == Some(pane) {
             input::reset_keyboard(self);
         }
-        let first = self.attachments.first() == Some(pane);
         let removed = self.attachments.remove(pane);
         let window = removed.as_ref().and_then(AttachedPane::window);
         self.clipboard.detach(pane);
@@ -55,9 +45,6 @@ impl State {
             .is_some_and(|(sent, _)| *sent == pane)
         {
             self.cursor.sent = None;
-        }
-        if first && let Some(next) = self.attachments.first() {
-            self.configure_output(self.attachments.panes[&next].presentation.size);
         }
         if let Some(window) = window {
             self.leave_output(window);
@@ -94,11 +81,7 @@ impl State {
         };
         entry.presentation.size = size;
         entry.presentation.mark_dirty();
-        let window = entry.window();
-        if self.attachments.first() == Some(pane) {
-            self.configure_output(size);
-        }
-        if let Some(window) = window {
+        if let Some(window) = entry.window() {
             self.apply_window_state(window);
         }
     }
@@ -117,7 +100,9 @@ impl State {
             Show::Activation(token) if window.is_some() => Some(token.clone()),
             _ => None,
         };
-        self.insert_pane(pane, AttachedPane::new(show, window, size));
+        self.attachments
+            .panes
+            .insert(pane, AttachedPane::new(show, window, size));
         if let Some(window) = window {
             self.show_pane_window(pane, window);
         }

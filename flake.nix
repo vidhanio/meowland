@@ -55,6 +55,8 @@
                   default = { };
                   example = {
                     output = {
+                      width = 2560;
+                      height = 1440;
                       scale = 1.5;
                       refresh_rate = 60;
                     };
@@ -68,8 +70,10 @@
                     Configuration written to
                     {file}`$XDG_CONFIG_HOME/meowland/config.toml`.
 
-                    Output settings are `scale` (0.5–4) and `refresh_rate`
-                    (1–1000 Hz). Keyboard settings are the XKB `layout`,
+                    Output settings are `width` and `height` in physical pixels
+                    (default 1920×1080), `scale` (0.5–4), and `refresh_rate`
+                    (1–1000 Hz). The virtual monitor resolution stays fixed when
+                    terminal panes resize. Keyboard settings are the XKB `layout`,
                     `variant`, and `options` strings, plus `repeat_delay`
                     in milliseconds and `repeat_rate` in events per second
                     (zero disables repeat). Unspecified settings use Meowland's

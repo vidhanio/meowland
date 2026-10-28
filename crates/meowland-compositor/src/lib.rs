@@ -135,7 +135,7 @@ pub struct Compositor {
     cursor: seat::CursorState,
     renderer: Renderer,
     events: Vec<Event>,
-    /// Output mode, rewritten as panes attach and leave.
+    /// Fixed virtual monitor size in logical coordinates.
     mode: Size<i32, Logical>,
     started: Instant,
     shutdown: bool,
@@ -163,8 +163,12 @@ impl State {
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
         let pointer = Some(seat.add_pointer());
         let text_input = text::manager(&display_handle, &seat);
-        let (output_manager, output, mode) =
-            scaling::output(&display_handle, scale, settings.refresh_rate);
+        let (output_manager, output, mode) = scaling::output(
+            &display_handle,
+            scale,
+            settings.refresh_rate,
+            settings.output_size,
+        );
         let primary_selection = PrimarySelectionState::new::<Self>(&display_handle);
         let data_control =
             WlrDataControlState::new::<Self, _>(&display_handle, Some(&primary_selection), |_| {

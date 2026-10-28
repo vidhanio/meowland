@@ -42,7 +42,7 @@ enum Commands {
 #[derive(Args)]
 struct ServerArgs {
     /// Read this TOML file instead of `$XDG_CONFIG_HOME/meowland/config.toml`.
-    #[usage(long, short = 'c')]
+    #[usage(long, short = 'c', env = "MEOWLAND_CONFIG")]
     config: Option<PathBuf>,
 }
 

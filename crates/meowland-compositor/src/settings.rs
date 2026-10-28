@@ -1,18 +1,31 @@
 //! Server-owned output and keyboard settings applied when the compositor
 //! starts.
 
-use meowland_core::{scale::UiScale, timing::RefreshRate};
+use meowland_core::{pixels::FrameSize, scale::UiScale, timing::RefreshRate};
 
 /// Output and keyboard policy shared by every pane.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Settings {
+    /// Fixed virtual monitor resolution, independent of terminal pane size.
+    pub output_size: FrameSize,
     /// Physical pixels per logical pixel.
     pub scale: UiScale,
     /// Advertised output refresh rate and visible frame callback cadence.
     pub refresh_rate: RefreshRate,
     /// XKB keymap and Wayland key repeat policy.
     pub keyboard: KeyboardSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            output_size: FrameSize::new(1920, 1080).expect("default output dimensions are valid"),
+            scale: UiScale::default(),
+            refresh_rate: RefreshRate::default(),
+            keyboard: KeyboardSettings::default(),
+        }
+    }
 }
 
 /// Keymap names understood by XKB and repeat timings advertised to clients.

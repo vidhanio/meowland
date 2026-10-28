@@ -4,6 +4,7 @@
 use std::io;
 
 use meowland_compositor::Settings;
+use meowland_core::pixels::FrameSize;
 use serde::Deserialize;
 
 /// Server-wide output and input policy, applied once at startup.
@@ -22,6 +23,10 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct OutputConfig {
+    /// Fixed virtual monitor width in physical pixels.
+    pub width: u32,
+    /// Fixed virtual monitor height in physical pixels.
+    pub height: u32,
     /// Physical pixels per logical pixel, between 0.5 and 4.
     pub scale: f64,
     /// Advertised refresh rate and visible callback cadence, between 1 and 1000
@@ -32,6 +37,8 @@ pub struct OutputConfig {
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
+            width: 1920,
+            height: 1080,
             scale: 1.0,
             refresh_rate: 120,
         }
@@ -78,6 +85,10 @@ impl Config {
             ));
         }
         let mut settings = Settings::default();
+        settings.output_size =
+            FrameSize::new(self.output.width, self.output.height).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid output dimensions")
+            })?;
         settings.scale = self.output.scale.to_string().parse()?;
         settings.refresh_rate = self.output.refresh_rate.try_into()?;
         settings.keyboard.layout = self.keyboard.layout;

@@ -1,6 +1,6 @@
 //! Preferred fractional scale and physical-to-logical pane geometry.
 
-use meowland_core::{scale::UiScale, timing::RefreshRate};
+use meowland_core::{pixels::FrameSize, scale::UiScale, timing::RefreshRate};
 use smithay::{
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::DisplayHandle,
@@ -18,9 +18,14 @@ pub(crate) fn output(
     display: &DisplayHandle,
     scale: UiScale,
     refresh_rate: RefreshRate,
+    size: FrameSize,
 ) -> (OutputManagerState, Output, Mode) {
     let mode = Mode {
-        size: (1920, 1080).into(),
+        size: (
+            i32::try_from(size.width()).expect("validated output width fits Wayland coordinates"),
+            i32::try_from(size.height()).expect("validated output height fits Wayland coordinates"),
+        )
+            .into(),
         refresh: refresh_rate.millihertz(),
     };
     let manager = OutputManagerState::new_with_xdg_output::<State>(display);

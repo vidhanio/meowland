@@ -2,7 +2,7 @@
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{Input, PaneAction, Shortcut, Show};
-use smithay::{output::Mode, reexports::wayland_protocols::xdg::shell::server::xdg_toplevel};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input::pane_input};
 
@@ -175,7 +175,10 @@ impl State {
         entry.surface.with_pending_state(|pending| {
             pending.size = Some(size);
             pending.bounds = Some(size);
-            pending.states.set(xdg_toplevel::State::Maximized);
+            pending.states.set(xdg_toplevel::State::TiledLeft);
+            pending.states.set(xdg_toplevel::State::TiledRight);
+            pending.states.set(xdg_toplevel::State::TiledTop);
+            pending.states.set(xdg_toplevel::State::TiledBottom);
             if activated {
                 pending.states.set(xdg_toplevel::State::Activated);
             } else {
@@ -188,27 +191,5 @@ impl State {
             }
         });
         entry.surface.send_configure();
-    }
-
-    pub(crate) fn configure_output(&mut self, size: FrameSize) {
-        let mode = Mode {
-            size: (
-                i32::try_from(size.width())
-                    .expect("validated frame width fits Wayland coordinates"),
-                i32::try_from(size.height())
-                    .expect("validated frame height fits Wayland coordinates"),
-            )
-                .into(),
-            refresh: self.refresh_rate.millihertz(),
-        };
-        self.mode = self.logical_size(size.width(), size.height());
-        for previous in self.output.modes() {
-            if previous != mode {
-                self.output.delete_mode(previous);
-            }
-        }
-        self.output.set_preferred(mode);
-        self.output
-            .change_current_state(Some(mode), None, None, None);
     }
 }

@@ -94,10 +94,6 @@ pub(crate) struct Attachments {
 }
 
 impl Attachments {
-    pub(crate) fn first(&self) -> Option<PaneId> {
-        self.panes.keys().copied().min()
-    }
-
     pub(crate) fn first_window(&self) -> Option<WindowId> {
         self.panes
             .iter()

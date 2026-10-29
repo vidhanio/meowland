@@ -20,19 +20,23 @@ fn window_id(value: u64) -> WindowId {
 }
 
 #[derive(Debug)]
-struct Fake {
+struct FakePresentation<const DIRTY_ON_NEW: bool, const DIRTY_ON_SIZE: bool> {
     size: FrameSize,
     transport: FrameTransport,
     due: bool,
     acked: Option<(PaneId, FrameAck)>,
 }
 
-impl Presentation for Fake {
+type Fake = FakePresentation<false, false>;
+
+impl<const DIRTY_ON_NEW: bool, const DIRTY_ON_SIZE: bool> Presentation
+    for FakePresentation<DIRTY_ON_NEW, DIRTY_ON_SIZE>
+{
     fn new(size: FrameSize) -> Self {
         Self {
             size,
             transport: FrameTransport::Inline,
-            due: false,
+            due: DIRTY_ON_NEW,
             acked: None,
         }
     }
@@ -43,6 +47,9 @@ impl Presentation for Fake {
 
     fn set_size(&mut self, size: FrameSize) {
         self.size = size;
+        if DIRTY_ON_SIZE {
+            self.due = true;
+        }
     }
 
     fn set_transport(&mut self, transport: FrameTransport) {
@@ -398,17 +405,129 @@ fn insert_replaces_an_existing_attachment() {
     assert_eq!(attachments.showing(window_id(3)), vec![pane_id(1)]);
 }
 
-fn decoded_show(raw: u16, window: WindowId, other: WindowId) -> Show {
-    match (raw >> 7) % 8 {
-        0 => Show::Id(window),
-        1 => Show::Id(other),
-        2 => Show::Newest,
-        3 => Show::Focused,
-        4 => Show::AppId("alpha".into()),
-        5 => Show::AppId("beta".into()),
-        6 => Show::Activation("first".into()),
-        _ => Show::Activation("second".into()),
-    }
+#[derive(Clone, Debug)]
+enum VisitAction {
+    MarkDirty,
+    Ack(FrameAck),
+    SetSize(FrameSize),
+}
+
+#[derive(Clone, Debug)]
+enum Operation {
+    Insert {
+        pane: PaneId,
+        show: Show,
+        resolved: Option<WindowId>,
+        size: FrameSize,
+    },
+    Show {
+        pane: PaneId,
+        window: WindowId,
+    },
+    Clear {
+        pane: PaneId,
+    },
+    Remove {
+        pane: PaneId,
+    },
+    Resize {
+        pane: PaneId,
+        size: FrameSize,
+    },
+    Ack {
+        pane: PaneId,
+        ack: FrameAck,
+    },
+    SetTransport {
+        pane: PaneId,
+        transport: FrameTransport,
+    },
+    Decide {
+        window: WindowId,
+        pane: PaneId,
+    },
+    ForgetWindow {
+        window: WindowId,
+    },
+    VisitAll {
+        action: VisitAction,
+    },
+}
+
+fn pane_strategy() -> impl Strategy<Value = PaneId> {
+    (0u64..4).prop_map(pane_id)
+}
+
+fn window_strategy() -> impl Strategy<Value = WindowId> {
+    (1u64..5).prop_map(window_id)
+}
+
+fn size_strategy() -> impl Strategy<Value = FrameSize> {
+    prop_oneof![Just(frame_size(80, 24)), Just(frame_size(100, 40))]
+}
+
+fn app_id_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![Just("alpha".to_owned()), Just("beta".to_owned())]
+}
+
+fn token_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![Just("first".to_owned()), Just("second".to_owned())]
+}
+
+fn show_strategy() -> impl Strategy<Value = Show> {
+    prop_oneof![
+        window_strategy().prop_map(Show::Id),
+        Just(Show::Newest),
+        Just(Show::Focused),
+        app_id_strategy().prop_map(Show::AppId),
+        token_strategy().prop_map(Show::Activation),
+    ]
+}
+
+fn ack_strategy() -> impl Strategy<Value = FrameAck> {
+    prop_oneof![Just(FrameAck::Retained), Just(FrameAck::Resync)]
+}
+
+fn transport_strategy() -> impl Strategy<Value = FrameTransport> {
+    prop_oneof![Just(FrameTransport::Inline), Just(FrameTransport::Shared)]
+}
+
+fn visit_strategy() -> impl Strategy<Value = VisitAction> {
+    prop_oneof![
+        Just(VisitAction::MarkDirty),
+        ack_strategy().prop_map(VisitAction::Ack),
+        size_strategy().prop_map(VisitAction::SetSize),
+    ]
+}
+
+fn operation_strategy() -> impl Strategy<Value = Operation> {
+    prop_oneof![
+        (
+            pane_strategy(),
+            show_strategy(),
+            proptest::option::of(window_strategy()),
+            size_strategy(),
+        )
+            .prop_map(|(pane, show, resolved, size)| Operation::Insert {
+                pane,
+                show,
+                resolved,
+                size,
+            }),
+        (pane_strategy(), window_strategy())
+            .prop_map(|(pane, window)| Operation::Show { pane, window }),
+        pane_strategy().prop_map(|pane| Operation::Clear { pane }),
+        pane_strategy().prop_map(|pane| Operation::Remove { pane }),
+        (pane_strategy(), size_strategy())
+            .prop_map(|(pane, size)| Operation::Resize { pane, size }),
+        (pane_strategy(), ack_strategy()).prop_map(|(pane, ack)| Operation::Ack { pane, ack }),
+        (pane_strategy(), transport_strategy())
+            .prop_map(|(pane, transport)| { Operation::SetTransport { pane, transport } }),
+        (window_strategy(), pane_strategy())
+            .prop_map(|(window, pane)| Operation::Decide { window, pane }),
+        window_strategy().prop_map(|window| Operation::ForgetWindow { window }),
+        visit_strategy().prop_map(|action| Operation::VisitAll { action }),
+    ]
 }
 
 proptest! {
@@ -418,119 +537,169 @@ proptest! {
     })]
 
     #[test]
-    fn indexes_and_due_counts_stay_consistent(operations in prop::collection::vec(any::<u16>(), 0..200)) {
-        let sizes = [frame_size(80, 24), frame_size(100, 40)];
-        let mut attachments = Attachments::<Fake>::default();
+    fn indexes_and_due_counts_stay_consistent(
+        operations in prop::collection::vec(operation_strategy(), 0..200)
+    ) {
+        let mut attachments = Attachments::<FakePresentation<true, true>>::default();
+        let mut bound = HashMap::new();
+        let mut sizes = HashMap::new();
+        let mut dirty = HashMap::new();
         let mut deciding = HashMap::new();
 
-        for (step, &raw) in operations.iter().enumerate() {
-            let pane = pane_id(u64::from(raw & 3));
-            let window = window_id(1 + u64::from((raw >> 2) & 3));
-            let other = window_id(1 + u64::from((raw >> 4) & 3));
-            let size = sizes[usize::from((raw >> 6) & 1)];
-            let show = decoded_show(raw, window, other);
-
-            match (raw >> 10) % 10 {
-                0 => attachments.insert(
+        for (step, operation) in operations.iter().enumerate() {
+            match operation {
+                Operation::Insert {
                     pane,
                     show,
-                    ((raw >> 13) & 1 == 1).then_some(window),
+                    resolved,
                     size,
-                ),
-                1 => {
-                    attachments.show(pane, window);
+                } => {
+                    attachments.insert(*pane, show.clone(), *resolved, *size);
+                    bound.insert(*pane, *resolved);
+                    sizes.insert(*pane, *size);
+                    dirty.insert(*pane, true);
                 }
-                2 => attachments.clear(pane),
-                3 => {
-                    attachments.remove(pane);
-                    deciding.retain(|_, owner| *owner != pane);
-                }
-                4 => {
-                    attachments.resize(pane, size);
-                }
-                5 => attachments.ack(
-                    pane,
-                    if raw & 1 == 0 {
-                        FrameAck::Retained
-                    } else {
-                        FrameAck::Resync
-                    },
-                ),
-                6 => attachments.set_transport(
-                    pane,
-                    if raw & 1 == 0 {
-                        FrameTransport::Inline
-                    } else {
-                        FrameTransport::Shared
-                    },
-                ),
-                7 => {
-                    attachments.decide(window, pane);
-                    deciding.insert(window, pane);
-                }
-                8 => {
-                    attachments.forget_window(window);
-                    deciding.remove(&window);
-                }
-                _ => attachments.for_each_presentation_mut(|_, _, presentation| {
-                    if raw & 1 == 0 {
-                        presentation.mark_dirty();
-                    } else {
-                        presentation.ack(pane, FrameAck::Retained);
+                Operation::Show { pane, window } => {
+                    attachments.show(*pane, *window);
+                    if let Some(binding) = bound.get_mut(pane) {
+                        *binding = Some(*window);
+                        dirty.insert(*pane, true);
                     }
-                }),
+                }
+                Operation::Clear { pane } => {
+                    attachments.clear(*pane);
+                    if let Some(binding) = bound.get_mut(pane) {
+                        *binding = None;
+                        dirty.insert(*pane, true);
+                    }
+                }
+                Operation::Remove { pane } => {
+                    attachments.remove(*pane);
+                    bound.remove(pane);
+                    sizes.remove(pane);
+                    dirty.remove(pane);
+                    deciding.retain(|_, owner| *owner != *pane);
+                }
+                Operation::Resize { pane, size } => {
+                    attachments.resize(*pane, *size);
+                    if sizes.get(pane) != Some(size) && sizes.contains_key(pane) {
+                        sizes.insert(*pane, *size);
+                        dirty.insert(*pane, true);
+                    }
+                }
+                Operation::Ack { pane, ack } => {
+                    attachments.ack(*pane, *ack);
+                    if bound.contains_key(pane) {
+                        dirty.insert(*pane, false);
+                    }
+                }
+                Operation::SetTransport { pane, transport } => {
+                    attachments.set_transport(*pane, *transport);
+                    if bound.contains_key(pane) {
+                        dirty.insert(*pane, *transport == FrameTransport::Shared);
+                    }
+                }
+                Operation::Decide { window, pane } => {
+                    attachments.decide(*window, *pane);
+                    deciding.insert(*window, *pane);
+                }
+                Operation::ForgetWindow { window } => {
+                    attachments.forget_window(*window);
+                    deciding.remove(window);
+                }
+                Operation::VisitAll { action } => {
+                    attachments.for_each_presentation_mut(|pane, _, presentation| {
+                        match action {
+                            VisitAction::MarkDirty => presentation.mark_dirty(),
+                            VisitAction::Ack(ack) => presentation.ack(pane, *ack),
+                            VisitAction::SetSize(size) => presentation.set_size(*size),
+                        }
+                    });
+                    match action {
+                        VisitAction::MarkDirty => {
+                            for dirty in dirty.values_mut() {
+                                *dirty = true;
+                            }
+                        }
+                        VisitAction::Ack(_) => {
+                            for dirty in dirty.values_mut() {
+                                *dirty = false;
+                            }
+                        }
+                        VisitAction::SetSize(size) => {
+                            for dirty in dirty.values_mut() {
+                                *dirty = true;
+                            }
+                            for current in sizes.values_mut() {
+                                *current = *size;
+                            }
+                        }
+                    }
+                }
             }
 
-            let expected_due = attachments
+            let expected_due = dirty.values().filter(|dirty| **dirty).count();
+            let actual_due = attachments
                 .iter()
                 .filter(|(_, entry)| entry.presentation.due())
                 .count();
             prop_assert_eq!(
                 attachments.due_frames(),
                 expected_due,
-                "step {} operation {:#06x}",
+                "step {} operation {:?} cached due",
                 step,
-                raw
+                operation
+            );
+            prop_assert_eq!(
+                actual_due, expected_due,
+                "step {} operation {:?} presentation due",
+                step,
+                operation
             );
 
             for number in 1..=4u64 {
                 let window = window_id(number);
-                let expected: Vec<PaneId> = attachments
+                let mut expected: Vec<PaneId> = bound
+                    .iter()
+                    .filter_map(|(&pane, binding)| (*binding == Some(window)).then_some(pane))
+                    .collect();
+                expected.sort_unstable();
+                let scanned: Vec<PaneId> = attachments
                     .iter()
                     .filter_map(|(&pane, entry)| (entry.window() == Some(window)).then_some(pane))
                     .collect();
                 let expected_owner = deciding
                     .get(&window)
                     .copied()
-                    .filter(|pane| {
-                        attachments
-                            .get(*pane)
-                            .is_some_and(|entry| entry.window() == Some(window))
-                    })
+                    .filter(|pane| bound.get(pane).copied().flatten() == Some(window))
                     .or_else(|| expected.first().copied());
+                let showing = attachments.showing(window);
+
                 prop_assert_eq!(
-                    attachments.showing(window),
-                    expected,
-                    "step {} window {}",
+                    &scanned,
+                    &expected,
+                    "step {} operation {:?} window {} scan",
                     step,
+                    operation,
+                    number
+                );
+                prop_assert_eq!(
+                    showing,
+                    expected,
+                    "step {} operation {:?} window {} index",
+                    step,
+                    operation,
                     number
                 );
                 prop_assert_eq!(
                     attachments.owner(window),
                     expected_owner,
-                    "step {} window {}",
+                    "step {} operation {:?} window {} owner",
                     step,
+                    operation,
                     number
                 );
             }
-
-            prop_assert_eq!(
-                attachments.first_window(),
-                attachments.iter().find_map(|(_, entry)| entry.window()),
-                "step {} operation {:#06x}",
-                step,
-                raw
-            );
         }
     }
 }

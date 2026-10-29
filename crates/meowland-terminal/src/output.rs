@@ -2,6 +2,7 @@
 use std::{fs::File, io};
 
 use futures::io::{AsyncWrite, AsyncWriteExt};
+use meowland_protocol::release_oversized;
 use rustix::fs::{self, Mode, OFlags};
 
 /// Most bytes written to the terminal in one scheduling turn.
@@ -63,6 +64,7 @@ impl Output {
     pub(crate) fn discard(&mut self) {
         self.bytes.clear();
         self.offset = 0;
+        release_oversized(&mut self.bytes);
     }
 
     /// Never monopolize the input loop, even when the terminal is writable.
@@ -78,6 +80,7 @@ impl Output {
         if !self.pending() {
             self.bytes.clear();
             self.offset = 0;
+            release_oversized(&mut self.bytes);
         }
         Ok(())
     }

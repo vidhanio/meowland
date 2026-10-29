@@ -25,7 +25,7 @@ pub(crate) const HEADER: usize = 4;
 /// Buffers grow to the largest message seen. A single maximum-size frame would
 /// otherwise pin `MAX_MESSAGE` bytes for the life of the process, so anything
 /// above this is trimmed once its message has been written or decoded.
-pub(crate) const RETAINED_BUFFER: usize = 1024 * 1024;
+pub const RETAINED_BUFFER: usize = 1024 * 1024;
 
 thread_local! {
     /// Reuse a message buffer across frames to avoid megabyte-scale allocations.
@@ -465,15 +465,17 @@ fn read_message<T: for<'de> Deserialize<'de>>(
     decode(&buffer[..size])
 }
 
-/// Trim a framing buffer back to [`RETAINED_BUFFER`] after a larger message.
+/// Trim a handled buffer back to [`RETAINED_BUFFER`].
 ///
-/// The retained window stays usable, so only messages above the threshold pay
-/// for a fresh allocation on the way back up.
-pub(crate) fn release_oversized(buffer: &mut Vec<u8>) {
+/// Buffers grow to the largest message they have carried, so this is called
+/// once that message has been written or decoded, or after clearing a buffer
+/// whose largest contents are gone. The retained window stays usable, so only
+/// messages above the threshold pay for a fresh allocation on the way back up.
+pub fn release_oversized(buffer: &mut Vec<u8>) {
     if buffer.len() > RETAINED_BUFFER {
         buffer.truncate(RETAINED_BUFFER);
-        buffer.shrink_to(RETAINED_BUFFER);
     }
+    buffer.shrink_to(RETAINED_BUFFER);
 }
 
 pub(crate) fn message_size(header: [u8; HEADER]) -> io::Result<usize> {

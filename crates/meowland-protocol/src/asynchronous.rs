@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     MAX_MESSAGE, PanePacket, ServerToPane,
-    protocol::{HEADER, decode, message_size},
+    protocol::{HEADER, decode, message_size, release_oversized},
 };
 const IO_BUDGET: usize = 64 * 1024;
 
@@ -84,7 +84,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         self.header_read = 0;
         self.body_read = 0;
         let decoded = decode(&self.body[..self.body_size]);
-        crate::protocol::release_oversized(&mut self.body);
+        release_oversized(&mut self.body);
         decoded.map(Some)
     }
 }
@@ -92,12 +92,15 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 /// At most one maximum-sized packet's worth of queued bytes.
 ///
 /// Frames retain their owned RGB payload separately from their small header.
-/// Partial writes retain their offsets across cancellation.
+/// Partial writes retain their offsets across cancellation. A fully written
+/// chunk is released back to [`RETAINED_BUFFER`](crate::RETAINED_BUFFER) and
+/// reused for the next packet, so the queue never pins an oversized buffer.
 #[derive(Debug, Default)]
 pub struct Outgoing {
     chunks: VecDeque<Vec<u8>>,
     offset: usize,
     queued: usize,
+    spare: Vec<u8>,
 }
 
 impl Outgoing {
@@ -116,7 +119,7 @@ impl Outgoing {
     pub fn send<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let size = postcard::experimental::serialized_size(message).map_err(invalid)?;
         self.reserve_packet(size)?;
-        let packet = encode_packet(message, size, size)?;
+        let packet = self.encode_packet(message, size, size)?;
         self.push(packet);
         Ok(())
     }
@@ -135,11 +138,30 @@ impl Outgoing {
         let prefix = postcard::experimental::serialized_size(&header).map_err(invalid)?;
         let size = prefix + frame.rgb().len();
         self.reserve_packet(size)?;
-        let packet = encode_packet(&header, prefix, size)?;
+        let packet = self.encode_packet(&header, prefix, size)?;
         let (_, _, rgb) = frame.into_parts();
         self.push(packet);
         self.push(rgb);
         Ok(())
+    }
+
+    /// Serialize a packet header into the spare buffer left by the last write.
+    fn encode_packet<T: Serialize>(
+        &mut self,
+        message: &T,
+        prefix: usize,
+        size: usize,
+    ) -> io::Result<Vec<u8>> {
+        let length = u32::try_from(size).map_err(invalid)?;
+        let mut bytes = std::mem::take(&mut self.spare);
+        bytes.clear();
+        bytes.resize(HEADER + prefix, 0);
+        bytes[..HEADER].copy_from_slice(&length.to_le_bytes());
+        let encoded = postcard::to_slice(message, &mut bytes[HEADER..]).map_err(invalid)?;
+        if encoded.len() != prefix {
+            return Err(invalid("serialized message size changed"));
+        }
+        Ok(bytes)
     }
 
     fn reserve_packet(&self, size: usize) -> io::Result<()> {
@@ -169,18 +191,29 @@ impl Outgoing {
         let Some(bytes) = self.chunks.front() else {
             return Ok(());
         };
-        let end = (self.offset + IO_BUDGET).min(bytes.len());
+        let len = bytes.len();
+        let end = (self.offset + IO_BUDGET).min(len);
         let written = writer.write(&bytes[self.offset..end]).await?;
         if written == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
         self.offset += written;
         self.queued -= written;
-        if self.offset == bytes.len() {
-            self.chunks.pop_front();
-            self.offset = 0;
+        if self.offset == len {
+            self.release_front();
         }
         Ok(())
+    }
+
+    /// Reclaim a fully written chunk as the next packet's buffer.
+    fn release_front(&mut self) {
+        self.offset = 0;
+        if let Some(mut chunk) = self.chunks.pop_front() {
+            release_oversized(&mut chunk);
+            if chunk.capacity() > self.spare.capacity() {
+                self.spare = chunk;
+            }
+        }
     }
 
     /// Drain queued packets. Cancellation retains all unsent bytes.
@@ -194,17 +227,6 @@ impl Outgoing {
         }
         writer.flush().await
     }
-}
-
-fn encode_packet<T: Serialize>(message: &T, prefix: usize, size: usize) -> io::Result<Vec<u8>> {
-    let mut bytes = vec![0; HEADER + prefix];
-    let length = u32::try_from(size).map_err(invalid)?;
-    bytes[..HEADER].copy_from_slice(&length.to_le_bytes());
-    let encoded = postcard::to_slice(message, &mut bytes[HEADER..]).map_err(invalid)?;
-    if encoded.len() != prefix {
-        return Err(invalid("serialized message size changed"));
-    }
-    Ok(bytes)
 }
 
 fn invalid(error: impl std::fmt::Display) -> io::Error {

@@ -17,6 +17,7 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
+from graphics import edit_rect
 from session import Session, terminal_requirement
 
 
@@ -28,6 +29,7 @@ def cases(full):
         width=1920,
         height=1080,
         transport="shared",
+        selection="shared",
     ):
         return {
             "name": name,
@@ -36,22 +38,39 @@ def cases(full):
             "width": width,
             "height": height,
             "transport": transport,
+            "selection": selection,
         }
 
     result = [
         case("full-1080p"),
-        case("sparse-1080p", pattern="sparse"),
-        case("input", kind="input", pattern="sparse", width=640, height=360),
-        case("static", kind="static", pattern="sparse", width=640, height=360),
-        case("inline", width=640, height=360, transport="inline"),
+        case("sparse-1080p", pattern="sparse", selection="inline"),
+        case("tall-1080p", pattern="tall", selection="inline"),
+        case("wide-1080p", pattern="wide", selection="inline"),
+        case(
+            "input",
+            kind="input",
+            pattern="sparse",
+            width=640,
+            height=360,
+            selection="inline",
+        ),
+        case(
+            "static",
+            kind="static",
+            pattern="sparse",
+            width=640,
+            height=360,
+            selection="none",
+        ),
+        case("inline", width=640, height=360, transport="inline", selection="inline"),
         case("stream", kind="stream"),
     ]
     if full:
         result += [
             case("full-4k", width=3840, height=2160),
-            case("inline-1080p", transport="inline"),
-            case("slow-inline", kind="slow", transport="inline"),
-            case("attach", pattern="sparse", width=640, height=360),
+            case("inline-1080p", transport="inline", selection="inline"),
+            case("slow-inline", kind="slow", transport="inline", selection="inline"),
+            case("attach", pattern="sparse", width=640, height=360, selection="inline"),
             case("resize", pattern="resize", width=640, height=360),
         ]
     return result
@@ -204,19 +223,26 @@ def execute(session, args):
     after = session.counters()
     counters = {key: value - before[key] for key, value in after.items()}
     if args.terminal == "headless":
-        if case["transport"] == "inline" and counters["shared_uploads"]:
-            raise RuntimeError("inline case unexpectedly used SHM")
-        if (
-            case["pattern"] == "full"
-            and case["transport"] == "shared"
-            and not counters["shared_uploads"]
-        ):
-            raise RuntimeError("shared case never used SHM")
-        if (
-            case["kind"] == "static"
-            and counters["shared_uploads"] + counters["inline_uploads"] != 0
-        ):
-            raise RuntimeError("unchanged commits unexpectedly emitted image uploads")
+        expected = case["selection"]
+        shared, inline = counters["shared_uploads"], counters["inline_uploads"]
+        if expected == "none" and shared + inline:
+            raise RuntimeError("case emitted image uploads but expected none")
+        if expected == "shared" and not shared:
+            raise RuntimeError("case never used SHM but expected shared uploads")
+        if expected == "inline" and (shared or not inline):
+            raise RuntimeError(
+                f"case chose {shared} shared and {inline} inline uploads, expected inline"
+            )
+        if edit_rect(case["pattern"], case["width"], case["height"]) is not None:
+            whole, edits = counters["whole_uploads"], counters["edit_uploads"]
+            if whole:
+                raise RuntimeError(
+                    f"measured {whole} whole-image uploads, expected only rectangle edits"
+                )
+            if edits != len(delivered_ids):
+                raise RuntimeError(
+                    f"measured {len(delivered_ids)} updates but {edits} rectangle edits"
+                )
     if case["kind"] != "static" and not raw:
         raise RuntimeError("no correlated frames")
     elapsed = (ended - started) / 1e9
@@ -401,6 +427,7 @@ def summarize(row):
         print(
             f"  PTY={counters['output_bytes'] / 1e6:.3f} MB "
             f"SHM/inline uploads={counters['shared_uploads']}/{counters['inline_uploads']} "
+            f"whole/edit uploads={counters['whole_uploads']}/{counters['edit_uploads']} "
             f"offered={row['offered_per_s']:.1f}/s drain={row['drain_s']:.3f}s",
             flush=True,
         )
@@ -412,10 +439,16 @@ def summarize(row):
         )
 
 
+def case_identity(case):
+    """Describe a case by its workload fields, ignoring presentation metadata."""
+    return {key: value for key, value in case.items() if key != "selection"}
+
+
 def comparison_values(data, case, field, statistic):
+    identity = case_identity(case)
     values = []
     for row in data["results"]:
-        if row["case"] == case and row["status"] == "ok":
+        if case_identity(row["case"]) == identity and row["status"] == "ok":
             value = row[field][statistic] if statistic else row[field]
             if value is not None:
                 values.append(value)
@@ -445,11 +478,12 @@ def compare(current, path):
     for case in {
         row["case"]["name"]: row["case"] for row in current["results"]
     }.values():
+        identity = case_identity(case)
         geometries = [
             {
                 tuple(row.get("window_size") or ())
                 for row in result["results"]
-                if row["case"] == case and row["status"] == "ok"
+                if case_identity(row["case"]) == identity and row["status"] == "ok"
             }
             for result in (previous, current)
         ]
@@ -468,14 +502,24 @@ def compare(current, path):
         }.get(case["kind"], ("latency", "p50_ms", "ms p50"))
         old = comparison_values(previous, case, field, statistic)
         new = comparison_values(current, case, field, statistic)
-        if old and new:
-            a, b = statistics.median(old), statistics.median(new)
-            change = f"{100 * (b / a - 1):+.1f}%" if a else f"delta {b - a:+.3f}"
+        if not old or not new:
+            missing = " and ".join(
+                label
+                for label, values in (("saved", old), ("current", new))
+                if not values
+            )
             print(
-                f"{case['name']:<18} {a:.3f} -> {b:.3f} {unit} {change} "
-                f"(runs {len(old)}/{len(new)}; current range {min(new):.3f}..{max(new):.3f})",
+                f"{case['name']:<18} no comparison: missing {missing} results",
                 flush=True,
             )
+            continue
+        a, b = statistics.median(old), statistics.median(new)
+        change = f"{100 * (b / a - 1):+.1f}%" if a else f"delta {b - a:+.3f}"
+        print(
+            f"{case['name']:<18} {a:.3f} -> {b:.3f} {unit} {change} "
+            f"(runs {len(old)}/{len(new)}; current range {min(new):.3f}..{max(new):.3f})",
+            flush=True,
+        )
 
 
 def main():
@@ -529,6 +573,7 @@ def main():
                 "width": 640,
                 "height": 360,
                 "transport": "shared",
+                "selection": "none",
             }
         )
     selected = [case for case in matrix if args.filter in case["name"]]

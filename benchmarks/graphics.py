@@ -15,6 +15,30 @@ def marker(frame):
     )
 
 
+def damage_rect(pattern, width, height):
+    """Client damage for bounded patterns, mirroring `fixture::Pattern::damage`."""
+    if pattern == "tall":
+        return (width // 2, 0, 16, height * 5 // 9)
+    if pattern == "wide":
+        return (0, height * 5 // 18, width * 5 // 6, height // 18)
+    return None
+
+
+def edit_rect(pattern, width, height):
+    """Rectangle an inline edit must cover once damage is widened to whole rows."""
+    rect = damage_rect(pattern, width, height)
+    if rect is None:
+        return None
+    y, w, h = rect[1:]
+    return (0, y, width, h) if w * 100 >= width * 75 else rect
+
+
+def marker_at(pattern, width, height):
+    """Pixel position of the frame marker, which every bounded pattern keeps in its damage."""
+    rect = damage_rect(pattern, width, height)
+    return (0, 0) if rect is None else rect[:2]
+
+
 def identify(rgb):
     if len(rgb) < 48 or any(
         rgb[i] != rgb[i + 1] or rgb[i] != rgb[i + 2] for i in range(0, 48, 3)
@@ -25,7 +49,18 @@ def identify(rgb):
     return frame if data == marker(frame) else None
 
 
+def content(x, y, width, frame):
+    value = ((y * width + x) * 0x9E3779B9) ^ (frame * 0x010101)
+    return bytes(((value >> 16) & 255, (value >> 8) & 255, value & 255))
+
+
 def verify(rgb, width, height, pattern, frame, tolerance=0):
+    """Check sampled pixels of a reconstructed frame.
+
+    Bounded patterns paint frame 0 outside their damage rectangle, so pixels
+    outside it must keep the initial content whether the pane was updated by an
+    edit or by a full reread of a correctly declared buffer.
+    """
     probes = [
         (20, 0),
         (85, 105),
@@ -35,16 +70,42 @@ def verify(rgb, width, height, pattern, frame, tolerance=0):
         (width - 1, height - 1),
     ]
     probes += [(width * i // 13, height * i // 13) for i in range(1, 13)]
+    rect = damage_rect(pattern, width, height)
+    if rect is not None:
+        x, y, w, h = rect
+        probes += [
+            (x, y),
+            (x + w - 1, y),
+            (x, y + h - 1),
+            (x + w - 1, y + h - 1),
+            (x + w // 2, y + h // 2),
+        ]
+        probes += [(x - 1, y)] if x > 0 else []
+        probes += [(x + w, y)] if x + w < width else []
+        probes += [(x, y - 1)] if y > 0 else []
+        probes += [(x, y + h)] if y + h < height else []
+    marker_x, marker_y = marker_at(pattern, width, height)
     for x, y in probes:
+        if y == marker_y and marker_x <= x < marker_x + 16:
+            continue
+        where = ""
         if pattern in ("full", "resize"):
             content_width = width // 2 if pattern == "resize" and frame % 2 else width
             content_height = (
                 height // 2 if pattern == "resize" and frame % 2 else height
             )
-            value = ((y * content_width + x) * 0x9E3779B9) ^ (frame * 0x010101)
-            expected = bytes(((value >> 16) & 255, (value >> 8) & 255, value & 255))
-            if x >= content_width or y >= content_height:
-                expected = bytes(3)
+            expected = (
+                bytes(3)
+                if x >= content_width or y >= content_height
+                else content(x, y, content_width, frame)
+            )
+        elif rect is not None:
+            inside = (
+                rect[0] <= x < rect[0] + rect[2] and rect[1] <= y < rect[1] + rect[3]
+            )
+            expected = content(x, y, width, frame if inside else 0)
+            if not inside:
+                where = f" outside damage {rect}"
         else:
             left = 80 if frame % 2 == 0 else 100
             expected = (
@@ -56,7 +117,8 @@ def verify(rgb, width, height, pattern, frame, tolerance=0):
             abs(a - b) > tolerance for a, b in zip(actual, expected)
         ):
             raise RuntimeError(
-                f"frame {frame}: RGB mismatch at {x},{y}: {actual.hex()} != {expected.hex()}"
+                f"frame {frame}: RGB mismatch at {x},{y}{where}: "
+                f"{actual.hex()} != {expected.hex()}"
             )
 
 
@@ -73,6 +135,7 @@ class Graphics:
         self.transfer = None
         self.last = None
         self.bytes = self.shared = self.inline = 0
+        self.whole = self.edits = 0
         self.names = set()
         self.pixel_bytes = 0
         self.probe = False
@@ -163,6 +226,11 @@ class Graphics:
         width, height = int(original["s"]), int(original["v"])
         if original.get("a") == "f":
             x, y = int(original.get("x", 0)), int(original.get("y", 0))
+            expected = edit_rect(self.pattern, self.width, self.height)
+            if expected is not None and (x, y, width, height) != expected:
+                raise RuntimeError(
+                    f"frame edit {x},{y} {width}x{height} != expected {expected}"
+                )
             if self.image is None or x + width > self.width or y + height > self.height:
                 raise RuntimeError("frame edit exceeds its base image")
             for row in range(height):
@@ -178,6 +246,8 @@ class Graphics:
             self.image = bytearray(data)
         self.shared += original.get("t") == "s"
         self.inline += original.get("t") != "s"
+        self.whole += original.get("a") != "f"
+        self.edits += original.get("a") == "f"
         self.pixel_bytes += length
         self.transfer = None
 
@@ -237,7 +307,9 @@ class Graphics:
                             self.gpu_sequence += 1
                             seen.append((self.gpu_sequence, time.monotonic_ns()))
                         continue
-                    frame = identify(self.image[:48])
+                    x, y = marker_at(self.pattern, self.width, self.height)
+                    at = (y * self.width + x) * 3
+                    frame = identify(self.image[at : at + 48])
                     if frame is None:
                         raise RuntimeError("corrupt frame marker")
                     if frame != self.last:

@@ -156,19 +156,29 @@ impl State {
             (self.width, self.height)
         };
         let pixels = &mut self.pixels[..width * height * 4];
-        fixture::paint(pixels, width, self.pattern, content);
+        fixture::paint(pixels, width, height, self.pattern, content);
         let buffer = &mut self.buffers[index];
         buffer.file.rewind()?;
         buffer.file.write_all(pixels)?;
         buffer.released = false;
         let proxy = if small { &buffer.small } else { &buffer.proxy };
         self.surface.attach(Some(proxy), 0, 0);
-        if initial || !matches!(self.pattern, Pattern::Sparse) {
+        if initial {
             self.surface
                 .damage_buffer(0, 0, i32::try_from(width)?, i32::try_from(height)?);
-        } else {
+        } else if let Some((x, y, w, h)) = self.pattern.damage(width, height) {
+            self.surface.damage_buffer(
+                i32::try_from(x)?,
+                i32::try_from(y)?,
+                i32::try_from(w)?,
+                i32::try_from(h)?,
+            );
+        } else if matches!(self.pattern, Pattern::Sparse) {
             self.surface.damage_buffer(0, 0, 16, 1);
             self.surface.damage_buffer(80, 100, 40, 20);
+        } else {
+            self.surface
+                .damage_buffer(0, 0, i32::try_from(width)?, i32::try_from(height)?);
         }
         let at = now();
         self.surface.commit();
@@ -181,7 +191,8 @@ fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [control, width, height, pattern] = args.as_slice() else {
         return Err(
-            "usage: meowland-workload CONTROL_SOCKET WIDTH HEIGHT full|sparse|resize".into(),
+            "usage: meowland-workload CONTROL_SOCKET WIDTH HEIGHT full|sparse|resize|tall|wide"
+                .into(),
         );
     };
     let width: usize = width.parse()?;
@@ -193,7 +204,9 @@ fn run() -> Result<()> {
         "full" => Pattern::Full,
         "sparse" => Pattern::Sparse,
         "resize" => Pattern::Resize,
-        _ => return Err("pattern must be full, sparse, or resize".into()),
+        "tall" => Pattern::Tall,
+        "wide" => Pattern::Wide,
+        _ => return Err("pattern must be full, sparse, resize, tall, or wide".into()),
     };
     let control = UnixStream::connect(control)?;
     control.set_read_timeout(Some(Duration::from_secs(5)))?;

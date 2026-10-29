@@ -14,7 +14,7 @@ target directory before starting the harness:
 cargo bench -p meowland-bench --bench suite
 ```
 
-This runs six cases with 3 warmups, 12 operations, and one fresh process tree per
+This runs eight cases with 3 warmups, 12 operations, and one fresh process tree per
 case. For a focused, less noisy measurement:
 
 ```sh
@@ -169,6 +169,8 @@ stack.
 | --- | --- |
 | `full-1080p` | Every RGB pixel changes; SHM negotiated, serial commit-to-consumption |
 | `sparse-1080p` | Marker plus alternating 20×20 patch; accurately declared damage, retained composition/edit path |
+| `tall-1080p` | 16×600 strip starting away from the left edge; nonzero-`x` inline rectangle, narrow enough to stay off SHM |
+| `wide-1080p` | 1600×60 strip; inline full-row rectangle after the 75% widening rule |
 | `input` | Armed key identity, independent application receipt, matching sparse rendered response at 640×360 |
 | `static` | Identical buffer content recommitted at 120 Hz; requires zero measured image uploads |
 | `inline` | 640×360 full frames, terminal rejects SHM; fast transport/encoding check |
@@ -180,7 +182,7 @@ stack.
 | `resize` | Alternate 640×360 and 320×180 surface buffers; verify cleared background outside the shrunken surface |
 | `vulkan` | Optional hardware source workload, changed-output throughput only |
 
-The first six are quick defaults. `--full` adds the next five. `--gpu` explicitly
+The first eight are quick defaults. `--full` adds the next five. `--gpu` explicitly
 adds Vulkan to either selection. The slow case starts throttling **only after**
 initial output, warmup, and settling. Its drain deadline derives from the
 uncompressed output size, a conservative 4 KiB effective read, and the 2 ms
@@ -192,10 +194,15 @@ failure from intentionally slow output without inflating every timeout. Slow
 cost; 4K bandwidth already has its own case.
 
 The fixture uses real Wayland SHM buffers, xdg-shell, keyboard events, and three
-release-tracked backing files. Pixel IDs carry a checksum. The consumer checks
-the marker plus 18 distributed/content-sensitive RGB probes, including both
-sides of the sparse patch and the resized surface boundary. This is sampled
-image validation, not an exhaustive image equality proof. Full-content painting
+release-tracked backing files. Bounded patterns paint frame 0 outside their
+declared damage in every backing buffer, so the workload obeys the buffer-damage
+contract and a compositor's full reread stays as valid as an incremental one. Pixel IDs carry a checksum. The consumer checks
+the marker plus distributed content-sensitive RGB probes, including both sides
+of the sparse patch, the corners and edges of each bounded damage rectangle, and
+the resized surface boundary. Pixels inside a bounded rectangle must carry the
+current frame and pixels outside it must still carry the initial frame, so an
+unexpected recomposition fails the case. This is sampled image validation, not
+an exhaustive image equality proof. Full-content painting
 and SHM writes occur **before** the commit timestamp. Commit timing starts just
 before enqueueing `wl_surface.commit`, including subsequent flush/scheduling,
 not when the server receives it. All fixture/runner timestamps use Linux

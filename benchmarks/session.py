@@ -16,7 +16,7 @@ import time
 import tty
 from pathlib import Path
 
-from graphics import Graphics, identify, verify
+from graphics import Graphics, identify, marker_at, verify
 
 
 def descendants(pid):
@@ -315,7 +315,9 @@ class Session:
         width, height = self.window_size
         if len(rgb) != width * height * 3:
             raise RuntimeError("Kitty window was resized during readback")
-        frame = identify(rgb[:48])
+        x, y = marker_at(self.case["pattern"], self.case["width"], self.case["height"])
+        at = (y * width + x) * 3
+        frame = identify(rgb[at : at + 48])
         if frame is not None and frame not in self.frames:
             cropped = b"".join(
                 rgb[y * width * 3 : (y * width + self.case["width"]) * 3]
@@ -416,6 +418,8 @@ class Session:
             "output_bytes": self.graphics.bytes,
             "shared_uploads": self.graphics.shared,
             "inline_uploads": self.graphics.inline,
+            "whole_uploads": self.graphics.whole,
+            "edit_uploads": self.graphics.edits,
             "uploaded_rgb_bytes": self.graphics.pixel_bytes,
         }
 

@@ -839,15 +839,13 @@ mod tests {
             covered, expected,
             "size {size:?}, scale {scale}, origin {origin:?}"
         );
-        let optimized = if covered {
-            compose_at_scale(&[(top, &top_geometry, origin)], size, scale)
-        } else {
-            full.clone()
-        };
-        assert_eq!(
-            optimized, full,
-            "size {size:?}, scale {scale}, origin {origin:?}"
-        );
+        if covered {
+            let optimized = compose_at_scale(&[(top, &top_geometry, origin)], size, scale);
+            assert_eq!(
+                optimized, full,
+                "size {size:?}, scale {scale}, origin {origin:?}"
+            );
+        }
     }
 
     #[test]

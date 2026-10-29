@@ -50,7 +50,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 - [ ] **Horizontal scroll is dropped.** Wheel codes 66 and 67 return `None`, and
   `Input::Pointer` can only express `scroll: i16` vertically. Add a horizontal axis to
   the protocol and handle `Axis::Horizontal` in `meowland-compositor/src/input.rs`.
-- [ ] **Configures are sent on every state touch.**
+- [x] **Configures are sent on every state touch.**
   `meowland-compositor/src/commands.rs` `apply_window_state` always calls
   `send_configure()`. It runs from `focus_window` (twice per focus change),
   `bind_pane_window`, `resize_pane`, `remove_pane`, `title_changed` (through

@@ -166,6 +166,8 @@ impl State {
         self.catalog.select(show, activation)
     }
 
+    /// Publish the tiling, activation, and size state the compositor wants
+    /// for a window, configuring the client only when it actually changed.
     pub(crate) fn apply_window_state(&self, window: WindowId) {
         let Some(entry) = self.windows.get(&window) else {
             return;
@@ -190,6 +192,6 @@ impl State {
                 pending.states.unset(xdg_toplevel::State::Fullscreen);
             }
         });
-        entry.surface.send_configure();
+        let _ = entry.surface.send_pending_configure();
     }
 }

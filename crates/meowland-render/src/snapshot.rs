@@ -190,7 +190,7 @@ impl Snapshot {
     }
 
     /// Reuse a previous snapshot's storage for a new tightly packed image.
-    fn reclaim(previous: Option<Self>, size: FrameSize) -> Vec<u8> {
+    pub(crate) fn reclaim(previous: Option<Self>, size: FrameSize) -> Vec<u8> {
         let mut pixels = previous.map_or_else(Vec::new, |previous| previous.pixels);
         pixels.resize(size.rgba_len(), 0);
         if pixels.capacity() >= pixels.len().saturating_mul(4).max(1 << 20) {

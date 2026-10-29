@@ -409,9 +409,10 @@ fn complete(state: &mut State, id: u64) {
     let ready = Instant::now();
     operation.buffer.finished = true;
     if let Some(gpu) = &mut state.gpu
-        && operation.surface.upgrade().is_ok()
+        && let Ok(surface) = operation.surface.upgrade()
     {
-        match gpu.complete(readback) {
+        let mut previous = state.surface_cache.spares.remove(&surface);
+        match gpu.complete(readback, &mut previous) {
             Ok(snapshot) => {
                 *operation
                     .slot
@@ -419,7 +420,12 @@ fn complete(state: &mut State, id: u64) {
                     .lock()
                     .expect("readback snapshot lock poisoned") = Some(snapshot);
             }
-            Err(error) => tracing::warn!(%error, "DMA-BUF readback failed"),
+            Err(error) => {
+                if let Some(previous) = previous {
+                    state.surface_cache.spares.insert(surface, previous);
+                }
+                tracing::warn!(%error, "DMA-BUF readback failed");
+            }
         }
     }
     state
@@ -432,6 +438,12 @@ fn complete(state: &mut State, id: u64) {
     notify(state, &client);
 }
 
+/// Cancel acquisition for a destroyed surface.
+///
+/// Submitted reads are left in [`Readbacks::reading`] until their native
+/// fence signals, because dropping the reservation early would let the client
+/// reuse a buffer the GPU still samples. Completion skips the slot when the
+/// surface is gone.
 pub(crate) fn destroyed(state: &mut State, surface: &WlSurface) {
     let mut clients = Vec::new();
     state.readbacks.acquiring.retain(|_, acquiring| {

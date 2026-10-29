@@ -117,11 +117,12 @@ impl State {
             .surface_cache
             .snapshots
             .keys()
+            .chain(self.surface_cache.spares.keys())
             .filter(|surface| self.window_for_surface(surface) == Some(id))
             .cloned()
             .collect();
         for surface in surfaces {
-            self.surface_cache.snapshots.remove(&surface);
+            self.surface_cache.forget(&surface);
         }
         if let Some(window) = self.windows.remove(&id) {
             window.with_surfaces(clear_owner);

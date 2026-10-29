@@ -392,9 +392,16 @@ impl DmabufBackend {
 
     /// Map only after the submission's native fence has reported completion.
     ///
+    /// `previous` is recycled as the destination storage when it fits, which
+    /// avoids a fresh allocation per frame. It is left untouched on error.
+    ///
     /// # Errors
     /// Returns an error if mapping or pixel conversion fails.
-    pub fn complete(&mut self, readback: Readback) -> Result<Snapshot, SnapshotError> {
+    pub fn complete(
+        &mut self,
+        readback: Readback,
+        previous: &mut Option<Snapshot>,
+    ) -> Result<Snapshot, SnapshotError> {
         let size = readback.size;
         let mapping = readback.mapping.map_err(SnapshotError::safe)?;
         let top_down = mapping.flipped();
@@ -407,7 +414,7 @@ impl DmabufBackend {
         if bytes.len() != needed {
             return Err(SnapshotError::safe(BackendError::ReadbackLength));
         }
-        let mut pixels = vec![0; needed];
+        let mut pixels = Snapshot::reclaim(previous.take(), size);
         if top_down {
             pixels.copy_from_slice(bytes);
         } else {

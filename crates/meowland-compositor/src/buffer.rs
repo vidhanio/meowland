@@ -27,6 +27,14 @@ use super::{Snapshot, State, readback, render, runtime::ClientState};
 #[derive(Default)]
 pub(crate) struct SurfaceCache {
     pub snapshots: HashMap<WlSurface, Snapshot>,
+    pub spares: HashMap<WlSurface, Snapshot>,
+}
+
+impl SurfaceCache {
+    pub(crate) fn forget(&mut self, surface: &WlSurface) {
+        self.snapshots.remove(surface);
+        self.spares.remove(surface);
+    }
 }
 
 /// Translate committed surface damage into buffer coordinates for snapshot
@@ -160,8 +168,9 @@ impl CompositorHandler for State {
                 let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
                     .map(|pixel| Snapshot::single_pixel(pixel.rgba8888()));
+                let dmabuf = get_dmabuf(&buffer).is_ok();
                 let snapshot = single_pixel.or_else(|| {
-                    if get_dmabuf(&buffer).is_ok() {
+                    if dmabuf {
                         readback::snapshot(surface)
                     } else {
                         with_buffer_contents(&buffer, |ptr, len, data| {
@@ -181,15 +190,22 @@ impl CompositorHandler for State {
                     }
                 });
                 buffer.release();
-                if let Some(snapshot) = snapshot.or(previous) {
+                let snapshot = match snapshot {
+                    Some(snapshot) => {
+                        if dmabuf && let Some(previous) = previous.take() {
+                            self.surface_cache.spares.insert(surface.clone(), previous);
+                        }
+                        Some(snapshot)
+                    }
+                    None => previous,
+                };
+                if let Some(snapshot) = snapshot {
                     self.surface_cache
                         .snapshots
                         .insert(surface.clone(), snapshot);
                 }
             }
-            Some(BufferAssignment::Removed) => {
-                self.surface_cache.snapshots.remove(surface);
-            }
+            Some(BufferAssignment::Removed) => self.surface_cache.forget(surface),
             None => {}
         }
         self.refresh_window_mapping(surface);
@@ -219,7 +235,7 @@ impl CompositorHandler for State {
     /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
         let window = self.window_for_surface(surface);
-        self.surface_cache.snapshots.remove(surface);
+        self.surface_cache.forget(surface);
         readback::destroyed(self, surface);
         if let Some(window) = window {
             if self.ids.get(surface) == Some(&window) {

@@ -140,10 +140,12 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   the full buffer on every commit, even when the damage is a few rows. At 4K that is
   33 MB per commit. Copy only the buffer-damage rectangles into the retained snapshot.
   The previous snapshot is already passed in for reuse.
-- [ ] **DMA-BUF readback allocates and reads the whole buffer every frame.**
-  `DmabufBackend::complete` allocates `vec![0; needed]` and runs a full alpha pass
-  each time, and `readback()` blits the whole texture. Reuse the previous snapshot
-  buffer, and restrict the blit and `copy_framebuffer` to the damage.
+- [x] **DMA-BUF readback allocates and reads the whole buffer every frame.**
+  `DmabufBackend::complete` allocated `vec![0; needed]` and ran a full alpha pass
+  each time. Recycle the previous snapshot buffer instead.
+  - [ ] Restrict the GPU blit and `copy_framebuffer` to the damage. Smithay's
+    renderer has no per-rectangle mapping export, so this needs a separate target
+    texture and copy per damaged region.
 - [ ] **Updates are sent as row bands, not rectangles.** `Renderer::update` computes a
   column range but only reports changed *rows*. `FrameBand` and the Kitty `a=f` edit
   then send full-width rows. A blinking cursor costs `width × 16 × 3` bytes before

@@ -2,9 +2,11 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use meowland_protocol::{Input, KEY_V, modifiers};
+use meowland_protocol::{Button, ButtonState, Input, KEY_V, Scroll, modifiers};
 use smithay::{
-    backend::input::{Axis, AxisSource, ButtonState, InputTime, KeyState, Keycode},
+    backend::input::{
+        Axis, AxisSource, ButtonState as WaylandButtonState, InputTime, KeyState, Keycode,
+    },
     input::{
         keyboard::{KeyboardHandle, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
@@ -23,8 +25,29 @@ pub(crate) struct KeyboardState {
     pub serials: VecDeque<(Serial, ClientId)>,
 }
 
-const SCROLL_FACTOR: f64 = 0.5;
 const SERIAL_HISTORY: usize = 32;
+/// Linux input code for the primary pointer button.
+const BTN_LEFT: u32 = 0x110;
+/// Linux input code for the secondary pointer button.
+const BTN_RIGHT: u32 = 0x111;
+/// Linux input code for the middle pointer button.
+const BTN_MIDDLE: u32 = 0x112;
+/// Linux input code for the backward side button.
+const BTN_SIDE: u32 = 0x113;
+/// Linux input code for the forward side button.
+const BTN_EXTRA: u32 = 0x114;
+/// First Linux input code reserved for buttons without a named code.
+const BTN_TRIGGER_HAPPY1: u32 = 0x2c0;
+/// Number of Linux input codes reserved for buttons without a named code.
+const EXTRA_BUTTON_CODES: u8 = 40;
+/// First X11 button number without a named protocol [`Button`] variant.
+const FIRST_EXTRA_BUTTON: u8 = 10;
+/// Wheel units the terminal reports for one detent.
+const SCROLL_UNITS_PER_DETENT: i32 = 120;
+/// Wayland axis distance emitted for one wheel detent.
+const AXIS_UNITS_PER_DETENT: f64 = 7.5;
+/// High-resolution Wayland units emitted for one wheel detent.
+const V120_PER_DETENT: i32 = 60;
 
 pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     if !valid_input(event) {
@@ -89,33 +112,18 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             x,
             y,
             button,
-            pressed,
             scroll,
         } => {
             let grabbed = state
                 .pointer
                 .as_ref()
                 .is_some_and(PointerHandle::is_grabbed);
-            if pressed && button.is_some() && !grabbed {
+            if !grabbed && button.is_some_and(|(_, transition)| transition == ButtonState::Pressed)
+            {
                 activate_keyboard(state, pane, window);
             }
             let scale = state.scale.factor();
-            pointer_input(
-                state,
-                window,
-                (x / scale, y / scale),
-                button.map(|button| {
-                    (
-                        button,
-                        if pressed {
-                            ButtonState::Pressed
-                        } else {
-                            ButtonState::Released
-                        },
-                    )
-                }),
-                scroll,
-            );
+            pointer_input(state, window, (x / scale, y / scale), button, scroll);
         }
     }
     state.send_pane_cursor(pane);
@@ -142,8 +150,8 @@ fn pointer_input(
     state: &mut State,
     window: WindowId,
     position: (f64, f64),
-    button: Option<(u8, ButtonState)>,
-    scroll: i16,
+    button: Option<(Button, ButtonState)>,
+    scroll: Scroll,
 ) {
     let (x, y) = position;
     let root = state
@@ -172,32 +180,70 @@ fn pointer_input(
             pointer.button(
                 state,
                 &ButtonEvent {
-                    button: match button {
-                        0 => 0x110,
-                        1 => 0x111,
-                        2 => 0x112,
-                        _ => 0x113,
+                    button: button_code(button),
+                    state: match transition {
+                        ButtonState::Pressed => WaylandButtonState::Pressed,
+                        ButtonState::Released => WaylandButtonState::Released,
                     },
-                    state: transition,
                     serial,
                     time,
                 },
             );
         }
-        let amount = -f64::from(scroll) * SCROLL_FACTOR;
-        if amount != 0.0 {
+        let vertical = -i32::from(scroll.vertical);
+        let horizontal = i32::from(scroll.horizontal);
+        if vertical != 0 || horizontal != 0 {
+            let frame = AxisFrame::new(time).source(AxisSource::Wheel);
+            let frame = if vertical == 0 {
+                frame
+            } else {
+                frame
+                    .value(Axis::Vertical, axis_units(vertical))
+                    .v120(Axis::Vertical, v120_units(vertical))
+            };
+            let frame = if horizontal == 0 {
+                frame
+            } else {
+                frame
+                    .value(Axis::Horizontal, axis_units(horizontal))
+                    .v120(Axis::Horizontal, v120_units(horizontal))
+            };
             pointer.frame(state);
-            pointer.axis(
-                state,
-                AxisFrame::new(time)
-                    .source(AxisSource::Wheel)
-                    .value(Axis::Vertical, amount * (15.0 / 120.0))
-                    .v120(Axis::Vertical, -i32::from(scroll) / 2),
-            );
+            pointer.axis(state, frame);
         }
         pointer.frame(state);
         state.pointer = Some(pointer);
     }
+}
+
+/// Map a terminal pointer button to its Linux input code.
+fn button_code(button: Button) -> u32 {
+    match button {
+        Button::Left => BTN_LEFT,
+        Button::Middle => BTN_MIDDLE,
+        Button::Right => BTN_RIGHT,
+        Button::Back => BTN_SIDE,
+        Button::Forward => BTN_EXTRA,
+        Button::Other(number) => {
+            let index = number.saturating_sub(FIRST_EXTRA_BUTTON);
+            let index = if index < EXTRA_BUTTON_CODES {
+                index
+            } else {
+                EXTRA_BUTTON_CODES - 1
+            };
+            BTN_TRIGGER_HAPPY1 + u32::from(index)
+        }
+    }
+}
+
+/// Convert a wheel delta in terminal units to Wayland axis distance.
+fn axis_units(units: i32) -> f64 {
+    f64::from(units) * AXIS_UNITS_PER_DETENT / f64::from(SCROLL_UNITS_PER_DETENT)
+}
+
+/// Convert a wheel delta in terminal units to Wayland high-resolution units.
+const fn v120_units(units: i32) -> i32 {
+    units * V120_PER_DETENT / SCROLL_UNITS_PER_DETENT
 }
 
 fn enter_keyboard(state: &mut State, pane: PaneId, window: WindowId, keys: &[u16], bits: u8) {

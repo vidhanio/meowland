@@ -7,7 +7,7 @@ use calloop::LoopHandle;
 use futures::io::AsyncReadExt;
 use meowland_core::asynchronous::Descriptor;
 use meowland_protocol::{
-    Input,
+    Button, ButtonState, Input, Scroll,
     clipboard::MAX_TEXT,
     modifiers::{ALT, CONTROL, HYPER, META, SUPER},
 };
@@ -18,6 +18,16 @@ const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
 const MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const MAX_MOUSE: usize = 64;
 const PASTE_END: &[u8] = b"\x1b[201~";
+/// SGR bit marking a wheel report rather than a button or motion report.
+const WHEEL: u32 = 64;
+/// SGR bit marking pointer motion.
+const MOTION: u32 = 32;
+/// SGR bit marking buttons above the first three, reported as numbers from 8.
+const EXTRA: u32 = 128;
+/// First X11 button number carried through the [`EXTRA`] bit.
+const EXTRA_BUTTON: u8 = 8;
+/// Wheel distance the terminal reports for one detent.
+const SCROLL_DETENT: i16 = 120;
 
 /// Key transition reported by the Kitty keyboard protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,9 +450,11 @@ fn committed_text(params: &[CsiParam]) -> Option<String> {
 
 fn mouse(report: &[u8]) -> Option<Event> {
     let (&final_byte, fields) = report.strip_prefix(MOUSE_PREFIX)?.split_last()?;
-    if !matches!(final_byte, b'M' | b'm') {
-        return None;
-    }
+    let released = match final_byte {
+        b'M' => false,
+        b'm' => true,
+        _ => return None,
+    };
     let mut fields = std::str::from_utf8(fields).ok()?.split(';');
     let code: u32 = fields.next()?.parse().ok()?;
     let x: i32 = fields.next()?.parse().ok()?;
@@ -450,35 +462,52 @@ fn mouse(report: &[u8]) -> Option<Event> {
     if fields.next().is_some() {
         return None;
     }
-    let (button, pressed, scroll) = if code & 64 != 0 {
-        (
-            None,
-            false,
-            match code & 3 {
-                0 => 120,
-                1 => -120,
-                _ => return None,
-            },
-        )
-    } else if code & (32 | 128) != 0 {
-        (None, false, 0)
+    let (button, scroll) = if code & WHEEL != 0 {
+        (None, wheel(code))
+    } else if code & MOTION != 0 {
+        (None, Scroll::default())
     } else {
-        (
-            match code & 3 {
-                0 => Some(0),
-                1 => Some(2),
-                2 => Some(1),
-                _ => None,
-            },
-            final_byte == b'M',
-            0,
-        )
+        let state = if released {
+            ButtonState::Released
+        } else {
+            ButtonState::Pressed
+        };
+        (Some((button(code)?, state)), Scroll::default())
     };
     Some(Event::Pointer(Input::Pointer {
         x: f64::from(x),
         y: f64::from(y),
         button,
-        pressed,
         scroll,
     }))
+}
+
+/// Decode the wheel direction of a report with the [`WHEEL`] bit set.
+fn wheel(code: u32) -> Scroll {
+    let mut scroll = Scroll::default();
+    match code & 3 {
+        0 => scroll.vertical = SCROLL_DETENT,
+        1 => scroll.vertical = -SCROLL_DETENT,
+        2 => scroll.horizontal = -SCROLL_DETENT,
+        _ => scroll.horizontal = SCROLL_DETENT,
+    }
+    scroll
+}
+
+/// Decode a button report into its X11 identity, rejecting reserved numbers.
+fn button(code: u32) -> Option<Button> {
+    let number = u8::try_from(code & 3).ok()?;
+    if code & EXTRA != 0 {
+        return Some(match number {
+            0 => Button::Back,
+            1 => Button::Forward,
+            other => Button::Other(EXTRA_BUTTON + other),
+        });
+    }
+    match number {
+        0 => Some(Button::Left),
+        1 => Some(Button::Middle),
+        2 => Some(Button::Right),
+        _ => None,
+    }
 }

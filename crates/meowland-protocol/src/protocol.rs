@@ -142,6 +142,41 @@ pub struct Hello {
     pub show: Show,
 }
 
+/// Pointer button identity, using X11 button numbers for extra buttons.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum Button {
+    /// Primary (left) button.
+    Left,
+    /// Middle button.
+    Middle,
+    /// Secondary (right) button.
+    Right,
+    /// Backward side button, X11 button 8.
+    Back,
+    /// Forward side button, X11 button 9.
+    Forward,
+    /// Any other button, identified by its X11 button number.
+    Other(u8),
+}
+
+/// Whether a pointer button is going down or coming up.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum ButtonState {
+    /// The button is now held down.
+    Pressed,
+    /// A previously held button was let go.
+    Released,
+}
+
+/// Wheel movement in signed 120-unit detents.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Scroll {
+    /// Vertical distance; positive scrolls up and negative scrolls down.
+    pub vertical: i16,
+    /// Horizontal distance; positive scrolls right and negative scrolls left.
+    pub horizontal: i16,
+}
+
 /// Terminal-originated input; key codes use Linux evdev identities, not XKB
 /// offsets.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -166,12 +201,10 @@ pub enum Input {
         /// Vertical pane pixel coordinate, possibly outside the pane during a
         /// drag.
         y: f64,
-        /// Terminal button identity, or no button transition for plain motion.
-        button: Option<u8>,
-        /// Whether the optional button was pressed rather than released.
-        pressed: bool,
-        /// Vertical wheel distance: 120 units is one detent; positive is up.
-        scroll: i16,
+        /// Terminal button transition, or no transition for plain motion.
+        button: Option<(Button, ButtonState)>,
+        /// Wheel movement since the previous event; 120 units is one detent.
+        scroll: Scroll,
     },
     /// Release the pane's keyboard state after terminal focus loss.
     ResetKeyboard,

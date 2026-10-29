@@ -44,10 +44,10 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   - Build the reverse map from the configured keymap with xkbcommon on the server.
   - Force the server keymap to `us` and forward text separately.
   - At minimum, document or reject non-US layouts in `KeyboardConfig`.
-- [ ] **Extra mouse buttons are treated as motion.** In `meowland-input/src/input.rs`
+- [x] **Extra mouse buttons are treated as motion.** In `meowland-input/src/input.rs`
   `mouse()`, SGR codes 128–131 (buttons 8–11, back and forward) hit the
   `code & (32 | 128) != 0` branch and become plain motion.
-- [ ] **Horizontal scroll is dropped.** Wheel codes 66 and 67 return `None`, and
+- [x] **Horizontal scroll is dropped.** Wheel codes 66 and 67 return `None`, and
   `Input::Pointer` can only express `scroll: i16` vertically. Add a horizontal axis to
   the protocol and handle `Axis::Horizontal` in `meowland-compositor/src/input.rs`.
 - [x] **Configures are sent on every state touch.**
@@ -188,7 +188,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 
 These follow the `rust-best-practices` skill.
 
-- [ ] **Invalid pointer states are representable.** `Input::Pointer { button:
+- [x] **Invalid pointer states are representable.** `Input::Pointer { button:
   Option<u8>, pressed: bool }`: `pressed` means nothing when `button` is `None`. Use
   `button: Option<(Button, ButtonState)>` with a `Button` enum instead of raw
   `0/1/2/_`.

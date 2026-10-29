@@ -27,3 +27,6 @@ smithay = { workspace = true, features = [
 ] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

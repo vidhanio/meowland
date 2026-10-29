@@ -260,9 +260,11 @@ off most, for when that is requested.
 
 ## 6. Tooling, CI, Nix
 
-- [ ] **CI duplicates the flake checks.** The GitHub `check` job and `nix flake check`
+- [x] **CI duplicates the flake checks.** The GitHub `check` job and `nix flake check`
   both run clippy, fmt, docs, and tests with different toolchains. Keep one source of
   truth, probably the flake.
+  Accepted: GitHub CI and `nix flake check` cover different environments and toolchains,
+  so both stay.
 - [x] **CI library setup is incomplete.** The CI `apt-get` installs only
   `libxkbcommon-dev`, while Nix also needs `libglvnd` and `libgbm`. The job works only
   because it never links the EGL paths at runtime.

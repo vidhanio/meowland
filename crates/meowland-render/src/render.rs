@@ -68,8 +68,9 @@ impl Renderer {
     /// Changes in surface order, placement, dimensions, viewport, scale, or
     /// transform invalidate the scene and force full composition. Otherwise
     /// only the bounding rectangle of accumulated content damage is sampled.
-    /// The callback receives accumulated changed rows and the ready image
-    /// prefix, allowing sequential publication while those pixels are hot.
+    /// The callback receives the accumulated changed rectangle and the ready
+    /// image prefix, allowing sequential publication while those pixels are
+    /// hot.
     ///
     /// # Panics
     /// Panics if clipped coordinates cannot be represented as buffer offsets,
@@ -81,7 +82,7 @@ impl Renderer {
         snapshots: &HashMap<WlSurface, Snapshot>,
         size: FrameSize,
         scale: f64,
-        mut publish: impl FnMut(Option<&Range<usize>>, &[u8]),
+        mut publish: impl FnMut(Option<&Changed>, &[u8]),
     ) -> Option<Changed> {
         scene.pixels.resize(size.rgb_len(), 0);
         let scale = if scale.is_finite() && scale > 0.0 {
@@ -97,6 +98,8 @@ impl Renderer {
             &scene.layers
         };
         let columns = damage.loc.x..damage.loc.x + damage.size.w;
+        let changed_columns = u32::try_from(columns.start).expect("clipped column is nonnegative")
+            ..u32::try_from(columns.end).expect("clipped column is nonnegative");
         let rows = damage.loc.y..damage.loc.y + damage.size.h;
         let row_bytes = usize::try_from(damage.size.w).expect("clipped width is positive") * 3;
         let mut changed: Option<Range<usize>> = None;
@@ -134,11 +137,15 @@ impl Renderer {
             }
             let ready =
                 usize::try_from(bottom).expect("clipped row is nonnegative") * size.rgb_stride();
-            publish(changed.as_ref(), &scene.pixels[..ready]);
+            let rect = changed.as_ref().map(|changed| Changed {
+                columns: changed_columns.clone(),
+                rows: u32::try_from(changed.start).expect("clipped row is nonnegative")
+                    ..u32::try_from(changed.end).expect("clipped row is nonnegative"),
+            });
+            publish(rect.as_ref(), &scene.pixels[..ready]);
         }
         changed.map(|rows| Changed {
-            columns: u32::try_from(columns.start).expect("clipped column is nonnegative")
-                ..u32::try_from(columns.end).expect("clipped column is nonnegative"),
+            columns: changed_columns,
             rows: u32::try_from(rows.start).expect("clipped row is nonnegative")
                 ..u32::try_from(rows.end).expect("clipped row is nonnegative"),
         })

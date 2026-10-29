@@ -3,15 +3,22 @@
 use std::{
     fs::File,
     io::Write as _,
-    ops::Range,
     time::{Duration, Instant},
 };
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameTransport, SharedObject};
+use meowland_render::Changed;
 
-/// Publish whole frames through SHM when changed rows cover at least a quarter.
-const SHARED_BAND_DIVISOR: usize = 4;
+use super::transfer_columns;
+
+/// Publish whole frames through SHM when the changed rectangle covers at least
+/// this fraction of the frame area.
+///
+/// A shared frame transfers every pixel once; an inline rectangle transfers
+/// only the changed columns for the changed rows. Below a quarter of the frame
+/// the rectangle is smaller, even after zlib, and skips the publication write.
+const SHARED_AREA_DIVISOR: u64 = 4;
 
 pub(super) struct Publication {
     size: FrameSize,
@@ -38,16 +45,13 @@ impl Publication {
         }
     }
 
-    pub(super) fn rows(&mut self, changed: Option<&Range<usize>>, ready: &[u8]) {
+    pub(super) fn changed(&mut self, changed: Option<&Changed>, ready: &[u8]) {
         if self.transport != FrameTransport::Shared {
             return;
         }
         if self.object.is_none()
             && !self.force
-            && !changed.is_some_and(|rows| {
-                (rows.end - rows.start) * SHARED_BAND_DIVISOR
-                    >= usize::try_from(self.size.height()).expect("validated height fits usize")
-            })
+            && !changed.is_some_and(|changed| self.prefers_shared(changed))
         {
             return;
         }
@@ -59,6 +63,15 @@ impl Publication {
             self.object = None;
             self.transport = FrameTransport::Inline;
         }
+    }
+
+    /// Whether a whole shared frame is cheaper than one inline rectangle.
+    fn prefers_shared(&self, changed: &Changed) -> bool {
+        let columns = transfer_columns(changed, self.size);
+        let width = u64::from(columns.end - columns.start);
+        let rows = u64::from(changed.rows.end - changed.rows.start);
+        width * rows * SHARED_AREA_DIVISOR
+            >= u64::from(self.size.width()) * u64::from(self.size.height())
     }
 
     fn write(&mut self, ready: &[u8]) -> std::io::Result<()> {
@@ -74,7 +87,7 @@ impl Publication {
 
     pub(super) fn finish(&mut self, pixels: &[u8]) -> Option<SharedObject> {
         if self.object.is_some() {
-            self.rows(None, pixels);
+            self.changed(None, pixels);
         }
         self.object.take().map(|(object, _)| object)
     }

@@ -1,6 +1,9 @@
 //! Independent Wayland callback clocks and damage-aware retained pane frames.
 
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use meowland_core::{latency::Latency, pixels::FrameSize};
 use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
@@ -73,6 +76,20 @@ impl FrameStats {
 /// little: zlib finds fewer cross-row matches, the terminal copies a row per
 /// row instead of a block, and the metadata overhead is unchanged.
 const FULL_ROW_PERCENT: u32 = 75;
+
+/// Columns transferred for a changed rectangle.
+///
+/// Widening nearly full-width rectangles to whole rows keeps the payload shape
+/// the terminal treats as a plain row range. The same columns are estimated by
+/// the shared-transport decision, so both agree on the bytes involved.
+fn transfer_columns(rect: &Changed, size: FrameSize) -> Range<u32> {
+    let width = rect.columns.end - rect.columns.start;
+    if width * 100 >= size.width() * FULL_ROW_PERCENT {
+        0..size.width()
+    } else {
+        rect.columns.clone()
+    }
+}
 
 pub(crate) struct PaneState {
     pub size: FrameSize,
@@ -155,7 +172,7 @@ impl PaneState {
             snapshots,
             self.size,
             scale,
-            |changed, ready| publication.rows(changed, ready),
+            |changed, ready| publication.changed(changed, ready),
         );
         let rect = if self.sent_size == Some(self.size) {
             rect?
@@ -192,13 +209,8 @@ impl PaneState {
     }
 
     fn band(&self, rect: &Changed) -> ServerToPane {
-        let width = rect.columns.end - rect.columns.start;
-        let whole_rows = width * 100 >= self.size.width() * FULL_ROW_PERCENT;
-        let (x, width) = if whole_rows {
-            (0, self.size.width())
-        } else {
-            (rect.columns.start, width)
-        };
+        let columns = transfer_columns(rect, self.size);
+        let (x, width) = (columns.start, columns.end - columns.start);
         let stride = self.size.rgb_stride();
         let row_bytes = usize::try_from(width).expect("validated width fits usize") * 3;
         let rows = rect.rows.end - rect.rows.start;

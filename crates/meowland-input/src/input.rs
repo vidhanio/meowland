@@ -158,6 +158,67 @@ struct Parser {
     decoder: Decoder,
     mouse: Vec<u8>,
     control_bytes: usize,
+    control_start: [u8; 2],
+    control_start_len: usize,
+    discard: Option<Discard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlKind {
+    Csi,
+    Osc,
+    String,
+    Escape,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Discard {
+    kind: ControlKind,
+    escaped: bool,
+}
+
+impl Discard {
+    const fn new(start: &[u8]) -> Self {
+        let kind = match start {
+            [0x1b, b'['] | [0x9b, ..] => ControlKind::Csi,
+            [0x1b, b']'] | [0x9d, ..] => ControlKind::Osc,
+            [0x1b, b'P' | b'_' | b'^' | b'X'] | [0x90 | 0x98 | 0x9e | 0x9f, ..] => {
+                ControlKind::String
+            }
+            _ => ControlKind::Escape,
+        };
+        Self {
+            kind,
+            escaped: false,
+        }
+    }
+
+    fn byte(&mut self, byte: u8) -> bool {
+        match self.kind {
+            ControlKind::Csi => (0x40..=0x7e).contains(&byte),
+            ControlKind::Osc => {
+                if self.escaped {
+                    self.escaped = byte == 0x1b;
+                    byte == b'\\'
+                } else if byte == 0x1b {
+                    self.escaped = true;
+                    false
+                } else {
+                    byte == 0x07
+                }
+            }
+            ControlKind::String => {
+                if self.escaped {
+                    self.escaped = byte == 0x1b;
+                    byte == b'\\'
+                } else {
+                    self.escaped = byte == 0x1b;
+                    false
+                }
+            }
+            ControlKind::Escape => (0x30..=0x7e).contains(&byte),
+        }
+    }
 }
 
 impl Parser {
@@ -167,10 +228,26 @@ impl Parser {
             decoder: Decoder::default(),
             mouse: Vec::new(),
             control_bytes: 0,
+            control_start: [0; 2],
+            control_start_len: 0,
+            discard: None,
         }
     }
 
+    fn consume_discard(&mut self, byte: u8) -> bool {
+        let Some(discard) = &mut self.discard else {
+            return false;
+        };
+        if discard.byte(byte) {
+            self.discard = None;
+        }
+        true
+    }
+
     fn push(&mut self, byte: u8) {
+        if self.consume_discard(byte) {
+            return;
+        }
         if self.decoder.paste.is_some() {
             self.decoder.paste_byte(byte);
             return;
@@ -223,6 +300,16 @@ impl Parser {
     }
 
     fn terminal_byte(&mut self, byte: u8) {
+        if self.consume_discard(byte) {
+            return;
+        }
+        if self.terminal.is_ground() {
+            self.control_start[0] = byte;
+            self.control_start_len = 1;
+        } else if self.control_start_len < self.control_start.len() {
+            self.control_start[self.control_start_len] = byte;
+            self.control_start_len += 1;
+        }
         self.terminal.parse_byte(byte, &mut self.decoder);
         self.control_bytes = if self.terminal.is_ground() {
             0
@@ -230,8 +317,10 @@ impl Parser {
             self.control_bytes + 1
         };
         if self.control_bytes > MAX_CONTROL {
+            self.discard = Some(Discard::new(&self.control_start[..self.control_start_len]));
             self.terminal = VTParser::new();
             self.control_bytes = 0;
+            self.control_start_len = 0;
             tracing::warn!("Discarded oversized terminal control sequence");
         }
     }
@@ -1076,13 +1165,35 @@ mod tests {
     }
 
     #[test]
-    fn parser_discards_oversized_control_sequences() {
-        let mut bytes = vec![0x1b, b'['];
-        bytes.extend(std::iter::repeat_n(b'1', MAX_CONTROL));
-        bytes.push(b'm');
-        bytes.extend_from_slice(b"\x1b[I");
-        let events = parse(&bytes);
-        assert!(matches!(events.last(), Some(Event::Focus(true))));
-        assert!(!events.iter().any(|event| matches!(event, Event::Key(_))));
+    fn parser_discards_oversized_control_sequences_until_their_terminator() {
+        let mut csi = b"\x1b[".to_vec();
+        csi.extend(std::iter::repeat_n(b'1', MAX_CONTROL + 16));
+        csi.push(b'm');
+        csi.extend_from_slice(b"\x1b[I");
+        let events = parse(&csi);
+        assert!(
+            matches!(events.as_slice(), [Event::Focus(true)]),
+            "oversized CSI: {events:?}"
+        );
+
+        let mut osc_st = b"\x1b]".to_vec();
+        osc_st.extend(std::iter::repeat_n(b'x', MAX_CONTROL + 16));
+        osc_st.extend_from_slice(b"\x1b\\");
+        osc_st.extend_from_slice(b"\x1b[I");
+        let events = parse(&osc_st);
+        assert!(
+            matches!(events.as_slice(), [Event::Focus(true)]),
+            "oversized OSC ST: {events:?}"
+        );
+
+        let mut osc_bel = b"\x1b]".to_vec();
+        osc_bel.extend(std::iter::repeat_n(b'x', MAX_CONTROL + 16));
+        osc_bel.push(0x07);
+        osc_bel.extend_from_slice(b"\x1b[I");
+        let events = parse(&osc_bel);
+        assert!(
+            matches!(events.as_slice(), [Event::Focus(true)]),
+            "oversized OSC BEL: {events:?}"
+        );
     }
 }

@@ -164,9 +164,8 @@ fn key_transition(
     let code = state.keymap.lookup(key);
     if transition == KeyState::Pressed {
         if let Some(code) = code {
-            if let Some(keyboard) = state.keyboard.take() {
+            if let Some(keyboard) = state.keyboard.clone() {
                 inject_key(&keyboard, state, key, code, transition, modifiers);
-                state.keyboard = Some(keyboard);
             }
         } else if let Some(text) = key_text(key, text, modifiers) {
             text::commit(state, &text);
@@ -180,10 +179,9 @@ fn key_transition(
     } else {
         let code = code.or_else(|| state.keyboard_state.held.get(&key).copied());
         if let Some(code) = code
-            && let Some(keyboard) = state.keyboard.take()
+            && let Some(keyboard) = state.keyboard.clone()
         {
             inject_key(&keyboard, state, key, code, transition, modifiers);
-            state.keyboard = Some(keyboard);
         }
     }
 }
@@ -307,7 +305,7 @@ fn enter_keyboard(
     if !keyboard_grabbed(state) {
         state.focus_window(window);
     }
-    if let Some(keyboard) = state.keyboard.take() {
+    if let Some(keyboard) = state.keyboard.clone() {
         keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
         set_modifiers(&keyboard, state, snapshot(bits));
         for key in keys {
@@ -319,7 +317,6 @@ fn enter_keyboard(
         }
         let surface = state.windows[&window].surface.wl_surface().clone();
         keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
-        state.keyboard = Some(keyboard);
     }
     state.keyboard_state.owner = Some(pane);
     state.keyboard_state.known = true;
@@ -332,10 +329,9 @@ fn activate_keyboard(state: &mut State, pane: PaneId, window: WindowId) {
     }
     if !keyboard_grabbed(state) {
         state.focus_window(window);
-        if changed && let Some(keyboard) = state.keyboard.take() {
+        if changed && let Some(keyboard) = state.keyboard.clone() {
             let surface = state.windows[&window].surface.wl_surface().clone();
             keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
-            state.keyboard = Some(keyboard);
         }
     }
     state.keyboard_state.owner = Some(pane);
@@ -392,13 +388,12 @@ pub(crate) fn reset_keyboard(state: &mut State) {
     state.keyboard_state.owner = None;
     state.keyboard_state.known = false;
     let keys = std::mem::take(&mut state.keyboard_state.held);
-    if let Some(keyboard) = state.keyboard.take() {
+    if let Some(keyboard) = state.keyboard.clone() {
         set_modifiers(&keyboard, state, ModifiersState::default());
         for code in keys.into_values() {
             forward(&keyboard, state, code, KeyState::Released);
         }
         keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
-        state.keyboard = Some(keyboard);
     }
 }
 
@@ -468,12 +463,11 @@ pub(crate) fn paste_action(state: &mut State, pane: PaneId) {
     let Some(code) = state.keymap.lookup(KEY_V) else {
         return;
     };
-    if let Some(keyboard) = state.keyboard.take() {
+    if let Some(keyboard) = state.keyboard.clone() {
         let previous = keyboard.modifier_state();
         set_modifiers(&keyboard, state, snapshot(Modifiers::CONTROL));
         forward(&keyboard, state, code, KeyState::Pressed);
         forward(&keyboard, state, code, KeyState::Released);
         set_modifiers(&keyboard, state, previous);
-        state.keyboard = Some(keyboard);
     }
 }

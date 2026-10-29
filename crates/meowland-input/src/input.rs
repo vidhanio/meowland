@@ -11,6 +11,7 @@ use rustix::fs::{Mode, OFlags, open};
 use vtparse::{CsiParam, VTActor, VTParser};
 
 const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
+const MAX_MUTED: usize = MAX_CONTROL * 4;
 const MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const MAX_MOUSE: usize = 64;
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -111,7 +112,8 @@ impl Reader {
     /// Read and decode the next bounded input chunk.
     ///
     /// # Errors
-    /// Returns an error on EOF or input failure.
+    /// Returns an error on EOF, input failure, or an unterminated control
+    /// sequence that exceeds the recovery limit.
     #[expect(
         clippy::future_not_send,
         reason = "terminal input belongs to the calloop owner thread"
@@ -125,7 +127,7 @@ impl Reader {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         for &byte in &self.bytes[..read] {
-            self.parser.push(byte);
+            self.parser.push(byte)?;
         }
         Ok(())
     }
@@ -158,66 +160,29 @@ struct Parser {
     decoder: Decoder,
     mouse: Vec<u8>,
     control_bytes: usize,
-    control_start: [u8; 2],
-    control_start_len: usize,
-    discard: Option<Discard>,
+    muted_bytes: usize,
 }
 
+/// An oversized control sequence that did not return to ground within the
+/// muted recovery limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControlKind {
-    Csi,
-    Osc,
-    String,
-    Escape,
-}
+struct InputError;
 
-#[derive(Clone, Copy, Debug)]
-struct Discard {
-    kind: ControlKind,
-    escaped: bool,
-}
-
-impl Discard {
-    const fn new(start: &[u8]) -> Self {
-        let kind = match start {
-            [0x1b, b'['] | [0x9b, ..] => ControlKind::Csi,
-            [0x1b, b']'] | [0x9d, ..] => ControlKind::Osc,
-            [0x1b, b'P' | b'_' | b'^' | b'X'] | [0x90 | 0x98 | 0x9e | 0x9f, ..] => {
-                ControlKind::String
-            }
-            _ => ControlKind::Escape,
-        };
-        Self {
-            kind,
-            escaped: false,
-        }
+impl std::fmt::Display for InputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "terminal input contained an unterminated control sequence longer than {} bytes",
+            MAX_CONTROL + MAX_MUTED
+        )
     }
+}
 
-    fn byte(&mut self, byte: u8) -> bool {
-        match self.kind {
-            ControlKind::Csi => (0x40..=0x7e).contains(&byte),
-            ControlKind::Osc => {
-                if self.escaped {
-                    self.escaped = byte == 0x1b;
-                    byte == b'\\'
-                } else if byte == 0x1b {
-                    self.escaped = true;
-                    false
-                } else {
-                    byte == 0x07
-                }
-            }
-            ControlKind::String => {
-                if self.escaped {
-                    self.escaped = byte == 0x1b;
-                    byte == b'\\'
-                } else {
-                    self.escaped = byte == 0x1b;
-                    false
-                }
-            }
-            ControlKind::Escape => (0x30..=0x7e).contains(&byte),
-        }
+impl std::error::Error for InputError {}
+
+impl From<InputError> for io::Error {
+    fn from(error: InputError) -> Self {
+        Self::new(io::ErrorKind::InvalidData, error)
     }
 }
 
@@ -228,29 +193,17 @@ impl Parser {
             decoder: Decoder::default(),
             mouse: Vec::new(),
             control_bytes: 0,
-            control_start: [0; 2],
-            control_start_len: 0,
-            discard: None,
+            muted_bytes: 0,
         }
     }
 
-    fn consume_discard(&mut self, byte: u8) -> bool {
-        let Some(discard) = &mut self.discard else {
-            return false;
-        };
-        if discard.byte(byte) {
-            self.discard = None;
-        }
-        true
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.consume_discard(byte) {
-            return;
+    fn push(&mut self, byte: u8) -> Result<(), InputError> {
+        if self.decoder.muted {
+            return self.terminal_byte(byte);
         }
         if self.decoder.paste.is_some() {
             self.decoder.paste_byte(byte);
-            return;
+            return Ok(());
         }
         if self.mouse.starts_with(MOUSE_PREFIX) {
             match byte {
@@ -270,59 +223,58 @@ impl Parser {
                 }
                 _ => {
                     self.mouse.clear();
-                    self.push(byte);
+                    return self.push(byte);
                 }
             }
-            return;
+            return Ok(());
         }
         if !self.mouse.is_empty() {
             if byte == b'\x1b' {
                 self.mouse.truncate(1);
-                return;
+                return Ok(());
             }
             self.mouse.push(byte);
             if MOUSE_PREFIX.starts_with(&self.mouse) {
-                return;
+                return Ok(());
             }
             let mut pending = std::mem::take(&mut self.mouse);
             for &byte in &pending {
-                self.terminal_byte(byte);
+                self.terminal_byte(byte)?;
             }
             pending.clear();
             self.mouse = pending;
-            return;
+            return Ok(());
         }
         if self.terminal.is_ground() && byte == b'\x1b' {
             self.mouse.push(byte);
+            Ok(())
         } else {
-            self.terminal_byte(byte);
+            self.terminal_byte(byte)
         }
     }
 
-    fn terminal_byte(&mut self, byte: u8) {
-        if self.consume_discard(byte) {
-            return;
-        }
-        if self.terminal.is_ground() {
-            self.control_start[0] = byte;
-            self.control_start_len = 1;
-        } else if self.control_start_len < self.control_start.len() {
-            self.control_start[self.control_start_len] = byte;
-            self.control_start_len += 1;
+    fn terminal_byte(&mut self, byte: u8) -> Result<(), InputError> {
+        if !self.decoder.muted && !self.terminal.is_ground() && self.control_bytes >= MAX_CONTROL {
+            self.decoder.muted = true;
+            self.muted_bytes = 0;
+            tracing::warn!("Discarding oversized terminal control sequence");
         }
         self.terminal.parse_byte(byte, &mut self.decoder);
         self.control_bytes = if self.terminal.is_ground() {
             0
         } else {
-            self.control_bytes + 1
+            self.control_bytes.saturating_add(1)
         };
-        if self.control_bytes > MAX_CONTROL {
-            self.discard = Some(Discard::new(&self.control_start[..self.control_start_len]));
-            self.terminal = VTParser::new();
-            self.control_bytes = 0;
-            self.control_start_len = 0;
-            tracing::warn!("Discarded oversized terminal control sequence");
+        if self.decoder.muted {
+            self.muted_bytes += 1;
+            if self.terminal.is_ground() {
+                self.decoder.muted = false;
+                self.muted_bytes = 0;
+            } else if self.muted_bytes > MAX_MUTED {
+                return Err(InputError);
+            }
         }
+        Ok(())
     }
 }
 
@@ -330,6 +282,7 @@ impl Parser {
 struct Decoder {
     events: VecDeque<Event>,
     paste: Option<Paste>,
+    muted: bool,
 }
 
 #[derive(Default)]
@@ -363,6 +316,9 @@ impl Paste {
 
 impl Decoder {
     fn paste_byte(&mut self, byte: u8) {
+        if self.muted {
+            return;
+        }
         if let Some(paste) = &mut self.paste
             && paste.push(byte)
             && let Some(text) = self.paste.take().and_then(Paste::finish)
@@ -374,7 +330,7 @@ impl Decoder {
 
 impl VTActor for Decoder {
     fn csi_dispatch(&mut self, params: &[CsiParam], truncated: bool, byte: u8) {
-        if truncated {
+        if self.muted || truncated {
             return;
         }
         if params == [CsiParam::Integer(200)] && byte == b'~' {
@@ -385,6 +341,9 @@ impl VTActor for Decoder {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]]) {
+        if self.muted {
+            return;
+        }
         if let [b"5522", metadata, rest @ ..] = params
             && rest.len() <= 1
         {
@@ -401,7 +360,7 @@ impl VTActor for Decoder {
     }
 
     fn print(&mut self, character: char) {
-        if !character.is_control() {
+        if !self.muted && !character.is_control() {
             self.events.push_back(Event::Text(character.to_string()));
         }
     }
@@ -596,12 +555,46 @@ fn button(code: u32) -> Option<Button> {
 mod tests {
     use super::*;
 
-    fn parse(bytes: &[u8]) -> Vec<Event> {
+    fn parse_result(bytes: &[u8]) -> (Result<(), InputError>, Vec<Event>) {
         let mut parser = Parser::new();
+        let mut result = Ok(());
         for &byte in bytes {
-            parser.push(byte);
+            if let Err(error) = parser.push(byte) {
+                result = Err(error);
+                break;
+            }
         }
-        parser.decoder.events.into_iter().collect()
+        (result, parser.decoder.events.into_iter().collect())
+    }
+
+    fn parse(bytes: &[u8]) -> Vec<Event> {
+        let (result, events) = parse_result(bytes);
+        result.expect("valid terminal input");
+        events
+    }
+
+    fn unterminated(prefix: &[u8], filler: u8) -> Vec<u8> {
+        let mut bytes = prefix.to_vec();
+        bytes.extend(std::iter::repeat_n(filler, MAX_CONTROL + 1));
+        bytes
+    }
+
+    fn terminated(prefix: &[u8], filler: u8, terminator: &[u8]) -> Vec<u8> {
+        let mut bytes = unterminated(prefix, filler);
+        bytes.extend_from_slice(terminator);
+        bytes.extend_from_slice(b"\x1b[I");
+        bytes
+    }
+
+    fn assert_focus_only(name: &str, bytes: &[u8]) {
+        let (result, events) = parse_result(bytes);
+        if let Err(error) = result {
+            panic!("{name}: {error}");
+        }
+        assert!(
+            matches!(events.as_slice(), [Event::Focus(true)]),
+            "{name}: {events:?}"
+        );
     }
 
     fn parse_chunks_after_drain(chunks: &[&[u8]]) -> Vec<Vec<Event>> {
@@ -610,7 +603,7 @@ mod tests {
             .iter()
             .map(|chunk| {
                 for &byte in *chunk {
-                    parser.push(byte);
+                    parser.push(byte).expect("valid terminal input");
                 }
                 parser.decoder.events.drain(..).collect()
             })
@@ -1186,34 +1179,69 @@ mod tests {
 
     #[test]
     fn parser_discards_oversized_control_sequences_until_their_terminator() {
-        let mut csi = b"\x1b[".to_vec();
-        csi.extend(std::iter::repeat_n(b'1', MAX_CONTROL + 16));
-        csi.push(b'm');
-        csi.extend_from_slice(b"\x1b[I");
-        let events = parse(&csi);
-        assert!(
-            matches!(events.as_slice(), [Event::Focus(true)]),
-            "oversized CSI: {events:?}"
-        );
+        let cases = [
+            ("CSI final", terminated(b"\x1b[", b'1', b"m")),
+            ("OSC ST", terminated(b"\x1b]", b'x', b"\x1b\\")),
+            ("OSC BEL", terminated(b"\x1b]", b'x', b"\x07")),
+            ("OSC C1 ST", terminated(b"\x1b]", b'x', b"\x9c")),
+            ("DCS ST", terminated(b"\x1bP", b'x', b"\x1b\\")),
+            ("APC ST", terminated(b"\x1b_", b'x', b"\x1b\\")),
+            ("UTF-8 C1 OSC ST", terminated(b"\xc2\x9d", b'x', b"\x1b\\")),
+        ];
+        for (name, bytes) in cases {
+            assert_focus_only(name, &bytes);
+        }
 
-        let mut osc_st = b"\x1b]".to_vec();
-        osc_st.extend(std::iter::repeat_n(b'x', MAX_CONTROL + 16));
-        osc_st.extend_from_slice(b"\x1b\\");
-        osc_st.extend_from_slice(b"\x1b[I");
-        let events = parse(&osc_st);
-        assert!(
-            matches!(events.as_slice(), [Event::Focus(true)]),
-            "oversized OSC ST: {events:?}"
-        );
+        let mut interrupted = unterminated(b"\x1b[", b'1');
+        interrupted.extend_from_slice(b"\x1b]interrupted\x07\x1b[I");
+        assert_focus_only("CSI interrupted by OSC", &interrupted);
+    }
 
-        let mut osc_bel = b"\x1b]".to_vec();
-        osc_bel.extend(std::iter::repeat_n(b'x', MAX_CONTROL + 16));
-        osc_bel.push(0x07);
-        osc_bel.extend_from_slice(b"\x1b[I");
-        let events = parse(&osc_bel);
+    #[test]
+    fn parser_recovers_when_oversized_control_sequences_are_cancelled() {
+        let cases: [(&str, &[u8], u8, u8); 4] = [
+            ("CSI cancelled by SUB", b"\x1b[", b'1', 0x1a),
+            ("OSC cancelled by CAN", b"\x1b]", b'x', 0x18),
+            ("DCS cancelled by SUB", b"\x1bP", b'x', 0x1a),
+            ("APC cancelled by CAN", b"\x1b_", b'x', 0x18),
+        ];
+        for (name, prefix, filler, cancel) in cases {
+            let mut bytes = unterminated(prefix, filler);
+            bytes.push(cancel);
+            bytes.extend_from_slice(b"\x1b[I");
+            assert_focus_only(name, &bytes);
+        }
+    }
+
+    #[test]
+    fn parser_recovers_when_st_straddles_the_control_limit() {
+        for payload in [
+            MAX_CONTROL - 3,
+            MAX_CONTROL - 2,
+            MAX_CONTROL - 1,
+            MAX_CONTROL,
+            MAX_CONTROL + 1,
+        ] {
+            let mut bytes = b"\x1b]".to_vec();
+            bytes.extend(std::iter::repeat_n(b'x', payload));
+            bytes.extend_from_slice(b"\x1b\\\x1b[I");
+            assert_focus_only(&format!("OSC payload {payload}"), &bytes);
+        }
+    }
+
+    #[test]
+    fn parser_fails_closed_when_oversized_control_never_terminates() {
+        let mut bytes = unterminated(b"\x1b]", b'x');
+        bytes.extend(std::iter::repeat_n(b'x', MAX_MUTED + 1));
+        bytes.extend_from_slice(b"\x1b[I");
+        let (result, events) = parse_result(&bytes);
+        let error = result.expect_err("unterminated control must fail");
+        assert!(events.is_empty(), "{events:?}");
+        let error = io::Error::from(error);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
-            matches!(events.as_slice(), [Event::Focus(true)]),
-            "oversized OSC BEL: {events:?}"
+            error.to_string().contains("unterminated control sequence"),
+            "{error}"
         );
     }
 }

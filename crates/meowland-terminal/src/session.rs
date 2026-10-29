@@ -170,7 +170,11 @@ impl TerminalSession {
             })
             .await;
             match ready {
-                Ready::Terminate => return self.close(None).await,
+                Ready::Input(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                    self.close(None).await?;
+                    return Err(error.into());
+                }
+                Ready::Terminate | Ready::Input(Err(_)) => return self.close(None).await,
                 Ready::Resize => self.send_event(input::Event::Resize)?,
                 Ready::Server(result) => self.handle_server_message(result?).await?,
                 Ready::Output(result) => {
@@ -178,13 +182,8 @@ impl TerminalSession {
                     self.presentation.finish(&mut self.tx)?;
                 }
                 Ready::Transmit(Err(error)) => return self.finish_after_write_error(error).await,
-                Ready::Input(result) => {
-                    if result.is_err() {
-                        return self.close(None).await;
-                    }
-                }
                 Ready::Deadline(result) => result?,
-                Ready::Transmit(Ok(())) | Ready::BufferedInput => {}
+                Ready::Input(Ok(())) | Ready::Transmit(Ok(())) | Ready::BufferedInput => {}
             }
             if !matches!(self.lifecycle, Lifecycle::Closed) && !self.tx.pending() {
                 self.handle_terminal_events()?;

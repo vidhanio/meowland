@@ -278,8 +278,12 @@ off most, for when that is requested.
   `protocol` framing (oversize, trailing bytes, cancellation-safe `Reader`).
 - [x] `catalog.rs` and `attachment.rs` selection and follow policy, which become
   testable without Wayland once split out (see §2).
-- [x] `render.rs` composition: blending, viewport, transforms, and damage-limited
+- [ ] `render.rs` composition: blending, viewport, transforms, and damage-limited
   recomposition matching full recomposition.
+  Blending, viewport, transforms, and direct clipped blits are covered. The
+  damage-limited claim still needs an end-to-end `Renderer::update` fixture with
+  surface commits; the opaque-cover shortcut is only tested through its decision
+  helper today.
 
 ## 6. Tooling, CI, Nix
 

@@ -906,19 +906,15 @@ mod tests {
         pixels
     }
 
-    fn patch_band(
-        frame: &mut [u8],
-        frame_width: i32,
-        band: &[u8],
-        region: Rectangle<i32, Logical>,
-    ) {
-        let band_width = usize::try_from(region.size.w).unwrap() * 3;
+    fn crop_region(frame: &[u8], frame_width: i32, region: Rectangle<i32, Logical>) -> Vec<u8> {
+        let width = usize::try_from(region.size.w).unwrap();
+        let mut pixels = Vec::with_capacity(width * usize::try_from(region.size.h).unwrap() * 3);
         for row in 0..region.size.h {
-            let from = usize::try_from(row).unwrap() * band_width;
-            let to =
+            let start =
                 usize::try_from((region.loc.y + row) * frame_width + region.loc.x).unwrap() * 3;
-            frame[to..to + band_width].copy_from_slice(&band[from..from + band_width]);
+            pixels.extend_from_slice(&frame[start..start + width * 3]);
         }
+        pixels
     }
 
     #[test]
@@ -965,7 +961,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn damage_limited_recomposition_matches_a_full_recomposition(
+        fn clipped_unscaled_blits_match_a_full_composition(
             damage in (0i32..6, 0i32..4).prop_flat_map(|(x, y)| {
                 (Just(x), Just(y), 1..=(6 - x), 1..=(4 - y))
                     .prop_map(|(x, y, width, height)| {
@@ -982,30 +978,19 @@ mod tests {
                     && y >= damage.loc.y
                     && y < damage.loc.y + damage.size.h
             };
-            let old_top = snapshot(6, 4, |x, y| {
+            let top = snapshot(6, 4, |x, y| {
                 if changed(x, y) {
-                    [0, 0, 0, 0]
+                    [60, 10, 20, 128]
                 } else {
-                    [10, 200, 30, 64]
-                }
-            });
-            let new_top = snapshot(6, 4, |x, y| {
-                if changed(x, y) {
-                    [200, 10, 20, 128]
-                } else {
-                    [10, 200, 30, 64]
+                    [10, 20, 30, 64]
                 }
             });
             let full = Rectangle::new((0, 0).into(), (6, 4).into());
 
-            let old_frame = compose_band(&bottom, &old_top, full);
-            let new_frame = compose_band(&bottom, &new_top, full);
-            let mut incremental = old_frame.clone();
-            let band = compose_band(&bottom, &new_top, damage);
-            patch_band(&mut incremental, 6, &band, damage);
-
-            prop_assert_ne!(&old_frame, &new_frame, "damage {:?}", damage);
-            prop_assert_eq!(&incremental, &new_frame, "damage {:?}", damage);
+            let full_frame = compose_band(&bottom, &top, full);
+            let clipped = compose_band(&bottom, &top, damage);
+            let expected = crop_region(&full_frame, 6, damage);
+            prop_assert_eq!(clipped, expected, "damage {:?}", damage);
         }
     }
 

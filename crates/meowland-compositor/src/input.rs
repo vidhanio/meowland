@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use meowland_protocol::{Button, ButtonState, Input, KEY_V, Scroll, modifiers};
+use meowland_protocol::{Button, ButtonState, Input, KEY_V, Modifiers, Scroll};
 use smithay::{
     backend::input::{
         Axis, AxisSource, ButtonState as WaylandButtonState, InputTime, KeyState, Keycode,
@@ -246,7 +246,13 @@ const fn v120_units(units: i32) -> i32 {
     units * V120_PER_DETENT / SCROLL_UNITS_PER_DETENT
 }
 
-fn enter_keyboard(state: &mut State, pane: PaneId, window: WindowId, keys: &[u16], bits: u8) {
+fn enter_keyboard(
+    state: &mut State,
+    pane: PaneId,
+    window: WindowId,
+    keys: &[u16],
+    bits: Modifiers,
+) {
     reset_keyboard(state);
     if !keyboard_grabbed(state) {
         state.focus_window(window);
@@ -344,14 +350,14 @@ pub(crate) fn reset_keyboard(state: &mut State) {
     }
 }
 
-fn snapshot(bits: u8) -> ModifiersState {
+fn snapshot(bits: Modifiers) -> ModifiersState {
     ModifiersState {
-        shift: bits & modifiers::SHIFT != 0,
-        ctrl: bits & modifiers::CONTROL != 0,
-        alt: bits & modifiers::ALT != 0,
-        logo: bits & modifiers::SUPER != 0,
-        caps_lock: bits & modifiers::CAPS_LOCK != 0,
-        num_lock: bits & modifiers::NUM_LOCK != 0,
+        shift: bits.contains(Modifiers::SHIFT),
+        ctrl: bits.contains(Modifiers::CONTROL),
+        alt: bits.contains(Modifiers::ALT),
+        logo: bits.contains(Modifiers::SUPER),
+        caps_lock: bits.contains(Modifiers::CAPS_LOCK),
+        num_lock: bits.contains(Modifiers::NUM_LOCK),
         ..ModifiersState::default()
     }
 }
@@ -369,7 +375,7 @@ fn inject_key(
     state: &mut State,
     code: u16,
     transition: KeyState,
-    bits: u8,
+    bits: Modifiers,
 ) {
     set_modifiers(keyboard, state, snapshot(bits));
     let changed = if transition == KeyState::Pressed {
@@ -406,7 +412,7 @@ pub(crate) fn paste_action(state: &mut State, pane: PaneId) {
     }
     if let Some(keyboard) = state.keyboard.take() {
         let previous = keyboard.modifier_state();
-        set_modifiers(&keyboard, state, snapshot(modifiers::CONTROL));
+        set_modifiers(&keyboard, state, snapshot(Modifiers::CONTROL));
         forward(&keyboard, state, KEY_V, KeyState::Pressed);
         forward(&keyboard, state, KEY_V, KeyState::Released);
         set_modifiers(&keyboard, state, previous);

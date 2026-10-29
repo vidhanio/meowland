@@ -6,11 +6,7 @@ use std::{collections::VecDeque, io};
 use calloop::LoopHandle;
 use futures::io::AsyncReadExt;
 use meowland_core::asynchronous::Descriptor;
-use meowland_protocol::{
-    Button, ButtonState, Input, Scroll,
-    clipboard::MAX_TEXT,
-    modifiers::{ALT, CONTROL, HYPER, META, SUPER},
-};
+use meowland_protocol::{Button, ButtonState, Input, Modifiers, Scroll, clipboard::MAX_TEXT};
 use rustix::fs::{Mode, OFlags, open};
 use vtparse::{CsiParam, VTActor, VTParser};
 
@@ -46,8 +42,8 @@ pub enum Kind {
 pub struct Key {
     /// Unicode code point or Kitty functional-key number.
     pub code: u32,
-    /// Modifier bits using [`meowland_protocol::modifiers`].
-    pub modifiers: u8,
+    /// Modifier bits using [`Modifiers`].
+    pub modifiers: Modifiers,
     /// Press, repeat, or release transition.
     pub kind: Kind,
 }
@@ -371,7 +367,7 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         .map_or(Some(1), number)?
         .checked_sub(1)?;
     let bits = u8::try_from(bits).ok()?;
-    let modifiers = (bits & !6) | ((bits & 2) << 1) | ((bits & 4) >> 1);
+    let modifiers = Modifiers::from_kitty(bits);
     let kind = match modifier
         .next()
         .filter(|params| !params.is_empty())
@@ -415,7 +411,7 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         },
         _ => return None,
     };
-    let shortcut = modifiers & (CONTROL | ALT | SUPER | HYPER | META) != 0;
+    let shortcut = modifiers.intersects(Modifiers::SHORTCUT);
     if matches!(kind, Kind::Press | Kind::Repeat)
         && !shortcut
         && crate::keyboard::key_code(code).is_none()

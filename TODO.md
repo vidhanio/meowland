@@ -192,7 +192,7 @@ These follow the `rust-best-practices` skill.
   Option<u8>, pressed: bool }`: `pressed` means nothing when `button` is `None`. Use
   `button: Option<(Button, ButtonState)>` with a `Button` enum instead of raw
   `0/1/2/_`.
-- [ ] **Modifiers are a raw `u8`.** `protocol::modifiers` is a `u8` with loose consts.
+- [x] **Modifiers are a raw `u8`.** `protocol::modifiers` is a `u8` with loose consts.
   Use a `bitflags` `Modifiers` type. The crate already decodes Kitty's bit layout by
   hand in `input.rs` `csi()` (`(bits & !6) | …`), which needs a comment or a named
   conversion.

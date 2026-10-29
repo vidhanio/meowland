@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use meowland_protocol::{Input, KEY_INSERT, KEY_V, modifiers};
+use meowland_protocol::{Input, KEY_INSERT, KEY_V, Modifiers};
 
 use super::input::{Key, Kind};
 
@@ -14,7 +14,7 @@ use super::input::{Key, Kind};
 pub struct Keyboard {
     intercepted: HashSet<u16>,
     held: BTreeSet<u16>,
-    modifiers: u8,
+    modifiers: Modifiers,
 }
 
 impl Keyboard {
@@ -64,16 +64,16 @@ impl Keyboard {
     pub fn reset(&mut self) {
         self.intercepted.clear();
         self.held.clear();
-        self.modifiers = 0;
+        self.modifiers = Modifiers::empty();
     }
 }
 
 /// Recognize Control-V or Shift-Insert, ignoring lock modifiers.
 #[must_use]
-pub const fn paste(code: u16, bits: u8) -> bool {
-    let bits = bits & !(modifiers::CAPS_LOCK | modifiers::NUM_LOCK);
-    (code == KEY_V && bits == modifiers::CONTROL)
-        || (code == KEY_INSERT && bits == modifiers::SHIFT)
+pub const fn paste(code: u16, bits: Modifiers) -> bool {
+    let bits = bits.difference(Modifiers::CAPS_LOCK.union(Modifiers::NUM_LOCK));
+    (code == KEY_V && bits.bits() == Modifiers::CONTROL.bits())
+        || (code == KEY_INSERT && bits.bits() == Modifiers::SHIFT.bits())
 }
 
 pub(crate) fn key_code(code: u32) -> Option<u16> {

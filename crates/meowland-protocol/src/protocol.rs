@@ -32,31 +32,69 @@ thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Shared modifier bits for [`Input::Key`].
-pub mod modifiers {
-    /// Either Shift key is held.
-    pub const SHIFT: u8 = 1;
-    /// Either Control key is held.
-    pub const CONTROL: u8 = 2;
-    /// Either Alt key is held.
-    pub const ALT: u8 = 4;
-    /// The Super modifier is active.
-    pub const SUPER: u8 = 8;
-    /// The Hyper modifier is active.
-    pub const HYPER: u8 = 16;
-    /// The Meta modifier is active.
-    pub const META: u8 = 32;
-    /// Caps Lock is enabled.
-    pub const CAPS_LOCK: u8 = 64;
-    /// Num Lock is enabled.
-    pub const NUM_LOCK: u8 = 128;
+bitflags::bitflags! {
+    /// Shared modifier bits for [`Input::Key`].
+    ///
+    /// Values follow the Linux input convention, which differs from Kitty's wire
+    /// order; [`Modifiers::from_kitty`] performs that translation.
+    #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash)]
+    #[serde(transparent)]
+    pub struct Modifiers: u8 {
+        /// Either Shift key is held.
+        const SHIFT = 1;
+        /// Either Control key is held.
+        const CONTROL = 2;
+        /// Either Alt key is held.
+        const ALT = 4;
+        /// The Super modifier is active.
+        const SUPER = 8;
+        /// The Hyper modifier is active.
+        const HYPER = 16;
+        /// The Meta modifier is active.
+        const META = 32;
+        /// Caps Lock is enabled.
+        const CAPS_LOCK = 64;
+        /// Num Lock is enabled.
+        const NUM_LOCK = 128;
+    }
+}
+
+/// Kitty's Alt bit, which Linux input numbers as Control.
+const KITTY_ALT: u8 = 0b010;
+/// Kitty's Control bit, which Linux input numbers as Alt.
+const KITTY_CONTROL: u8 = 0b100;
+
+impl Modifiers {
+    /// Modifiers that turn a key press into a shortcut rather than text.
+    pub const SHORTCUT: Self = Self::CONTROL
+        .union(Self::ALT)
+        .union(Self::SUPER)
+        .union(Self::HYPER)
+        .union(Self::META);
+
+    /// Translate Kitty's modifier bit layout into this type.
+    ///
+    /// Kitty and Linux agree on every bit except Alt and Control: Kitty reports
+    /// Alt as bit 1 and Control as bit 2, while this type follows Linux input,
+    /// which swaps them.
+    #[must_use]
+    pub const fn from_kitty(bits: u8) -> Self {
+        let mut modifiers = Self::from_bits_retain(bits & !(KITTY_ALT | KITTY_CONTROL));
+        if bits & KITTY_ALT != 0 {
+            modifiers = modifiers.union(Self::CONTROL);
+        }
+        if bits & KITTY_CONTROL != 0 {
+            modifiers = modifiers.union(Self::ALT);
+        }
+        modifiers
+    }
 
     /// Whether a key carrying these modifiers is a compositor binding.
     ///
     /// Shift and lock state are allowed; other shortcut modifiers are not.
     #[must_use]
-    pub const fn alt_only(modifiers: u8) -> bool {
-        modifiers & (CONTROL | SUPER | HYPER | META) == 0 && modifiers & ALT != 0
+    pub const fn alt_only(self) -> bool {
+        self.contains(Self::ALT) && !self.intersects(Self::SHORTCUT.difference(Self::ALT))
     }
 }
 
@@ -81,8 +119,8 @@ pub enum Shortcut {
 impl Shortcut {
     /// Recognize an Alt binding from a Linux key code and modifier snapshot.
     #[must_use]
-    pub const fn from_key(code: u16, bits: u8) -> Option<Self> {
-        if !modifiers::alt_only(bits) {
+    pub const fn from_key(code: u16, modifiers: Modifiers) -> Option<Self> {
+        if !modifiers.alt_only() {
             return None;
         }
         match code {
@@ -187,8 +225,8 @@ pub enum Input {
         code: u16,
         /// A real key transition. It stays down until its release or a reset.
         pressed: bool,
-        /// [`modifiers`] snapshot, including lock state.
-        modifiers: u8,
+        /// [`Modifiers`] snapshot, including lock state.
+        modifiers: Modifiers,
         /// Client-known held keys immediately before this transition.
         held: Vec<u16>,
     },
@@ -212,8 +250,8 @@ pub enum Input {
     KeyboardEnter {
         /// Linux input codes held when focus was gained.
         keys: Vec<u16>,
-        /// [`modifiers`] snapshot, including lock state.
-        modifiers: u8,
+        /// [`Modifiers`] snapshot, including lock state.
+        modifiers: Modifiers,
     },
     /// Committed Unicode text that has no usable Linux key code.
     Text(String),

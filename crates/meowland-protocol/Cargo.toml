@@ -12,6 +12,7 @@ workspace = true
 async = ["dep:futures"]
 
 [dependencies]
+bitflags = { workspace = true, features = ["serde"] }
 getrandom = { workspace = true }
 futures = { workspace = true, optional = true }
 meowland-core = { workspace = true }

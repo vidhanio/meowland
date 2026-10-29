@@ -8,8 +8,9 @@ use futures::{
     channel::{mpsc, oneshot},
     io::{AsyncReadExt, AsyncWrite},
 };
+use meowland_async::asynchronous::timeout;
 use meowland_compositor::PaneId;
-use meowland_core::{asynchronous::timeout, pixels::FrameSize};
+use meowland_core::pixels::FrameSize;
 use meowland_protocol::{
     self as protocol, ControlRequest, PaneToServer, ServerToPane,
     asynchronous::{Outgoing, Reader},

@@ -7,11 +7,11 @@ use std::{
 
 use calloop::LoopHandle;
 use futures::FutureExt;
-use meowland_core::{
+use meowland_async::{
     asynchronous::{Descriptor, sleep_until, when},
-    pixels::FrameSize,
     signals,
 };
+use meowland_core::pixels::FrameSize;
 use meowland_input as input;
 use meowland_kitty::{query_frame_edits, query_shared};
 use meowland_protocol::SharedObject;

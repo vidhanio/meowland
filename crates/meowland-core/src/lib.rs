@@ -1,15 +1,10 @@
-//! Shared errors, validated frame dimensions, and async runtime helpers.
-
-#[cfg(feature = "async")]
-pub mod asynchronous;
+//! Shared errors, validated frame dimensions, scale, refresh rate, and latency
+//! statistics.
 
 mod error;
-pub mod future;
 pub mod latency;
 pub mod pixels;
 pub mod scale;
-#[cfg(feature = "async")]
-pub mod signals;
 pub mod timing;
 
 pub use error::{Error, Result};

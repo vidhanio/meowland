@@ -9,12 +9,13 @@ publish.workspace = true
 workspace = true
 
 [features]
-async = ["dep:futures"]
+async = ["dep:futures", "dep:meowland-async"]
 
 [dependencies]
 bitflags = { workspace = true, features = ["serde"] }
 getrandom = { workspace = true }
 futures = { workspace = true, optional = true }
+meowland-async = { workspace = true, optional = true }
 meowland-core = { workspace = true }
 postcard = { workspace = true, features = ["use-std"] }
 rustix = { workspace = true, features = ["time", "shm", "fs"] }

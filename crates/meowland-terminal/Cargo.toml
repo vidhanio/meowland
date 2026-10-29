@@ -11,7 +11,8 @@ workspace = true
 [dependencies]
 meowland-input = { workspace = true }
 meowland-terminal-clipboard = { workspace = true }
-meowland-core = { workspace = true, features = ["async"] }
+meowland-core = { workspace = true }
+meowland-async = { workspace = true }
 meowland-protocol = { workspace = true, features = ["async"] }
 calloop = { workspace = true }
 futures = { workspace = true }

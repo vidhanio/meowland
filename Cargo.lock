@@ -599,6 +599,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "meowland-async"
+version = "0.1.0"
+dependencies = [
+ "calloop",
+ "futures",
+ "rustix 1.1.5",
+]
+
+[[package]]
 name = "meowland-bench"
 version = "0.1.0"
 dependencies = [
@@ -626,9 +635,6 @@ dependencies = [
 name = "meowland-core"
 version = "0.1.0"
 dependencies = [
- "calloop",
- "futures",
- "rustix 1.1.5",
  "thiserror",
 ]
 
@@ -638,7 +644,7 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "futures",
- "meowland-core",
+ "meowland-async",
  "meowland-protocol",
  "rustix 1.1.5",
  "tracing",
@@ -662,6 +668,7 @@ dependencies = [
  "bitflags",
  "futures",
  "getrandom",
+ "meowland-async",
  "meowland-core",
  "mime",
  "postcard",
@@ -688,6 +695,7 @@ dependencies = [
  "calloop",
  "futures",
  "listenfd",
+ "meowland-async",
  "meowland-compositor",
  "meowland-core",
  "meowland-protocol",
@@ -706,6 +714,7 @@ dependencies = [
  "calloop",
  "crossterm",
  "futures",
+ "meowland-async",
  "meowland-core",
  "meowland-input",
  "meowland-kitty",

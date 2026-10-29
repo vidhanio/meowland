@@ -9,7 +9,7 @@ use std::{
 
 use calloop::{LoopHandle, io::Async, signals::Signal as UnixSignal};
 use futures::{FutureExt, io::AsyncWriteExt};
-use meowland_core::{
+use meowland_async::{
     asynchronous::{Descriptor, sleep_until, when},
     future::yield_now,
     signals,

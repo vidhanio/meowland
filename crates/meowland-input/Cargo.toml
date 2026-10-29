@@ -9,7 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-meowland-core = { workspace = true, features = ["async"] }
+meowland-async = { workspace = true }
 meowland-protocol = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 futures = { workspace = true }

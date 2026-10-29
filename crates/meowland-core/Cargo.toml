@@ -8,11 +8,5 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-async = ["dep:calloop", "dep:futures", "dep:rustix"]
-
 [dependencies]
-rustix = { workspace = true, optional = true, features = ["fs", "net"] }
-calloop = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
 thiserror = { workspace = true }

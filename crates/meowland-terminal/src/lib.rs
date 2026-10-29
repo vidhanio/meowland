@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use calloop::{Dispatcher, EventLoop, futures::executor};
-use meowland_core::asynchronous::{connect, timeout};
+use meowland_async::asynchronous::{connect, timeout};
 use meowland_protocol::{Show, asynchronous::Reader};
 
 mod error;

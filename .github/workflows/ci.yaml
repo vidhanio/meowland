@@ -37,8 +37,8 @@ jobs:
 
       - name: Check optional runtime features
         run: |
-          cargo check --locked -p meowland-core --no-default-features
           cargo check --locked -p meowland-protocol --no-default-features
+          cargo check --locked -p meowland-protocol --features async
 
       - name: Run tests
         run: cargo test --locked --workspace --all-features

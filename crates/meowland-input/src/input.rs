@@ -5,7 +5,7 @@ use std::{collections::VecDeque, io};
 
 use calloop::LoopHandle;
 use futures::io::AsyncReadExt;
-use meowland_core::asynchronous::Descriptor;
+use meowland_async::asynchronous::Descriptor;
 use meowland_protocol::{Button, ButtonState, Input, Modifiers, Scroll, clipboard::MAX_TEXT};
 use rustix::fs::{Mode, OFlags, open};
 use vtparse::{CsiParam, VTActor, VTParser};

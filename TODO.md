@@ -102,7 +102,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   including a single control request. The duplicated display fd is registered with a
   no-op callback just to force wakeups. Track dirty and due state, and only walk the
   collections when something changed.
-- [ ] **`meowland-core` is a grab bag.** Errors, pixel geometry, UI scale, refresh rate,
+- [x] **`meowland-core` is a grab bag.** Errors, pixel geometry, UI scale, refresh rate,
   latency stats, calloop async helpers, and signals have nothing in common. Move
   `asynchronous` and `signals` into a `meowland-async` crate (or into
   protocol/terminal), and keep `core` for value types.

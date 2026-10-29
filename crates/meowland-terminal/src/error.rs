@@ -48,5 +48,14 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether [`Display`](std::fmt::Display) already includes this error's
+    /// immediate [`source`](std::error::Error::source).
+    #[must_use]
+    pub const fn source_is_in_display(&self) -> bool {
+        matches!(self, Self::Connect { .. })
+    }
+}
+
 /// Result of a pane client operation.
 pub type Result<T> = std::result::Result<T, Error>;

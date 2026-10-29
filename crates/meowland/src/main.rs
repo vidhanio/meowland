@@ -17,62 +17,68 @@ fn main() {
 
 fn format_error(error: &anyhow::Error) -> String {
     let mut rendered = String::new();
+    let mut skip_source = false;
     for (index, cause) in error.chain().enumerate() {
-        let cause = cause.to_string();
-        if index > 0 && rendered.ends_with(&cause) {
+        if skip_source {
+            skip_source = false;
             continue;
         }
         if index > 0 {
             rendered.push_str(": ");
         }
-        rendered.push_str(&cause);
+        rendered.push_str(&cause.to_string());
+        skip_source = source_is_in_display(cause);
     }
     rendered
 }
 
+fn source_is_in_display(cause: &(dyn std::error::Error + 'static)) -> bool {
+    cause
+        .downcast_ref::<meowland_server::Error>()
+        .is_some_and(meowland_server::Error::source_is_in_display)
+        || cause
+            .downcast_ref::<meowland_terminal::Error>()
+            .is_some_and(meowland_terminal::Error::source_is_in_display)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fmt;
+    use std::{io, path::PathBuf};
 
     use super::format_error;
 
-    #[derive(Debug)]
-    struct Inner;
+    #[test]
+    fn error_chains_render_each_source_once() {
+        let server = anyhow::Error::new(meowland_server::Error::IoContext {
+            action: "binding the control socket".into(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+        })
+        .context("starting server");
+        assert_eq!(
+            format_error(&server),
+            "starting server: binding the control socket: permission denied"
+        );
 
-    impl fmt::Display for Inner {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("permission denied")
-        }
-    }
-
-    impl std::error::Error for Inner {}
-
-    #[derive(Debug)]
-    struct Library {
-        source: Inner,
-    }
-
-    impl fmt::Display for Library {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "binding: {}", self.source)
-        }
-    }
-
-    impl std::error::Error for Library {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(&self.source)
-        }
+        let terminal = anyhow::Error::new(meowland_terminal::Error::Connect {
+            path: PathBuf::from("/run/user/1000/meowland-pane.sock"),
+            source: io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
+        });
+        assert_eq!(
+            format_error(&terminal),
+            "could not reach the pane socket /run/user/1000/meowland-pane.sock (is the server running?): connection refused"
+        );
     }
 
     #[test]
-    fn error_chains_render_each_source_once() {
-        let contextual = anyhow::Error::new(Library { source: Inner }).context("starting server");
-        assert_eq!(
-            format_error(&contextual),
-            "starting server: binding: permission denied"
-        );
+    fn coincidental_source_suffixes_are_still_rendered() {
+        let source = io::Error::from_raw_os_error(2).to_string();
+        let path = format!("/tmp/{source}");
+        let error = anyhow::Error::new(io::Error::from_raw_os_error(2))
+            .context(format!("reading configuration {path}"));
 
-        let ordinary = anyhow::anyhow!("permission denied").context("binding");
-        assert_eq!(format_error(&ordinary), "binding: permission denied");
+        assert_eq!(
+            format_error(&error),
+            format!("reading configuration {path}: {source}")
+        );
     }
 }

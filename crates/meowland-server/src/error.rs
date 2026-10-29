@@ -45,14 +45,21 @@ impl Error {
         }
     }
 
+    /// Whether [`Display`](std::fmt::Display) already includes this error's
+    /// immediate [`source`](std::error::Error::source).
+    #[must_use]
+    pub const fn source_is_in_display(&self) -> bool {
+        matches!(self, Self::IoContext { .. })
+    }
+
     pub(crate) fn report(&self) -> String {
         let mut report = self.to_string();
         let mut source = std::error::Error::source(self);
+        if self.source_is_in_display() {
+            source = source.and_then(std::error::Error::source);
+        }
         while let Some(error) = source {
-            let rendered = error.to_string();
-            if !report.ends_with(&rendered) {
-                let _ = write!(report, ": {rendered}");
-            }
+            let _ = write!(report, ": {error}");
             source = std::error::Error::source(error);
         }
         report
@@ -81,5 +88,16 @@ mod tests {
             error.report(),
             "binding the control socket: permission denied"
         );
+    }
+
+    #[test]
+    fn report_keeps_a_source_that_repeats_the_end_of_the_action() {
+        let message = io::Error::from_raw_os_error(2).to_string();
+        let error = Error::IoContext {
+            action: format!("binding /tmp/{message}"),
+            source: io::Error::from_raw_os_error(2),
+        };
+
+        assert_eq!(error.report(), format!("binding /tmp/{message}: {message}"));
     }
 }

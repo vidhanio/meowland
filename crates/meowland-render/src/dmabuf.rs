@@ -22,7 +22,7 @@ use smithay::{
 };
 use thiserror::Error;
 
-use super::snapshot::Snapshot;
+use super::snapshot::{Opacity, Snapshot};
 
 #[derive(Debug, Error)]
 enum BackendError {
@@ -418,19 +418,16 @@ impl DmabufBackend {
                 destination.copy_from_slice(source);
             }
         }
-        let mut opaque = true;
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            if readback.force_opaque {
-                pixel[3] = 255;
-            } else {
-                opaque &= pixel[3] == 255;
-            }
-        }
-        Ok(Snapshot {
-            width: size.width(),
-            height: size.height(),
+        let opacity = if readback.force_opaque {
+            Opacity::Force
+        } else {
+            Opacity::Source
+        };
+        Ok(Snapshot::from_rgba(
+            size.width(),
+            size.height(),
             pixels,
-            opaque,
-        })
+            opacity,
+        ))
     }
 }

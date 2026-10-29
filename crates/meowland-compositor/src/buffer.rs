@@ -8,16 +8,17 @@ use smithay::{
         Client,
         protocol::{wl_buffer, wl_surface::WlSurface},
     },
-    utils::Transform,
+    utils::{Buffer, Rectangle, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, Damage,
             SurfaceAttributes, add_pre_commit_hook, with_states,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         shm::{ShmHandler, ShmState, with_buffer_contents},
         single_pixel_buffer::get_single_pixel_buffer,
+        viewporter::ViewportCachedState,
     },
 };
 
@@ -26,6 +27,40 @@ use super::{Snapshot, State, readback, render, runtime::ClientState};
 #[derive(Default)]
 pub(crate) struct SurfaceCache {
     pub snapshots: HashMap<WlSurface, Snapshot>,
+}
+
+/// Translate committed surface damage into buffer coordinates for snapshot
+/// patching.
+///
+/// Empty damage means the whole buffer may have changed. A viewport maps
+/// surface damage through a source region, so patching falls back to a full
+/// copy for those surfaces.
+fn buffer_damage(
+    damage: &[Damage],
+    data: &smithay::wayland::shm::BufferData,
+    scale: i32,
+    transform: Transform,
+    viewport: ViewportCachedState,
+) -> Vec<Rectangle<i32, Buffer>> {
+    if damage.is_empty() {
+        return Vec::new();
+    }
+    let size = Size::<i32, Buffer>::from((data.width, data.height));
+    let surface = size.to_logical(scale, transform);
+    let mut rects = Vec::with_capacity(damage.len());
+    for damage in damage {
+        let rect = match damage {
+            Damage::Buffer(rect) => *rect,
+            Damage::Surface(rect) => {
+                if viewport.src.is_some() || viewport.dst.is_some() {
+                    return Vec::new();
+                }
+                rect.to_buffer(scale, transform, &surface)
+            }
+        };
+        rects.push(rect);
+    }
+    rects
 }
 
 impl BufferHandler for State {
@@ -130,11 +165,16 @@ impl CompositorHandler for State {
                         readback::snapshot(surface)
                     } else {
                         with_buffer_contents(&buffer, |ptr, len, data| {
+                            let viewport = with_states(surface, |states| {
+                                *states.cached_state.get::<ViewportCachedState>().current()
+                            });
+                            let damage = buffer_damage(&damage, &data, scale, transform, viewport);
                             // SAFETY: Smithay keeps the mapped pool readable
-                            // for this callback and
-                            // supplies its pointer and length
-                            // together.
-                            unsafe { Snapshot::copy_shm(ptr, len, &data, bound, &mut previous) }
+                            // for this callback and supplies its pointer and
+                            // length together.
+                            unsafe {
+                                Snapshot::copy_shm(ptr, len, &data, bound, &damage, &mut previous)
+                            }
                         })
                         .ok()
                         .flatten()

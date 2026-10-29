@@ -306,7 +306,7 @@ fn blit(
         blit_unscaled(snapshot, dst.left, dst.top, clip, target);
         return;
     }
-    if snapshot.opaque {
+    if snapshot.opaque() {
         blit_scaled::<true>(snapshot, geometry, dst, clip, target);
     } else {
         blit_scaled::<false>(snapshot, geometry, dst, clip, target);
@@ -423,7 +423,7 @@ fn blit_unscaled(
     clip: Rectangle<i32, Logical>,
     target: &mut Target<'_>,
 ) {
-    if snapshot.opaque {
+    if snapshot.opaque() {
         blit_unscaled_inner::<true>(snapshot, left, top, clip, target);
     } else {
         blit_unscaled_inner::<false>(snapshot, left, top, clip, target);
@@ -510,7 +510,7 @@ fn opaque_cover(
     let Some(dst) = placement(layer.origin, layer.geometry.dst, scale) else {
         return false;
     };
-    snapshot.opaque
+    snapshot.opaque()
         && dst.left <= 0
         && dst.top <= 0
         && dst.left.saturating_add(dst.width) >= coordinate(i64::from(width))

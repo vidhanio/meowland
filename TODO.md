@@ -136,7 +136,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 
 ## 3. Performance
 
-- [ ] **shm commits copy the whole buffer.** `Snapshot::copy_shm` copies and swizzles
+- [x] **shm commits copy the whole buffer.** `Snapshot::copy_shm` copies and swizzles
   the full buffer on every commit, even when the damage is a few rows. At 4K that is
   33 MB per commit. Copy only the buffer-damage rectangles into the retained snapshot.
   The previous snapshot is already passed in for reuse.

@@ -49,6 +49,7 @@ mod decoration;
 mod event_loop;
 mod frame;
 mod input;
+mod keymap;
 mod panes;
 mod popup;
 mod readback;
@@ -126,6 +127,7 @@ pub struct Compositor {
     seat: Seat<Self>,
     keyboard: Option<KeyboardHandle<Self>>,
     keyboard_state: input::KeyboardState,
+    keymap: keymap::Keymap,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
     windows: HashMap<WindowId, Window>,
@@ -253,6 +255,7 @@ impl State {
             seat,
             keyboard: None,
             keyboard_state: input::KeyboardState::default(),
+            keymap: keymap::Keymap::default(),
             pointer,
             output,
             windows: HashMap::new(),

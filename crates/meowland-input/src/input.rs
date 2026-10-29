@@ -36,8 +36,7 @@ pub enum Kind {
     Release,
 }
 
-/// Logical key identity and modifier state before translation to Linux input
-/// codes.
+/// Logical key identity and modifier state reported by the Kitty protocol.
 #[derive(Clone, Copy, Debug)]
 pub struct Key {
     /// Unicode code point or Kitty functional-key number.
@@ -51,9 +50,9 @@ pub struct Key {
 /// Decoded terminal event, with bounded text and control-sequence payloads.
 #[derive(Debug)]
 pub enum Event {
-    /// Kitty keyboard transition awaiting evdev translation.
+    /// Kitty keyboard transition for the compositor to resolve.
     Key(Key),
-    /// Committed Unicode text without a usable Linux key code.
+    /// Committed Unicode text that arrived outside a key event.
     Text(String),
     /// Pixel-accurate pointer input, including signed drag coordinates.
     Pointer(Input),
@@ -310,7 +309,7 @@ impl VTActor for Decoder {
     }
 
     fn print(&mut self, character: char) {
-        if !character.is_control() && crate::keyboard::key_code(u32::from(character)).is_none() {
+        if !character.is_control() {
             self.events.push_back(Event::Text(character.to_string()));
         }
     }
@@ -411,19 +410,11 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         },
         _ => return None,
     };
-    let shortcut = modifiers.intersects(Modifiers::SHORTCUT);
-    if matches!(kind, Kind::Press | Kind::Repeat)
-        && !shortcut
-        && crate::keyboard::key_code(code).is_none()
-    {
-        let text = text.or_else(|| {
-            char::from_u32(code)
-                .filter(|character| !character.is_control() && !(0xe000..=0xf8ff).contains(&code))
-                .map(|character| character.to_string())
-        });
-        if let Some(text) = text {
-            return Some(Event::Text(text));
-        }
+    if code == 0 {
+        return match kind {
+            Kind::Press | Kind::Repeat => text.map(Event::Text),
+            Kind::Release => None,
+        };
     }
     Some(Event::Key(Key {
         code,

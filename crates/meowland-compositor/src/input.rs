@@ -1,6 +1,6 @@
 //! Terminal-pane keyboard and pointer events mapped into Wayland input.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use meowland_protocol::{Button, ButtonState, Input, KEY_V, Modifiers, Scroll};
 use smithay::{
@@ -15,12 +15,12 @@ use smithay::{
     utils::{Point, SERIAL_COUNTER, Serial},
 };
 
-use super::{AttachedPane, PaneId, State, WindowId, WlSurface, text};
+use super::{AttachedPane, PaneId, State, WindowId, WlSurface, keymap, text};
 
 #[derive(Default)]
 pub(crate) struct KeyboardState {
     pub owner: Option<PaneId>,
-    pub held: HashSet<u16>,
+    pub held: HashMap<u32, u16>,
     pub known: bool,
     pub serials: VecDeque<(Serial, ClientId)>,
 }
@@ -48,6 +48,8 @@ const SCROLL_UNITS_PER_DETENT: i32 = 120;
 const AXIS_UNITS_PER_DETENT: f64 = 7.5;
 /// High-resolution Wayland units emitted for one wheel detent.
 const V120_PER_DETENT: i32 = 60;
+/// Largest Unicode scalar value accepted as a Kitty key identity.
+const MAX_UNICODE: u32 = 0x0010_ffff;
 
 pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     if !valid_input(event) {
@@ -77,30 +79,33 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     }
     match *event {
         Input::Key {
-            code,
+            key,
             pressed,
             modifiers,
             ref held,
         } => {
+            keymap::refresh(state);
             if state.keyboard_state.owner != Some(pane) || !state.keyboard_state.known {
                 enter_keyboard(state, pane, window, held, modifiers);
             } else {
                 activate_keyboard(state, pane, window);
             }
-            if let Some(keyboard) = state.keyboard.take() {
-                let transition = if pressed {
+            key_transition(
+                state,
+                key,
+                if pressed {
                     KeyState::Pressed
                 } else {
                     KeyState::Released
-                };
-                inject_key(&keyboard, state, code, transition, modifiers);
-                state.keyboard = Some(keyboard);
-            }
+                },
+                modifiers,
+            );
         }
         Input::KeyboardEnter {
             ref keys,
             modifiers,
         } => {
+            keymap::refresh(state);
             enter_keyboard(state, pane, window, keys, modifiers);
         }
         Input::ResetKeyboard => unreachable!(),
@@ -131,19 +136,56 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
 
 fn valid_input(event: &Input) -> bool {
     match event {
-        Input::Key { code, held, .. } => valid_key(*code) && valid_keys(held),
+        Input::Key { key, held, .. } => valid_key(*key) && valid_keys(held),
         Input::KeyboardEnter { keys, .. } => valid_keys(keys),
         Input::Pointer { x, y, .. } => x.is_finite() && y.is_finite(),
         Input::Text(_) | Input::ResetKeyboard => true,
     }
 }
 
-const fn valid_key(code: u16) -> bool {
-    code > 0 && code <= 255
+const fn valid_key(key: u32) -> bool {
+    key > 0 && key <= MAX_UNICODE
 }
 
-fn valid_keys(keys: &[u16]) -> bool {
-    keys.len() <= 256 && keys.iter().all(|code| valid_key(*code))
+fn valid_keys(keys: &[u32]) -> bool {
+    keys.len() <= 256 && keys.iter().all(|key| valid_key(*key))
+}
+
+/// Route one key transition through the active layout or the text fallback.
+fn key_transition(state: &mut State, key: u32, transition: KeyState, modifiers: Modifiers) {
+    let code = state.keymap.lookup(key);
+    if transition == KeyState::Pressed {
+        if let Some(code) = code {
+            if let Some(keyboard) = state.keyboard.take() {
+                inject_key(&keyboard, state, key, code, transition, modifiers);
+                state.keyboard = Some(keyboard);
+            }
+        } else if let Some(text) = key_text(key, modifiers) {
+            text::commit(state, &text);
+        } else if modifiers.intersects(Modifiers::SHORTCUT) {
+            tracing::debug!(
+                key,
+                ?modifiers,
+                "dropping modified key the active layout cannot type"
+            );
+        }
+    } else {
+        let code = code.or_else(|| state.keyboard_state.held.get(&key).copied());
+        if let Some(code) = code
+            && let Some(keyboard) = state.keyboard.take()
+        {
+            inject_key(&keyboard, state, key, code, transition, modifiers);
+            state.keyboard = Some(keyboard);
+        }
+    }
+}
+
+/// Text an unmapped printable key commits when no shortcut owns it.
+fn key_text(key: u32, bits: Modifiers) -> Option<String> {
+    if bits.intersects(Modifiers::SHORTCUT) {
+        return None;
+    }
+    keymap::text(key)
 }
 
 fn pointer_input(
@@ -250,7 +292,7 @@ fn enter_keyboard(
     state: &mut State,
     pane: PaneId,
     window: WindowId,
-    keys: &[u16],
+    keys: &[u32],
     bits: Modifiers,
 ) {
     reset_keyboard(state);
@@ -260,9 +302,11 @@ fn enter_keyboard(
     if let Some(keyboard) = state.keyboard.take() {
         keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
         set_modifiers(&keyboard, state, snapshot(bits));
-        for code in keys {
-            if state.keyboard_state.held.insert(*code) {
-                forward(&keyboard, state, *code, KeyState::Pressed);
+        for key in keys {
+            if let Some(code) = state.keymap.lookup(*key)
+                && state.keyboard_state.held.insert(*key, code).is_none()
+            {
+                forward(&keyboard, state, code, KeyState::Pressed);
             }
         }
         let surface = state.windows[&window].surface.wl_surface().clone();
@@ -342,7 +386,7 @@ pub(crate) fn reset_keyboard(state: &mut State) {
     let keys = std::mem::take(&mut state.keyboard_state.held);
     if let Some(keyboard) = state.keyboard.take() {
         set_modifiers(&keyboard, state, ModifiersState::default());
-        for code in keys {
+        for code in keys.into_values() {
             forward(&keyboard, state, code, KeyState::Released);
         }
         keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
@@ -373,15 +417,18 @@ fn set_modifiers(keyboard: &KeyboardHandle<State>, state: &mut State, modifiers:
 fn inject_key(
     keyboard: &KeyboardHandle<State>,
     state: &mut State,
+    key: u32,
     code: u16,
     transition: KeyState,
     bits: Modifiers,
 ) {
     set_modifiers(keyboard, state, snapshot(bits));
-    let changed = if transition == KeyState::Pressed {
-        state.keyboard_state.held.insert(code)
+    let (changed, code) = if transition == KeyState::Pressed {
+        (state.keyboard_state.held.insert(key, code).is_none(), code)
+    } else if let Some(code) = state.keyboard_state.held.remove(&key) {
+        (true, code)
     } else {
-        state.keyboard_state.held.remove(&code)
+        (false, code)
     };
     if changed {
         forward(keyboard, state, code, transition);
@@ -407,14 +454,17 @@ pub(crate) fn paste_action(state: &mut State, pane: PaneId) {
         return;
     };
     activate_keyboard(state, pane, window);
-    if state.keyboard_state.held.contains(&KEY_V) {
+    if state.keyboard_state.held.contains_key(&KEY_V) {
         return;
     }
+    let Some(code) = state.keymap.lookup(KEY_V) else {
+        return;
+    };
     if let Some(keyboard) = state.keyboard.take() {
         let previous = keyboard.modifier_state();
         set_modifiers(&keyboard, state, snapshot(Modifiers::CONTROL));
-        forward(&keyboard, state, KEY_V, KeyState::Pressed);
-        forward(&keyboard, state, KEY_V, KeyState::Released);
+        forward(&keyboard, state, code, KeyState::Pressed);
+        forward(&keyboard, state, code, KeyState::Released);
         set_modifiers(&keyboard, state, previous);
         state.keyboard = Some(keyboard);
     }

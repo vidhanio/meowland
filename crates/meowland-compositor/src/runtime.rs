@@ -55,16 +55,17 @@ impl Runtime {
             options: (!keyboard.options.is_empty()).then(|| keyboard.options.clone()),
             ..XkbConfig::default()
         };
-        state.keyboard = Some(
-            state
-                .seat
-                .add_keyboard(
-                    keymap,
-                    keyboard.repeat_delay.milliseconds(),
-                    keyboard.repeat_rate.hertz(),
-                )
-                .map_err(io::Error::other)?,
-        );
+        let keyboard_handle = state
+            .seat
+            .add_keyboard(
+                keymap,
+                keyboard.repeat_delay.milliseconds(),
+                keyboard.repeat_rate.hertz(),
+            )
+            .map_err(io::Error::other)?;
+        let keymap = super::keymap::Keymap::new(&keyboard_handle, &mut state);
+        state.keymap = keymap;
+        state.keyboard = Some(keyboard_handle);
         let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;
         handle.insert_source(
             Generic::new(listener, Interest::READ, Mode::Level),

@@ -82,12 +82,12 @@ impl State {
             }
             PaneAction::Input(event) => {
                 if let Input::Key {
-                    code,
+                    key,
                     modifiers,
                     pressed: true,
                     ..
                 } = &event
-                    && let Some(shortcut) = Shortcut::from_key(*code, *modifiers)
+                    && let Some(shortcut) = Shortcut::from_key(*key, *modifiers)
                 {
                     match shortcut {
                         Shortcut::CloseWindow => self.close_shown(pane),

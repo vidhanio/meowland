@@ -16,20 +16,20 @@ use crate::Result;
 impl TerminalSession {
     pub(super) fn send_event(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::Key(key) => {
+            Event::Key(event) => {
                 if let Some(
                     input @ Input::Key {
-                        code,
+                        key,
                         pressed,
                         modifiers,
                         ..
                     },
-                ) = self.keyboard.input(key)
+                ) = self.keyboard.input(event)
                 {
-                    if pressed && Shortcut::from_key(code, modifiers).is_some() {
-                        self.keyboard.intercept(code);
+                    if pressed && Shortcut::from_key(key, modifiers).is_some() {
+                        self.keyboard.intercept(key);
                     }
-                    let defer = if pressed && keyboard::paste(code, modifiers) {
+                    let defer = if pressed && keyboard::paste(key, modifiers) {
                         self.clipboard.refresh(Selection::Clipboard, Refresh::Paste)
                     } else {
                         None

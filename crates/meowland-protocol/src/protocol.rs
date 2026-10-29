@@ -98,14 +98,15 @@ impl Modifiers {
     }
 }
 
-/// Linux input code for Q, used by the close-window binding.
-pub const KEY_Q: u16 = 16;
-/// Linux input code for W, used by the detach-pane binding.
-pub const KEY_W: u16 = 17;
-/// Linux input code for V, used by the clipboard paste binding.
-pub const KEY_V: u16 = 47;
-/// Linux input code for Insert, used by the alternate paste binding.
-pub const KEY_INSERT: u16 = 110;
+/// Kitty key identity for Q, used by the close-window binding.
+pub const KEY_Q: u32 = 0x71;
+/// Kitty key identity for W, used by the detach-pane binding.
+pub const KEY_W: u32 = 0x77;
+/// Kitty key identity for V, used by the clipboard paste binding.
+pub const KEY_V: u32 = 0x76;
+/// Kitty functional-key number for Insert, used by the alternate paste
+/// binding.
+pub const KEY_INSERT: u32 = 57348;
 
 /// Compositor bindings shared by terminal release interception and dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,13 +118,13 @@ pub enum Shortcut {
 }
 
 impl Shortcut {
-    /// Recognize an Alt binding from a Linux key code and modifier snapshot.
+    /// Recognize an Alt binding from a Kitty key identity and modifiers.
     #[must_use]
-    pub const fn from_key(code: u16, modifiers: Modifiers) -> Option<Self> {
+    pub const fn from_key(key: u32, modifiers: Modifiers) -> Option<Self> {
         if !modifiers.alt_only() {
             return None;
         }
-        match code {
+        match key {
             KEY_Q => Some(Self::CloseWindow),
             KEY_W => Some(Self::DetachPane),
             _ => None,
@@ -215,20 +216,21 @@ pub struct Scroll {
     pub horizontal: i16,
 }
 
-/// Terminal-originated input; key codes use Linux evdev identities, not XKB
-/// offsets.
+/// Terminal-originated input; key identities follow the Kitty keyboard
+/// protocol rather than Linux evdev codes.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Input {
     /// One key transition with the terminal's authoritative modifier snapshot.
     Key {
-        /// Linux input code (`KEY_*`), eight below the XKB evdev key code.
-        code: u16,
+        /// Kitty key identity: an unshifted Unicode code point, or a functional
+        /// key number from 57344 upward.
+        key: u32,
         /// A real key transition. It stays down until its release or a reset.
         pressed: bool,
         /// [`Modifiers`] snapshot, including lock state.
         modifiers: Modifiers,
         /// Client-known held keys immediately before this transition.
-        held: Vec<u16>,
+        held: Vec<u32>,
     },
     /// Pointer motion, an optional button transition, and vertical wheel
     /// movement.
@@ -248,12 +250,12 @@ pub enum Input {
     ResetKeyboard,
     /// Client-known held keys and modifiers on focus entry.
     KeyboardEnter {
-        /// Linux input codes held when focus was gained.
-        keys: Vec<u16>,
+        /// Kitty key identities held when focus was gained.
+        keys: Vec<u32>,
         /// [`Modifiers`] snapshot, including lock state.
         modifiers: Modifiers,
     },
-    /// Committed Unicode text that has no usable Linux key code.
+    /// Committed Unicode text that arrived without a key identity.
     Text(String),
 }
 

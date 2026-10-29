@@ -1,4 +1,4 @@
-//! Terminal event decoding and Kitty-to-evdev keyboard state.
+//! Terminal event decoding and Kitty key tracking.
 
 mod input;
 pub mod keyboard;

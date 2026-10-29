@@ -16,7 +16,7 @@ relative to `crates/` unless stated otherwise.
 | `meowland-protocol` | 1103 | Postcard wire types, sync and async framing, shared-memory frames, clipboard limits |
 | `meowland-terminal` | 1593 | Pane client: probe, session select loop, presentation, terminal modes |
 | `meowland-terminal-clipboard` | 973 | OSC 5522 (Kitty) and OSC 52 clipboard state machines |
-| `meowland-input` | 681 | VT parser wrapper, SGR pixel mouse, Kitty keyboard to evdev |
+| `meowland-input` | 681 | VT parser wrapper, SGR pixel mouse, Kitty key tracking |
 | `meowland-kitty` | 331 | Kitty graphics encoder (zlib, base64, chunking, in-place frame edits) |
 | `meowland-core` | 628 | Error enum, `FrameSize`, `UiScale`, `RefreshRate`, latency stats, calloop async helpers |
 
@@ -35,15 +35,14 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 
 ## 1. Correctness bugs
 
-- [ ] **Non-US keyboard layouts send the wrong keys.** `meowland-input/src/keyboard.rs`
-  maps Kitty *logical* key codes to evdev codes with a hard-coded US table
-  (`char_code`). The server then looks those evdev codes up in the *configured* XKB
-  keymap (`keyboard.layout`). With `layout = "de"`, pressing `y` sends evdev 21, which
-  the German keymap turns into `z`. Possible fixes:
-  - Request `REPORT_ALTERNATE_KEYS` and translate the base-layout key.
-  - Build the reverse map from the configured keymap with xkbcommon on the server.
-  - Force the server keymap to `us` and forward text separately.
-  - At minimum, document or reject non-US layouts in `KeyboardConfig`.
+- [x] **Non-US keyboard layouts send the wrong keys.** `meowland-input` translated
+  Kitty *logical* key codes to evdev codes with a hard-coded US table
+  (`char_code`), while the server resolved those codes against the *configured* XKB
+  keymap (`keyboard.layout`), so `layout = "de"` turned `y` into `z`. The pane now
+  forwards Kitty key identities and the compositor builds a reverse
+  keysym-to-keycode map from the active layout
+  (`meowland-compositor/src/keymap.rs`, levels 0 and 1), committing text for
+  printable keys the layout cannot type.
 - [x] **Extra mouse buttons are treated as motion.** In `meowland-input/src/input.rs`
   `mouse()`, SGR codes 128–131 (buttons 8–11, back and forward) hit the
   `code & (32 | 128) != 0` branch and become plain motion.

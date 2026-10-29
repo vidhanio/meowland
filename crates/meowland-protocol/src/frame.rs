@@ -147,3 +147,168 @@ impl<'de> Deserialize<'de> for FrameBand {
         .ok_or_else(|| D::Error::custom("invalid RGB band"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_bytes::ByteBuf;
+
+    use super::*;
+
+    fn frame_size(width: u32, height: u32) -> FrameSize {
+        FrameSize::new(width, height).expect("valid test dimensions")
+    }
+
+    fn encode_packet(
+        width: u32,
+        height: u32,
+        x: u32,
+        y: u32,
+        band_width: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        postcard::to_allocvec(&FramePacket {
+            width,
+            height,
+            x,
+            y,
+            band_width,
+            payload: ByteBuf::from(payload.to_vec()),
+        })
+        .expect("frame packet serializes")
+    }
+
+    #[test]
+    fn frame_band_accepts_whole_and_partial_rectangles() {
+        let size = frame_size(4, 3);
+        let whole = FrameBand::new(size, 0, 0, 4, vec![0; 4 * 3 * 3]).expect("whole band");
+        assert_eq!(whole.size(), size);
+        assert_eq!((whole.x(), whole.y()), (0, 0));
+        assert_eq!((whole.width(), whole.height()), (4, 3));
+        assert!(whole.is_whole());
+
+        let partial = FrameBand::new(size, 1, 1, 2, vec![0; 2 * 2 * 3]).expect("partial band");
+        assert_eq!(partial.size(), size);
+        assert_eq!((partial.x(), partial.y()), (1, 1));
+        assert_eq!((partial.width(), partial.height()), (2, 2));
+        assert!(!partial.is_whole());
+        assert_eq!(partial.rgb(), &[0; 2 * 2 * 3]);
+
+        let edge = FrameBand::new(size, 3, 2, 1, vec![0; 3]).expect("edge band");
+        assert_eq!((edge.width(), edge.height()), (1, 1));
+        assert!(!edge.is_whole());
+    }
+
+    #[test]
+    fn frame_band_rejects_invalid_rectangles() {
+        let size = frame_size(4, 3);
+        let cases: &[(&str, u32, u32, u32, Vec<u8>)] = &[
+            ("zero width", 0, 0, 0, vec![]),
+            ("x at right edge", 4, 0, 1, vec![0; 3]),
+            ("y at bottom edge", 0, 3, 1, vec![0; 3]),
+            ("empty payload", 0, 0, 1, vec![]),
+            ("partial row", 0, 0, 2, vec![0; 11]),
+            ("x overflow", u32::MAX, 0, 1, vec![0; 3]),
+            ("y overflow", 0, u32::MAX, 1, vec![0; 3]),
+        ];
+        for (name, x, y, width, rgb) in cases {
+            assert!(
+                FrameBand::new(size, *x, *y, *width, rgb.clone()).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_band_deserializes_valid_packets() {
+        let size = frame_size(4, 3);
+        let band = FrameBand::new(size, 1, 0, 2, vec![1; 2 * 2 * 3]).expect("valid band");
+        let bytes = postcard::to_allocvec(&band).expect("band serializes");
+        let decoded: FrameBand = postcard::from_bytes(&bytes).expect("band deserializes");
+        assert_eq!(decoded.size(), size);
+        assert_eq!((decoded.x(), decoded.y()), (1, 0));
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        assert_eq!(decoded.rgb(), band.rgb());
+    }
+
+    #[test]
+    fn frame_band_rejects_invalid_packets() {
+        struct Case<'a> {
+            name: &'a str,
+            width: u32,
+            height: u32,
+            x: u32,
+            y: u32,
+            band_width: u32,
+            payload: &'a [u8],
+        }
+
+        let cases = [
+            Case {
+                name: "zero frame width",
+                width: 0,
+                height: 3,
+                x: 0,
+                y: 0,
+                band_width: 1,
+                payload: &[0; 3],
+            },
+            Case {
+                name: "oversized frame width",
+                width: 8193,
+                height: 3,
+                x: 0,
+                y: 0,
+                band_width: 1,
+                payload: &[0; 3],
+            },
+            Case {
+                name: "zero band width",
+                width: 4,
+                height: 3,
+                x: 0,
+                y: 0,
+                band_width: 0,
+                payload: &[],
+            },
+            Case {
+                name: "partial rows",
+                width: 4,
+                height: 3,
+                x: 0,
+                y: 0,
+                band_width: 2,
+                payload: &[0; 11],
+            },
+            Case {
+                name: "x overflow",
+                width: 4,
+                height: 3,
+                x: u32::MAX,
+                y: 0,
+                band_width: 1,
+                payload: &[0; 3],
+            },
+            Case {
+                name: "y overflow",
+                width: 4,
+                height: 3,
+                x: 0,
+                y: u32::MAX,
+                band_width: 1,
+                payload: &[0; 3],
+            },
+        ];
+        for case in cases {
+            let bytes = encode_packet(
+                case.width,
+                case.height,
+                case.x,
+                case.y,
+                case.band_width,
+                case.payload,
+            );
+            let error = postcard::from_bytes::<FrameBand>(&bytes).expect_err(case.name);
+            assert_eq!(error, postcard::Error::SerdeDeCustom, "{}", case.name);
+        }
+    }
+}

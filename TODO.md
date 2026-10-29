@@ -25,9 +25,9 @@ Also in the repo: `benchmarks/*.py` (process-level harness), `share/systemd/user
 (socket and service units), `flake.nix` (crane build, Home Manager module, treefmt),
 `.github/workflows/ci.yaml`.
 
-There are **no tests** (`#[test]` appears 0 times). CI and `nix flake check` run
-`cargo test` against an empty suite. Clippy is clean with the pedantic and nursery lint
-groups.
+Focused unit tests now cover the pure parsers, protocol framing, and shortcut
+configuration (see §5). CI and `nix flake check` run `cargo test`. Clippy is clean with
+the pedantic and nursery lint groups.
 
 ---
 
@@ -270,12 +270,13 @@ These follow the `rust-best-practices` skill.
 AGENTS.md says not to add tests unless asked. This section lists where tests would pay
 off most, for when that is requested.
 
-- [ ] Pure parsers of untrusted input: `input.rs` `csi()` and `mouse()`, `Parser::push`
+- [x] Pure parsers of untrusted input: `input.rs` `csi()` and `mouse()`, `Parser::push`
   (split escape sequences, signed coordinates), `probe.rs` `ProbeParser`, and
-  `terminal-clipboard` `Packet::parse`. These are good targets for property tests and
-  `cargo fuzz`.
-- [ ] `keyboard::key_code` round-trips, `FrameBand` rectangle edge cases, and
+  `terminal-clipboard` `Packet::parse`.
+- [x] `keyboard::key_code` round-trips, `FrameBand` rectangle edge cases, and
   `protocol` framing (oversize, trailing bytes, cancellation-safe `Reader`).
+- [ ] Add a `cargo fuzz` harness for the pure parsers once the Nix nightly sanitizer flags
+  are configured; this round only added deterministic unit tests.
 - [x] `catalog.rs` and `attachment.rs` selection and follow policy, which become
   testable without Wayland once split out (see §2).
 - [ ] `render.rs` composition: blending, viewport, transforms, and damage-limited

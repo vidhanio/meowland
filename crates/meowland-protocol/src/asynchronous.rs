@@ -232,3 +232,118 @@ impl Outgoing {
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use futures::io::AsyncRead;
+
+    use super::*;
+
+    enum Step {
+        Bytes(Vec<u8>),
+        Pending,
+    }
+
+    struct Scripted {
+        steps: VecDeque<Step>,
+    }
+
+    impl Scripted {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: VecDeque::from(steps),
+            }
+        }
+    }
+
+    impl AsyncRead for Scripted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.steps.front_mut() {
+                Some(Step::Pending) => {
+                    self.steps.pop_front();
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Step::Bytes(bytes)) => {
+                    let read = bytes.len().min(buffer.len());
+                    buffer[..read].copy_from_slice(&bytes[..read]);
+                    bytes.drain(..read);
+                    if bytes.is_empty() {
+                        self.steps.pop_front();
+                    }
+                    Poll::Ready(Ok(read))
+                }
+                None => Poll::Ready(Ok(0)),
+            }
+        }
+    }
+
+    fn poll_once<T>(future: &mut Pin<Box<impl std::future::Future<Output = T>>>) -> Poll<T> {
+        let mut context = Context::from_waker(Waker::noop());
+        future.as_mut().poll(&mut context)
+    }
+
+    #[test]
+    fn reader_resumes_after_cancellation_mid_header_and_mid_body() {
+        let message = "hello".to_owned();
+        let body = postcard::to_allocvec(&message).expect("test message encodes");
+        let header = u32::try_from(body.len())
+            .expect("test body fits the header")
+            .to_le_bytes();
+        let body_split = body.len() / 2;
+
+        let stream = Scripted::new(vec![
+            Step::Bytes(header[..2].to_vec()),
+            Step::Pending,
+            Step::Bytes(header[2..].to_vec()),
+            Step::Pending,
+            Step::Bytes(body[..body_split].to_vec()),
+            Step::Pending,
+            Step::Bytes(body[body_split..].to_vec()),
+        ]);
+        let mut reader = Reader::new(stream);
+
+        let mut future = Box::pin(reader.read::<String>());
+        assert!(poll_once(&mut future).is_pending());
+        drop(future);
+        assert_eq!(reader.header_read, 2);
+
+        let mut future = Box::pin(reader.read::<String>());
+        assert!(poll_once(&mut future).is_pending());
+        assert!(poll_once(&mut future).is_pending());
+        drop(future);
+        assert_eq!(reader.header_read, 4);
+        assert_eq!(reader.body_size, body.len());
+        assert_eq!(reader.body_read, 0);
+
+        let mut future = Box::pin(reader.read::<String>());
+        assert!(poll_once(&mut future).is_pending());
+        drop(future);
+        assert_eq!(reader.body_read, body_split);
+
+        let mut future = Box::pin(reader.read::<String>());
+        assert!(poll_once(&mut future).is_pending());
+        drop(future);
+        assert_eq!(reader.body_read, body_split);
+
+        let mut future = Box::pin(reader.read::<String>());
+        let result = poll_once(&mut future);
+        drop(future);
+        match result {
+            Poll::Ready(Ok(decoded)) => assert_eq!(decoded, message),
+            other => panic!("expected the completed message, got {other:?}"),
+        }
+        assert_eq!(reader.header_read, 0);
+        assert_eq!(reader.body_read, 0);
+    }
+}

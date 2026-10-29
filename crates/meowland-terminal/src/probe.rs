@@ -270,3 +270,138 @@ fn kitty_reply(body: &[u8], id: u32) -> Option<bool> {
 fn parse_u32(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.trim().parse().ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyboardEnhancementFlags;
+
+    use super::*;
+
+    fn parse_chunks(chunks: &[&[u8]]) -> ProbeInfo {
+        let mut parser = ProbeParser::default();
+        for chunk in chunks {
+            parser.parse(chunk);
+        }
+        parser.finish()
+    }
+
+    fn parse(bytes: &[u8]) -> ProbeInfo {
+        parse_chunks(&[bytes])
+    }
+
+    fn attributes_seen(chunks: &[&[u8]]) -> bool {
+        let mut parser = ProbeParser::default();
+        for chunk in chunks {
+            parser.parse(chunk);
+        }
+        parser.attributes_seen()
+    }
+
+    #[test]
+    fn probe_decodes_pixel_and_cell_sizes_across_chunks() {
+        let info = parse_chunks(&[b"\x1b[4;3", b"60;640t\x1b[6;20", b";10t"]);
+        assert_eq!(info.pixels, Some((640, 360)));
+        assert_eq!(info.cell, Some((10, 20)));
+    }
+
+    #[test]
+    fn probe_ignores_invalid_sizes() {
+        for report in [
+            &b"\x1b[4;0;640t"[..],
+            &b"\x1b[4;360;0t"[..],
+            &b"\x1b[4;360t"[..],
+            &b"\x1b[4;360;640"[..],
+        ] {
+            assert_eq!(parse(report).pixels, None, "report {report:?}");
+        }
+        for report in [
+            &b"\x1b[6;20;70000t"[..],
+            &b"\x1b[6;70000;20t"[..],
+            &b"\x1b[6;20;0t"[..],
+        ] {
+            assert_eq!(parse(report).cell, None, "report {report:?}");
+        }
+    }
+
+    #[test]
+    fn probe_starts_quiet_window_only_after_device_attributes() {
+        assert!(attributes_seen(&[b"\x1b[?1;2c"]));
+        assert!(attributes_seen(&[b"\x1b[?1", b";2c"]));
+        assert!(!attributes_seen(&[b"\x1b[c"]));
+        assert!(!attributes_seen(&[b"\x1b[?1016;1$y"]));
+        assert!(attributes_seen(&[b"\x1b[?1016;1$y\x1b[?1;2c"]));
+    }
+
+    #[test]
+    fn probe_decodes_kitty_graphics_replies_by_id() {
+        let info = parse(b"\x1b_Gi=30;OK\x1b\\");
+        assert!(info.frame_edits);
+        assert!(!info.shared_memory);
+
+        let info = parse(b"\x1b_Gi=32;OK\x1b\\");
+        assert!(!info.frame_edits);
+        assert!(info.shared_memory);
+
+        let info = parse(b"\x1b_Gi=30;ENOENT\x1b\\");
+        assert!(!info.frame_edits);
+
+        let info = parse(b"\x1b_Gi=31;OK\x1b\\");
+        assert!(!info.frame_edits);
+        assert!(!info.shared_memory);
+
+        let info = parse(b"\x1b_Gx=1,i=30;OK\x1b\\");
+        assert!(info.frame_edits);
+    }
+
+    #[test]
+    fn probe_decodes_decrqm_reports() {
+        for value in [1, 3] {
+            let report = format!("\x1b[?1016;{value}$y");
+            assert!(parse(report.as_bytes()).sgr_pixels, "value {value}");
+        }
+        for value in [0, 4] {
+            let report = format!("\x1b[?1016;{value}$y");
+            assert!(!parse(report.as_bytes()).sgr_pixels, "value {value}");
+        }
+
+        let cases = [
+            (1, Some(super::super::terminal::ClipboardMode::Enabled)),
+            (2, Some(super::super::terminal::ClipboardMode::Disabled)),
+            (3, Some(super::super::terminal::ClipboardMode::Enabled)),
+            (0, None),
+            (4, None),
+        ];
+        for (value, expected) in cases {
+            let report = format!("\x1b[?5522;{value}$y");
+            assert_eq!(
+                parse(report.as_bytes()).clipboard,
+                expected,
+                "value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_decodes_keyboard_enhancement_flags() {
+        let info = parse(b"\x1b[?5u");
+        assert_eq!(
+            info.keyboard_flags,
+            Some(KeyboardEnhancementFlags::from_bits_retain(5))
+        );
+
+        let info = parse(b"\x1b[?0u");
+        assert_eq!(info.keyboard_flags, Some(KeyboardEnhancementFlags::empty()));
+    }
+
+    #[test]
+    fn probe_decodes_xtversion_names() {
+        let info = parse(b"\x1bP>|kitty(0.40.1)\x1b\\");
+        assert_eq!(info.name.as_deref(), Some("kitty(0.40.1)"));
+
+        let info = parse(b"\x1bP>|  WezTerm  \x1b\\");
+        assert_eq!(info.name.as_deref(), Some("WezTerm"));
+
+        let info = parse(b"\x1bP>|\x1b\\");
+        assert_eq!(info.name, None);
+    }
+}

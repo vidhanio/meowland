@@ -284,3 +284,105 @@ impl InvalidShortcut {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_binding_accepts_modifiers_and_one_key() {
+        let cases = [
+            (
+                "q",
+                KeyBinding {
+                    key: u32::from(b'q'),
+                    modifiers: Modifiers::empty(),
+                },
+            ),
+            (
+                "alt+q",
+                KeyBinding {
+                    key: u32::from(b'q'),
+                    modifiers: Modifiers::ALT,
+                },
+            ),
+            (
+                "control+shift+Q",
+                KeyBinding {
+                    key: u32::from(b'q'),
+                    modifiers: Modifiers::CONTROL | Modifiers::SHIFT,
+                },
+            ),
+            (
+                " ctrl + alt + q ",
+                KeyBinding {
+                    key: u32::from(b'q'),
+                    modifiers: Modifiers::CONTROL | Modifiers::ALT,
+                },
+            ),
+            (
+                "SUPER+Hyper+meta+alt+q",
+                KeyBinding {
+                    key: u32::from(b'q'),
+                    modifiers: Modifiers::SUPER
+                        | Modifiers::HYPER
+                        | Modifiers::META
+                        | Modifiers::ALT,
+                },
+            ),
+            (
+                "alt+é",
+                KeyBinding {
+                    key: u32::from('é'),
+                    modifiers: Modifiers::ALT,
+                },
+            ),
+            (
+                "alt+alt+q",
+                KeyBinding {
+                    key: u32::from(b'q'),
+                    modifiers: Modifiers::ALT,
+                },
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                parse_binding(value).expect("valid shortcut"),
+                Some(expected),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_binding_treats_blank_values_as_disabled() {
+        assert_eq!(parse_binding("").expect("blank shortcut"), None);
+        assert_eq!(parse_binding("   ").expect("blank shortcut"), None);
+    }
+
+    #[test]
+    fn parse_binding_rejects_invalid_shortcuts() {
+        for value in [
+            "alt",
+            "alt+",
+            "alt++q",
+            "alt+qq",
+            "alt+q+r",
+            "foo+q",
+            "alt+\u{7f}",
+            "alt+\n",
+            "+",
+        ] {
+            assert!(parse_binding(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn parse_binding_reports_the_invalid_value() {
+        let error = parse_binding(" alt+qq ").expect_err("invalid shortcut");
+        assert_eq!(
+            error.to_string(),
+            "invalid shortcut `alt+qq`; use modifiers joined to one key, such as `ctrl+shift+q`"
+        );
+    }
+}

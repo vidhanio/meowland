@@ -178,3 +178,90 @@ fn key_code(keycode: xkb::Keycode) -> Option<u16> {
     let code = u16::try_from(code).ok()?;
     (MIN_KEY..=MAX_KEY).contains(&code).then_some(code)
 }
+
+#[cfg(test)]
+mod tests {
+    use smithay::input::keyboard::xkb;
+
+    use super::*;
+
+    #[test]
+    fn functional_code_covers_key_ranges_and_rejects_gaps() {
+        let cases = [
+            (27, 1),
+            (13, 28),
+            (9, 15),
+            (8, 14),
+            (127, 14),
+            (57344, 1),
+            (57352, 103),
+            (57353, 108),
+            (57364, 59),
+            (57373, 68),
+            (57374, 87),
+            (57375, 88),
+            (57376, 183),
+            (57387, 194),
+            (57399, 82),
+            (57408, 73),
+            (57409, 83),
+            (57410, 98),
+            (57426, 83),
+            (57427, 76),
+            (57441, 42),
+            (57450, 126),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(functional_code(key), Some(expected), "key {key}");
+        }
+
+        for key in [0, 1, 97, 57343, 57428, 57440, 57451, 0x11_0000] {
+            assert_eq!(functional_code(key), None, "key {key}");
+        }
+    }
+
+    #[test]
+    fn text_skips_controls_and_functional_keys() {
+        assert_eq!(text(u32::from('a')), Some("a".to_owned()));
+        assert_eq!(text(u32::from('é')), Some("é".to_owned()));
+        assert_eq!(text(0x1f600), Some("😀".to_owned()));
+
+        for key in [0, 9, 27, 0x7f, 0x80, 57344, 0xd800, 0x11_0000] {
+            assert_eq!(text(key), None, "key {key}");
+        }
+    }
+
+    #[test]
+    fn lookup_prefers_functional_keys_then_lowercased_layout_keysyms() {
+        let empty = Keymap::default();
+        assert_eq!(empty.lookup(57344), Some(1));
+        assert_eq!(empty.lookup(27), Some(1));
+        assert_eq!(empty.lookup(1), None);
+        assert_eq!(empty.lookup(57343), None);
+        assert_eq!(empty.lookup(0x11_0000), None);
+        assert_eq!(empty.lookup(u32::from('q')), None);
+
+        let mut keysyms = HashMap::new();
+        keysyms.insert(xkb::utf32_to_keysym(u32::from('q')), 16);
+        keysyms.insert(xkb::utf32_to_keysym(u32::from('é')), 18);
+        keysyms.insert(xkb::utf32_to_keysym(0x1f600), 19);
+        let keymap = Keymap {
+            keysyms,
+            layout: Layout::default(),
+        };
+        assert_eq!(keymap.lookup(u32::from('Q')), Some(16));
+        assert_eq!(keymap.lookup(u32::from('q')), Some(16));
+        assert_eq!(keymap.lookup(u32::from('é')), Some(18));
+        assert_eq!(keymap.lookup(0x1f600), Some(19));
+        assert_eq!(keymap.lookup(u32::from('a')), None);
+    }
+
+    #[test]
+    fn key_code_applies_the_evdev_offset_and_bounds() {
+        assert_eq!(key_code(xkb::Keycode::new(9)), Some(1));
+        assert_eq!(key_code(xkb::Keycode::new(263)), Some(255));
+        assert_eq!(key_code(xkb::Keycode::new(8)), None);
+        assert_eq!(key_code(xkb::Keycode::new(264)), None);
+        assert_eq!(key_code(xkb::Keycode::new(u32::MAX)), None);
+    }
+}

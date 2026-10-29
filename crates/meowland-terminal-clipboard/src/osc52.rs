@@ -160,3 +160,124 @@ impl Clipboard {
         self.actions.push_back(Action::Unblock);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reading() -> Clipboard {
+        let mut clipboard = Clipboard::default();
+        let deadline = clipboard.refresh(Selection::Clipboard, Refresh::Paste);
+        assert!(deadline.is_some());
+        let mut output = Vec::new();
+        clipboard.poll(&mut output);
+        assert_eq!(output, b"\x1b]52;c;?\x1b\\");
+        clipboard
+    }
+
+    fn expect_offer(clipboard: &mut Clipboard) -> ClipboardOfferId {
+        match clipboard.next_action() {
+            Some(Action::Offer {
+                selection,
+                offer,
+                mimes,
+                paste,
+            }) => {
+                assert_eq!(selection, Selection::Clipboard);
+                assert_eq!(
+                    mimes,
+                    TEXT_MIMES
+                        .iter()
+                        .map(|mime| (*mime).to_owned())
+                        .collect::<Vec<_>>()
+                );
+                assert!(!paste);
+                offer
+            }
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
+    fn expect_unblock(clipboard: &mut Clipboard) {
+        assert!(matches!(clipboard.next_action(), Some(Action::Unblock)));
+        assert!(clipboard.next_action().is_none());
+    }
+
+    #[test]
+    fn text_accepts_valid_utf8() {
+        let mut clipboard = reading();
+        clipboard.text(STANDARD.encode("hello").as_bytes());
+        let _offer = expect_offer(&mut clipboard);
+        expect_unblock(&mut clipboard);
+    }
+
+    #[test]
+    fn text_accepts_exactly_max_text() {
+        let payload = vec![b'a'; MAX_TEXT];
+        let mut clipboard = reading();
+        clipboard.text(STANDARD.encode(&payload).as_bytes());
+        let _offer = expect_offer(&mut clipboard);
+        expect_unblock(&mut clipboard);
+    }
+
+    #[test]
+    fn text_rejects_decoded_payloads_over_max_text() {
+        let payload = vec![b'a'; MAX_TEXT + 1];
+        let mut clipboard = reading();
+        clipboard.text(STANDARD.encode(&payload).as_bytes());
+        assert!(matches!(clipboard.next_action(), Some(Action::Unblock)));
+        assert!(clipboard.next_action().is_none());
+    }
+
+    #[test]
+    fn text_rejects_invalid_base64_and_utf8() {
+        for payload in [STANDARD.encode([0xff]), "%%%".to_owned()] {
+            let mut clipboard = reading();
+            clipboard.text(payload.as_bytes());
+            assert!(matches!(clipboard.next_action(), Some(Action::Unblock)));
+            assert!(clipboard.next_action().is_none());
+        }
+    }
+
+    #[test]
+    fn text_is_ignored_when_idle() {
+        let mut clipboard = Clipboard::default();
+        clipboard.text(STANDARD.encode("hello").as_bytes());
+        assert!(clipboard.next_action().is_none());
+    }
+
+    #[test]
+    fn text_drains_an_uncorrelated_reply() {
+        let mut clipboard = reading();
+        clipboard.cancel_refresh();
+        clipboard.text(STANDARD.encode("hello").as_bytes());
+        assert!(clipboard.next_action().is_none());
+    }
+
+    #[test]
+    fn read_returns_the_snapshot_for_text_mimes() {
+        let mut clipboard = reading();
+        clipboard.text(STANDARD.encode("hello").as_bytes());
+        let offer = expect_offer(&mut clipboard);
+        expect_unblock(&mut clipboard);
+
+        let request = ClipboardRequestId::from(9);
+        clipboard.read(
+            request,
+            offer,
+            "text/plain",
+            Deadline::new(Duration::from_secs(1)),
+        );
+        match clipboard.next_action() {
+            Some(Action::Reply {
+                request: got,
+                data: Some(data),
+            }) => {
+                assert_eq!(got, request);
+                assert_eq!(data, b"hello");
+            }
+            other => panic!("expected a reply, got {other:?}"),
+        }
+        assert!(clipboard.next_action().is_none());
+    }
+}

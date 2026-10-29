@@ -502,3 +502,587 @@ fn button(code: u32) -> Option<Button> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_chunks(chunks: &[&[u8]]) -> Vec<Event> {
+        let mut parser = Parser::new();
+        for chunk in chunks {
+            for &byte in *chunk {
+                parser.push(byte);
+            }
+        }
+        parser.decoder.events.into_iter().collect()
+    }
+
+    fn parse(bytes: &[u8]) -> Vec<Event> {
+        parse_chunks(&[bytes])
+    }
+
+    fn key(event: &Event) -> &Key {
+        match event {
+            Event::Key(key) => key,
+            other => panic!("expected a key event, got {other:?}"),
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Pointer {
+        x: f64,
+        y: f64,
+        button: Option<(Button, Transition)>,
+        scroll: Scroll,
+    }
+
+    fn pointer(event: &Event) -> Pointer {
+        match event {
+            Event::Pointer(Input::Pointer {
+                x,
+                y,
+                button,
+                scroll,
+            }) => Pointer {
+                x: *x,
+                y: *y,
+                button: *button,
+                scroll: *scroll,
+            },
+            other => panic!("expected a pointer event, got {other:?}"),
+        }
+    }
+
+    fn text_params(length: usize) -> Vec<CsiParam> {
+        let mut params = vec![
+            CsiParam::Integer(97),
+            CsiParam::P(b';'),
+            CsiParam::Integer(1),
+            CsiParam::P(b';'),
+        ];
+        for index in 0..length {
+            if index > 0 {
+                params.push(CsiParam::P(b':'));
+            }
+            params.push(CsiParam::Integer(97));
+        }
+        params
+    }
+
+    #[test]
+    fn csi_decodes_focus_and_rejects_parameterized_focus() {
+        assert!(matches!(csi(&[], b'I'), Some(Event::Focus(true))));
+        assert!(matches!(csi(&[], b'O'), Some(Event::Focus(false))));
+        assert!(csi(&[CsiParam::Integer(1)], b'I').is_none());
+        assert!(csi(&[], b'Z').is_none());
+    }
+
+    #[test]
+    fn csi_maps_every_kitty_modifier_bit() {
+        let cases = [
+            (0, Modifiers::empty()),
+            (1, Modifiers::SHIFT),
+            (2, Modifiers::ALT),
+            (4, Modifiers::CONTROL),
+            (8, Modifiers::SUPER),
+            (16, Modifiers::HYPER),
+            (32, Modifiers::META),
+            (64, Modifiers::CAPS_LOCK),
+            (128, Modifiers::NUM_LOCK),
+            (3, Modifiers::SHIFT | Modifiers::ALT),
+            (5, Modifiers::SHIFT | Modifiers::CONTROL),
+        ];
+        for (bits, expected) in cases {
+            let params = [
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(i64::from(bits) + 1),
+            ];
+            let event = csi(&params, b'u').expect("valid Kitty key event");
+            let key = key(&event);
+            assert_eq!(key.code, u32::from(b'a'), "Kitty bits {bits}");
+            assert_eq!(key.modifiers, expected, "Kitty bits {bits}");
+            assert_eq!(key.kind, Kind::Press, "Kitty bits {bits}");
+            assert_eq!(key.text, None, "Kitty bits {bits}");
+        }
+    }
+
+    #[test]
+    fn csi_decodes_key_transitions() {
+        let cases = [(1, Kind::Press), (2, Kind::Repeat), (3, Kind::Release)];
+        for (encoded, expected) in cases {
+            let params = [
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(1),
+                CsiParam::P(b':'),
+                CsiParam::Integer(encoded),
+            ];
+            let event = csi(&params, b'u').expect("valid Kitty transition");
+            assert_eq!(key(&event).kind, expected, "encoded kind {encoded}");
+        }
+        for encoded in [0, 4, 99] {
+            let params = [
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(1),
+                CsiParam::P(b':'),
+                CsiParam::Integer(encoded),
+            ];
+            assert!(
+                csi(&params, b'u').is_none(),
+                "encoded kind {encoded} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_decodes_associated_text() {
+        let cases: [(&[CsiParam], &str); 3] = [
+            (
+                &[
+                    CsiParam::Integer(97),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(1),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(97),
+                ],
+                "a",
+            ),
+            (
+                &[
+                    CsiParam::Integer(97),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(1),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(97),
+                    CsiParam::P(b':'),
+                    CsiParam::Integer(98),
+                ],
+                "ab",
+            ),
+            (
+                &[
+                    CsiParam::Integer(97),
+                    CsiParam::P(b';'),
+                    CsiParam::P(b';'),
+                    CsiParam::Integer(97),
+                ],
+                "a",
+            ),
+        ];
+        for (params, expected) in cases {
+            let event = csi(params, b'u').expect("valid Kitty key event");
+            assert_eq!(key(&event).text.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn csi_bounds_associated_text() {
+        let exact = text_params(meowland_protocol::MAX_INPUT_TEXT);
+        let event = csi(&exact, b'u').expect("valid Kitty key event");
+        assert_eq!(
+            key(&event).text.as_deref().map(str::len),
+            Some(meowland_protocol::MAX_INPUT_TEXT)
+        );
+
+        let oversized = text_params(meowland_protocol::MAX_INPUT_TEXT + 1);
+        let event = csi(&oversized, b'u').expect("valid Kitty key event");
+        assert_eq!(key(&event).text, None);
+    }
+
+    #[test]
+    fn csi_rejects_invalid_associated_text() {
+        let cases: [&[CsiParam]; 4] = [
+            &[
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(1),
+                CsiParam::P(b';'),
+                CsiParam::Integer(0),
+            ],
+            &[
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(1),
+                CsiParam::P(b';'),
+                CsiParam::Integer(0x7f),
+            ],
+            &[
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(1),
+                CsiParam::P(b';'),
+                CsiParam::Integer(0x11_0000),
+            ],
+            &[
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(1),
+                CsiParam::P(b';'),
+            ],
+        ];
+        for params in cases {
+            let event = csi(params, b'u').expect("text is optional for key events");
+            assert_eq!(key(&event).text, None, "params {params:?}");
+        }
+    }
+
+    #[test]
+    fn csi_turns_text_only_events_into_committed_text() {
+        let params = [
+            CsiParam::Integer(0),
+            CsiParam::P(b';'),
+            CsiParam::Integer(1),
+            CsiParam::P(b';'),
+            CsiParam::Integer(97),
+        ];
+        assert!(matches!(csi(&params, b'u'), Some(Event::Text(text)) if text == "a"));
+
+        let repeat = [
+            CsiParam::Integer(0),
+            CsiParam::P(b';'),
+            CsiParam::Integer(1),
+            CsiParam::P(b':'),
+            CsiParam::Integer(2),
+            CsiParam::P(b';'),
+            CsiParam::Integer(97),
+        ];
+        assert!(matches!(csi(&repeat, b'u'), Some(Event::Text(text)) if text == "a"));
+
+        let release = [
+            CsiParam::Integer(0),
+            CsiParam::P(b';'),
+            CsiParam::Integer(1),
+            CsiParam::P(b':'),
+            CsiParam::Integer(3),
+            CsiParam::P(b';'),
+            CsiParam::Integer(97),
+        ];
+        assert!(csi(&release, b'u').is_none());
+        assert!(csi(&[CsiParam::Integer(0)], b'u').is_none());
+    }
+
+    #[test]
+    fn csi_decodes_functional_keys() {
+        let csi_cases = [
+            (b'A', 57352),
+            (b'B', 57353),
+            (b'C', 57351),
+            (b'D', 57350),
+            (b'H', 57356),
+            (b'F', 57357),
+            (b'E', 57427),
+            (b'P', 57364),
+            (b'Q', 57365),
+            (b'R', 57366),
+            (b'S', 57367),
+        ];
+        for (byte, expected) in csi_cases {
+            let event = csi(&[], byte).expect("valid functional key");
+            assert_eq!(key(&event).code, expected, "final byte {byte:?}");
+        }
+
+        let tilde_cases = [
+            (1, 57356),
+            (2, 57348),
+            (3, 57349),
+            (4, 57357),
+            (5, 57354),
+            (6, 57355),
+            (7, 57356),
+            (8, 57357),
+            (11, 57364),
+            (15, 57368),
+            (17, 57369),
+            (21, 57373),
+            (23, 57374),
+            (24, 57375),
+            (57427, 57427),
+        ];
+        for (number, expected) in tilde_cases {
+            let event = csi(&[CsiParam::Integer(number)], b'~').expect("valid tilde key");
+            assert_eq!(key(&event).code, expected, "tilde {number}");
+        }
+        for number in [0, 9, 10, 16, 22, 25, 57426] {
+            assert!(
+                csi(&[CsiParam::Integer(number)], b'~').is_none(),
+                "tilde {number} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn csi_rejects_malformed_parameters() {
+        let cases: [&[CsiParam]; 5] = [
+            &[CsiParam::Integer(-1)],
+            &[
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(0),
+            ],
+            &[
+                CsiParam::Integer(97),
+                CsiParam::P(b';'),
+                CsiParam::Integer(300),
+            ],
+            &[CsiParam::P(b';')],
+            &[],
+        ];
+        for params in cases {
+            assert!(csi(params, b'u').is_none(), "params {params:?}");
+        }
+        assert!(csi(&[], b'Z').is_none());
+    }
+
+    #[test]
+    fn mouse_decodes_buttons_and_signed_coordinates() {
+        struct Case {
+            report: &'static [u8],
+            button: Option<(Button, Transition)>,
+            x: f64,
+            y: f64,
+        }
+
+        let cases = [
+            Case {
+                report: b"\x1b[<0;10;20M",
+                button: Some((Button::Left, Transition::Pressed)),
+                x: 10.0,
+                y: 20.0,
+            },
+            Case {
+                report: b"\x1b[<0;10;20m",
+                button: Some((Button::Left, Transition::Released)),
+                x: 10.0,
+                y: 20.0,
+            },
+            Case {
+                report: b"\x1b[<1;-5;-20M",
+                button: Some((Button::Middle, Transition::Pressed)),
+                x: -5.0,
+                y: -20.0,
+            },
+            Case {
+                report: b"\x1b[<2;0;0m",
+                button: Some((Button::Right, Transition::Released)),
+                x: 0.0,
+                y: 0.0,
+            },
+            Case {
+                report: b"\x1b[<128;1;2M",
+                button: Some((Button::Back, Transition::Pressed)),
+                x: 1.0,
+                y: 2.0,
+            },
+            Case {
+                report: b"\x1b[<129;1;2M",
+                button: Some((Button::Forward, Transition::Pressed)),
+                x: 1.0,
+                y: 2.0,
+            },
+            Case {
+                report: b"\x1b[<130;1;2M",
+                button: Some((Button::Other(10), Transition::Pressed)),
+                x: 1.0,
+                y: 2.0,
+            },
+            Case {
+                report: b"\x1b[<131;1;2m",
+                button: Some((Button::Other(11), Transition::Released)),
+                x: 1.0,
+                y: 2.0,
+            },
+        ];
+        for case in cases {
+            let event = mouse(case.report).expect("valid mouse report");
+            let pointer = pointer(&event);
+            assert_eq!(pointer.x, case.x, "report {:?}", case.report);
+            assert_eq!(pointer.y, case.y, "report {:?}", case.report);
+            assert_eq!(pointer.button, case.button, "report {:?}", case.report);
+            assert_eq!(
+                pointer.scroll,
+                Scroll::default(),
+                "report {:?}",
+                case.report
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_decodes_all_wheel_directions_and_motion() {
+        let cases = [
+            (
+                b"\x1b[<64;1;2M",
+                Scroll {
+                    vertical: SCROLL_DETENT,
+                    horizontal: 0,
+                },
+            ),
+            (
+                b"\x1b[<65;1;2M",
+                Scroll {
+                    vertical: -SCROLL_DETENT,
+                    horizontal: 0,
+                },
+            ),
+            (
+                b"\x1b[<66;1;2M",
+                Scroll {
+                    vertical: 0,
+                    horizontal: -SCROLL_DETENT,
+                },
+            ),
+            (
+                b"\x1b[<67;1;2M",
+                Scroll {
+                    vertical: 0,
+                    horizontal: SCROLL_DETENT,
+                },
+            ),
+        ];
+        for (report, expected) in cases {
+            let event = mouse(report).expect("valid wheel report");
+            let pointer = pointer(&event);
+            assert_eq!(pointer.button, None, "report {report:?}");
+            assert_eq!(pointer.scroll, expected, "report {report:?}");
+        }
+
+        for report in [&b"\x1b[<32;7;8M"[..], &b"\x1b[<35;7;8m"[..]] {
+            let event = mouse(report).expect("valid motion report");
+            let pointer = pointer(&event);
+            assert_eq!((pointer.x, pointer.y), (7.0, 8.0));
+            assert_eq!(pointer.button, None);
+            assert_eq!(pointer.scroll, Scroll::default());
+        }
+    }
+
+    #[test]
+    fn mouse_rejects_malformed_reports() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"\x1b[<",
+            b"\x1b[<0",
+            b"\x1b[<0;1",
+            b"\x1b[<0;1;2",
+            b"\x1b[<0;1;2X",
+            b"\x1b[<0;1;2;3M",
+            b"\x1b[<a;1;2M",
+            b"\x1b[<0;a;2M",
+            b"\x1b[<0;1;999999999999M",
+            b"\x1b[<3;1;2M",
+            b"\x1b[<0;1;2M\xff",
+        ];
+        for report in cases {
+            assert!(mouse(report).is_none(), "report {report:?}");
+        }
+        assert!(mouse(b"\x1b[<0;\xff;2M").is_none());
+    }
+
+    #[test]
+    fn parser_accepts_every_split_boundary() {
+        let key_sequence = b"\x1b[97;6u";
+        for split in 0..=key_sequence.len() {
+            let events = parse_chunks(&[&key_sequence[..split], &key_sequence[split..]]);
+            assert_eq!(events.len(), 1, "split at {split}");
+            let key = key(&events[0]);
+            assert_eq!(key.code, u32::from(b'a'), "split at {split}");
+            assert_eq!(
+                key.modifiers,
+                Modifiers::SHIFT | Modifiers::CONTROL,
+                "split at {split}"
+            );
+        }
+
+        let mouse_sequence = b"\x1b[<0;-10;20M";
+        for split in 0..=mouse_sequence.len() {
+            let events = parse_chunks(&[&mouse_sequence[..split], &mouse_sequence[split..]]);
+            assert_eq!(events.len(), 1, "split at {split}");
+            let pointer = pointer(&events[0]);
+            assert_eq!((pointer.x, pointer.y), (-10.0, 20.0), "split at {split}");
+            assert_eq!(
+                pointer.button,
+                Some((Button::Left, Transition::Pressed)),
+                "split at {split}"
+            );
+        }
+
+        let paste_sequence = b"\x1b[200~hello\x1b[201~";
+        for split in 0..=paste_sequence.len() {
+            let events = parse_chunks(&[&paste_sequence[..split], &paste_sequence[split..]]);
+            assert!(
+                matches!(&events[..], [Event::Paste(text)] if text == "hello"),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_keeps_escape_prefix_ambiguity() {
+        assert!(matches!(parse(b"\x1b[I").as_slice(), [Event::Focus(true)]));
+        assert!(matches!(
+            parse(b"\x1b\x1b[I").as_slice(),
+            [Event::Focus(true)]
+        ));
+
+        let events = parse(b"\x1b[<0;1;2M\x1b[I");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            pointer(&events[0]).button,
+            Some((Button::Left, Transition::Pressed))
+        );
+        assert!(matches!(events[1], Event::Focus(true)));
+
+        let events = parse(b"\x1b[<0;1;2X\x1b[I");
+        assert!(matches!(&events[..], [Event::Text(text), Event::Focus(true)] if text == "X"));
+    }
+
+    #[test]
+    fn parser_decodes_utf8_text_split_at_every_boundary() {
+        let sequence = "é".as_bytes();
+        for split in 0..=sequence.len() {
+            let events = parse_chunks(&[&sequence[..split], &sequence[split..]]);
+            assert!(
+                matches!(&events[..], [Event::Text(text)] if text == "é"),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_decodes_paste_across_chunks() {
+        let events = parse_chunks(&[b"\x1b[200~he", b"llo\x1b[201", b"~"]);
+        assert!(matches!(&events[..], [Event::Paste(text)] if text == "hello"));
+
+        let events = parse(b"\x1b[200~\xff\x1b[201~x");
+        assert!(matches!(&events[..], [Event::Text(text)] if text == "x"));
+    }
+
+    #[test]
+    fn parser_bounds_bracketed_paste() {
+        let payload = vec![b'a'; meowland_protocol::clipboard::MAX_TEXT];
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\x1b[201~");
+        let events = parse(&bytes);
+        assert!(matches!(&events[..], [Event::Paste(text)] if text.len() == payload.len()));
+
+        let payload = vec![b'a'; meowland_protocol::clipboard::MAX_TEXT + 1];
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\x1b[201~\x1b[I");
+        let events = parse(&bytes);
+        assert!(matches!(&events[..], [Event::Focus(true)]));
+    }
+
+    #[test]
+    fn parser_discards_oversized_control_sequences() {
+        let mut bytes = vec![0x1b, b'['];
+        bytes.extend(std::iter::repeat_n(b'1', MAX_CONTROL));
+        bytes.push(b'm');
+        bytes.extend_from_slice(b"\x1b[I");
+        let events = parse(&bytes);
+        assert!(matches!(events.last(), Some(Event::Focus(true))));
+        assert!(!events.iter().any(|event| matches!(event, Event::Key(_))));
+    }
+}

@@ -664,3 +664,152 @@ pub fn sanitize_with_limit(input: &str, limit: usize) -> String {
         .take(limit)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn send_and_recv_round_trip() {
+        let value = "hello".to_owned();
+        let mut bytes = Vec::new();
+        send(&mut bytes, &value).expect("message encodes");
+        let decoded: String = recv(&mut Cursor::new(bytes)).expect("message decodes");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn decode_round_trips_one_message() {
+        let value = 42_u32;
+        let bytes = postcard::to_allocvec(&value).expect("message encodes");
+        let decoded: u32 = decode(&bytes).expect("message decodes");
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn recv_rejects_oversized_lengths() {
+        let size = u32::try_from(MAX_MESSAGE + 1).expect("test message size fits u32");
+        let error = recv::<u8>(&mut Cursor::new(size.to_le_bytes()))
+            .expect_err("oversized length must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "message too large");
+    }
+
+    #[test]
+    fn decode_rejects_oversized_bodies() {
+        let bytes = vec![0; MAX_MESSAGE + 1];
+        let error = decode::<u8>(&bytes).expect_err("oversized body must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "message too large");
+    }
+
+    #[test]
+    fn recv_rejects_truncated_header_and_body() {
+        let error = recv::<u8>(&mut Cursor::new([])).expect_err("missing header");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let mut bytes = 4_u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"ab");
+        let error = recv::<u32>(&mut Cursor::new(bytes)).expect_err("truncated body");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn recv_and_decode_reject_trailing_bytes() {
+        let mut bytes = 2_u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[7, 8]);
+        let error = recv::<u8>(&mut Cursor::new(bytes)).expect_err("trailing body bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "trailing message bytes");
+
+        let error = decode::<u8>(&[7, 8]).expect_err("trailing decoded bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "trailing message bytes");
+    }
+
+    #[test]
+    fn decode_rejects_truncated_body() {
+        let error = decode::<String>(&[5, b'a']).expect_err("truncated string");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sanitize_strips_controls_and_bounds_characters() {
+        assert_eq!(sanitize("a\n\tb\u{0}c"), "abc");
+        assert_eq!(sanitize("é😀"), "é😀");
+        assert_eq!(sanitize_with_limit("abc", 2), "ab");
+        assert_eq!(sanitize_with_limit("😀😀😀", 2), "😀😀");
+        assert_eq!(sanitize_with_limit("a\nb", 0), "");
+        assert_eq!(sanitize(&"x".repeat(300)), "x".repeat(256));
+    }
+
+    #[test]
+    fn key_binding_matches_required_modifiers() {
+        let binding = KeyBinding {
+            key: u32::from(b'q'),
+            modifiers: Modifiers::ALT,
+        };
+        assert!(binding.matches(u32::from(b'q'), Modifiers::ALT));
+        assert!(binding.matches(u32::from(b'q'), Modifiers::ALT | Modifiers::SHIFT));
+        assert!(binding.matches(
+            u32::from(b'q'),
+            Modifiers::ALT | Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK
+        ));
+        assert!(!binding.matches(u32::from(b'q'), Modifiers::empty()));
+        assert!(!binding.matches(u32::from(b'q'), Modifiers::CONTROL));
+        assert!(!binding.matches(u32::from(b'q'), Modifiers::ALT | Modifiers::CONTROL));
+        assert!(!binding.matches(u32::from(b'w'), Modifiers::ALT));
+    }
+
+    #[test]
+    fn key_binding_ignores_extra_shift_but_not_other_shortcut_modifiers() {
+        let binding = KeyBinding {
+            key: u32::from(b'q'),
+            modifiers: Modifiers::CONTROL | Modifiers::SHIFT,
+        };
+        assert!(binding.matches(
+            u32::from(b'q'),
+            Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::CAPS_LOCK
+        ));
+        assert!(!binding.matches(u32::from(b'q'), Modifiers::CONTROL));
+        assert!(!binding.matches(
+            u32::from(b'q'),
+            Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT
+        ));
+    }
+
+    #[test]
+    fn key_binding_without_modifiers_rejects_shortcut_modifiers() {
+        let binding = KeyBinding {
+            key: u32::from(b'q'),
+            modifiers: Modifiers::empty(),
+        };
+        assert!(binding.matches(u32::from(b'q'), Modifiers::empty()));
+        assert!(binding.matches(u32::from(b'q'), Modifiers::SHIFT));
+        assert!(binding.matches(u32::from(b'q'), Modifiers::CAPS_LOCK));
+        assert!(!binding.matches(u32::from(b'q'), Modifiers::ALT));
+        assert!(!binding.matches(u32::from(b'w'), Modifiers::empty()));
+    }
+
+    #[test]
+    fn shortcuts_resolve_default_and_disabled_bindings() {
+        let shortcuts = Shortcuts::default();
+        assert_eq!(
+            shortcuts.action(u32::from(b'q'), Modifiers::ALT),
+            Some(Shortcut::CloseWindow)
+        );
+        assert_eq!(
+            shortcuts.action(u32::from(b'w'), Modifiers::ALT),
+            Some(Shortcut::DetachPane)
+        );
+        assert_eq!(shortcuts.action(u32::from(b'q'), Modifiers::CONTROL), None);
+
+        let disabled = Shortcuts {
+            close_window: None,
+            detach_pane: None,
+        };
+        assert_eq!(disabled.action(u32::from(b'q'), Modifiers::ALT), None);
+    }
+}

@@ -618,3 +618,94 @@ impl<'a> Packet<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_parses_metadata_and_payload() {
+        let packet = Packet::parse(
+            b"type=read:status=OK:id=abc:mime=dGV4dC9wbGFpbg==:pw=c2VjcmV0:loc=primary;cGF5bG9hZA==",
+        )
+        .expect("valid packet");
+        assert_eq!(packet.kind, "read");
+        assert_eq!(packet.status, "OK");
+        assert_eq!(packet.id, Some("abc"));
+        assert_eq!(packet.mime.as_deref(), Some("text/plain"));
+        assert_eq!(packet.password.as_deref(), Some("secret"));
+        assert!(packet.primary);
+        assert_eq!(packet.payload, "cGF5bG9hZA==");
+    }
+
+    #[test]
+    fn packet_parses_optional_fields_and_defaults() {
+        let packet = Packet::parse(b"type=write:status=DONE;").expect("valid packet");
+        assert_eq!(packet.kind, "write");
+        assert_eq!(packet.status, "DONE");
+        assert_eq!(packet.id, None);
+        assert_eq!(packet.mime, None);
+        assert_eq!(packet.password, None);
+        assert!(!packet.primary);
+        assert_eq!(packet.payload, "");
+
+        let packet =
+            Packet::parse(b"type=read:status=OK:loc=secondary;payload").expect("valid packet");
+        assert!(!packet.primary);
+        assert_eq!(packet.payload, "payload");
+    }
+
+    #[test]
+    fn packet_preserves_semicolons_in_payload() {
+        let packet = Packet::parse(b"type=read:status=OK;one;two").expect("valid packet");
+        assert_eq!(packet.payload, "one;two");
+    }
+
+    #[test]
+    fn packet_rejects_duplicate_keys() {
+        for bytes in [
+            &b"type=read:type=write:status=OK;"[..],
+            &b"type=read:status=OK:status=DONE;"[..],
+            &b"type=read:status=OK:id=a:id=b;"[..],
+            &b"type=read:status=OK:mime=dGV4dA==:mime=dGV4dA==;"[..],
+        ] {
+            assert!(Packet::parse(bytes).is_none(), "packet {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn packet_rejects_malformed_metadata() {
+        for bytes in [
+            &b""[..],
+            &b";"[..],
+            &b"type=read:status;"[..],
+            &b"status=OK;"[..],
+            &b"type=read;"[..],
+            &b"type=read:status=OK:;"[..],
+        ] {
+            assert!(Packet::parse(bytes).is_none(), "packet {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn packet_rejects_invalid_base64_and_utf8() {
+        for bytes in [
+            &b"type=read:status=OK:mime=%%%;"[..],
+            &b"type=read:status=OK:pw=%%%:"[..],
+            &b"type=read:status=OK:mime=/w==;"[..],
+            &b"type=read:status=OK:pw=/w==;"[..],
+            &b"type=read:status=OK;\xff"[..],
+        ] {
+            assert!(Packet::parse(bytes).is_none(), "packet {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn packet_rejects_oversized_decoded_fields() {
+        let oversized = STANDARD.encode(vec![b'a'; MAX_CHUNK_BYTES + 1]);
+        for field in ["mime", "pw"] {
+            let packet = format!("type=read:status=OK:{field}={oversized};");
+            assert!(Packet::parse(packet.as_bytes()).is_none(), "field {field}");
+        }
+    }
+}

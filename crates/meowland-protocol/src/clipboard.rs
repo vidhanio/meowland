@@ -177,3 +177,129 @@ impl Deadline {
 /// Transfer timeout, including time spent awaiting terminal clipboard
 /// permission.
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_mime_accepts_mime_types_and_opaque_targets() {
+        for mime in [
+            "text/plain",
+            "text/plain;charset=utf-8",
+            "UTF8_STRING",
+            "TEXT",
+            "image/png",
+            "application/octet-stream",
+            "a",
+            &"a".repeat(MAX_MIME_LENGTH),
+        ] {
+            assert!(valid_mime(mime), "mime {mime:?}");
+        }
+        for mime in [
+            "",
+            ".",
+            "text/plain\n",
+            "text/plain; charset",
+            "bad mime",
+            "text/",
+            "é",
+            &"a".repeat(MAX_MIME_LENGTH + 1),
+        ] {
+            assert!(!valid_mime(mime), "mime {mime:?}");
+        }
+    }
+
+    #[test]
+    fn mime_types_filters_duplicates_and_preserves_order() {
+        let types = [
+            "text/plain",
+            ".",
+            "text/html",
+            "text/plain",
+            "bad mime",
+            "UTF8_STRING",
+        ]
+        .into_iter()
+        .map(str::to_owned);
+        assert_eq!(
+            mime_types(types),
+            ["text/plain", "text/html", "UTF8_STRING"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mime_types_bounds_the_number_of_types() {
+        let types = (0..MAX_TYPES + 5).map(|index| format!("application/x-{index}"));
+        let result = mime_types(types);
+        assert_eq!(result.len(), MAX_TYPES);
+        assert_eq!(result.first().map(String::as_str), Some("application/x-0"));
+        assert_eq!(
+            result.last().map(String::as_str),
+            Some(format!("application/x-{}", MAX_TYPES - 1).as_str())
+        );
+    }
+
+    #[test]
+    fn clipboard_data_validates_types_count_and_bytes() {
+        assert!(ClipboardData::default().valid());
+        assert!(ClipboardData::text("hello").valid());
+
+        let invalid_mime = ClipboardData {
+            items: vec![Item {
+                mime: ".".into(),
+                data: Vec::new(),
+            }],
+        };
+        assert!(!invalid_mime.valid());
+
+        let exact_types = (0..MAX_TYPES)
+            .map(|index| Item {
+                mime: format!("application/x-{index}"),
+                data: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(ClipboardData { items: exact_types }.valid());
+
+        let too_many = (0..=MAX_TYPES)
+            .map(|index| Item {
+                mime: format!("application/x-{index}"),
+                data: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!ClipboardData { items: too_many }.valid());
+
+        let too_large = ClipboardData {
+            items: vec![Item {
+                mime: "text/plain".into(),
+                data: vec![0; MAX_BYTES + 1],
+            }],
+        };
+        assert!(!too_large.valid());
+    }
+
+    #[test]
+    fn utf8_text_prefers_valid_plain_text_representations() {
+        let text = ClipboardData::text("hello");
+        assert_eq!(text.utf8_text(), Some(b"hello".as_slice()));
+
+        let alias = ClipboardData {
+            items: vec![Item {
+                mime: "UTF8_STRING".into(),
+                data: b"hello".to_vec(),
+            }],
+        };
+        assert_eq!(alias.utf8_text(), Some(b"hello".as_slice()));
+
+        let invalid = ClipboardData {
+            items: vec![Item {
+                mime: "text/plain".into(),
+                data: vec![0xff],
+            }],
+        };
+        assert_eq!(invalid.utf8_text(), None);
+    }
+}

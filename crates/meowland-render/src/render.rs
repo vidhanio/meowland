@@ -532,7 +532,16 @@ fn opaque_cover(
     let Some(snapshot) = snapshots.get(&layer.surface) else {
         return false;
     };
-    let Some(dst) = placement(layer.origin, layer.geometry.dst, scale) else {
+    covers_pane(
+        snapshot,
+        placement(layer.origin, layer.geometry.dst, scale),
+        width,
+        height,
+    )
+}
+
+fn covers_pane(snapshot: &Snapshot, dst: Option<Placement>, width: u32, height: u32) -> bool {
+    let Some(dst) = dst else {
         return false;
     };
     snapshot.opaque()
@@ -781,30 +790,99 @@ mod tests {
         }
     }
 
-    #[test]
-    fn opaque_top_layer_makes_partial_recomposition_match_full_composition() {
-        let size = (6, 4);
-        let bottom = snapshot(6, 4, mixed);
-        let top = snapshot(6, 4, opaque);
-        let bottom_geometry = direct(&bottom);
-        let top_geometry = direct(&top);
-
-        let mut full = compose_direct(&bottom, &bottom_geometry, (0, 0).into(), size);
-        {
-            let mut target = Target {
-                pixels: &mut full,
-                columns: 0..size.0,
-                rows: 0..size.1,
-            };
-            blit(&top, &top_geometry, (0, 0).into(), &mut target, 1.0);
+    fn compose_at_scale(
+        layers: &[(&Snapshot, &SurfaceGeometry, Point<i32, Logical>)],
+        size: (i32, i32),
+        scale: f64,
+    ) -> Vec<u8> {
+        let mut pixels = background(size.0, size.1);
+        let mut target = Target {
+            pixels: &mut pixels,
+            columns: 0..size.0,
+            rows: 0..size.1,
+        };
+        for (snapshot, geometry, origin) in layers {
+            blit(snapshot, geometry, *origin, &mut target, scale);
         }
-        let shortcut = compose_direct(&top, &top_geometry, (0, 0).into(), size);
-        assert_eq!(full, shortcut);
+        pixels
+    }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "the expected cover outcome is a single boolean contract"
+    )]
+    fn assert_cover_shortcut(
+        bottom: &Snapshot,
+        top: &Snapshot,
+        origin: Point<i32, Logical>,
+        size: (i32, i32),
+        scale: f64,
+        expected: bool,
+    ) {
+        let bottom_geometry = direct(bottom);
+        let top_geometry = direct(top);
+        let full = compose_at_scale(
+            &[
+                (bottom, &bottom_geometry, (0, 0).into()),
+                (top, &top_geometry, origin),
+            ],
+            size,
+            scale,
+        );
+        let covered = covers_pane(
+            top,
+            placement(origin, top_geometry.dst, scale),
+            u32::try_from(size.0).unwrap(),
+            u32::try_from(size.1).unwrap(),
+        );
+        assert_eq!(
+            covered, expected,
+            "size {size:?}, scale {scale}, origin {origin:?}"
+        );
+        let optimized = if covered {
+            compose_at_scale(&[(top, &top_geometry, origin)], size, scale)
+        } else {
+            full.clone()
+        };
+        assert_eq!(
+            optimized, full,
+            "size {size:?}, scale {scale}, origin {origin:?}"
+        );
+    }
+
+    #[test]
+    fn cover_shortcut_matches_full_composition_of_the_same_scene() {
+        let bottom = snapshot(6, 4, mixed);
+        let full = snapshot(6, 4, opaque);
         let partial = snapshot(3, 2, opaque);
-        let partial_geometry = direct(&partial);
-        let shortcut = compose_direct(&partial, &partial_geometry, (0, 0).into(), size);
-        assert_ne!(full, shortcut);
+        let offset = snapshot(7, 6, opaque);
+        let translucent = snapshot(6, 4, mixed);
+
+        assert_cover_shortcut(&bottom, &full, (0, 0).into(), (6, 4), 1.0, true);
+        assert_cover_shortcut(&bottom, &partial, (0, 0).into(), (6, 4), 1.0, false);
+        assert_cover_shortcut(&bottom, &offset, (-1, -1).into(), (6, 4), 1.0, true);
+        assert_cover_shortcut(&bottom, &translucent, (0, 0).into(), (6, 4), 1.0, false);
+
+        let scaled_bottom = snapshot(6, 4, mixed);
+        let scaled_full = snapshot(6, 4, opaque);
+        let scaled_partial = snapshot(3, 2, opaque);
+        assert_cover_shortcut(
+            &scaled_bottom,
+            &scaled_full,
+            (0, 0).into(),
+            (12, 8),
+            2.0,
+            true,
+        );
+        assert_cover_shortcut(
+            &scaled_bottom,
+            &scaled_partial,
+            (0, 0).into(),
+            (12, 8),
+            2.0,
+            false,
+        );
+        assert_cover_shortcut(&scaled_bottom, &offset, (-1, -1).into(), (12, 8), 2.0, true);
     }
 
     fn pixel_at(pixels: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {

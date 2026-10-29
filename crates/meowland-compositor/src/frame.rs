@@ -355,6 +355,5 @@ impl Compositor {
                     events.push(Event { pane, message });
                 }
             });
-        self.attachments.clear_due();
     }
 }

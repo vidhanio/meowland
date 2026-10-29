@@ -220,11 +220,6 @@ impl<P: Presentation> Attachments<P> {
         self.due
     }
 
-    /// Reset after every dirty frame was handed to the compositor.
-    pub const fn clear_due(&mut self) {
-        self.due = 0;
-    }
-
     /// Iterate over attached panes in pane-identity order.
     pub fn iter(&self) -> impl Iterator<Item = (&PaneId, &AttachedPane<P>)> {
         self.panes.iter()

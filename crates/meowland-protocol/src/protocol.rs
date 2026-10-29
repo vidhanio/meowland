@@ -59,9 +59,9 @@ bitflags::bitflags! {
     }
 }
 
-/// Kitty's Alt bit, which Linux input numbers as Control.
+/// Kitty's Alt bit, which this type numbers as [`Modifiers::ALT`].
 const KITTY_ALT: u8 = 0b010;
-/// Kitty's Control bit, which Linux input numbers as Alt.
+/// Kitty's Control bit, which this type numbers as [`Modifiers::CONTROL`].
 const KITTY_CONTROL: u8 = 0b100;
 
 impl Modifiers {
@@ -74,17 +74,17 @@ impl Modifiers {
 
     /// Translate Kitty's modifier bit layout into this type.
     ///
-    /// Kitty and Linux agree on every bit except Alt and Control: Kitty reports
-    /// Alt as bit 1 and Control as bit 2, while this type follows Linux input,
-    /// which swaps them.
+    /// Kitty reports Alt as bit 1 (value 2) and Control as bit 2 (value 4),
+    /// while this type numbers Control as 2 and Alt as 4. Every other bit
+    /// already matches, so only those two swap.
     #[must_use]
     pub const fn from_kitty(bits: u8) -> Self {
         let mut modifiers = Self::from_bits_retain(bits & !(KITTY_ALT | KITTY_CONTROL));
         if bits & KITTY_ALT != 0 {
-            modifiers = modifiers.union(Self::CONTROL);
+            modifiers = modifiers.union(Self::ALT);
         }
         if bits & KITTY_CONTROL != 0 {
-            modifiers = modifiers.union(Self::ALT);
+            modifiers = modifiers.union(Self::CONTROL);
         }
         modifiers
     }

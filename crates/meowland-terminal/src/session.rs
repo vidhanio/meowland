@@ -1,6 +1,7 @@
 //! Async scheduling and explicit lifecycle for one terminal attachment.
 
 use std::{
+    future::{Future, poll_fn},
     io::{self, Write},
     os::unix::net::UnixStream,
     time::{Duration, Instant},
@@ -38,6 +39,17 @@ mod events;
 
 const EVENTS_PER_TURN: usize = 64;
 
+/// Turns the session loop may complete without yielding to the executor.
+///
+/// Most turns finish without waiting: a writable terminal, buffered input, or a
+/// queued frame is ready immediately, and each turn already does bounded work
+/// (up to [`EVENTS_PER_TURN`] input events and one 64 KiB write). Yielding
+/// after every turn cost an executor round trip per event, so instead the loop
+/// yields once a budget of productive turns is spent. A turn that actually
+/// waited resets the budget because the executor already got control while the
+/// loop was pending.
+const TURNS_PER_YIELD: usize = 16;
+
 enum Lifecycle {
     Handshaking { deadline: Instant },
     Waiting,
@@ -56,7 +68,7 @@ struct PendingWindow {
 enum Ready {
     Terminate,
     Resize,
-    Deadline,
+    Deadline(io::Result<()>),
     Server(io::Result<ServerToPane>),
     Output(Result<()>),
     Transmit(io::Result<()>),
@@ -129,6 +141,7 @@ impl TerminalSession {
         reason = "the terminal session runs on calloop's local executor"
     )]
     pub(crate) async fn run(mut self) -> Result<()> {
+        let mut turns = TURNS_PER_YIELD;
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             self.prepare_pending_work()?;
             let active = matches!(self.lifecycle, Lifecycle::Active(_));
@@ -136,16 +149,19 @@ impl TerminalSession {
             let pending_input = self.input.pending();
             let deadline = self.next_deadline();
             let pending_tx = self.tx.pending();
-            let ready = futures::select! {
-                _ = self.termination.recv().fuse() => Ready::Terminate,
-                _ = self.resize.recv().fuse() => Ready::Resize,
-                result = sleep_until(&self.handle, deadline).fuse() => { result?; Ready::Deadline },
-                result = when(pending_output.then(|| self.presentation.drain(&mut self.stdout))).fuse() => Ready::Output(result),
-                result = when((!pending_output && !pending_tx).then(|| self.receiver.read())).fuse() => Ready::Server(result),
-                result = when(pending_tx.then(|| self.tx.write_ready(&mut self.writer))).fuse() => Ready::Transmit(result),
-                result = when((active && !pending_input && !pending_tx).then(|| self.input.read_ready())).fuse() => Ready::Input(result),
-                () = when((pending_input && !pending_tx).then(yield_now)).fuse() => Ready::BufferedInput,
-            };
+            let (ready, waited) = scheduled(async {
+                futures::select! {
+                    _ = self.termination.recv().fuse() => Ready::Terminate,
+                    _ = self.resize.recv().fuse() => Ready::Resize,
+                    result = sleep_until(&self.handle, deadline).fuse() => Ready::Deadline(result),
+                    result = when(pending_output.then(|| self.presentation.drain(&mut self.stdout))).fuse() => Ready::Output(result),
+                    result = when((!pending_output && !pending_tx).then(|| self.receiver.read())).fuse() => Ready::Server(result),
+                    result = when(pending_tx.then(|| self.tx.write_ready(&mut self.writer))).fuse() => Ready::Transmit(result),
+                    result = when((active && !pending_input && !pending_tx).then(|| self.input.read_ready())).fuse() => Ready::Input(result),
+                    () = when((pending_input && !pending_tx).then(yield_now)).fuse() => Ready::BufferedInput,
+                }
+            })
+            .await;
             match ready {
                 Ready::Terminate => return self.close(None).await,
                 Ready::Resize => self.send_event(input::Event::Resize)?,
@@ -160,12 +176,21 @@ impl TerminalSession {
                         return self.close(None).await;
                     }
                 }
-                Ready::Transmit(Ok(())) | Ready::Deadline | Ready::BufferedInput => {}
+                Ready::Deadline(result) => result?,
+                Ready::Transmit(Ok(())) | Ready::BufferedInput => {}
             }
             if !matches!(self.lifecycle, Lifecycle::Closed) && !self.tx.pending() {
                 self.handle_terminal_events()?;
             }
-            yield_now().await;
+            turns = if waited {
+                TURNS_PER_YIELD
+            } else {
+                turns.saturating_sub(1)
+            };
+            if turns == 0 {
+                turns = TURNS_PER_YIELD;
+                yield_now().await;
+            }
         }
         Ok(())
     }
@@ -438,4 +463,21 @@ impl TerminalSession {
         self.stdout.flush().await?;
         Ok(())
     }
+}
+
+/// Await one scheduling turn, reporting whether it had to wait for readiness.
+///
+/// A turn that never returned `Pending` kept the executor to itself, so the
+/// caller counts it against its budget. A turn that waited already handed
+/// control to other tasks and does not.
+async fn scheduled<F: Future>(future: F) -> (F::Output, bool) {
+    let mut future = std::pin::pin!(future);
+    let mut waited = false;
+    let output = poll_fn(|context| {
+        let poll = future.as_mut().poll(context);
+        waited |= poll.is_pending();
+        poll
+    })
+    .await;
+    (output, waited)
 }

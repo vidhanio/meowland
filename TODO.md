@@ -179,7 +179,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   64 MiB). Shrink after oversized messages.
 - [x] **One `Outgoing` per message.** `pane_writer` allocates a fresh `Outgoing` for
   every message (`transport.rs`). Reuse one.
-- [ ] **`yield_now()` on every session iteration.** `TerminalSession::run` yields at the
+- [x] **`yield_now()` on every session iteration.** `TerminalSession::run` yields at the
   end of every loop iteration, on top of the per-chunk yields in `Reader::read` and
   `Outgoing::flush_to`. That is an extra executor round trip per event. Yield only
   after an event budget is spent.

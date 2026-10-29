@@ -79,15 +79,17 @@ impl State {
             input::reset_keyboard(self);
         }
         for pane in self.panes_showing(id) {
-            if self.attachments.panes[&pane].policy != Policy::FollowNewest {
+            if self
+                .attachments
+                .get(pane)
+                .is_none_or(|entry| entry.policy != Policy::FollowNewest)
+            {
                 continue;
             }
             if let Some(next) = self.catalog.newest() {
                 self.bind_pane_window(pane, next);
             } else {
-                if let Some(entry) = self.attachments.panes.get_mut(&pane) {
-                    entry.clear();
-                }
+                self.attachments.clear(pane);
                 self.emit(pane, ServerToPane::Title(String::new()));
                 self.send_pane_cursor(pane);
             }

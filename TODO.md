@@ -161,7 +161,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   page faults for every page, and an unlink per frame, because the terminal unlinks
   after reading. Measure against `t=f` with a reusable file, or a small ring of
   objects.
-- [ ] **O(windows × panes) scans in hot paths.** `Attachments::visible`, `showing`,
+- [x] **O(windows × panes) scans in hot paths.** `Attachments::visible`, `showing`,
   `owner`, and `first_window` scan every pane. They are called per window in
   `frame_callbacks`, per commit, and on every focus change. Keep a
   `HashMap<WindowId, SmallVec<PaneId>>` index.

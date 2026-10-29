@@ -10,7 +10,7 @@ use smithay::{
     },
 };
 
-use super::{Binding, Selection, ServerToPane, State, WindowId};
+use super::{Selection, ServerToPane, State, WindowId};
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -44,10 +44,11 @@ impl State {
     pub fn cancel_activation(&mut self, token: &str, reason: &str) {
         self.forget_activation(token);
         let waiting: Vec<_> = self
-            .attachments.panes
+            .attachments
             .iter()
-            .filter_map(|(pane, entry)| {
-                matches!(&entry.binding, Binding::Waiting(Selection::Activation(pending)) if pending == token).then_some(*pane)
+            .filter_map(|(&pane, entry)| {
+                matches!(entry.waiting(), Some(Selection::Activation(pending)) if pending == token)
+                    .then_some(pane)
             })
             .collect();
         for pane in waiting {

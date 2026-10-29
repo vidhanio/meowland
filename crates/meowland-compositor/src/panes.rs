@@ -4,7 +4,7 @@ use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
 use smithay::utils::{Logical, Size};
 
-use super::{AttachedPane, Binding, PaneId, Selection, ServerToPane, State, WindowId, input};
+use super::{AttachedPane, PaneId, Selection, ServerToPane, State, WindowId, input};
 
 impl State {
     /// The last-used pane decides the window's size; otherwise use the first
@@ -28,10 +28,14 @@ impl State {
         let removed = self.attachments.remove(pane);
         let window = removed.as_ref().and_then(AttachedPane::window);
         self.clipboard.detach(pane);
-        if let Some(AttachedPane {
-            binding: Binding::Waiting(Selection::Activation(token)),
-            ..
-        }) = removed
+        if let Some(token) =
+            removed
+                .as_ref()
+                .and_then(AttachedPane::waiting)
+                .and_then(|selection| match selection {
+                    Selection::Activation(token) => Some(token.clone()),
+                    Selection::AppId(_) => None,
+                })
         {
             self.forget_activation(&token);
         }
@@ -76,7 +80,7 @@ impl State {
     }
 
     pub(crate) fn resize_pane(&mut self, pane: PaneId, size: FrameSize) {
-        let Some(entry) = self.attachments.panes.get_mut(&pane) else {
+        let Some(entry) = self.attachments.get_mut(pane) else {
             return;
         };
         if entry.presentation.size == size {
@@ -103,9 +107,7 @@ impl State {
             Show::Activation(token) if window.is_some() => Some(token.clone()),
             _ => None,
         };
-        self.attachments
-            .panes
-            .insert(pane, AttachedPane::new(show, window, size));
+        self.attachments.insert(pane, show, window, size);
         if let Some(window) = window {
             self.show_pane_window(pane, window);
         }
@@ -120,11 +122,10 @@ impl State {
     }
 
     pub(crate) fn bind_pane_window(&mut self, pane: PaneId, window: WindowId) {
-        let Some(entry) = self.attachments.panes.get_mut(&pane) else {
+        let Some(previous) = self.attachments.get(pane).map(AttachedPane::window) else {
             return;
         };
-        let previous = entry.window();
-        let token = entry.show(window);
+        let token = self.attachments.show(pane, window);
         if let Some(token) = token {
             self.forget_activation(&token);
         }
@@ -149,17 +150,13 @@ impl State {
     pub(crate) fn resolve_pending_panes(&mut self) {
         let ready: Vec<_> = self
             .attachments
-            .panes
             .iter()
-            .filter_map(|(pane, entry)| {
-                let show = match &entry.binding {
-                    Binding::Waiting(Selection::AppId(id)) => Show::AppId(id.clone()),
-                    Binding::Waiting(Selection::Activation(token)) => {
-                        Show::Activation(token.clone())
-                    }
-                    Binding::Empty | Binding::Showing(_) => return None,
+            .filter_map(|(&pane, entry)| {
+                let show = match entry.waiting()? {
+                    Selection::AppId(id) => Show::AppId(id.clone()),
+                    Selection::Activation(token) => Show::Activation(token.clone()),
                 };
-                self.selected_window(&show).map(|window| (*pane, window))
+                self.selected_window(&show).map(|window| (pane, window))
             })
             .collect();
         for (pane, window) in ready {

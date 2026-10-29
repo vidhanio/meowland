@@ -169,11 +169,9 @@ impl CompositorHandler for State {
                         render::SurfaceDamage::new(&damage, &geometry)
                     }
                 });
-            for entry in self.attachments.panes.values_mut() {
-                if entry.window() == Some(window) {
-                    entry.presentation.damage(surface, damage, changed);
-                }
-            }
+            self.attachments.for_each_showing_mut(window, |_, entry| {
+                entry.presentation.damage(surface, damage, changed);
+            });
         }
     }
 

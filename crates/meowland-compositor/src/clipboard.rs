@@ -124,24 +124,16 @@ pub(crate) fn selection(
     source: Option<SelectionSource>,
 ) {
     state.clipboard.set_export(target, None);
+    let focused = state.catalog.focused();
     let pane = state
         .last_input_pane
         .filter(|pane| {
-            state.attachments.panes.get(pane).is_some_and(|pane| {
-                pane.window().is_some() && pane.window() == state.catalog.focused()
-            })
-        })
-        .or_else(|| {
             state
                 .attachments
-                .panes
-                .iter()
-                .filter(|(_, pane)| {
-                    pane.window().is_some() && pane.window() == state.catalog.focused()
-                })
-                .map(|(id, _)| *id)
-                .min()
-        });
+                .get(*pane)
+                .is_some_and(|pane| pane.window().is_some() && pane.window() == focused)
+        })
+        .or_else(|| focused.and_then(|focused| state.attachments.first_showing(focused)));
     let Some(pane) = pane else {
         return;
     };
@@ -206,7 +198,7 @@ fn export_next(state: &mut State, target: SelectionTarget) {
     let Some(mut export) = state.clipboard.take_export(target) else {
         return;
     };
-    if export.deadline.expired() || !state.attachments.panes.contains_key(&export.pane) {
+    if export.deadline.expired() || !state.attachments.contains(export.pane) {
         return;
     }
     while let Some(mime) = export.mimes.pop_front() {
@@ -358,7 +350,7 @@ pub(crate) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) 
             }
         }
         Source::Terminal { pane, offer } => {
-            if !state.attachments.panes.contains_key(pane) {
+            if !state.attachments.contains(*pane) {
                 return;
             }
             let request = state.clipboard.id();
@@ -507,7 +499,7 @@ pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
         mimes,
         paste,
     } = offer;
-    if !state.attachments.panes.contains_key(&pane) {
+    if !state.attachments.contains(pane) {
         return;
     }
     let target = wayland_selection(selection);
@@ -536,8 +528,7 @@ pub(crate) fn paste(state: &mut State, pane: PaneId, text: &str) {
     if text.len() > meowland_protocol::clipboard::MAX_TEXT
         || state
             .attachments
-            .panes
-            .get(&pane)
+            .get(pane)
             .is_none_or(|pane| pane.window().is_none())
     {
         return;

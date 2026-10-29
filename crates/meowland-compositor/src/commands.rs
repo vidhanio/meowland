@@ -124,7 +124,7 @@ impl State {
             }
             PaneAction::Ack(ack) => self.pane_ack(pane, ack),
             PaneAction::FrameTransport(transport) => {
-                if let Some(entry) = self.attachments.panes.get_mut(&pane) {
+                if let Some(entry) = self.attachments.get_mut(pane) {
                     entry.presentation.transport = transport;
                 }
             }
@@ -134,8 +134,7 @@ impl State {
     fn close_shown(&mut self, pane: PaneId) {
         if let Some(window) = self
             .attachments
-            .panes
-            .get(&pane)
+            .get(pane)
             .and_then(AttachedPane::window)
             .and_then(|id| self.windows.get(&id))
         {

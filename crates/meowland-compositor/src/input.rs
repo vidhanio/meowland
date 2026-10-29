@@ -42,12 +42,7 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     {
         return;
     }
-    let Some(window) = state
-        .attachments
-        .panes
-        .get(&pane)
-        .and_then(AttachedPane::window)
-    else {
+    let Some(window) = state.attachments.get(pane).and_then(AttachedPane::window) else {
         return;
     };
     if !state.catalog.drawable(window) {
@@ -356,12 +351,7 @@ fn forward(keyboard: &KeyboardHandle<State>, state: &mut State, code: u16, trans
 /// A terminal paste action has no physical key event. Its explicit shortcut
 /// leaves the real held-key set and modifier state unchanged.
 pub(crate) fn paste_action(state: &mut State, pane: PaneId) {
-    let Some(window) = state
-        .attachments
-        .panes
-        .get(&pane)
-        .and_then(AttachedPane::window)
-    else {
+    let Some(window) = state.attachments.get(pane).and_then(AttachedPane::window) else {
         return;
     };
     activate_keyboard(state, pane, window);

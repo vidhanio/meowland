@@ -63,7 +63,7 @@ mod toplevels;
 mod window;
 
 use Compositor as State;
-use attachment::{AttachedPane, Attachments, Binding, Policy, Selection};
+use attachment::{AttachedPane, Attachments, Policy, Selection};
 pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
 pub use commands::{CloseWindowError, Command};
@@ -150,7 +150,7 @@ impl std::fmt::Debug for Compositor {
         formatter
             .debug_struct("Compositor")
             .field("windows", &self.windows.len())
-            .field("panes", &self.attachments.panes.len())
+            .field("panes", &self.attachments.len())
             .field("shutdown", &self.shutdown)
             .finish_non_exhaustive()
     }
@@ -283,23 +283,19 @@ impl State {
     /// pane only the global surface limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
         let window = self.window_for_surface(surface)?;
-        self.attachments
-            .panes
-            .values()
-            .filter(|pane| pane.window() == Some(window))
-            .fold(None, |bound: Option<(u32, u32)>, pane| {
-                let pane = (
-                    self.scale
-                        .logical(pane.presentation.size.width())
-                        .unsigned_abs()
-                        * 2,
-                    self.scale
-                        .logical(pane.presentation.size.height())
-                        .unsigned_abs()
-                        * 2,
-                );
-                Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))))
-            })
+        let scale = self.scale;
+        let mut bound: Option<(u32, u32)> = None;
+        self.attachments.for_each_showing(window, |_, pane| {
+            let pane = (
+                scale.logical(pane.presentation.size.width()).unsigned_abs() * 2,
+                scale
+                    .logical(pane.presentation.size.height())
+                    .unsigned_abs()
+                    * 2,
+            );
+            bound = Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))));
+        });
+        bound
     }
 
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
@@ -334,11 +330,8 @@ impl State {
     }
 
     fn touch(&mut self, window: WindowId) {
-        for entry in self.attachments.panes.values_mut() {
-            if entry.window() == Some(window) {
-                entry.presentation.mark_dirty();
-            }
-        }
+        self.attachments
+            .for_each_showing_mut(window, |_, entry| entry.presentation.mark_dirty());
     }
 
     fn send_title(&mut self, pane: PaneId, window: WindowId) {
@@ -348,14 +341,12 @@ impl State {
 
     fn send_titles(&mut self, window: WindowId) {
         let title = meowland_protocol::sanitize(self.catalog.title(window));
-        for (&pane, entry) in &self.attachments.panes {
-            if entry.window() == Some(window) {
-                self.events.push(Event {
-                    pane,
-                    message: ServerToPane::Title(title.clone()),
-                });
-            }
-        }
+        self.attachments.for_each_showing(window, |pane, _| {
+            self.events.push(Event {
+                pane,
+                message: ServerToPane::Title(title.clone()),
+            });
+        });
     }
 
     fn emit(&mut self, pane: PaneId, message: ServerToPane) {

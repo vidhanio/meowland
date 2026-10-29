@@ -199,9 +199,8 @@ impl State {
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
         if self
             .attachments
-            .panes
-            .values()
-            .any(|pane| pane.presentation.due())
+            .iter()
+            .any(|(_, pane)| pane.presentation.due())
         {
             return Some(Duration::ZERO);
         }
@@ -252,13 +251,13 @@ impl State {
     }
 
     pub(crate) fn pane_ack(&mut self, pane: super::PaneId, ack: FrameAck) {
-        if let Some(entry) = self.attachments.panes.get_mut(&pane) {
+        if let Some(entry) = self.attachments.get_mut(pane) {
             entry.presentation.ack(pane, ack);
         }
     }
 
     pub(crate) fn dispatch_frames(&mut self) {
-        for (&pane, entry) in &mut self.attachments.panes {
+        for (&pane, entry) in self.attachments.iter_mut() {
             if !entry.presentation.due() {
                 continue;
             }

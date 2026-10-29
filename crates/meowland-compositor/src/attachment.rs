@@ -1,6 +1,6 @@
 //! Pane bindings and selection policy, independent of Wayland resources.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
@@ -23,7 +23,7 @@ pub(crate) enum Selection {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum Binding {
+enum Binding {
     Waiting(Selection),
     Empty,
     Showing(WindowId),
@@ -36,13 +36,13 @@ pub(crate) enum Policy {
 }
 
 pub(crate) struct AttachedPane {
-    pub binding: Binding,
+    binding: Binding,
     pub policy: Policy,
     pub presentation: PaneState,
 }
 
 impl AttachedPane {
-    pub(crate) fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
+    fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
         let policy = if matches!(show, Show::Newest)
             || (window.is_none() && matches!(show, Show::Focused))
         {
@@ -72,7 +72,15 @@ impl AttachedPane {
         }
     }
 
-    pub(crate) fn show(&mut self, window: WindowId) -> Option<String> {
+    /// Selection this pane cannot resolve to a window yet, if any.
+    pub(crate) const fn waiting(&self) -> Option<&Selection> {
+        match &self.binding {
+            Binding::Waiting(selection) => Some(selection),
+            Binding::Empty | Binding::Showing(_) => None,
+        }
+    }
+
+    fn show(&mut self, window: WindowId) -> Option<String> {
         let previous = std::mem::replace(&mut self.binding, Binding::Showing(window));
         self.presentation.mark_dirty();
         match previous {
@@ -81,38 +89,122 @@ impl AttachedPane {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
+    fn clear(&mut self) {
         self.binding = Binding::Empty;
         self.presentation.mark_dirty();
     }
 }
 
+/// Attached panes plus the index from windows to the panes showing them.
+///
+/// Binding changes go through this type so the index cannot drift.
 #[derive(Default)]
 pub(crate) struct Attachments {
-    pub panes: HashMap<PaneId, AttachedPane>,
+    panes: BTreeMap<PaneId, AttachedPane>,
+    by_window: HashMap<WindowId, BTreeSet<PaneId>>,
     deciding: HashMap<WindowId, PaneId>,
 }
 
 impl Attachments {
-    pub(crate) fn first_window(&self) -> Option<WindowId> {
-        self.panes
-            .iter()
-            .filter_map(|(id, pane)| pane.window().map(|window| (*id, window)))
-            .min_by_key(|(id, _)| *id)
-            .map(|(_, window)| window)
+    pub(crate) fn len(&self) -> usize {
+        self.panes.len()
+    }
+
+    pub(crate) fn contains(&self, pane: PaneId) -> bool {
+        self.panes.contains_key(&pane)
+    }
+
+    pub(crate) fn get(&self, pane: PaneId) -> Option<&AttachedPane> {
+        self.panes.get(&pane)
+    }
+
+    /// Borrow a pane for presentation changes; binding changes belong to
+    /// [`Attachments::show`] and [`Attachments::clear`].
+    pub(crate) fn get_mut(&mut self, pane: PaneId) -> Option<&mut AttachedPane> {
+        self.panes.get_mut(&pane)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&PaneId, &AttachedPane)> {
+        self.panes.iter()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&PaneId, &mut AttachedPane)> {
+        self.panes.iter_mut()
+    }
+
+    /// Attach a pane, replacing any previous attachment with the same ID.
+    pub(crate) fn insert(
+        &mut self,
+        pane: PaneId,
+        show: Show,
+        window: Option<WindowId>,
+        size: FrameSize,
+    ) {
+        let entry = AttachedPane::new(show, window, size);
+        let window = entry.window();
+        if let Some(previous) = self.panes.insert(pane, entry)
+            && let Some(previous) = previous.window()
+        {
+            self.unlink(previous, pane);
+        }
+        if let Some(window) = window {
+            self.link(window, pane);
+        }
+    }
+
+    /// Bind a pane to a window, returning the activation token it was waiting
+    /// for.
+    pub(crate) fn show(&mut self, pane: PaneId, window: WindowId) -> Option<String> {
+        let entry = self.panes.get_mut(&pane)?;
+        let previous = entry.window();
+        let token = entry.show(window);
+        if previous != Some(window) {
+            if let Some(previous) = previous {
+                self.unlink(previous, pane);
+            }
+            self.link(window, pane);
+        }
+        token
+    }
+
+    /// Leave a pane attached but showing no window.
+    pub(crate) fn clear(&mut self, pane: PaneId) {
+        let Some(entry) = self.panes.get_mut(&pane) else {
+            return;
+        };
+        let previous = entry.window();
+        entry.clear();
+        if let Some(previous) = previous {
+            self.unlink(previous, pane);
+        }
+    }
+
+    pub(crate) fn remove(&mut self, pane: PaneId) -> Option<AttachedPane> {
+        self.deciding.retain(|_, owner| *owner != pane);
+        let removed = self.panes.remove(&pane)?;
+        if let Some(window) = removed.window() {
+            self.unlink(window, pane);
+        }
+        Some(removed)
     }
 
     pub(crate) fn showing(&self, window: WindowId) -> Vec<PaneId> {
-        self.panes
-            .iter()
-            .filter_map(|(id, pane)| (pane.window() == Some(window)).then_some(*id))
+        self.by_window
+            .get(&window)
+            .into_iter()
+            .flatten()
+            .copied()
             .collect()
+    }
+
+    pub(crate) fn first_window(&self) -> Option<WindowId> {
+        self.panes.values().find_map(AttachedPane::window)
     }
 
     pub(crate) fn following(&self) -> Vec<PaneId> {
         self.panes
             .iter()
-            .filter_map(|(id, pane)| (pane.policy == Policy::FollowNewest).then_some(*id))
+            .filter_map(|(&pane, entry)| (entry.policy == Policy::FollowNewest).then_some(pane))
             .collect()
     }
 
@@ -124,18 +216,18 @@ impl Attachments {
         self.deciding
             .get(&window)
             .copied()
-            .filter(|id| {
+            .filter(|pane| {
                 self.panes
-                    .get(id)
-                    .is_some_and(|pane| pane.window() == Some(window))
+                    .get(pane)
+                    .is_some_and(|entry| entry.window() == Some(window))
             })
-            .or_else(|| {
-                self.panes
-                    .iter()
-                    .filter(|(_, pane)| pane.window() == Some(window))
-                    .min_by_key(|(id, _)| *id)
-                    .map(|(id, _)| *id)
-            })
+            .or_else(|| self.first_showing(window))
+    }
+
+    pub(crate) fn first_showing(&self, window: WindowId) -> Option<PaneId> {
+        self.by_window
+            .get(&window)
+            .and_then(|panes| panes.first().copied())
     }
 
     pub(crate) fn size(&self, window: WindowId) -> Option<FrameSize> {
@@ -145,17 +237,47 @@ impl Attachments {
     }
 
     pub(crate) fn visible(&self, window: WindowId) -> bool {
-        self.panes
-            .values()
-            .any(|pane| pane.window() == Some(window))
+        self.by_window.contains_key(&window)
     }
 
-    pub(crate) fn remove(&mut self, pane: PaneId) -> Option<AttachedPane> {
-        self.deciding.retain(|_, owner| *owner != pane);
-        self.panes.remove(&pane)
+    pub(crate) fn for_each_showing(
+        &self,
+        window: WindowId,
+        mut visit: impl FnMut(PaneId, &AttachedPane),
+    ) {
+        for &pane in self.by_window.get(&window).into_iter().flatten() {
+            if let Some(entry) = self.panes.get(&pane) {
+                visit(pane, entry);
+            }
+        }
+    }
+
+    pub(crate) fn for_each_showing_mut(
+        &mut self,
+        window: WindowId,
+        mut visit: impl FnMut(PaneId, &mut AttachedPane),
+    ) {
+        for &pane in self.by_window.get(&window).into_iter().flatten() {
+            if let Some(entry) = self.panes.get_mut(&pane) {
+                visit(pane, entry);
+            }
+        }
     }
 
     pub(crate) fn forget_window(&mut self, window: WindowId) {
         self.deciding.remove(&window);
+    }
+
+    fn link(&mut self, window: WindowId, pane: PaneId) {
+        self.by_window.entry(window).or_default().insert(pane);
+    }
+
+    fn unlink(&mut self, window: WindowId, pane: PaneId) {
+        if let Some(panes) = self.by_window.get_mut(&window) {
+            panes.remove(&pane);
+            if panes.is_empty() {
+                self.by_window.remove(&window);
+            }
+        }
     }
 }

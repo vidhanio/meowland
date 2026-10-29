@@ -72,11 +72,7 @@ impl State {
     }
 
     pub(crate) fn send_pane_cursor(&mut self, pane: PaneId) {
-        let window = self
-            .attachments
-            .panes
-            .get(&pane)
-            .and_then(AttachedPane::window);
+        let window = self.attachments.get(pane).and_then(AttachedPane::window);
         let focused = self
             .pointer
             .as_ref()

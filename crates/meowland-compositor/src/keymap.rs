@@ -22,6 +22,8 @@ const MAX_KEY: u16 = 255;
 const LEVELS: u32 = 2;
 /// First Kitty functional-key number.
 const FUNCTIONAL_BASE: u32 = 57344;
+/// First key number after the Kitty functional-key range.
+const FUNCTIONAL_END: u32 = 63744;
 
 /// Reverse keyboard map for the active layout.
 #[derive(Debug, Default)]
@@ -42,7 +44,7 @@ impl Keymap {
         if let Some(code) = functional_code(key) {
             return Some(code);
         }
-        if key >= FUNCTIONAL_BASE {
+        if is_functional(key) {
             return None;
         }
         let character = char::from_u32(key)?.to_ascii_lowercase();
@@ -92,11 +94,15 @@ pub(crate) fn refresh(state: &mut Compositor) {
 
 /// Text committed for a printable key the active layout cannot type.
 pub(crate) fn text(key: u32) -> Option<String> {
-    if key >= FUNCTIONAL_BASE {
+    if is_functional(key) {
         return None;
     }
     let character = char::from_u32(key)?;
     (!character.is_control()).then(|| character.to_string())
+}
+
+fn is_functional(key: u32) -> bool {
+    (FUNCTIONAL_BASE..FUNCTIONAL_END).contains(&key)
 }
 
 fn active_layout(keyboard: &KeyboardHandle<Compositor>, state: &mut Compositor) -> Layout {

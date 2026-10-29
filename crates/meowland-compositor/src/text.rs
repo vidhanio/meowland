@@ -57,11 +57,10 @@ fn fallback(state: &mut State, text: &str) {
         .chars()
         .map(|character| xkb::utf32_to_keysym(u32::from(character)))
         .collect();
-    let Some(keyboard) = state.keyboard.take() else {
+    let Some(keyboard) = state.keyboard.clone() else {
         return;
     };
     for chunk in keysyms.chunks(200) {
         keyboard.inject_text_keysyms(state, chunk, InputTime::now());
     }
-    state.keyboard = Some(keyboard);
 }

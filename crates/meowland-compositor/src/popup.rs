@@ -12,13 +12,12 @@ impl State {
         let Some(grab) = self.popup_grab.take_if(|grab| grab.has_ended()) else {
             return;
         };
-        if let Some(keyboard) = self.keyboard.take() {
-            if keyboard.has_grab(grab.serial()) {
-                keyboard.unset_grab(self);
-                let focus = grab.current_grab().filter(Resource::is_alive);
-                keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
-            }
-            self.keyboard = Some(keyboard);
+        if let Some(keyboard) = self.keyboard.clone()
+            && keyboard.has_grab(grab.serial())
+        {
+            keyboard.unset_grab(self);
+            let focus = grab.current_grab().filter(Resource::is_alive);
+            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
         }
         if let Some(pointer) = self.pointer.take() {
             if pointer.has_grab(grab.serial()) {

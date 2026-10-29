@@ -61,9 +61,8 @@ impl State {
             .windows
             .get(&window)
             .map(|entry| entry.surface.wl_surface().clone());
-        if let Some(keyboard) = self.keyboard.take() {
+        if let Some(keyboard) = self.keyboard.clone() {
             keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
-            self.keyboard = Some(keyboard);
         }
         if let Some(previous) = previous {
             self.apply_window_state(previous);
@@ -86,6 +85,11 @@ impl State {
         self.send_cursor(pane, shape);
     }
 
+    /// Drop pointer focus on a window that is going away.
+    ///
+    /// The handle stays taken across `motion` so the `cursor_image` callback
+    /// it can trigger does not deliver a cursor mid-move; the delivery below
+    /// sees the new focus instead.
     pub(crate) fn clear_window_pointer(&mut self, window: WindowId) {
         let focused = self
             .pointer

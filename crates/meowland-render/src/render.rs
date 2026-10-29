@@ -698,29 +698,29 @@ mod tests {
     }
 
     #[test]
-    fn blending_matches_a_rounded_reference_formula() {
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::suboptimal_flops,
+        reason = "the reference rounds a clamped value into the byte range without fused arithmetic"
+    )]
+    fn blending_matches_a_float_source_over_reference() {
         for alpha in 0..=u8::MAX {
-            for source in 0..=u8::MAX {
+            for source in 0..=alpha {
+                let source_rgb = [source, alpha - source, source / 2];
                 for under in 0..=u8::MAX {
                     let underneath = [under, under.wrapping_add(40), under.wrapping_sub(50)];
-                    let source_rgb = [source, source.wrapping_mul(5), source.wrapping_add(77)];
                     let mut rgb = underneath;
                     blend_pixel(
                         [source_rgb[0], source_rgb[1], source_rgb[2], alpha],
                         &mut rgb,
                     );
                     for channel in 0..3 {
-                        let expected = match alpha {
-                            0 => underneath[channel],
-                            255 => source_rgb[channel],
-                            _ => {
-                                let alpha = u32::from(alpha);
-                                let numerator = u32::from(source_rgb[channel]) * 255
-                                    + u32::from(underneath[channel]) * (255 - alpha)
-                                    + 127;
-                                u8::try_from((numerator / 255).min(255)).unwrap()
-                            }
-                        };
+                        let expected = (f64::from(source_rgb[channel])
+                            + f64::from(underneath[channel]) * (1.0 - f64::from(alpha) / 255.0))
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
                         assert_eq!(
                             rgb[channel], expected,
                             "alpha {alpha}, source {source}, under {under}, channel {channel}"
@@ -729,6 +729,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn invalid_premultiplied_pixels_saturate_and_zero_alpha_is_ignored() {
+        let mut saturated = [250, 250, 250];
+        blend_pixel([200, 200, 200, 64], &mut saturated);
+        assert_eq!(
+            saturated,
+            [255, 255, 255],
+            "invalid channels must saturate rather than wrap"
+        );
+
+        let mut underneath = [1, 2, 3];
+        blend_pixel([200, 150, 100, 0], &mut underneath);
+        assert_eq!(
+            underneath,
+            [1, 2, 3],
+            "a zero-alpha source pixel must leave the pane untouched"
+        );
     }
 
     #[test]

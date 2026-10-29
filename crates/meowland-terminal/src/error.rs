@@ -1,16 +1,27 @@
 //! Failures reported by the terminal-pane client.
 
-use std::io;
+use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
-/// A pane client failure: an underlying transport error or a missing terminal
-/// capability.
+/// A pane client failure: a transport error or a missing terminal capability.
 #[derive(Debug, Error)]
 pub enum Error {
     /// An underlying transport, signal, or I/O failure.
     #[error(transparent)]
-    Core(#[from] meowland_core::Error),
+    Io(#[from] io::Error),
+    /// The pane socket could not be reached.
+    #[error(
+        "could not reach the pane socket {} (is the server running?)",
+        .path.display()
+    )]
+    Connect {
+        /// Socket that was being connected.
+        path: PathBuf,
+        /// Original connection error.
+        #[source]
+        source: io::Error,
+    },
     /// The terminal cannot report pixel-accurate pointer events.
     #[error("terminal does not support SGR pixel mouse reporting")]
     PixelMouseUnsupported,
@@ -35,20 +46,6 @@ pub enum Error {
         /// Height in physical pixels.
         height: u32,
     },
-}
-
-impl Error {
-    /// Attach an operation description without discarding the original I/O
-    /// error.
-    pub fn io(action: impl Into<String>, source: io::Error) -> Self {
-        Self::Core(meowland_core::Error::io(action, source))
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(source: io::Error) -> Self {
-        Self::Core(source.into())
-    }
 }
 
 /// Result of a pane client operation.

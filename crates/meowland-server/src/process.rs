@@ -7,10 +7,10 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use meowland_core::{Error, Result};
 use nix::sys::signal::{SigSet, Signal};
 
 use super::Server;
+use crate::{Error, Result};
 
 /// Launch with the server's signalfd subscriptions unblocked in the child.
 /// The pre-exec closure only invokes the async-signal-safe signal-mask

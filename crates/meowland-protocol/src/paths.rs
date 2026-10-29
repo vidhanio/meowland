@@ -1,6 +1,20 @@
+//! Socket discovery inside the user's runtime directory.
+
 use std::{env, path::PathBuf};
 
-use meowland_core::{Error, Result};
+use thiserror::Error;
+
+/// Why socket discovery failed.
+#[derive(Clone, Debug, Error)]
+#[non_exhaustive]
+pub enum PathsError {
+    /// Socket discovery requires a runtime directory.
+    #[error("XDG_RUNTIME_DIR is not set")]
+    RuntimeDirectoryUnset,
+    /// The configured runtime path is not a directory.
+    #[error("XDG_RUNTIME_DIR is not a directory: {0}")]
+    RuntimeDirectoryInvalid(PathBuf),
+}
 
 /// The server's control and pane socket addresses.
 #[derive(Clone, Debug)]
@@ -16,10 +30,10 @@ impl Paths {
     ///
     /// # Errors
     /// Returns an error when `XDG_RUNTIME_DIR` is unset or is not a directory.
-    pub fn discover() -> Result<Self> {
+    pub fn discover() -> Result<Self, PathsError> {
         let runtime = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .ok_or(Error::RuntimeDirectoryUnset)?;
+            .ok_or(PathsError::RuntimeDirectoryUnset)?;
         Self::in_runtime_dir(runtime)
     }
 
@@ -27,10 +41,10 @@ impl Paths {
     ///
     /// # Errors
     /// Returns an error when the directory does not exist.
-    fn in_runtime_dir(runtime: impl Into<PathBuf>) -> Result<Self> {
+    fn in_runtime_dir(runtime: impl Into<PathBuf>) -> Result<Self, PathsError> {
         let runtime = runtime.into();
         if !runtime.is_dir() {
-            return Err(Error::RuntimeDirectoryInvalid(runtime));
+            return Err(PathsError::RuntimeDirectoryInvalid(runtime));
         }
         Ok(Self {
             control: runtime.join("meowland-control.sock"),

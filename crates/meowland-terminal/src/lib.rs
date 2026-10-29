@@ -47,14 +47,9 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
                 connect(&handle, &socket),
             )
             .await
-            .map_err(|error| {
-                Error::io(
-                    format!(
-                        "could not reach the pane socket {} (is the server running?)",
-                        socket.display()
-                    ),
-                    error,
-                )
+            .map_err(|source| Error::Connect {
+                path: socket.clone(),
+                source,
             })?;
             let writer = handle
                 .adapt_io(stream.get_mut().try_clone()?)

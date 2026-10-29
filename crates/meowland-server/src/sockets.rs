@@ -12,8 +12,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use meowland_core::{Error, Result};
 use meowland_protocol::Paths;
+
+use crate::{Error, Result};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SocketIdentity {
@@ -58,8 +59,11 @@ pub(crate) fn listeners(paths: &Paths) -> Result<Listeners> {
     let mut inherited = listenfd::ListenFd::from_env();
     if inherited.len() == 0 {
         return Ok(Listeners {
-            control: bind(&paths.control)?,
-            pane: bind(&paths.pane)?,
+            control: bind(&paths.control).map_err(|error| {
+                error.with_context(format!("binding {}", paths.control.display()))
+            })?,
+            pane: bind(&paths.pane)
+                .map_err(|error| error.with_context(format!("binding {}", paths.pane.display())))?,
         });
     }
     if inherited.len() != 2 {

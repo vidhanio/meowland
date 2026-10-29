@@ -9,7 +9,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-meowland-core = { workspace = true }
 meowland-async = { workspace = true }
 meowland-protocol = { workspace = true, features = ["async"] }
 meowland-compositor = { workspace = true }
@@ -21,4 +20,5 @@ sd-notify = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true, features = ["use-std"] }
 futures = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }

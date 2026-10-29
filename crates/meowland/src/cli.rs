@@ -7,14 +7,13 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, Result, bail};
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowId, WindowInfo,
     WindowState,
 };
 use meowland_terminal as terminal;
 use usage_rs::{Args, Cli, Subcommands, ValueEnum};
-
-use crate::error::{Error, Result};
 
 #[derive(Cli)]
 #[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
@@ -190,7 +189,8 @@ pub(crate) fn run(command: Commands) -> Result<()> {
         Commands::Server(args) => {
             let paths = Paths::discover()?;
             let settings = crate::configuration::load(args.config.as_deref())?;
-            Ok(meowland_server::serve(&paths, &settings)?)
+            meowland_server::serve(&paths, &settings)?;
+            Ok(())
         }
         Commands::List => {
             let paths = Paths::discover()?;
@@ -218,22 +218,21 @@ pub(crate) fn run(command: Commands) -> Result<()> {
             let launch = ControlRequest::Run {
                 args: client,
                 env: std::env::vars_os().collect(),
-                cwd: std::env::current_dir()
-                    .map_err(|error| Error::io("reading launch working directory", error))?,
+                cwd: std::env::current_dir().context("reading launch working directory")?,
             };
             let ControlResponse::Started(token) = request(&paths, &launch)? else {
-                return Err(Error::UnexpectedRunResponse);
+                bail!("server did not return a launch activation token");
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 let show = app_id.map_or(Show::Activation(token), Show::AppId);
-                Ok(terminal::attach(&paths.pane, show)?)
-            } else {
-                Ok(())
+                terminal::attach(&paths.pane, show)?;
             }
+            Ok(())
         }
         Commands::Attach(AttachArgs { window }) => {
             let paths = Paths::discover()?;
-            Ok(terminal::attach(&paths.pane, window_target(window))?)
+            terminal::attach(&paths.pane, window_target(window))?;
+            Ok(())
         }
         Commands::Kill(args) => {
             let paths = Paths::discover()?;
@@ -259,7 +258,7 @@ fn list_with_timeout(paths: &Paths, timeout: Duration) -> Result<Vec<WindowInfo>
     let ControlResponse::Windows(windows) =
         request_with_timeout(paths, &ControlRequest::List, timeout)?
     else {
-        return Err(Error::UnexpectedWindowListResponse);
+        bail!("server did not return windows");
     };
     Ok(windows)
 }
@@ -273,18 +272,20 @@ fn request_with_timeout(
     value: &ControlRequest,
     timeout: Duration,
 ) -> Result<ControlResponse> {
-    let mut socket = UnixStream::connect(&paths.control).map_err(|error| {
-        Error::io(
-            "cannot reach the server; run `meowland server` or start `meowland.socket` with systemctl --user",
-            error,
-        )
-    })?;
-    socket.set_read_timeout(Some(timeout))?;
-    socket.set_write_timeout(Some(timeout))?;
-    protocol::send(&mut socket, value)?;
-    let reply: ControlResponse = protocol::recv(&mut socket)?;
+    let mut socket = UnixStream::connect(&paths.control).context(
+        "cannot reach the server; run `meowland server` or start `meowland.socket` with systemctl --user",
+    )?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .context("configuring the control socket")?;
+    socket
+        .set_write_timeout(Some(timeout))
+        .context("configuring the control socket")?;
+    protocol::send(&mut socket, value).context("sending the control request")?;
+    let reply: ControlResponse =
+        protocol::recv(&mut socket).context("reading the control response")?;
     match reply {
-        ControlResponse::Error(error) => Err(Error::ServerResponse(error)),
+        ControlResponse::Error(error) => bail!("server rejected the request: {error}"),
         reply => Ok(reply),
     }
 }

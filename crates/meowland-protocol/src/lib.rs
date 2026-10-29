@@ -10,7 +10,7 @@ mod protocol;
 mod shared;
 
 pub use frame::FrameBand;
-pub use paths::Paths;
+pub use paths::{Paths, PathsError};
 pub use protocol::{
     Button, ClipboardOfferId, ClipboardRequestId, ControlRequest, ControlResponse, FrameAck, Hello,
     Input, KEY_INSERT, KEY_V, KeyBinding, MAX_INPUT_TEXT, MAX_MESSAGE, Modifiers, OfferIntent,

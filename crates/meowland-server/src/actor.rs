@@ -13,19 +13,20 @@ use calloop::{
     signals::{Signal, Signals},
 };
 use meowland_compositor::{CompositorHandle, Runtime, Settings};
-use meowland_core::Result;
 use meowland_protocol::Paths;
 
 use super::{
-    Completion, ConnectionId, Listener, MAX_CONNECTIONS, Server,
+    Completion, ConnectionId, Error, Listener, MAX_CONNECTIONS, Result, Server,
     lifecycle::Shutdown,
     notify, sockets,
     transport::{self, ConnectionKind},
 };
 
 pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
-    let listeners = sockets::listeners(paths)?;
-    let event_loop = EventLoop::<Server>::try_new().map_err(io::Error::from)?;
+    let listeners = sockets::listeners(paths)
+        .map_err(|error| error.with_context("setting up control and pane sockets"))?;
+    let event_loop = EventLoop::<Server>::try_new()
+        .map_err(|error| Error::io("creating the event loop", io::Error::from(error)))?;
     let handle = event_loop.handle();
     let signals = Signals::new(&[
         Signal::SIGINT,
@@ -33,15 +34,17 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
         Signal::SIGHUP,
         Signal::SIGCHLD,
     ])
-    .map_err(io::Error::from)?;
+    .map_err(|error| Error::io("installing signal handling", io::Error::from(error)))?;
     notify(&[sd_notify::NotifyState::Status("Starting compositor")]);
     let display = format!("wayland-meowland-{}", std::process::id());
     let (wayland, compositor) = Runtime::with_settings(
         &display,
         settings,
         &CompositorHandle::new(handle.clone(), |server| &mut server.compositor),
-    )?;
-    let (executor, scheduler) = futures::executor().map_err(io::Error::from)?;
+    )
+    .map_err(|error| Error::io("starting the Wayland compositor", error))?;
+    let (executor, scheduler) = futures::executor()
+        .map_err(|error| Error::io("creating the async executor", io::Error::from(error)))?;
     let executor = Dispatcher::new(
         executor,
         |completion, (), server: &mut Server| match completion {
@@ -56,19 +59,23 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
     );
     let executor_token = handle
         .register_dispatcher(executor.clone())
-        .map_err(io::Error::from)?;
+        .map_err(|error| Error::io("registering the async executor", io::Error::from(error)))?;
     handle
         .insert_source(signals, |event, (), server| match event.signal() {
             Signal::SIGCHLD => server.reap_children(),
             Signal::SIGINT | Signal::SIGTERM => server.begin_shutdown(),
             _ => {}
         })
-        .map_err(|error| io::Error::from(error.error))?;
+        .map_err(|error| Error::io("registering signal handling", io::Error::from(error.error)))?;
     let mut registered = Vec::new();
     for (socket, kind) in [
         (listeners.control, ConnectionKind::Control),
         (listeners.pane, ConnectionKind::Pane),
     ] {
+        let action = match kind {
+            ConnectionKind::Control => "registering the control socket",
+            ConnectionKind::Pane => "registering the pane socket",
+        };
         let token = handle
             .insert_source(
                 Generic::new(socket, Interest::READ, Mode::Level),
@@ -77,7 +84,7 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
                     Ok(PostAction::Continue)
                 },
             )
-            .map_err(|error| io::Error::from(error.error))?;
+            .map_err(|error| Error::io(action, io::Error::from(error.error)))?;
         registered.push(Listener {
             token,
             kind,
@@ -117,7 +124,9 @@ fn run(mut event_loop: EventLoop<'static, Server>, mut server: Server) -> Result
         if server.shutdown.stopped() {
             break;
         }
-        server.update_listeners()?;
+        server
+            .update_listeners()
+            .map_err(|error| Error::io("updating listener state", error))?;
         let timeout = Runtime::next_wakeup(&server.compositor)
             .into_iter()
             .chain(
@@ -129,8 +138,11 @@ fn run(mut event_loop: EventLoop<'static, Server>, mut server: Server) -> Result
             .min();
         event_loop
             .dispatch(timeout, &mut server)
-            .map_err(io::Error::from)?;
-        server.wayland.dispatch(&mut server.compositor)?;
+            .map_err(|error| Error::io("running the event loop", io::Error::from(error)))?;
+        server
+            .wayland
+            .dispatch(&mut server.compositor)
+            .map_err(|error| Error::io("dispatching Wayland clients", error))?;
         events.extend(server.compositor.drain_events());
         #[expect(
             clippy::iter_with_drain,
@@ -145,7 +157,7 @@ fn run(mut event_loop: EventLoop<'static, Server>, mut server: Server) -> Result
     }
     server.reap_children();
     if let Some(error) = server.error.take() {
-        return Err(error.into());
+        return Err(error);
     }
     Ok(())
 }
@@ -192,7 +204,7 @@ impl Server {
                 return;
             }
             Err(error) => {
-                self.error = Some(error);
+                self.error = Some(Error::io("accepting a connection", error));
                 self.begin_shutdown();
                 return;
             }

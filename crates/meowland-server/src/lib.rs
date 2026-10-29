@@ -15,18 +15,19 @@ pub use meowland_compositor::{
     InvalidOutputSize, InvalidRepeatDelay, InvalidRepeatRate, KeyboardSettings, RepeatDelay,
     RepeatRate, Settings,
 };
-use meowland_core::Result;
 use meowland_protocol::{
     ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane, Shortcuts,
 };
 
 mod actor;
 mod control;
+mod error;
 mod lifecycle;
 mod process;
 mod sockets;
 mod transport;
 
+pub use error::{Error, Result};
 use lifecycle::Shutdown;
 use transport::{ConnectionKind, PaneTransport};
 
@@ -86,7 +87,7 @@ struct Server {
     shortcuts: Shortcuts,
     children: Vec<Child>,
     shutdown: Shutdown,
-    error: Option<io::Error>,
+    error: Option<Error>,
 }
 
 /// Run the single-owner server with output and keyboard settings.

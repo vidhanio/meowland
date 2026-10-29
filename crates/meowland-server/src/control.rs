@@ -34,7 +34,7 @@ impl Server {
                     Err(error) => {
                         self.compositor
                             .cancel_activation(&token, "launch cancelled");
-                        ControlResponse::Error(error.to_string())
+                        ControlResponse::Error(error.report())
                     }
                 }
             }

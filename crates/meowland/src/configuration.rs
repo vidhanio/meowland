@@ -1,6 +1,6 @@
 use std::{fs, io, path::Path};
 
-use meowland_core::{Error, Result};
+use anyhow::{Context, Result};
 use meowland_server::Settings;
 
 pub(crate) fn load(path: Option<&Path>) -> Result<Settings> {
@@ -10,9 +10,7 @@ pub(crate) fn load(path: Option<&Path>) -> Result<Settings> {
         path
     } else {
         default_path = dirs::config_dir()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "cannot locate config directory")
-            })?
+            .context("cannot locate config directory")?
             .join("meowland/config.toml");
         &default_path
     };
@@ -22,16 +20,8 @@ pub(crate) fn load(path: Option<&Path>) -> Result<Settings> {
             return Ok(Settings::default());
         }
         Err(error) => {
-            return Err(Error::io(
-                format!("reading configuration {}", path.display()),
-                error,
-            ));
+            return Err(error).with_context(|| format!("reading configuration {}", path.display()));
         }
     };
-    toml::from_str(&contents).map_err(|error| {
-        Error::io(
-            format!("loading configuration {}", path.display()),
-            io::Error::new(io::ErrorKind::InvalidData, error),
-        )
-    })
+    toml::from_str(&contents).with_context(|| format!("loading configuration {}", path.display()))
 }

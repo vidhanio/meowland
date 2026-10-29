@@ -2,7 +2,6 @@
 
 mod cli;
 mod configuration;
-mod error;
 mod logging;
 
 use std::io::{self, Write};
@@ -11,7 +10,7 @@ fn main() {
     let command = cli::parse();
     logging::init(command.log_destination());
     if let Err(error) = cli::run(command) {
-        let _ = writeln!(io::stderr().lock(), "meowland: {error}");
+        let _ = writeln!(io::stderr().lock(), "meowland: {error:#}");
         std::process::exit(1);
     }
 }

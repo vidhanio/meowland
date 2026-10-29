@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "appendlist"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -653,12 +659,11 @@ dependencies = [
 name = "meowland"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dirs",
- "meowland-core",
  "meowland-protocol",
  "meowland-server",
  "meowland-terminal",
- "thiserror",
  "toml",
  "tracing-journald",
  "tracing-subscriber",
@@ -764,6 +769,7 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_bytes",
+ "thiserror",
 ]
 
 [[package]]
@@ -813,13 +819,13 @@ dependencies = [
  "listenfd",
  "meowland-async",
  "meowland-compositor",
- "meowland-core",
  "meowland-protocol",
  "nix",
  "postcard",
  "rustix 1.1.5",
  "sd-notify",
  "serde",
+ "thiserror",
  "tracing",
 ]
 

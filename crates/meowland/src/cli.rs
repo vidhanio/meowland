@@ -7,12 +7,13 @@ use std::{
     time::Duration,
 };
 
-use meowland_core::{Error, Result};
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowInfo,
 };
 use meowland_terminal as terminal;
 use usage_rs::{Args, Cli, Subcommands, ValueEnum};
+
+use crate::error::{Error, Result};
 
 #[derive(Cli)]
 #[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
@@ -188,7 +189,7 @@ pub(crate) fn run(command: Commands) -> Result<()> {
         Commands::Server(args) => {
             let paths = Paths::discover()?;
             let settings = crate::configuration::load(args.config.as_deref())?;
-            meowland_server::serve(&paths, &settings)
+            Ok(meowland_server::serve(&paths, &settings)?)
         }
         Commands::List => {
             let paths = Paths::discover()?;
@@ -221,14 +222,14 @@ pub(crate) fn run(command: Commands) -> Result<()> {
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 let show = app_id.map_or(Show::Activation(token), Show::AppId);
-                terminal::attach(&paths.pane, show)
+                Ok(terminal::attach(&paths.pane, show)?)
             } else {
                 Ok(())
             }
         }
         Commands::Attach(AttachArgs { window }) => {
             let paths = Paths::discover()?;
-            terminal::attach(&paths.pane, window_target(window))
+            Ok(terminal::attach(&paths.pane, window_target(window))?)
         }
         Commands::Kill(args) => {
             let paths = Paths::discover()?;

@@ -590,6 +590,7 @@ dependencies = [
  "meowland-server",
  "meowland-terminal",
  "rustix 1.1.5",
+ "thiserror",
  "toml",
  "tracing-journald",
  "tracing-subscriber",
@@ -702,6 +703,7 @@ dependencies = [
  "meowland-protocol",
  "meowland-terminal-clipboard",
  "rustix 1.1.5",
+ "thiserror",
  "tracing",
  "vtparse",
 ]

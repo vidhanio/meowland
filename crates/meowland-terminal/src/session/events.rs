@@ -1,6 +1,5 @@
 //! Terminal events and clipboard actions coordinated by one session owner.
 
-use meowland_core::Result;
 use meowland_input::{Event, keyboard};
 use meowland_protocol::{
     self as protocol, Input, PaneAction, PaneToServer, Shortcut,
@@ -12,6 +11,7 @@ use super::{
     TerminalSession,
     terminal::{self, FALLBACK_CELL},
 };
+use crate::Result;
 
 impl TerminalSession {
     pub(super) fn send_event(&mut self, event: Event) -> Result<()> {

@@ -37,6 +37,7 @@ meowland-compositor = { workspace = true }
 meowland-protocol = { workspace = true }
 meowland-server = { workspace = true }
 meowland-terminal = { workspace = true }
+thiserror = { workspace = true }
 toml = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use futures::io::AsyncWrite;
-use meowland_core::{Result, latency::Latency};
+use meowland_core::latency::Latency;
 use meowland_kitty::{PresentOutcome, Presenter, present_shared};
 use meowland_protocol::{
     FrameAck, FrameBand, FrameTransport, PaneAction, PaneToServer, SharedFrame,
@@ -11,6 +11,7 @@ use meowland_protocol::{
 };
 
 use super::output;
+use crate::Result;
 
 mod shared;
 use shared::{Consumption, SharedPresentation};

@@ -3,18 +3,18 @@
 use std::path::Path;
 
 use calloop::{Dispatcher, EventLoop, futures::executor};
-use meowland_core::{
-    Error, Result,
-    asynchronous::{connect, timeout},
-};
+use meowland_core::asynchronous::{connect, timeout};
 use meowland_protocol::{Show, asynchronous::Reader};
 
+mod error;
 mod input_gate;
 mod output;
 mod presentation;
 mod probe;
 mod session;
 mod terminal;
+
+pub use error::{Error, Result};
 
 /// Attach this terminal to a pane until release or disconnection.
 ///

@@ -2,6 +2,7 @@
 
 mod cli;
 mod configuration;
+mod error;
 mod logging;
 
 use std::io::{self, Write};

@@ -9,7 +9,6 @@ use std::{
 use calloop::{LoopHandle, io::Async, signals::Signal as UnixSignal};
 use futures::FutureExt;
 use meowland_core::{
-    Error, Result,
     asynchronous::{Descriptor, sleep_until, when},
     future::yield_now,
     signals,
@@ -33,6 +32,7 @@ use super::{
     probe::terminal_probe,
     terminal::{self, FALLBACK_CELL, KEYBOARD_FLAGS, TerminalGuard, cursor_bytes, title_bytes},
 };
+use crate::{Error, Result};
 
 mod events;
 

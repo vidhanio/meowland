@@ -2,8 +2,7 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
-/// Failures encountered while running the compositor, server, or terminal
-/// client.
+/// Failures encountered while running the compositor or server.
 #[derive(Debug, Error)]
 pub enum Error {
     /// An operating-system or stream operation failed.
@@ -30,31 +29,6 @@ pub enum Error {
     /// A launch request contained no executable.
     #[error("run requires a command")]
     RunRequiresCommand,
-    /// The terminal cannot report pixel-accurate pointer events.
-    #[error("terminal does not support SGR pixel mouse reporting")]
-    PixelMouseUnsupported,
-    /// The terminal cannot edit Kitty graphics images in place.
-    #[error(
-        "terminal must support Kitty graphics with in-place frame updates (use Ghostty 1.4+ or current Kitty)"
-    )]
-    GraphicsUnsupported,
-    /// The terminal cannot report the required keyboard transitions.
-    #[error(
-        "terminal must support Kitty keyboard disambiguation, event types, and all-key reporting"
-    )]
-    KeyboardUnsupported,
-    /// The server did not answer the initial pane handshake in time.
-    #[error("pane handshake timed out")]
-    PaneHandshakeTimeout,
-    /// A list request received a different response type.
-    #[error("server did not return windows")]
-    UnexpectedWindowListResponse,
-    /// A successful launch response omitted its activation token.
-    #[error("server did not return a launch activation token")]
-    UnexpectedRunResponse,
-    /// The server supplied a rejection reason.
-    #[error("server rejected the request: {0}")]
-    ServerResponse(String),
 }
 
 impl Error {

@@ -103,7 +103,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   latency stats, calloop async helpers, and signals have nothing in common. Move
   `asynchronous` and `signals` into a `meowland-async` crate (or into
   protocol/terminal), and keep `core` for value types.
-- [ ] **Replace the crate-wide `Error` enum** (`meowland-core/src/error.rs`). It mixes
+- [x] **Replace the crate-wide `Error` enum** (`meowland-core/src/error.rs`). It mixes
   terminal capabilities (`PixelMouseUnsupported`, `KeyboardUnsupported`), CLI response
   handling (`UnexpectedWindowListResponse`), and server startup. Give each library
   crate its own error type. The `meowland` binary should use `anyhow`-style context.

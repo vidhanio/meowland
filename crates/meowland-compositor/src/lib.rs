@@ -63,7 +63,6 @@ mod text;
 mod toplevels;
 mod window;
 
-use Compositor as State;
 pub use attachment::PaneId;
 use attachment::{AttachedPane, Attachments, Policy, Selection};
 use catalog::WindowCatalog;
@@ -94,15 +93,11 @@ struct Window {
     callback_pending: bool,
 }
 
-/// Single-owner Wayland state, also available to host event sources.
-pub struct Compositor {
-    display: DisplayHandle,
-    handle: CompositorHandle,
+/// Protocol globals and the Smithay state that keeps them alive.
+struct Protocols {
     surfaces: CompositorState,
     shm: ShmState,
     dmabuf: DmabufState,
-    gpu: Option<DmabufBackend>,
-    readbacks: readback::Readbacks,
     xdg: XdgShellState,
     activation: XdgActivationState,
     launches: HashMap<String, activation::Launch>,
@@ -111,39 +106,58 @@ pub struct Compositor {
     kde_decoration: KdeDecorationState,
     _viewporter: ViewporterState,
     _fractional_scale: FractionalScaleManagerState,
-    scale: UiScale,
-    refresh_rate: RefreshRate,
     _single_pixel_buffer: SinglePixelBufferState,
     _output_manager: OutputManagerState,
     data_device: DataDeviceState,
     data_control: WlrDataControlState,
     ext_data_control: ExtDataControlState,
     primary_selection: PrimarySelectionState,
-    clipboard: clipboard::Bridge,
     _cursor_shape: CursorShapeManagerState,
-    bell: bell::Bell,
     _text_input: TextInputManagerState,
-    popups: PopupManager,
-    popup_grab: Option<PopupGrab<Self>>,
-    popups_dirty: bool,
-    seats: SeatState<Self>,
-    seat: Seat<Self>,
-    keyboard: Option<KeyboardHandle<Self>>,
+    toplevels: toplevels::Toplevels,
+}
+
+/// Seat, keyboard, pointer, and popup-grab state.
+struct Input {
+    seats: SeatState<Compositor>,
+    seat: Seat<Compositor>,
+    keyboard: Option<KeyboardHandle<Compositor>>,
     keyboard_state: input::KeyboardState,
     shortcuts: Shortcuts,
     keymap: keymap::Keymap,
-    pointer: Option<PointerHandle<Self>>,
-    output: Output,
-    windows: HashMap<WindowId, Window>,
-    callback_deadline: Option<Instant>,
-    ids: HashMap<WlSurface, WindowId>,
-    surface_cache: buffer::SurfaceCache,
-    catalog: WindowCatalog,
-    toplevels: toplevels::Toplevels,
-    attachments: Attachments,
+    pointer: Option<PointerHandle<Compositor>>,
+    cursor: seat::CursorState,
+    popup_grab: Option<PopupGrab<Compositor>>,
     /// Most recent input source, also used to route selection exports.
     last_input_pane: Option<PaneId>,
-    cursor: seat::CursorState,
+}
+
+/// Window map, surface index, and frame-callback pacing shared by windows.
+struct Windows {
+    by_id: HashMap<WindowId, Window>,
+    ids: HashMap<WlSurface, WindowId>,
+    callback_deadline: Option<Instant>,
+    surface_cache: buffer::SurfaceCache,
+    catalog: WindowCatalog,
+    popups: PopupManager,
+    popups_dirty: bool,
+}
+
+/// Single-owner Wayland state, also available to host event sources.
+pub struct Compositor {
+    display: DisplayHandle,
+    handle: CompositorHandle,
+    protocols: Protocols,
+    input: Input,
+    windows: Windows,
+    gpu: Option<DmabufBackend>,
+    readbacks: readback::Readbacks,
+    attachments: Attachments,
+    clipboard: clipboard::Bridge,
+    bell: bell::Bell,
+    scale: UiScale,
+    refresh_rate: RefreshRate,
+    output: Output,
     renderer: Renderer,
     events: Vec<Event>,
     /// Fixed virtual monitor size in logical coordinates.
@@ -156,7 +170,7 @@ impl std::fmt::Debug for Compositor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Compositor")
-            .field("windows", &self.windows.len())
+            .field("windows", &self.windows.by_id.len())
             .field("panes", &self.attachments.len())
             .field("shutdown", &self.shutdown)
             .finish_non_exhaustive()
@@ -196,7 +210,7 @@ fn clear_owner(surface: &WlSurface) {
     });
 }
 
-impl State {
+impl Compositor {
     fn new(display_handle: DisplayHandle, handle: CompositorHandle, settings: &Settings) -> Self {
         let scale = settings.scale;
         let mut seat_state = SeatState::new();
@@ -229,52 +243,58 @@ impl State {
             }
         }
         Self {
-            surfaces: CompositorState::new::<Self>(&display_handle),
-            shm: ShmState::new::<Self>(&display_handle, vec![]),
-            dmabuf,
-            gpu,
             handle,
+            protocols: Protocols {
+                surfaces: CompositorState::new::<Self>(&display_handle),
+                shm: ShmState::new::<Self>(&display_handle, vec![]),
+                dmabuf,
+                xdg: XdgShellState::new::<Self>(&display_handle),
+                activation: XdgActivationState::new::<Self>(&display_handle),
+                launches: HashMap::new(),
+                activation_deadline: None,
+                _decoration: XdgDecorationState::new::<Self>(&display_handle),
+                kde_decoration: decoration::kde(&display_handle),
+                _viewporter: ViewporterState::new::<Self>(&display_handle),
+                _fractional_scale: FractionalScaleManagerState::new::<Self>(&display_handle),
+                _single_pixel_buffer: SinglePixelBufferState::new::<Self>(&display_handle),
+                _output_manager: output_manager,
+                data_device: DataDeviceState::new::<Self>(&display_handle),
+                data_control,
+                ext_data_control,
+                primary_selection,
+                _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
+                _text_input: text_input,
+                toplevels: toplevels::Toplevels::new(&display_handle),
+            },
+            input: Input {
+                seats: seat_state,
+                seat,
+                keyboard: None,
+                keyboard_state: input::KeyboardState::default(),
+                shortcuts: settings.shortcuts,
+                keymap: keymap::Keymap::default(),
+                pointer,
+                cursor: seat::CursorState::default(),
+                popup_grab: None,
+                last_input_pane: None,
+            },
+            windows: Windows {
+                by_id: HashMap::new(),
+                ids: HashMap::new(),
+                callback_deadline: None,
+                surface_cache: buffer::SurfaceCache::default(),
+                catalog: WindowCatalog::default(),
+                popups: PopupManager::default(),
+                popups_dirty: false,
+            },
+            gpu,
             readbacks: readback::Readbacks::default(),
-            xdg: XdgShellState::new::<Self>(&display_handle),
-            activation: XdgActivationState::new::<Self>(&display_handle),
-            launches: HashMap::new(),
-            activation_deadline: None,
-            _decoration: XdgDecorationState::new::<Self>(&display_handle),
-            kde_decoration: decoration::kde(&display_handle),
-            _viewporter: ViewporterState::new::<Self>(&display_handle),
-            _fractional_scale: FractionalScaleManagerState::new::<Self>(&display_handle),
+            attachments: Attachments::default(),
+            clipboard: clipboard::Bridge::default(),
+            bell: bell::Bell::new(&display_handle),
             scale,
             refresh_rate: settings.refresh_rate,
-            _single_pixel_buffer: SinglePixelBufferState::new::<Self>(&display_handle),
-            _output_manager: output_manager,
-            data_device: DataDeviceState::new::<Self>(&display_handle),
-            data_control,
-            ext_data_control,
-            primary_selection,
-            clipboard: clipboard::Bridge::default(),
-            _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
-            bell: bell::Bell::new(&display_handle),
-            _text_input: text_input,
-            popups: PopupManager::default(),
-            popup_grab: None,
-            popups_dirty: false,
-            seats: seat_state,
-            seat,
-            keyboard: None,
-            keyboard_state: input::KeyboardState::default(),
-            shortcuts: settings.shortcuts,
-            keymap: keymap::Keymap::default(),
-            pointer,
             output,
-            windows: HashMap::new(),
-            callback_deadline: None,
-            ids: HashMap::new(),
-            surface_cache: buffer::SurfaceCache::default(),
-            catalog: WindowCatalog::default(),
-            toplevels: toplevels::Toplevels::new(&display_handle),
-            attachments: Attachments::default(),
-            last_input_pane: None,
-            cursor: seat::CursorState::default(),
             renderer: Renderer::default(),
             events: Vec::new(),
             mode: Size::from((
@@ -311,7 +331,7 @@ impl State {
     }
 
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
-        if let Some(window) = self.ids.get(surface) {
+        if let Some(window) = self.windows.ids.get(surface) {
             return Some(*window);
         }
         if let Some(window) = cached_owner(surface) {
@@ -320,6 +340,7 @@ impl State {
         let mut current = surface.clone();
         for _ in 0..64 {
             let owner = self
+                .windows
                 .ids
                 .get(&current)
                 .copied()
@@ -328,7 +349,7 @@ impl State {
                 cache_owner(surface, window);
                 return Some(window);
             }
-            current = match self.popups.find_popup(&current) {
+            current = match self.windows.popups.find_popup(&current) {
                 Some(PopupKind::Xdg(popup)) => popup.get_parent_surface()?,
                 Some(PopupKind::InputMethod(_)) => return None,
                 None => get_parent(&current)?,
@@ -338,7 +359,7 @@ impl State {
     }
 
     fn window_info(&self, window: WindowId) -> WindowInfo {
-        self.catalog.info(window)
+        self.windows.catalog.info(window)
     }
 
     fn touch(&mut self, window: WindowId) {
@@ -347,12 +368,12 @@ impl State {
     }
 
     fn send_title(&mut self, pane: PaneId, window: WindowId) {
-        let title = meowland_protocol::sanitize(self.catalog.title(window));
+        let title = meowland_protocol::sanitize(self.windows.catalog.title(window));
         self.emit(pane, ServerToPane::Title(title));
     }
 
     fn send_titles(&mut self, window: WindowId) {
-        let title = meowland_protocol::sanitize(self.catalog.title(window));
+        let title = meowland_protocol::sanitize(self.windows.catalog.title(window));
         self.attachments.for_each_showing(window, |pane, _| {
             self.events.push(Event {
                 pane,
@@ -375,8 +396,9 @@ impl State {
     pub fn window_list(&self) -> Vec<WindowInfo> {
         let mut windows: Vec<_> = self
             .windows
+            .by_id
             .keys()
-            .filter(|&&id| self.catalog.drawable(id))
+            .filter(|&&id| self.windows.catalog.drawable(id))
             .map(|&id| self.window_info(id))
             .collect();
         windows.sort_unstable_by_key(|window| window.id);
@@ -393,21 +415,21 @@ impl State {
         if !self.attachments.visible(window) {
             return;
         }
-        if let Some(entry) = self.windows.get(&window)
-            && self.catalog.drawable(window)
+        if let Some(entry) = self.windows.by_id.get(&window)
+            && self.windows.catalog.drawable(window)
         {
             entry.with_surfaces(|surface| self.output.enter(surface));
         }
     }
 
     fn leave_output(&self, window: WindowId) {
-        if self.attachments.visible(window) && self.catalog.drawable(window) {
+        if self.attachments.visible(window) && self.windows.catalog.drawable(window) {
             return;
         }
-        if let Some(entry) = self.windows.get(&window) {
+        if let Some(entry) = self.windows.by_id.get(&window) {
             entry.with_surfaces(|surface| self.output.leave(surface));
         }
     }
 }
 
-delegate_dispatch2!(State);
+delegate_dispatch2!(Compositor);

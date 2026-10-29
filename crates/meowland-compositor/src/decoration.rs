@@ -18,15 +18,15 @@ use smithay::{
     },
 };
 
-use super::State;
+use super::Compositor;
 
 pub(crate) fn kde(display: &DisplayHandle) -> KdeDecorationState {
-    KdeDecorationState::new::<State>(display, KdeDefaultMode::Server)
+    KdeDecorationState::new::<Compositor>(display, KdeDefaultMode::Server)
 }
 
-impl KdeDecorationHandler for State {
+impl KdeDecorationHandler for Compositor {
     fn kde_decoration_state(&self) -> &KdeDecorationState {
-        &self.kde_decoration
+        &self.protocols.kde_decoration
     }
 
     fn new_decoration(&mut self, _surface: &WlSurface, decoration: &OrgKdeKwinServerDecoration) {
@@ -39,7 +39,7 @@ fn borderless(toplevel: &ToplevelSurface) {
     toplevel.send_configure();
 }
 
-impl XdgDecorationHandler for State {
+impl XdgDecorationHandler for Compositor {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         borderless(&toplevel);
     }

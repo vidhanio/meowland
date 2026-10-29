@@ -4,7 +4,9 @@ use meowland_core::pixels::FrameSize;
 use meowland_protocol::{Input, PaneAction, Shortcut, Show, Transition};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
-use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input::pane_input};
+use super::{
+    AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, input::pane_input,
+};
 
 /// The requested selector did not identify a mapped window to close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -42,7 +44,7 @@ pub enum Command {
     CloseAll,
 }
 
-impl State {
+impl Compositor {
     /// Apply one pane or lifecycle command on the event-loop thread.
     pub fn handle_command(&mut self, command: Command) {
         match command {
@@ -52,7 +54,7 @@ impl State {
             Command::Detach { pane } => self.release_pane_window(pane),
             Command::Pane { pane, action } => self.pane_action(pane, action),
             Command::CloseAll => {
-                for window in self.windows.values() {
+                for window in self.windows.by_id.values() {
                     window.surface.send_close();
                 }
             }
@@ -69,7 +71,7 @@ impl State {
                     state: Transition::Pressed,
                     ..
                 } = &event
-                    && let Some(shortcut) = self.shortcuts.action(*key, *modifiers)
+                    && let Some(shortcut) = self.input.shortcuts.action(*key, *modifiers)
                 {
                     match shortcut {
                         Shortcut::CloseWindow => self.close_shown(pane),
@@ -116,7 +118,7 @@ impl State {
             .attachments
             .get(pane)
             .and_then(AttachedPane::window)
-            .and_then(|id| self.windows.get(&id))
+            .and_then(|id| self.windows.by_id.get(&id))
         {
             window.surface.send_close();
         } else {
@@ -131,7 +133,7 @@ impl State {
     pub fn close_window(&self, show: &Show) -> Result<(), CloseWindowError> {
         let window = self
             .selected_window(show)
-            .and_then(|id| self.windows.get(&id))
+            .and_then(|id| self.windows.by_id.get(&id))
             .ok_or(CloseWindowError)?;
         window.surface.send_close();
         Ok(())
@@ -139,19 +141,23 @@ impl State {
 
     pub(crate) fn selected_window(&self, show: &Show) -> Option<WindowId> {
         let activation = match show {
-            Show::Activation(token) => self.launches.get(token).and_then(|launch| launch.window),
+            Show::Activation(token) => self
+                .protocols
+                .launches
+                .get(token)
+                .and_then(|launch| launch.window),
             _ => None,
         };
-        self.catalog.select(show, activation)
+        self.windows.catalog.select(show, activation)
     }
 
     /// Publish the tiling, activation, and size state the compositor wants
     /// for a window, configuring the client only when it actually changed.
     pub(crate) fn apply_window_state(&self, window: WindowId) {
-        let Some(entry) = self.windows.get(&window) else {
+        let Some(entry) = self.windows.by_id.get(&window) else {
             return;
         };
-        let activated = self.catalog.focused() == Some(window);
+        let activated = self.windows.catalog.focused() == Some(window);
         let size = self.pane_size(window);
         entry.surface.with_pending_state(|pending| {
             pending.size = Some(size);

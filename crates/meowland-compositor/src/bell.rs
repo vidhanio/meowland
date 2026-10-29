@@ -7,7 +7,7 @@ use smithay::{
     wayland::xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState},
 };
 
-use super::{ServerToPane, State, WlSurface};
+use super::{Compositor, ServerToPane, WlSurface};
 
 const INTERVAL: Duration = Duration::from_millis(250);
 
@@ -19,17 +19,17 @@ pub(crate) struct Bell {
 impl Bell {
     pub(crate) fn new(display: &DisplayHandle) -> Self {
         Self {
-            _protocol: XdgSystemBellState::new::<State>(display),
+            _protocol: XdgSystemBellState::new::<Compositor>(display),
             last: None,
         }
     }
 }
 
-impl XdgSystemBellHandler for State {
+impl XdgSystemBellHandler for Compositor {
     fn ring(&mut self, surface: Option<WlSurface>) {
         let window = match surface {
             Some(surface) => self.window_for_surface(&surface),
-            None => self.catalog.focused(),
+            None => self.windows.catalog.focused(),
         };
         let Some(window) = window else {
             return;

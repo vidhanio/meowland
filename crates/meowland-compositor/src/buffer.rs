@@ -22,7 +22,7 @@ use smithay::{
     },
 };
 
-use super::{Snapshot, State, readback, render, runtime::ClientState};
+use super::{Compositor, Snapshot, readback, render, runtime::ClientState};
 
 #[derive(Default)]
 pub(crate) struct SurfaceCache {
@@ -71,19 +71,19 @@ fn buffer_damage(
     rects
 }
 
-impl BufferHandler for State {
+impl BufferHandler for Compositor {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
-impl ShmHandler for State {
+impl ShmHandler for Compositor {
     fn shm_state(&self) -> &ShmState {
-        &self.shm
+        &self.protocols.shm
     }
 }
 
-impl DmabufHandler for State {
+impl DmabufHandler for Compositor {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.dmabuf
+        &mut self.protocols.dmabuf
     }
 
     fn dmabuf_imported(
@@ -100,9 +100,9 @@ impl DmabufHandler for State {
     }
 }
 
-impl CompositorHandler for State {
+impl CompositorHandler for Compositor {
     fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.surfaces
+        &mut self.protocols.surfaces
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
@@ -143,7 +143,7 @@ impl CompositorHandler for State {
         reason = "`cached` borrows from the guard and must outlive `current`"
     )]
     fn commit(&mut self, surface: &WlSurface) {
-        self.popups.commit(surface);
+        self.windows.popups.commit(surface);
         let window = self.window_for_surface(surface);
         let changed = readback::prepared_at(surface).unwrap_or_else(Instant::now);
         let (assignment, damage, scale, transform, callbacks) = with_states(surface, |states| {
@@ -164,7 +164,7 @@ impl CompositorHandler for State {
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = render::source_bound(self.pane_bound(surface), scale, transform);
-                let mut previous = self.surface_cache.snapshots.remove(surface);
+                let mut previous = self.windows.surface_cache.snapshots.remove(surface);
                 let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
                     .map(|pixel| Snapshot::single_pixel(pixel.rgba8888()));
@@ -193,27 +193,32 @@ impl CompositorHandler for State {
                 let snapshot = match snapshot {
                     Some(snapshot) => {
                         if dmabuf && let Some(previous) = previous.take() {
-                            self.surface_cache.spares.insert(surface.clone(), previous);
+                            self.windows
+                                .surface_cache
+                                .spares
+                                .insert(surface.clone(), previous);
                         }
                         Some(snapshot)
                     }
                     None => previous,
                 };
                 if let Some(snapshot) = snapshot {
-                    self.surface_cache
+                    self.windows
+                        .surface_cache
                         .snapshots
                         .insert(surface.clone(), snapshot);
                 }
             }
-            Some(BufferAssignment::Removed) => self.surface_cache.forget(surface),
+            Some(BufferAssignment::Removed) => self.windows.surface_cache.forget(surface),
             None => {}
         }
         self.refresh_window_mapping(surface);
         if let Some(window) = window {
-            if self.attachments.visible(window) && self.catalog.drawable(window) {
+            if self.attachments.visible(window) && self.windows.catalog.drawable(window) {
                 self.output.enter(surface);
             }
             let damage = self
+                .windows
                 .surface_cache
                 .snapshots
                 .get(surface)
@@ -235,11 +240,11 @@ impl CompositorHandler for State {
     /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
         let window = self.window_for_surface(surface);
-        self.popups_dirty = true;
-        self.surface_cache.forget(surface);
+        self.windows.popups_dirty = true;
+        self.windows.surface_cache.forget(surface);
         readback::destroyed(self, surface);
         if let Some(window) = window {
-            if self.ids.get(surface) == Some(&window) {
+            if self.windows.ids.get(surface) == Some(&window) {
                 self.unmap_window(window);
             } else {
                 self.touch(window);

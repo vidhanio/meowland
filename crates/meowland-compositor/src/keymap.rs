@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use smithay::input::keyboard::{KeyboardHandle, Layout, xkb};
 
-use super::State;
+use super::Compositor;
 
 /// Difference between XKB keycodes and Linux input event codes.
 const EVDEV_OFFSET: u32 = 8;
@@ -32,7 +32,7 @@ pub(crate) struct Keymap {
 
 impl Keymap {
     /// Collect the reverse map for the keyboard's active layout.
-    pub(crate) fn new(keyboard: &KeyboardHandle<State>, state: &mut State) -> Self {
+    pub(crate) fn new(keyboard: &KeyboardHandle<Compositor>, state: &mut Compositor) -> Self {
         let layout = active_layout(keyboard, state);
         Self::build(keyboard, state, layout)
     }
@@ -53,7 +53,11 @@ impl Keymap {
         self.keysyms.get(&keysym).copied()
     }
 
-    fn build(keyboard: &KeyboardHandle<State>, state: &mut State, layout: Layout) -> Self {
+    fn build(
+        keyboard: &KeyboardHandle<Compositor>,
+        state: &mut Compositor,
+        layout: Layout,
+    ) -> Self {
         let mut keysyms = HashMap::new();
         keyboard.with_xkb_state(state, |context| {
             let xkb = context.xkb().lock().expect("xkb state lock");
@@ -76,13 +80,13 @@ impl Keymap {
 }
 
 /// Rebuild the reverse map if the keyboard's active layout changed.
-pub(crate) fn refresh(state: &mut State) {
-    let Some(keyboard) = state.keyboard.clone() else {
+pub(crate) fn refresh(state: &mut Compositor) {
+    let Some(keyboard) = state.input.keyboard.clone() else {
         return;
     };
     let layout = active_layout(&keyboard, state);
-    if layout != state.keymap.layout {
-        state.keymap = Keymap::build(&keyboard, state, layout);
+    if layout != state.input.keymap.layout {
+        state.input.keymap = Keymap::build(&keyboard, state, layout);
     }
 }
 
@@ -95,7 +99,7 @@ pub(crate) fn text(key: u32) -> Option<String> {
     (!character.is_control()).then(|| character.to_string())
 }
 
-fn active_layout(keyboard: &KeyboardHandle<State>, state: &mut State) -> Layout {
+fn active_layout(keyboard: &KeyboardHandle<Compositor>, state: &mut Compositor) -> Layout {
     keyboard.with_xkb_state(state, |context| {
         let xkb = context.xkb().lock().expect("xkb state lock");
         xkb.active_layout()

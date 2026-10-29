@@ -10,7 +10,7 @@ use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
 use meowland_render::{Changed, Renderer, Scene, Snapshot, SurfaceDamage};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-use super::{Event, PaneId, ServerToPane, State};
+use super::{Compositor, Event, PaneId, ServerToPane};
 
 mod publication;
 
@@ -233,18 +233,20 @@ impl PaneState {
     }
 }
 
-impl State {
+impl Compositor {
     /// Wait for frame or activation deadlines; transfers wake through readiness
     /// sources.
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
         if self.attachments.due_frames() > 0 {
             return Some(Duration::ZERO);
         }
-        self.activation_deadline
+        self.protocols
+            .activation_deadline
             .map(|deadline| deadline.saturating_duration_since(now))
             .into_iter()
             .chain(
-                self.callback_deadline
+                self.windows
+                    .callback_deadline
                     .map(|deadline| deadline.saturating_duration_since(now)),
             )
             .min()
@@ -254,15 +256,19 @@ impl State {
     /// at one Hz.
     pub(crate) fn frame_callbacks(&mut self) {
         let now = Instant::now();
-        if self.callback_deadline.is_none_or(|deadline| now < deadline) {
+        if self
+            .windows
+            .callback_deadline
+            .is_none_or(|deadline| now < deadline)
+        {
             return;
         }
         let time = self.started.elapsed();
-        for (&id, window) in &mut self.windows {
+        for (&id, window) in &mut self.windows.by_id {
             if !window.callback_pending || now < window.callback_due {
                 continue;
             }
-            let interval = if self.attachments.visible(id) && self.catalog.drawable(id) {
+            let interval = if self.attachments.visible(id) && self.windows.catalog.drawable(id) {
                 self.refresh_rate.interval()
             } else {
                 Duration::from_secs(1)
@@ -281,8 +287,9 @@ impl State {
     /// Recompute the earliest pending callback after a window is added,
     /// removed, or acknowledges a frame.
     pub(crate) fn refresh_callback_deadline(&mut self) {
-        self.callback_deadline = self
+        self.windows.callback_deadline = self
             .windows
+            .by_id
             .values()
             .filter(|window| window.callback_pending)
             .map(|window| window.callback_due)
@@ -291,28 +298,30 @@ impl State {
 
     /// Queue a frame callback at the window's paced deadline.
     pub(crate) fn request_callback(&mut self, window: super::WindowId) {
-        let Some(entry) = self.windows.get_mut(&window) else {
+        let Some(entry) = self.windows.by_id.get_mut(&window) else {
             return;
         };
         entry.callback_pending = true;
         let due = entry.callback_due;
-        self.callback_deadline = Some(
-            self.callback_deadline
+        self.windows.callback_deadline = Some(
+            self.windows
+                .callback_deadline
                 .map_or(due, |deadline| deadline.min(due)),
         );
     }
 
     pub(crate) fn resume_callbacks(&mut self, window: super::WindowId) {
         if self.attachments.visible(window)
-            && let Some(window) = self.windows.get_mut(&window)
+            && let Some(window) = self.windows.by_id.get_mut(&window)
         {
             window.callback_due = window
                 .callback_due
                 .min(Instant::now() + self.refresh_rate.interval());
             if window.callback_pending {
                 let due = window.callback_due;
-                self.callback_deadline = Some(
-                    self.callback_deadline
+                self.windows.callback_deadline = Some(
+                    self.windows
+                        .callback_deadline
                         .map_or(due, |deadline| deadline.min(due)),
                 );
             }
@@ -333,13 +342,13 @@ impl State {
             }
             let root = entry
                 .window()
-                .filter(|&id| self.catalog.drawable(id))
-                .and_then(|id| self.windows.get(&id))
+                .filter(|&id| self.windows.catalog.drawable(id))
+                .and_then(|id| self.windows.by_id.get(&id))
                 .map(|window| window.surface.wl_surface());
             if let Some(message) = entry.presentation.frame(
                 &mut self.renderer,
                 root,
-                &self.surface_cache.snapshots,
+                &self.windows.surface_cache.snapshots,
                 self.scale.factor(),
             ) {
                 self.events.push(Event { pane, message });

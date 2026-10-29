@@ -33,7 +33,7 @@ use smithay::{
     },
 };
 
-use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input};
+use super::{AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, input};
 
 #[derive(Default)]
 pub(crate) struct CursorState {
@@ -41,27 +41,28 @@ pub(crate) struct CursorState {
     pub sent: Option<(PaneId, Option<String>)>,
 }
 
-impl State {
+impl Compositor {
     pub(crate) fn focus_window(&mut self, window: WindowId) {
-        if !self.catalog.drawable(window) {
+        if !self.windows.catalog.drawable(window) {
             return;
         }
         self.refresh_popup_grab();
-        if self.catalog.focused() == Some(window) {
+        if self.windows.catalog.focused() == Some(window) {
             return;
         }
-        if let Some(grab) = &mut self.popup_grab {
+        if let Some(grab) = &mut self.input.popup_grab {
             grab.ungrab(smithay::desktop::PopupUngrabStrategy::All);
             self.refresh_popup_grab();
         }
         input::reset_keyboard(self);
-        self.keyboard_state.serials.clear();
-        let previous = self.catalog.focus(Some(window));
+        self.input.keyboard_state.serials.clear();
+        let previous = self.windows.catalog.focus(Some(window));
         let surface = self
             .windows
+            .by_id
             .get(&window)
             .map(|entry| entry.surface.wl_surface().clone());
-        if let Some(keyboard) = self.keyboard.clone() {
+        if let Some(keyboard) = self.input.keyboard.clone() {
             keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
         }
         if let Some(previous) = previous {
@@ -73,12 +74,13 @@ impl State {
     pub(crate) fn send_pane_cursor(&mut self, pane: PaneId) {
         let window = self.attachments.get(pane).and_then(AttachedPane::window);
         let focused = self
+            .input
             .pointer
             .as_ref()
             .and_then(PointerHandle::current_focus)
             .and_then(|surface| self.window_for_surface(&surface));
         let shape = if window.is_some() && window == focused {
-            self.cursor.shape.clone()
+            self.input.cursor.shape.clone()
         } else {
             None
         };
@@ -92,6 +94,7 @@ impl State {
     /// sees the new focus instead.
     pub(crate) fn clear_window_pointer(&mut self, window: WindowId) {
         let focused = self
+            .input
             .pointer
             .as_ref()
             .and_then(PointerHandle::current_focus)
@@ -99,7 +102,7 @@ impl State {
         if focused != Some(window) {
             return;
         }
-        if let Some(pointer) = self.pointer.take() {
+        if let Some(pointer) = self.input.pointer.take() {
             pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
             pointer.motion(
                 self,
@@ -111,30 +114,30 @@ impl State {
                 },
             );
             pointer.frame(self);
-            self.pointer = Some(pointer);
+            self.input.pointer = Some(pointer);
         }
-        if let Some(pane) = self.last_input_pane {
+        if let Some(pane) = self.input.last_input_pane {
             self.send_pane_cursor(pane);
         }
     }
 
     fn send_cursor(&mut self, pane: PaneId, shape: Option<String>) {
         let cursor = (pane, shape);
-        if self.cursor.sent.as_ref() == Some(&cursor) {
+        if self.input.cursor.sent.as_ref() == Some(&cursor) {
             return;
         }
         self.emit(pane, ServerToPane::Cursor(cursor.1.clone()));
-        self.cursor.sent = Some(cursor);
+        self.input.cursor.sent = Some(cursor);
     }
 }
 
-impl SeatHandler for State {
+impl SeatHandler for Compositor {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seats
+        &mut self.input.seats
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
@@ -150,9 +153,9 @@ impl SeatHandler for State {
             CursorImageStatus::Named(icon) => Some(cursor_name(icon).to_owned()),
             CursorImageStatus::Hidden | CursorImageStatus::Surface(_) => None,
         };
-        self.cursor.shape = shape;
-        if self.pointer.is_some()
-            && let Some(pane) = self.last_input_pane
+        self.input.cursor.shape = shape;
+        if self.input.pointer.is_some()
+            && let Some(pane) = self.input.last_input_pane
         {
             self.send_pane_cursor(pane);
         }
@@ -200,7 +203,7 @@ const fn cursor_name(icon: CursorIcon) -> &'static str {
     }
 }
 
-impl SelectionHandler for State {
+impl SelectionHandler for Compositor {
     type SelectionUserData = clipboard::Source;
 
     fn new_selection(
@@ -224,34 +227,34 @@ impl SelectionHandler for State {
     }
 }
 
-impl PrimarySelectionHandler for State {
+impl PrimarySelectionHandler for Compositor {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
-        &mut self.primary_selection
+        &mut self.protocols.primary_selection
     }
 }
 
-impl WlrDataControlHandler for State {
+impl WlrDataControlHandler for Compositor {
     fn data_control_state(&mut self) -> &mut WlrDataControlState {
-        &mut self.data_control
+        &mut self.protocols.data_control
     }
 }
 
-impl ExtDataControlHandler for State {
+impl ExtDataControlHandler for Compositor {
     fn data_control_state(&mut self) -> &mut ExtDataControlState {
-        &mut self.ext_data_control
+        &mut self.protocols.ext_data_control
     }
 }
 
-impl PointerConstraintsHandler for State {}
-impl DndGrabHandler for State {}
-impl WaylandDndGrabHandler for State {}
-impl TabletSeatHandler for State {
+impl PointerConstraintsHandler for Compositor {}
+impl DndGrabHandler for Compositor {}
+impl WaylandDndGrabHandler for Compositor {}
+impl TabletSeatHandler for Compositor {
     type ToolFocus = WlSurface;
 }
-impl DataDeviceHandler for State {
+impl DataDeviceHandler for Compositor {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
-        &mut self.data_device
+        &mut self.protocols.data_device
     }
 }
 
-impl OutputHandler for State {}
+impl OutputHandler for Compositor {}

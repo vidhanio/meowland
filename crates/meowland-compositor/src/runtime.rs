@@ -16,7 +16,7 @@ use smithay::{
     wayland::compositor::CompositorClientState,
 };
 
-use super::{CompositorHandle, Settings, State};
+use super::{Compositor, CompositorHandle, Settings};
 
 #[derive(Default)]
 pub(crate) struct ClientState {
@@ -32,7 +32,7 @@ impl ClientData for ClientState {
 /// Wayland display dispatch, sharing the host's loop and uniquely owned state.
 #[derive(Debug)]
 pub struct Runtime {
-    display: Display<State>,
+    display: Display<Compositor>,
 }
 
 impl Runtime {
@@ -45,9 +45,9 @@ impl Runtime {
         name: &str,
         settings: &Settings,
         handle: &CompositorHandle,
-    ) -> io::Result<(Self, State)> {
-        let display = Display::<State>::new().map_err(io::Error::other)?;
-        let mut state = State::new(display.handle(), handle.clone(), settings);
+    ) -> io::Result<(Self, Compositor)> {
+        let display = Display::<Compositor>::new().map_err(io::Error::other)?;
+        let mut state = Compositor::new(display.handle(), handle.clone(), settings);
         let keyboard = &settings.keyboard;
         let keymap = XkbConfig {
             layout: &keyboard.layout,
@@ -56,6 +56,7 @@ impl Runtime {
             ..XkbConfig::default()
         };
         let keyboard_handle = state
+            .input
             .seat
             .add_keyboard(
                 keymap,
@@ -64,8 +65,8 @@ impl Runtime {
             )
             .map_err(io::Error::other)?;
         let keymap = super::keymap::Keymap::new(&keyboard_handle, &mut state);
-        state.keymap = keymap;
-        state.keyboard = Some(keyboard_handle);
+        state.input.keymap = keymap;
+        state.input.keyboard = Some(keyboard_handle);
         let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;
         handle.insert_source(
             Generic::new(listener, Interest::READ, Mode::Level),
@@ -91,7 +92,7 @@ impl Runtime {
     ///
     /// # Errors
     /// Returns an error if client dispatch or flushing fails.
-    pub fn dispatch(&mut self, state: &mut State) -> io::Result<()> {
+    pub fn dispatch(&mut self, state: &mut Compositor) -> io::Result<()> {
         self.display.dispatch_clients(state)?;
         state.refresh_popup_grab();
         state.expire_activation_tokens();
@@ -101,7 +102,7 @@ impl Runtime {
     }
 
     /// Time remaining until compositor work needs another dispatch turn.
-    pub fn next_wakeup(state: &State) -> Option<Duration> {
+    pub fn next_wakeup(state: &Compositor) -> Option<Duration> {
         state.next_wakeup(Instant::now())
     }
 }

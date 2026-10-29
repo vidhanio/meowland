@@ -29,7 +29,7 @@ use smithay::wayland::selection::{
     primary_selection::{request_primary_client_selection, set_primary_selection},
 };
 
-use super::{PaneId, ServerToPane, State, input::paste_action, sources::Sources};
+use super::{Compositor, PaneId, ServerToPane, input::paste_action, sources::Sources};
 
 #[derive(Clone, Debug)]
 pub enum Source {
@@ -175,13 +175,14 @@ impl Bridge {
 }
 
 pub(crate) fn selection(
-    state: &mut State,
+    state: &mut Compositor,
     target: SelectionTarget,
     source: Option<SelectionSource>,
 ) {
     state.clipboard.set_export(target, None);
-    let focused = state.catalog.focused();
+    let focused = state.windows.catalog.focused();
     let pane = state
+        .input
         .last_input_pane
         .filter(|pane| {
             state
@@ -226,7 +227,7 @@ pub(crate) fn selection(
 }
 
 /// Smithay updates the seat selection after returning from `new_selection`.
-fn schedule_export(state: &mut State, target: SelectionTarget, id: u64) {
+fn schedule_export(state: &mut Compositor, target: SelectionTarget, id: u64) {
     let mut sources = Sources::new(&state.handle);
     match state
         .handle
@@ -255,7 +256,7 @@ fn schedule_export(state: &mut State, target: SelectionTarget, id: u64) {
     }
 }
 
-fn export_next(state: &mut State, target: SelectionTarget) {
+fn export_next(state: &mut Compositor, target: SelectionTarget) {
     let Some(mut export) = state.clipboard.take_export(target) else {
         return;
     };
@@ -282,7 +283,7 @@ fn export_next(state: &mut State, target: SelectionTarget) {
     );
 }
 
-fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sources> {
+fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Result<Sources> {
     let (read, write) = rustix::pipe::pipe()?;
     nonblocking(&read)?;
     let mut sources = Sources::new(&state.handle);
@@ -369,11 +370,11 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
     );
     match target {
         SelectionTarget::Clipboard => {
-            request_data_device_client_selection(&state.seat, requested_mime, write)
+            request_data_device_client_selection(&state.input.seat, requested_mime, write)
                 .map_err(io::Error::other)?;
         }
         SelectionTarget::Primary => {
-            request_primary_client_selection(&state.seat, requested_mime, write)
+            request_primary_client_selection(&state.input.seat, requested_mime, write)
                 .map_err(io::Error::other)?;
         }
     }
@@ -399,7 +400,7 @@ fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io
     Ok(false)
 }
 
-pub(crate) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) {
+pub(crate) fn send(state: &mut Compositor, fd: OwnedFd, mime: &str, source: &Source) {
     if state.clipboard.deliveries.len() >= 16 {
         return;
     }
@@ -440,7 +441,7 @@ pub(crate) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) 
 }
 
 fn delivery_timer(
-    state: &State,
+    state: &Compositor,
     request: ClipboardRequestId,
     deadline: Deadline,
 ) -> io::Result<Sources> {
@@ -470,7 +471,7 @@ fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
+fn write(state: &mut Compositor, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
     if data.is_empty() || data.len() > MAX_BYTES || deadline.expired() {
         return;
     }
@@ -534,7 +535,7 @@ fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
 }
 
 pub(crate) fn reply(
-    state: &mut State,
+    state: &mut Compositor,
     pane: PaneId,
     request: ClipboardRequestId,
     data: Option<Vec<u8>>,
@@ -562,7 +563,7 @@ pub(crate) struct TerminalOffer {
     pub intent: OfferIntent,
 }
 
-pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
+pub(crate) fn offer(state: &mut Compositor, pane: PaneId, offer: TerminalOffer) {
     let TerminalOffer {
         selection,
         id: offer,
@@ -578,13 +579,13 @@ pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
     match target {
         SelectionTarget::Clipboard => set_data_device_selection(
             &state.display,
-            &state.seat,
+            &state.input.seat,
             mimes,
             Source::Terminal { pane, offer },
         ),
         SelectionTarget::Primary => set_primary_selection(
             &state.display,
-            &state.seat,
+            &state.input.seat,
             mimes,
             Source::Terminal { pane, offer },
         ),
@@ -594,7 +595,7 @@ pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
     }
 }
 
-pub(crate) fn paste(state: &mut State, pane: PaneId, text: &str) {
+pub(crate) fn paste(state: &mut Compositor, pane: PaneId, text: &str) {
     if text.len() > meowland_protocol::clipboard::MAX_TEXT
         || state
             .attachments
@@ -606,6 +607,11 @@ pub(crate) fn paste(state: &mut State, pane: PaneId, text: &str) {
     state.clipboard.set_export(SelectionTarget::Clipboard, None);
     let data = Arc::new(ClipboardData::text(text));
     let mimes = data.items.iter().map(|item| item.mime.clone()).collect();
-    set_data_device_selection(&state.display, &state.seat, mimes, Source::Local(data));
+    set_data_device_selection(
+        &state.display,
+        &state.input.seat,
+        mimes,
+        Source::Local(data),
+    );
     paste_action(state, pane);
 }

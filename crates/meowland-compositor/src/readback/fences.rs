@@ -9,9 +9,9 @@ use rustix::{
 };
 use smithay::backend::allocator::dmabuf::{AlreadyReady, Dmabuf};
 
-use super::{Sources, State};
+use super::{Compositor, Sources};
 
-pub(super) fn watch(state: &mut State, id: u64, dmabuf: &Dmabuf) {
+pub(super) fn watch(state: &mut Compositor, id: u64, dmabuf: &Dmabuf) {
     if let Some(fences) = snapshot(dmabuf) {
         state
             .readbacks
@@ -60,7 +60,7 @@ pub(super) fn watch(state: &mut State, id: u64, dmabuf: &Dmabuf) {
     }
 }
 
-fn add_source(state: &mut State, id: u64, token: RegistrationToken) {
+fn add_source(state: &mut Compositor, id: u64, token: RegistrationToken) {
     let mut sources = Sources::new(&state.handle);
     sources.io = Some(token);
     state
@@ -72,7 +72,7 @@ fn add_source(state: &mut State, id: u64, token: RegistrationToken) {
         .push(sources);
 }
 
-fn acquired(state: &mut State, id: u64, index: usize) {
+fn acquired(state: &mut Compositor, id: u64, index: usize) {
     let Some(acquiring) = state.readbacks.acquiring.get_mut(&id) else {
         return;
     };
@@ -83,7 +83,7 @@ fn acquired(state: &mut State, id: u64, index: usize) {
     }
 }
 
-fn abandon(state: &mut State, id: u64) {
+fn abandon(state: &mut Compositor, id: u64) {
     if let Some(acquiring) = state.readbacks.acquiring.remove(&id) {
         let client = acquiring.operation.client.clone();
         drop(acquiring);

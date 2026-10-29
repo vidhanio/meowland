@@ -10,7 +10,7 @@ use smithay::{
     output::Output,
 };
 
-use super::{Policy, ServerToPane, State, Window, WindowId, WlSurface, clear_owner, input};
+use super::{Compositor, Policy, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
 
 impl Window {
     fn with_surface_trees(&self, mut visit: impl FnMut(&WlSurface)) {
@@ -36,12 +36,12 @@ impl Window {
     }
 }
 
-impl State {
+impl Compositor {
     pub(crate) fn refresh_window_mapping(&mut self, surface: &WlSurface) {
-        let Some(id) = self.ids.get(surface).copied() else {
+        let Some(id) = self.windows.ids.get(surface).copied() else {
             return;
         };
-        if self.surface_cache.snapshots.contains_key(surface) {
+        if self.windows.surface_cache.snapshots.contains_key(surface) {
             self.map_window(id);
         } else {
             self.unmap_window(id);
@@ -49,11 +49,13 @@ impl State {
     }
 
     fn map_window(&mut self, id: WindowId) {
-        if !self.catalog.map(id) {
+        if !self.windows.catalog.map(id) {
             return;
         }
         let info = self.window_info(id);
-        self.toplevels.announce(id, &info.title, &info.app_id);
+        self.protocols
+            .toplevels
+            .announce(id, &info.title, &info.app_id);
         self.touch(id);
         self.follow_panes(id);
         self.resolve_pending_panes();
@@ -63,17 +65,17 @@ impl State {
     }
 
     pub(crate) fn unmap_window(&mut self, id: WindowId) {
-        let focused = self.catalog.focused() == Some(id);
-        if !self.catalog.unmap(id) {
+        let focused = self.windows.catalog.focused() == Some(id);
+        if !self.windows.catalog.unmap(id) {
             return;
         }
-        self.toplevels.remove(id);
-        self.popups_dirty = true;
+        self.protocols.toplevels.remove(id);
+        self.windows.popups_dirty = true;
         self.leave_output(id);
         self.clear_window_pointer(id);
         self.touch(id);
         if focused {
-            if let Some(grab) = &mut self.popup_grab {
+            if let Some(grab) = &mut self.input.popup_grab {
                 grab.ungrab(PopupUngrabStrategy::All);
             }
             self.refresh_popup_grab();
@@ -87,7 +89,7 @@ impl State {
             {
                 continue;
             }
-            if let Some(next) = self.catalog.newest() {
+            if let Some(next) = self.windows.catalog.newest() {
                 self.bind_pane_window(pane, next);
             } else {
                 self.attachments.clear(pane);
@@ -99,8 +101,8 @@ impl State {
             let next = self
                 .attachments
                 .first_window()
-                .filter(|&id| self.catalog.drawable(id))
-                .or_else(|| self.catalog.newest());
+                .filter(|&id| self.windows.catalog.drawable(id))
+                .or_else(|| self.windows.catalog.newest());
             if let Some(next) = next {
                 self.focus_window(next);
             }
@@ -115,25 +117,26 @@ impl State {
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }
         let surfaces: Vec<_> = self
+            .windows
             .surface_cache
             .snapshots
             .keys()
-            .chain(self.surface_cache.spares.keys())
+            .chain(self.windows.surface_cache.spares.keys())
             .filter(|surface| self.window_for_surface(surface) == Some(id))
             .cloned()
             .collect();
         for surface in surfaces {
-            self.surface_cache.forget(&surface);
+            self.windows.surface_cache.forget(&surface);
         }
-        if let Some(window) = self.windows.remove(&id) {
+        if let Some(window) = self.windows.by_id.remove(&id) {
             window.with_surfaces(clear_owner);
-            self.ids.remove(window.surface.wl_surface());
+            self.windows.ids.remove(window.surface.wl_surface());
         }
         self.refresh_callback_deadline();
-        self.toplevels.remove(id);
+        self.protocols.toplevels.remove(id);
         self.attachments.forget_window(id);
-        self.catalog.remove(id);
-        self.popups.cleanup();
-        self.popups_dirty = false;
+        self.windows.catalog.remove(id);
+        self.windows.popups.cleanup();
+        self.windows.popups_dirty = false;
     }
 }

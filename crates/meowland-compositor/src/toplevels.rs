@@ -9,7 +9,7 @@ use smithay::{
     },
 };
 
-use super::{State, WindowId};
+use super::{Compositor, WindowId};
 
 pub(crate) struct Toplevels {
     protocol: ForeignToplevelListState,
@@ -19,13 +19,13 @@ pub(crate) struct Toplevels {
 impl Toplevels {
     pub(crate) fn new(display: &DisplayHandle) -> Self {
         Self {
-            protocol: ForeignToplevelListState::new::<State>(display),
+            protocol: ForeignToplevelListState::new::<Compositor>(display),
             handles: HashMap::new(),
         }
     }
 
     pub(crate) fn announce(&mut self, id: WindowId, title: &str, app_id: &str) {
-        let handle = self.protocol.new_toplevel::<State>(title, app_id);
+        let handle = self.protocol.new_toplevel::<Compositor>(title, app_id);
         if let Some(previous) = self.handles.insert(id, handle) {
             previous.send_closed();
         }
@@ -46,8 +46,8 @@ impl Toplevels {
     }
 }
 
-impl ForeignToplevelListHandler for State {
+impl ForeignToplevelListHandler for Compositor {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
-        &mut self.toplevels.protocol
+        &mut self.protocols.toplevels.protocol
     }
 }

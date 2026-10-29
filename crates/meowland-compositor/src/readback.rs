@@ -23,7 +23,7 @@ use smithay::{
     },
 };
 
-use super::{ClientState, Snapshot, State, WlSurface, sources::Sources};
+use super::{ClientState, Compositor, Snapshot, WlSurface, sources::Sources};
 
 mod fences;
 
@@ -271,7 +271,12 @@ impl Readbacks {
     }
 }
 
-pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer, dmabuf: &Dmabuf) {
+pub(crate) fn prepare(
+    state: &mut Compositor,
+    surface: &WlSurface,
+    buffer: &WlBuffer,
+    dmabuf: &Dmabuf,
+) {
     let started = Instant::now();
     let Some(client) = surface.client() else {
         return;
@@ -337,7 +342,7 @@ pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer,
     fences::watch(state, id, dmabuf);
 }
 
-fn submit(state: &mut State, id: u64) {
+fn submit(state: &mut Compositor, id: u64) {
     let Some(mut acquiring) = state.readbacks.acquiring.remove(&id) else {
         return;
     };
@@ -396,7 +401,7 @@ fn submit(state: &mut State, id: u64) {
     }
 }
 
-fn complete(state: &mut State, id: u64) {
+fn complete(state: &mut Compositor, id: u64) {
     let Some(Reading {
         mut operation,
         readback,
@@ -411,7 +416,7 @@ fn complete(state: &mut State, id: u64) {
     if let Some(gpu) = &mut state.gpu
         && let Ok(surface) = operation.surface.upgrade()
     {
-        let mut previous = state.surface_cache.spares.remove(&surface);
+        let mut previous = state.windows.surface_cache.spares.remove(&surface);
         match gpu.complete(readback, &mut previous) {
             Ok(snapshot) => {
                 *operation
@@ -422,7 +427,7 @@ fn complete(state: &mut State, id: u64) {
             }
             Err(error) => {
                 if let Some(previous) = previous {
-                    state.surface_cache.spares.insert(surface, previous);
+                    state.windows.surface_cache.spares.insert(surface, previous);
                 }
                 tracing::warn!(%error, "DMA-BUF readback failed");
             }
@@ -444,7 +449,7 @@ fn complete(state: &mut State, id: u64) {
 /// fence signals, because dropping the reservation early would let the client
 /// reuse a buffer the GPU still samples. Completion skips the slot when the
 /// surface is gone.
-pub(crate) fn destroyed(state: &mut State, surface: &WlSurface) {
+pub(crate) fn destroyed(state: &mut Compositor, surface: &WlSurface) {
     let mut clients = Vec::new();
     state.readbacks.acquiring.retain(|_, acquiring| {
         if acquiring.operation.surface == surface.downgrade() {
@@ -459,7 +464,7 @@ pub(crate) fn destroyed(state: &mut State, surface: &WlSurface) {
     }
 }
 
-fn notify(state: &mut State, client: &Client) {
+fn notify(state: &mut Compositor, client: &Client) {
     if let Some(client_state) = client.get_data::<ClientState>() {
         let display = state.display.clone();
         client_state

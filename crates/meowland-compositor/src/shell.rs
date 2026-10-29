@@ -19,18 +19,18 @@ use smithay::{
     },
 };
 
-use super::{State, Window, WlSurface, input, render};
+use super::{Compositor, Window, WlSurface, input, render};
 
-impl XdgShellHandler for State {
+impl XdgShellHandler for Compositor {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg
+        &mut self.protocols.xdg
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let (app_id, title) = metadata(&surface);
-        let id = self.catalog.insert(app_id, title);
-        self.ids.insert(surface.wl_surface().clone(), id);
-        self.windows.insert(
+        let id = self.windows.catalog.insert(app_id, title);
+        self.windows.ids.insert(surface.wl_surface().clone(), id);
+        self.windows.by_id.insert(
             id,
             Window {
                 surface,
@@ -44,13 +44,14 @@ impl XdgShellHandler for State {
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         if self
+            .windows
             .popups
             .track_popup(PopupKind::Xdg(surface.clone()))
             .is_err()
         {
             return;
         }
-        self.popups_dirty = true;
+        self.windows.popups_dirty = true;
         place_popup(self, &surface, positioner);
         let _ = surface.send_configure();
     }
@@ -74,11 +75,11 @@ impl XdgShellHandler for State {
             dismiss_popup(self, &root, &kind);
             return;
         };
-        if seat != self.seat || !input::valid_serial(self, serial, &root) {
+        if seat != self.input.seat || !input::valid_serial(self, serial, &root) {
             dismiss_popup(self, &root, &kind);
             return;
         }
-        let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else {
+        let Ok(mut grab) = self.windows.popups.grab_popup(root, kind, &seat, serial) else {
             return;
         };
         let previous = grab.previous_serial().unwrap_or(serial);
@@ -101,7 +102,7 @@ impl XdgShellHandler for State {
         if let Some(pointer) = pointer {
             pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
         }
-        self.popup_grab = Some(grab);
+        self.input.popup_grab = Some(grab);
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
@@ -112,7 +113,7 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
             return;
         };
         self.remove_window(id);
@@ -123,14 +124,14 @@ impl XdgShellHandler for State {
         surface: ToplevelSurface,
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
             return;
         };
-        let Some(window) = self.windows.get_mut(&id) else {
+        let Some(window) = self.windows.by_id.get_mut(&id) else {
             return;
         };
         window.fullscreen = true;
-        if self.catalog.drawable(id) {
+        if self.windows.catalog.drawable(id) {
             self.follow_panes(id);
         }
         self.enter_output(id);
@@ -139,30 +140,32 @@ impl XdgShellHandler for State {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
             return;
         };
-        if let Some(window) = self.windows.get_mut(&id) {
+        if let Some(window) = self.windows.by_id.get_mut(&id) {
             window.fullscreen = false;
         }
         self.apply_window_state(id);
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(id) = self.ids.get(surface.wl_surface()).copied() {
+        if let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() {
             self.apply_window_state(id);
         }
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
             return;
         };
         let (app_id, title) = metadata(&surface);
-        self.catalog.update(id, app_id, title);
+        self.windows.catalog.update(id, app_id, title);
         self.resolve_pending_panes();
         let info = self.window_info(id);
-        self.toplevels.update(id, &info.title, &info.app_id);
+        self.protocols
+            .toplevels
+            .update(id, &info.title, &info.app_id);
         self.send_titles(id);
     }
 
@@ -171,7 +174,7 @@ impl XdgShellHandler for State {
     }
 }
 
-fn dismiss_popup(state: &mut State, root: &WlSurface, popup: &PopupKind) {
+fn dismiss_popup(state: &mut Compositor, root: &WlSurface, popup: &PopupKind) {
     if let Some(window) = state.window_for_surface(popup.wl_surface()) {
         state.touch(window);
     }
@@ -193,10 +196,10 @@ fn metadata(surface: &ToplevelSurface) -> (String, String) {
     })
 }
 
-fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> {
+fn popup_target(state: &Compositor, popup: &PopupSurface) -> Rectangle<i32, Logical> {
     let window = state.window_for_surface(popup.wl_surface());
     let geometry = window
-        .and_then(|window| state.windows.get(&window))
+        .and_then(|window| state.windows.by_id.get(&window))
         .map_or_else(
             || (0, 0).into(),
             |window| render::window_geometry(window.surface.wl_surface()),
@@ -213,7 +216,7 @@ fn popup_target(state: &State, popup: &PopupSurface) -> Rectangle<i32, Logical> 
     )
 }
 
-fn place_popup(state: &State, surface: &PopupSurface, positioner: PositionerState) {
+fn place_popup(state: &Compositor, surface: &PopupSurface, positioner: PositionerState) {
     let target = popup_target(state, surface);
     surface.with_pending_state(|pending| {
         pending.geometry = positioner.get_unconstrained_geometry(target);

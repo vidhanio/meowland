@@ -4,9 +4,9 @@ use meowland_core::pixels::FrameSize;
 use meowland_protocol::Show;
 use smithay::utils::{Logical, Size};
 
-use super::{AttachedPane, PaneId, Selection, ServerToPane, State, WindowId, input};
+use super::{AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, input};
 
-impl State {
+impl Compositor {
     /// The last-used pane decides the window's size; otherwise use the first
     /// attached pane, then the output mode.
     pub(crate) fn pane_size(&self, window: WindowId) -> Size<i32, Logical> {
@@ -22,7 +22,7 @@ impl State {
     /// Remove every pane-keyed entry and restore the remaining window size
     /// owner.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
-        if self.keyboard_state.owner == Some(pane) {
+        if self.input.keyboard_state.owner == Some(pane) {
             input::reset_keyboard(self);
         }
         let removed = self.attachments.remove(pane);
@@ -39,16 +39,17 @@ impl State {
         {
             self.forget_activation(&token);
         }
-        if self.last_input_pane == Some(pane) {
-            self.last_input_pane = None;
+        if self.input.last_input_pane == Some(pane) {
+            self.input.last_input_pane = None;
         }
         if self
+            .input
             .cursor
             .sent
             .as_ref()
             .is_some_and(|(sent, _)| *sent == pane)
         {
-            self.cursor.sent = None;
+            self.input.cursor.sent = None;
         }
         if let Some(window) = window {
             self.leave_output(window);
@@ -65,7 +66,7 @@ impl State {
         let Some(window) = self.remove_pane(pane) else {
             return;
         };
-        if self.catalog.focused() == Some(window)
+        if self.windows.catalog.focused() == Some(window)
             && !self.attachments.visible(window)
             && let Some(next) = self.attachments.first_window()
         {
@@ -86,7 +87,8 @@ impl State {
     }
 
     pub(crate) fn attach_pane(&mut self, pane: PaneId, show: Show, size: FrameSize) {
-        if matches!(&show, Show::Activation(token) if !self.launches.contains_key(token)) {
+        if matches!(&show, Show::Activation(token) if !self.protocols.launches.contains_key(token))
+        {
             self.emit(pane, ServerToPane::Release("no such activation".into()));
             return;
         }
@@ -122,7 +124,7 @@ impl State {
             self.forget_activation(&token);
         }
         if previous != Some(window) {
-            if self.keyboard_state.owner == Some(pane) {
+            if self.input.keyboard_state.owner == Some(pane) {
                 input::reset_keyboard(self);
             }
             if let Some(previous) = previous {

@@ -12,7 +12,7 @@ use smithay::{
     },
 };
 
-use super::{State, WlSurface};
+use super::{Compositor, WlSurface};
 
 pub(crate) fn output(
     display: &DisplayHandle,
@@ -28,7 +28,7 @@ pub(crate) fn output(
             .into(),
         refresh: refresh_rate.millihertz(),
     };
-    let manager = OutputManagerState::new_with_xdg_output::<State>(display);
+    let manager = OutputManagerState::new_with_xdg_output::<Compositor>(display);
     let output = Output::new(
         "meowland".into(),
         PhysicalProperties {
@@ -39,7 +39,7 @@ pub(crate) fn output(
             serial_number: String::new(),
         },
     );
-    output.create_global::<State>(display);
+    output.create_global::<Compositor>(display);
     output.change_current_state(
         Some(mode),
         None,
@@ -50,7 +50,7 @@ pub(crate) fn output(
     (manager, output, mode)
 }
 
-impl FractionalScaleHandler for State {
+impl FractionalScaleHandler for Compositor {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| {
@@ -60,7 +60,7 @@ impl FractionalScaleHandler for State {
     }
 }
 
-impl State {
+impl Compositor {
     pub(crate) fn logical_size(&self, width: u32, height: u32) -> Size<i32, Logical> {
         Size::from((self.scale.logical(width), self.scale.logical(height)))
     }

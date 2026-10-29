@@ -13,19 +13,19 @@ use smithay::{
     wayland::text_input::{TextInputActivation, TextInputManagerState, TextInputSeat},
 };
 
-use super::State;
+use super::Compositor;
 
-pub(crate) fn manager(display: &DisplayHandle, seat: &Seat<State>) -> TextInputManagerState {
-    let manager = TextInputManagerState::new::<State>(display);
+pub(crate) fn manager(display: &DisplayHandle, seat: &Seat<Compositor>) -> TextInputManagerState {
+    let manager = TextInputManagerState::new::<Compositor>(display);
     seat.text_input().set_compositor_input_method(true);
     manager
 }
 
-pub(crate) fn commit(state: &mut State, text: &str) {
+pub(crate) fn commit(state: &mut Compositor, text: &str) {
     if !valid(text) {
         return;
     }
-    let handle = state.seat.text_input();
+    let handle = state.input.seat.text_input();
     let mut committed = false;
     handle.with_active_text_input(|input, _| {
         input.commit_string(Some(text.to_owned()));
@@ -40,9 +40,9 @@ pub(crate) fn commit(state: &mut State, text: &str) {
     fallback(state, text);
 }
 
-impl TextInputActivation for State {
+impl TextInputActivation for Compositor {
     fn activated(&mut self, _content_type: Option<(ContentHint, ContentPurpose)>) {
-        self.seat.text_input().done(false);
+        self.input.seat.text_input().done(false);
     }
 }
 
@@ -52,12 +52,12 @@ fn valid(text: &str) -> bool {
         && !text.chars().any(char::is_control)
 }
 
-fn fallback(state: &mut State, text: &str) {
+fn fallback(state: &mut Compositor, text: &str) {
     let keysyms: Vec<_> = text
         .chars()
         .map(|character| xkb::utf32_to_keysym(u32::from(character)))
         .collect();
-    let Some(keyboard) = state.keyboard.clone() else {
+    let Some(keyboard) = state.input.keyboard.clone() else {
         return;
     };
     for chunk in keysyms.chunks(200) {

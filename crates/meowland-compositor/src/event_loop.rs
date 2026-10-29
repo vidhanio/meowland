@@ -7,14 +7,14 @@ use calloop::{
     TokenFactory,
 };
 
-use super::State;
+use super::Compositor;
 
 trait Source {
     fn dispatch(
         &mut self,
         readiness: Readiness,
         token: Token,
-        state: &mut State,
+        state: &mut Compositor,
     ) -> io::Result<PostAction>;
     fn register(&mut self, poll: &mut Poll, tokens: &mut TokenFactory) -> calloop::Result<()>;
     fn reregister(&mut self, poll: &mut Poll, tokens: &mut TokenFactory) -> calloop::Result<()>;
@@ -31,13 +31,13 @@ struct Callback<S, F> {
 impl<S, F> Source for Callback<S, F>
 where
     S: EventSource,
-    F: FnMut(S::Event, &mut S::Metadata, &mut State) -> S::Ret,
+    F: FnMut(S::Event, &mut S::Metadata, &mut Compositor) -> S::Ret,
 {
     fn dispatch(
         &mut self,
         readiness: Readiness,
         token: Token,
-        state: &mut State,
+        state: &mut Compositor,
     ) -> io::Result<PostAction> {
         self.source
             .process_events(readiness, token, |event, metadata| {
@@ -129,7 +129,7 @@ impl CompositorHandle {
     /// Register compositor callbacks against a field of the host's loop data.
     pub fn new<D: 'static>(
         handle: LoopHandle<'static, D>,
-        project: fn(&mut D) -> &mut State,
+        project: fn(&mut D) -> &mut Compositor,
     ) -> Self {
         let removing = handle.clone();
         Self {
@@ -151,7 +151,7 @@ impl CompositorHandle {
     ) -> io::Result<RegistrationToken>
     where
         S: EventSource + 'static,
-        F: FnMut(S::Event, &mut S::Metadata, &mut State) -> S::Ret + 'static,
+        F: FnMut(S::Event, &mut S::Metadata, &mut Compositor) -> S::Ret + 'static,
     {
         (self.register)(Projected(Box::new(Callback { source, callback })))
     }

@@ -81,12 +81,15 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
     independent state machine with its own sources and timers.
   - `catalog.rs` + `attachment.rs`: pure policy that never touches Wayland. As a
     separate crate it could be unit-tested without Smithay.
-- [ ] **Break up the `Compositor` god struct.** It has about 45 fields, and every
+- [x] **Break up the `Compositor` god struct.** It has about 45 fields, and every
   submodule reaches into all of them through `impl State`. Group them into
   sub-structs (`Protocols`, `Seat`, `Windows`, `Panes`, `Selection`), so borrows split
   cleanly and the `keyboard.take() … self.keyboard = Some(keyboard)` dance (repeated
   about 12 times) goes away. Drop the `use Compositor as State` alias: two names for
   one type makes grepping harder.
+  - Protocol, seat/input, and window state now live in `Protocols`, `Input`, and
+    `Windows`. The `pointer.take()` around motion stays on purpose: the take
+    suppresses `cursor_image` delivery while the pointer moves.
 - [x] **Replace the `CompositorHandle` projection machinery.**
   `meowland-compositor/src/event_loop.rs` adds a custom `Source` trait object,
   `Projected`, and `Rc<dyn Fn>` boxing (about 160 lines) so the compositor can register

@@ -10,7 +10,7 @@ use smithay::{
     },
 };
 
-use super::{Selection, ServerToPane, State, WindowId};
+use super::{Compositor, Selection, ServerToPane, WindowId};
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -19,13 +19,13 @@ pub(crate) struct Launch {
     expires: Instant,
 }
 
-impl State {
+impl Compositor {
     /// Reserve an activation token for a client launched by the host.
     pub fn create_activation_token(&mut self) -> String {
-        let (token, data) = self.activation.create_external_token(None);
+        let (token, data) = self.protocols.activation.create_external_token(None);
         let token = token.as_str().to_owned();
         let expires = data.timestamp + TOKEN_LIFETIME;
-        self.launches.insert(
+        self.protocols.launches.insert(
             token.clone(),
             Launch {
                 window: None,
@@ -37,8 +37,10 @@ impl State {
     }
 
     pub(crate) fn forget_activation(&mut self, token: &str) {
-        self.launches.remove(token);
-        self.activation.remove_token(&token.to_owned().into());
+        self.protocols.launches.remove(token);
+        self.protocols
+            .activation
+            .remove_token(&token.to_owned().into());
         self.refresh_activation_deadline();
     }
 
@@ -61,6 +63,7 @@ impl State {
 
     pub(crate) fn cancel_window_activations(&mut self, window: WindowId) {
         let tokens: Vec<_> = self
+            .protocols
             .launches
             .iter()
             .filter(|(_, launch)| launch.window == Some(window))
@@ -73,12 +76,14 @@ impl State {
 
     /// Recompute the earliest launch or external-token expiry.
     pub(crate) fn refresh_activation_deadline(&mut self) {
-        self.activation_deadline = self
+        self.protocols.activation_deadline = self
+            .protocols
             .launches
             .values()
             .map(|launch| launch.expires)
             .chain(
-                self.activation
+                self.protocols
+                    .activation
                     .tokens()
                     .map(|(_, data)| data.timestamp + TOKEN_LIFETIME),
             )
@@ -89,12 +94,14 @@ impl State {
     pub(crate) fn expire_activation_tokens(&mut self) {
         let now = Instant::now();
         if self
+            .protocols
             .activation_deadline
             .is_none_or(|deadline| now < deadline)
         {
             return;
         }
         let expired: Vec<_> = self
+            .protocols
             .launches
             .iter()
             .filter(|(_, launch)| launch.expires <= now)
@@ -106,22 +113,24 @@ impl State {
                 "client did not activate a window; use --app-id for clients without xdg-activation-v1 support",
             );
         }
-        self.activation
+        self.protocols
+            .activation
             .retain_tokens(|_, data| now < data.timestamp + TOKEN_LIFETIME);
         self.refresh_activation_deadline();
     }
 }
 
-impl XdgActivationHandler for State {
+impl XdgActivationHandler for Compositor {
     fn activation_state(&mut self) -> &mut XdgActivationState {
-        &mut self.activation
+        &mut self.protocols.activation
     }
 
     /// Only the focused Wayland client may delegate activation to another app.
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        self.catalog
+        self.windows
+            .catalog
             .focused()
-            .and_then(|window| self.windows.get(&window))
+            .and_then(|window| self.windows.by_id.get(&window))
             .and_then(|window| window.surface.wl_surface().client())
             .is_some_and(|client| data.client_id == Some(client.id()))
     }
@@ -136,16 +145,16 @@ impl XdgActivationHandler for State {
             self.cancel_activation(token.as_str(), "activation token expired");
             return;
         }
-        let Some(window) = self.ids.get(&surface).copied() else {
+        let Some(window) = self.windows.ids.get(&surface).copied() else {
             return;
         };
-        self.activation.remove_token(&token);
-        if let Some(launch) = self.launches.get_mut(token.as_str()) {
+        self.protocols.activation.remove_token(&token);
+        if let Some(launch) = self.protocols.launches.get_mut(token.as_str()) {
             launch.window = Some(window);
         }
         self.refresh_activation_deadline();
         self.resolve_pending_panes();
-        if self.catalog.drawable(window) {
+        if self.windows.catalog.drawable(window) {
             self.focus_window(window);
         }
     }

@@ -142,11 +142,74 @@ pub enum FrameAck {
     Resync,
 }
 
+/// Server-assigned identity of a window, stable for its lifetime.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    /// Numeric identity as assigned by the compositor.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for WindowId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for WindowId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Server-assigned identity of one terminal clipboard read.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ClipboardRequestId(u64);
+
+impl ClipboardRequestId {
+    /// Numeric identity as assigned by the compositor.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for ClipboardRequestId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Terminal-assigned identity of one clipboard selection offer.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ClipboardOfferId(u64);
+
+impl ClipboardOfferId {
+    /// Numeric identity as assigned by the terminal.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for ClipboardOfferId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// Window selector used by attachment, launch, and control requests.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Show {
     /// Select a particular server-assigned window ID.
-    Id(u64),
+    Id(WindowId),
     /// Follow the newest mapped window.
     Newest,
     /// Select the currently focused window.
@@ -161,7 +224,7 @@ pub enum Show {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WindowInfo {
     /// Server-assigned window ID, stable for the window's lifetime.
-    pub id: u64,
+    pub id: WindowId,
     /// Application identity advertised by the Wayland client.
     pub app_id: String,
     /// Client-provided title; sanitize before emitting terminal control
@@ -290,7 +353,7 @@ pub enum PaneAction {
         /// Clipboard or primary selection being replaced.
         selection: crate::clipboard::Selection,
         /// Terminal-assigned offer identity for subsequent reads.
-        offer: u64,
+        offer: ClipboardOfferId,
         /// Available MIME types, validated and bounded by the receiver.
         mimes: Vec<String>,
         /// Whether accepting the offer should also trigger paste.
@@ -299,7 +362,7 @@ pub enum PaneAction {
     /// Complete a previously requested terminal clipboard read.
     ClipboardReply {
         /// Server-assigned request identity.
-        request: u64,
+        request: ClipboardRequestId,
         /// Raw bytes on success, or `None` if unavailable or denied.
         #[serde(with = "serde_bytes")]
         data: Option<Vec<u8>>,
@@ -338,9 +401,9 @@ pub enum PanePacket<F> {
     /// Request one MIME representation from a previously announced offer.
     ClipboardRead {
         /// Server-assigned identity used in the reply or cancellation.
-        request: u64,
+        request: ClipboardRequestId,
         /// Terminal-assigned identity of the selection offer.
-        offer: u64,
+        offer: ClipboardOfferId,
         /// Requested MIME representation.
         mime: String,
         /// Shared monotonic deadline, including time spent awaiting permission.
@@ -349,7 +412,7 @@ pub enum PanePacket<F> {
     /// Discard a pending read and suppress any eventual reply.
     ClipboardCancel {
         /// Server-assigned identity of the cancelled read.
-        request: u64,
+        request: ClipboardRequestId,
     },
     /// Ring the terminal's audible or visual bell.
     Bell,

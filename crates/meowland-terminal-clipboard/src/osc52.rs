@@ -7,7 +7,10 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use meowland_protocol::clipboard::{ClipboardData, Deadline, MAX_TEXT, Selection, TEXT_MIMES};
+use meowland_protocol::{
+    ClipboardOfferId, ClipboardRequestId,
+    clipboard::{ClipboardData, Deadline, MAX_TEXT, Selection, TEXT_MIMES},
+};
 
 use super::{Action, Refresh};
 
@@ -27,7 +30,7 @@ enum State {
 pub(crate) struct Clipboard {
     state: State,
     next: u64,
-    snapshot: Option<(u64, Vec<u8>)>,
+    snapshot: Option<(ClipboardOfferId, Vec<u8>)>,
     actions: VecDeque<Action>,
 }
 
@@ -56,7 +59,13 @@ impl Clipboard {
         Some(deadline)
     }
 
-    pub(crate) fn read(&mut self, request: u64, offer: u64, mime: &str, deadline: Deadline) {
+    pub(crate) fn read(
+        &mut self,
+        request: ClipboardRequestId,
+        offer: ClipboardOfferId,
+        mime: &str,
+        deadline: Deadline,
+    ) {
         let data = self.snapshot.as_ref().and_then(|(id, bytes)| {
             (*id == offer && TEXT_MIMES.contains(&mime) && !deadline.expired())
                 .then(|| bytes.clone())
@@ -64,7 +73,7 @@ impl Clipboard {
         self.actions.push_back(Action::Reply { request, data });
     }
 
-    pub(crate) fn cancel(&mut self, request: u64) {
+    pub(crate) fn cancel(&mut self, request: ClipboardRequestId) {
         self.actions.retain(
             |action| !matches!(action, Action::Reply { request: number, .. } if *number == request),
         );
@@ -137,10 +146,11 @@ impl Clipboard {
             .filter(|bytes| bytes.len() <= MAX_TEXT && std::str::from_utf8(bytes).is_ok());
         if let Some(bytes) = data {
             self.next += 1;
-            self.snapshot = Some((self.next, bytes));
+            let offer = ClipboardOfferId::from(self.next);
+            self.snapshot = Some((offer, bytes));
             self.actions.push_back(Action::Offer {
                 selection: Selection::Clipboard,
-                offer: self.next,
+                offer,
                 mimes: TEXT_MIMES.into_iter().map(str::to_owned).collect(),
                 paste: false,
             });

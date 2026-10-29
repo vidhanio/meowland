@@ -7,8 +7,11 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use meowland_protocol::clipboard::{
-    ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, Selection, TRANSFER_TIMEOUT, mime_types,
+use meowland_protocol::{
+    ClipboardOfferId, ClipboardRequestId,
+    clipboard::{
+        ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, Selection, TRANSFER_TIMEOUT, mime_types,
+    },
 };
 
 use super::{Action, Focus, Refresh};
@@ -85,8 +88,8 @@ enum Request {
     },
     Read {
         selection: Selection,
-        request: u64,
-        offer: u64,
+        request: ClipboardRequestId,
+        offer: ClipboardOfferId,
         mime: String,
         deadline: Deadline,
     },
@@ -120,7 +123,7 @@ pub(crate) struct Clipboard {
     requests: VecDeque<Queued>,
     active: Option<Operation>,
     notification: Option<Reading>,
-    offers: HashMap<u64, Credentials>,
+    offers: HashMap<ClipboardOfferId, Credentials>,
     actions: VecDeque<Action>,
 }
 
@@ -191,7 +194,13 @@ impl Clipboard {
 
     /// Queue a representation read from a previously advertised selection
     /// offer.
-    pub(crate) fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
+    pub(crate) fn read(
+        &mut self,
+        request: ClipboardRequestId,
+        offer: ClipboardOfferId,
+        mime: String,
+        deadline: Deadline,
+    ) {
         let selection = self
             .offers
             .get(&offer)
@@ -212,7 +221,7 @@ impl Clipboard {
     }
 
     /// Suppress a pending representation read and any queued reply for it.
-    pub(crate) fn cancel(&mut self, request: u64) {
+    pub(crate) fn cancel(&mut self, request: ClipboardRequestId) {
         let matches = |candidate: &Request| matches!(candidate, Request::Read { request: number, .. } if *number == request);
         self.requests.retain(|queued| !matches(&queued.request));
         if let Some(operation) = &mut self.active
@@ -512,7 +521,7 @@ impl Clipboard {
         };
         let mimes = mime_types(types.split_ascii_whitespace().map(str::to_owned));
         self.next += 1;
-        let offer = self.next;
+        let offer = ClipboardOfferId::from(self.next);
         if self.offers.len() >= MAX_OFFERS
             && let Some(oldest) = self.offers.keys().min().copied()
         {

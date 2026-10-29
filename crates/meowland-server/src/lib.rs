@@ -39,13 +39,13 @@ struct ConnectionId(u64);
 
 impl From<ConnectionId> for PaneId {
     fn from(connection: ConnectionId) -> Self {
-        Self(connection.0)
+        Self::from(connection.0)
     }
 }
 
 impl From<PaneId> for ConnectionId {
     fn from(pane: PaneId) -> Self {
-        Self(pane.0)
+        Self(pane.get())
     }
 }
 

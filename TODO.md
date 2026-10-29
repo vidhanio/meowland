@@ -210,7 +210,7 @@ These follow the `rust-best-practices` skill.
   `PaneAction::Resize` carry raw `u32`s that the server validates in three places
   (`transport.rs`, `commands.rs` twice). Send `FrameSize` and validate during
   deserialization, as `FrameBand` and `SharedFrame` already do.
-- [ ] **Use ID newtypes on the wire.** `WindowInfo::id`, `Show::Id`, and the clipboard
+- [x] **Use ID newtypes on the wire.** `WindowInfo::id`, `Show::Id`, and the clipboard
   `request` and `offer` IDs are bare `u64`. Use `WindowId`, `RequestId`, and `OfferId`.
   `PaneId(pub u64)` and `WindowId(pub u64)` expose their fields.
 - [ ] **Bool fields in the protocol.** `ClipboardOffer.paste`, `Input::Key.pressed`,

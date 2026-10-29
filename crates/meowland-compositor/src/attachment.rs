@@ -3,18 +3,28 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{FrameAck, FrameTransport, Show, clipboard::Transport};
+use meowland_protocol::{FrameAck, FrameTransport, Show, WindowId, clipboard::Transport};
 
 use super::frame::PaneState;
 
 /// Host-assigned identity of a terminal pane, distinct from a Wayland window
 /// ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PaneId(pub u64);
+pub struct PaneId(u64);
 
-/// Compositor-assigned identity stable for one Wayland toplevel's lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WindowId(pub u64);
+impl PaneId {
+    /// Numeric identity as assigned by the server.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for PaneId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum Selection {

@@ -12,9 +12,12 @@ use calloop::{
     generic::Generic,
     timer::{TimeoutAction, Timer},
 };
-use meowland_protocol::clipboard::{
-    ClipboardData, Deadline, Item, MAX_BYTES, MAX_TEXT, Selection as ClipboardSelection,
-    TRANSFER_TIMEOUT, Transport, mime_types,
+use meowland_protocol::{
+    ClipboardOfferId, ClipboardRequestId,
+    clipboard::{
+        ClipboardData, Deadline, Item, MAX_BYTES, MAX_TEXT, Selection as ClipboardSelection,
+        TRANSFER_TIMEOUT, Transport, mime_types,
+    },
 };
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
@@ -31,7 +34,10 @@ use super::{PaneId, ServerToPane, State, input::paste_action, sources::Sources};
 #[derive(Clone, Debug)]
 pub enum Source {
     Local(Arc<ClipboardData>),
-    Terminal { pane: PaneId, offer: u64 },
+    Terminal {
+        pane: PaneId,
+        offer: ClipboardOfferId,
+    },
 }
 
 struct Export {
@@ -130,7 +136,7 @@ fn export_types(advertised: impl IntoIterator<Item = String>, transport: Transpo
 #[derive(Default)]
 pub(crate) struct Bridge {
     exports: [Option<Export>; 2],
-    deliveries: HashMap<u64, Delivery>,
+    deliveries: HashMap<ClipboardRequestId, Delivery>,
     next: u64,
 }
 
@@ -408,7 +414,7 @@ pub(crate) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) 
             if !state.attachments.contains(*pane) {
                 return;
             }
-            let request = state.clipboard.id();
+            let request = ClipboardRequestId::from(state.clipboard.id());
             let Ok(sources) = delivery_timer(state, request, deadline) else {
                 return;
             };
@@ -433,7 +439,11 @@ pub(crate) fn send(state: &mut State, fd: OwnedFd, mime: &str, source: &Source) 
     }
 }
 
-fn delivery_timer(state: &State, request: u64, deadline: Deadline) -> io::Result<Sources> {
+fn delivery_timer(
+    state: &State,
+    request: ClipboardRequestId,
+    deadline: Deadline,
+) -> io::Result<Sources> {
     let mut sources = Sources::new(&state.handle);
     sources.timer = Some(
         state
@@ -464,7 +474,7 @@ fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
     if data.is_empty() || data.len() > MAX_BYTES || deadline.expired() {
         return;
     }
-    let request = state.clipboard.id();
+    let request = ClipboardRequestId::from(state.clipboard.id());
     let result = (|| -> io::Result<Sources> {
         nonblocking(&fd)?;
         let mut sources = delivery_timer(state, request, deadline)?;
@@ -523,7 +533,12 @@ fn write(state: &mut State, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
     }
 }
 
-pub(crate) fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<Vec<u8>>) {
+pub(crate) fn reply(
+    state: &mut State,
+    pane: PaneId,
+    request: ClipboardRequestId,
+    data: Option<Vec<u8>>,
+) {
     if state.clipboard.deliveries.get(&request).is_none_or(|delivery| {
         !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
     }) {
@@ -542,7 +557,7 @@ pub(crate) fn reply(state: &mut State, pane: PaneId, request: u64, data: Option<
 
 pub(crate) struct TerminalOffer {
     pub selection: ClipboardSelection,
-    pub id: u64,
+    pub id: ClipboardOfferId,
     pub mimes: Vec<String>,
     pub paste: bool,
 }

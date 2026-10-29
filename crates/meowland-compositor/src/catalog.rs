@@ -25,7 +25,7 @@ pub(crate) struct WindowCatalog {
 impl WindowCatalog {
     pub(crate) fn insert(&mut self, app_id: String, title: String) -> WindowId {
         self.next += 1;
-        let id = WindowId(self.next);
+        let id = WindowId::from(self.next);
         self.windows.insert(
             id,
             Metadata {
@@ -97,7 +97,7 @@ impl WindowCatalog {
             .get(&id)
             .map_or_default(|window| (window.app_id.clone(), window.title.clone()));
         WindowInfo {
-            id: id.0,
+            id,
             app_id,
             title,
             active: self.focused == Some(id),
@@ -112,7 +112,7 @@ impl WindowCatalog {
 
     pub(crate) fn select(&self, show: &Show, activation: Option<WindowId>) -> Option<WindowId> {
         let window = match show {
-            Show::Id(id) => Some(WindowId(*id)),
+            Show::Id(id) => Some(*id),
             Show::Newest => self.newest,
             Show::Focused => self.focused,
             Show::AppId(app_id) => self.newest_matching(|window| window.app_id == *app_id),

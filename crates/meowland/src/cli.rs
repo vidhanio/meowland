@@ -8,7 +8,7 @@ use std::{
 };
 
 use meowland_protocol::{
-    self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowInfo,
+    self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowId, WindowInfo,
 };
 use meowland_terminal as terminal;
 use usage_rs::{Args, Cli, Subcommands, ValueEnum};
@@ -94,8 +94,8 @@ impl WindowArgs {
 
 fn window_target(window: String) -> Show {
     window
-        .parse()
-        .map_or_else(|_| Show::AppId(window), Show::Id)
+        .parse::<u64>()
+        .map_or(Show::AppId(window), |id| Show::Id(WindowId::from(id)))
 }
 
 fn window_targets<P>(

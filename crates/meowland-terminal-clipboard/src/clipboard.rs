@@ -3,7 +3,10 @@
 
 use std::{io, time::Instant};
 
-use meowland_protocol::clipboard::{ClipboardData, Deadline, Selection};
+use meowland_protocol::{
+    ClipboardOfferId, ClipboardRequestId,
+    clipboard::{ClipboardData, Deadline, Selection},
+};
 
 use crate::{kitty, osc52};
 
@@ -15,7 +18,7 @@ pub enum Action {
         /// Selection whose contents changed.
         selection: Selection,
         /// Terminal-assigned identity used for subsequent reads.
-        offer: u64,
+        offer: ClipboardOfferId,
         /// Validated MIME representations available from this offer.
         mimes: Vec<String>,
         /// Whether this originated from an explicit paste notification.
@@ -24,7 +27,7 @@ pub enum Action {
     /// Complete a server-requested selection read.
     Reply {
         /// Server-assigned read identity.
-        request: u64,
+        request: ClipboardRequestId,
         /// Raw representation bytes, or `None` if unavailable.
         data: Option<Vec<u8>>,
     },
@@ -133,7 +136,13 @@ impl Clipboard {
 
     /// Queue a representation read, reporting unavailable or expired offers
     /// through [`Action::Reply`].
-    pub fn read(&mut self, request: u64, offer: u64, mime: String, deadline: Deadline) {
+    pub fn read(
+        &mut self,
+        request: ClipboardRequestId,
+        offer: ClipboardOfferId,
+        mime: String,
+        deadline: Deadline,
+    ) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.read(request, offer, mime, deadline),
             Transport::Text(clipboard) => clipboard.read(request, offer, &mime, deadline),
@@ -142,7 +151,7 @@ impl Clipboard {
 
     /// Suppress a pending read and any queued reply with the given request
     /// identity.
-    pub fn cancel(&mut self, request: u64) {
+    pub fn cancel(&mut self, request: ClipboardRequestId) {
         match &mut self.transport {
             Transport::Kitty(clipboard) => clipboard.cancel(request),
             Transport::Text(clipboard) => clipboard.cancel(request),

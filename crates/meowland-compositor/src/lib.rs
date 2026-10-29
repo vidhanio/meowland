@@ -64,11 +64,12 @@ mod toplevels;
 mod window;
 
 use Compositor as State;
+pub use attachment::PaneId;
 use attachment::{AttachedPane, Attachments, Policy, Selection};
-pub use attachment::{PaneId, WindowId};
 use catalog::WindowCatalog;
 pub use commands::{CloseWindowError, Command};
 pub use event_loop::CompositorHandle;
+pub use meowland_protocol::WindowId;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;
 pub use runtime::Runtime;

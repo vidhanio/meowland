@@ -13,7 +13,7 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 use meowland_protocol::{
-    ClipboardOfferId, ClipboardRequestId,
+    ClipboardOfferId, ClipboardRequestId, OfferIntent,
     clipboard::{
         ClipboardData, Deadline, Item, MAX_BYTES, MAX_TEXT, Selection as ClipboardSelection,
         TRANSFER_TIMEOUT, Transport, mime_types,
@@ -559,7 +559,7 @@ pub(crate) struct TerminalOffer {
     pub selection: ClipboardSelection,
     pub id: ClipboardOfferId,
     pub mimes: Vec<String>,
-    pub paste: bool,
+    pub intent: OfferIntent,
 }
 
 pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
@@ -567,7 +567,7 @@ pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
         selection,
         id: offer,
         mimes,
-        paste,
+        intent,
     } = offer;
     if !state.attachments.contains(pane) {
         return;
@@ -589,7 +589,7 @@ pub(crate) fn offer(state: &mut State, pane: PaneId, offer: TerminalOffer) {
             Source::Terminal { pane, offer },
         ),
     }
-    if paste && target == SelectionTarget::Clipboard {
+    if intent == OfferIntent::Paste && target == SelectionTarget::Clipboard {
         paste_action(state, pane);
     }
 }

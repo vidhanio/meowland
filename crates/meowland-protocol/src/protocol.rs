@@ -231,7 +231,16 @@ pub struct WindowInfo {
     /// sequences.
     pub title: String,
     /// Whether this window currently has compositor focus.
-    pub active: bool,
+    pub state: WindowState,
+}
+
+/// Compositor focus state of one window.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum WindowState {
+    /// The window currently has compositor focus.
+    Active,
+    /// Another window or no window has compositor focus.
+    Inactive,
 }
 
 /// Initial pane request, sent before any [`PaneAction`].
@@ -260,12 +269,12 @@ pub enum Button {
     Other(u8),
 }
 
-/// Whether a pointer button is going down or coming up.
+/// Whether a key or pointer button is going down or coming up.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-pub enum ButtonState {
-    /// The button is now held down.
+pub enum Transition {
+    /// The key or button is now held down.
     Pressed,
-    /// A previously held button was let go.
+    /// A previously held key or button was let go.
     Released,
 }
 
@@ -287,8 +296,9 @@ pub enum Input {
         /// Kitty key identity: an unshifted Unicode code point, or a functional
         /// key number from 57344 upward.
         key: u32,
-        /// A real key transition. It stays down until its release or a reset.
-        pressed: bool,
+        /// A real key transition. The key stays down until its release or a
+        /// reset.
+        state: Transition,
         /// [`Modifiers`] snapshot, including lock state.
         modifiers: Modifiers,
         /// Text the terminal associated with the transition, when it reported
@@ -308,7 +318,7 @@ pub enum Input {
         /// drag.
         y: f64,
         /// Terminal button transition, or no transition for plain motion.
-        button: Option<(Button, ButtonState)>,
+        button: Option<(Button, Transition)>,
         /// Wheel movement since the previous event; 120 units is one detent.
         scroll: Scroll,
     },
@@ -334,6 +344,15 @@ pub enum PaneToServer {
     Action(PaneAction),
 }
 
+/// Why a terminal published a clipboard offer.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum OfferIntent {
+    /// Refresh MIME metadata without triggering paste.
+    Refresh,
+    /// Publish the offer and trigger the application's paste shortcut.
+    Paste,
+}
+
 /// Actions accepted after the pane handshake, independent of socket ownership.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PaneAction {
@@ -356,8 +375,8 @@ pub enum PaneAction {
         offer: ClipboardOfferId,
         /// Available MIME types, validated and bounded by the receiver.
         mimes: Vec<String>,
-        /// Whether accepting the offer should also trigger paste.
-        paste: bool,
+        /// What accepting the offer should do.
+        intent: OfferIntent,
     },
     /// Complete a previously requested terminal clipboard read.
     ClipboardReply {

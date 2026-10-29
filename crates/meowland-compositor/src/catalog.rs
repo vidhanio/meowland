@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use meowland_protocol::{Show, WindowInfo};
+use meowland_protocol::{Show, WindowInfo, WindowState};
 
 use super::WindowId;
 
@@ -100,7 +100,11 @@ impl WindowCatalog {
             id,
             app_id,
             title,
-            active: self.focused == Some(id),
+            state: if self.focused == Some(id) {
+                WindowState::Active
+            } else {
+                WindowState::Inactive
+            },
         }
     }
 

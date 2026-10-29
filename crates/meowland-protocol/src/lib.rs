@@ -12,10 +12,10 @@ mod shared;
 pub use frame::FrameBand;
 pub use paths::Paths;
 pub use protocol::{
-    Button, ButtonState, ClipboardOfferId, ClipboardRequestId, ControlRequest, ControlResponse,
-    FrameAck, Hello, Input, KEY_INSERT, KEY_Q, KEY_V, KEY_W, MAX_INPUT_TEXT, MAX_MESSAGE,
-    Modifiers, PaneAction, PanePacket, PaneToServer, REQUEST_TIMEOUT, RETAINED_BUFFER, Scroll,
-    ServerToPane, Shortcut, Show, WindowId, WindowInfo, decode, recv, release_oversized, sanitize,
-    sanitize_with_limit, send,
+    Button, ClipboardOfferId, ClipboardRequestId, ControlRequest, ControlResponse, FrameAck, Hello,
+    Input, KEY_INSERT, KEY_Q, KEY_V, KEY_W, MAX_INPUT_TEXT, MAX_MESSAGE, Modifiers, OfferIntent,
+    PaneAction, PanePacket, PaneToServer, REQUEST_TIMEOUT, RETAINED_BUFFER, Scroll, ServerToPane,
+    Shortcut, Show, Transition, WindowId, WindowInfo, WindowState, decode, recv, release_oversized,
+    sanitize, sanitize_with_limit, send,
 };
 pub use shared::{FrameTransport, SharedFrame, SharedObject};

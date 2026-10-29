@@ -213,7 +213,7 @@ These follow the `rust-best-practices` skill.
 - [x] **Use ID newtypes on the wire.** `WindowInfo::id`, `Show::Id`, and the clipboard
   `request` and `offer` IDs are bare `u64`. Use `WindowId`, `RequestId`, and `OfferId`.
   `PaneId(pub u64)` and `WindowId(pub u64)` expose their fields.
-- [ ] **Bool fields in the protocol.** `ClipboardOffer.paste`, `Input::Key.pressed`,
+- [x] **Bool fields in the protocol.** `ClipboardOffer.paste`, `Input::Key.pressed`,
   and `WindowInfo.active` should be enums.
 - [x] **Pair related probe fields.** `ProbeInfo` stores `pixel_width`/`pixel_height`
   and `cell_width`/`cell_height` as independent `Option`s. Use

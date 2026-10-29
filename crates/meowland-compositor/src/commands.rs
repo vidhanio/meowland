@@ -1,7 +1,7 @@
 //! Pane commands and their Wayland side effects.
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{Input, PaneAction, Shortcut, Show};
+use meowland_protocol::{Input, PaneAction, Shortcut, Show, Transition};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{AttachedPane, PaneId, ServerToPane, State, WindowId, clipboard, input::pane_input};
@@ -66,7 +66,7 @@ impl State {
                 if let Input::Key {
                     key,
                     modifiers,
-                    pressed: true,
+                    state: Transition::Pressed,
                     ..
                 } = &event
                     && let Some(shortcut) = Shortcut::from_key(*key, *modifiers)
@@ -87,7 +87,7 @@ impl State {
                 selection,
                 offer,
                 mimes,
-                paste,
+                intent,
             } => clipboard::offer(
                 self,
                 pane,
@@ -95,7 +95,7 @@ impl State {
                     selection,
                     id: offer,
                     mimes,
-                    paste,
+                    intent,
                 },
             ),
             PaneAction::ClipboardReply { request, data } => {

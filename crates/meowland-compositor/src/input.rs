@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use meowland_protocol::{Button, ButtonState, Input, KEY_V, Modifiers, Scroll};
+use meowland_protocol::{Button, Input, KEY_V, Modifiers, Scroll, Transition};
 use smithay::{
     backend::input::{
         Axis, AxisSource, ButtonState as WaylandButtonState, InputTime, KeyState, Keycode,
@@ -62,8 +62,13 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
         }
         return;
     }
-    if matches!(event, Input::Key { pressed: false, .. })
-        && state.keyboard_state.owner != Some(pane)
+    if matches!(
+        event,
+        Input::Key {
+            state: Transition::Released,
+            ..
+        }
+    ) && state.keyboard_state.owner != Some(pane)
     {
         return;
     }
@@ -80,7 +85,7 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
     match *event {
         Input::Key {
             key,
-            pressed,
+            state: transition,
             modifiers,
             ref text,
             ref held,
@@ -94,10 +99,9 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             key_transition(
                 state,
                 key,
-                if pressed {
-                    KeyState::Pressed
-                } else {
-                    KeyState::Released
+                match transition {
+                    Transition::Pressed => KeyState::Pressed,
+                    Transition::Released => KeyState::Released,
                 },
                 modifiers,
                 text.as_deref(),
@@ -125,8 +129,7 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
                 .pointer
                 .as_ref()
                 .is_some_and(PointerHandle::is_grabbed);
-            if !grabbed && button.is_some_and(|(_, transition)| transition == ButtonState::Pressed)
-            {
+            if !grabbed && button.is_some_and(|(_, transition)| transition == Transition::Pressed) {
                 activate_keyboard(state, pane, window);
             }
             let scale = state.scale.factor();
@@ -198,7 +201,7 @@ fn pointer_input(
     state: &mut State,
     window: WindowId,
     position: (f64, f64),
-    button: Option<(Button, ButtonState)>,
+    button: Option<(Button, Transition)>,
     scroll: Scroll,
 ) {
     let (x, y) = position;
@@ -230,8 +233,8 @@ fn pointer_input(
                 &ButtonEvent {
                     button: button_code(button),
                     state: match transition {
-                        ButtonState::Pressed => WaylandButtonState::Pressed,
-                        ButtonState::Released => WaylandButtonState::Released,
+                        Transition::Pressed => WaylandButtonState::Pressed,
+                        Transition::Released => WaylandButtonState::Released,
                     },
                     serial,
                     time,

@@ -2,7 +2,7 @@
 
 use meowland_input::{Event, keyboard};
 use meowland_protocol::{
-    self as protocol, Input, PaneAction, PaneToServer, Shortcut,
+    self as protocol, Input, OfferIntent, PaneAction, PaneToServer, Shortcut, Transition,
     clipboard::{MAX_TEXT, Selection},
 };
 use meowland_terminal_clipboard::{Action, Focus, Refresh};
@@ -20,12 +20,13 @@ impl TerminalSession {
                 if let Some(
                     input @ Input::Key {
                         key,
-                        pressed,
+                        state,
                         modifiers,
                         ..
                     },
                 ) = self.keyboard.input(event)
                 {
+                    let pressed = state == Transition::Pressed;
                     if pressed && Shortcut::from_key(key, modifiers).is_some() {
                         self.keyboard.intercept(key);
                     }
@@ -100,12 +101,17 @@ impl TerminalSession {
                     paste,
                 } => {
                     let deferred_paste = paste && self.input_gate.blocked();
+                    let intent = if paste && !deferred_paste {
+                        OfferIntent::Paste
+                    } else {
+                        OfferIntent::Refresh
+                    };
                     self.tx
                         .send(&PaneToServer::Action(PaneAction::ClipboardOffer {
                             selection,
                             offer,
                             mimes,
-                            paste: paste && !deferred_paste,
+                            intent,
                         }))?;
                     if deferred_paste {
                         self.input_gate.flush(&mut self.tx)?;

@@ -6,7 +6,7 @@ use std::{collections::VecDeque, io};
 use calloop::LoopHandle;
 use futures::io::AsyncReadExt;
 use meowland_async::asynchronous::Descriptor;
-use meowland_protocol::{Button, ButtonState, Input, Modifiers, Scroll, clipboard::MAX_TEXT};
+use meowland_protocol::{Button, Input, Modifiers, Scroll, Transition, clipboard::MAX_TEXT};
 use rustix::fs::{Mode, OFlags, open};
 use vtparse::{CsiParam, VTActor, VTParser};
 
@@ -459,9 +459,9 @@ fn mouse(report: &[u8]) -> Option<Event> {
         (None, Scroll::default())
     } else {
         let state = if released {
-            ButtonState::Released
+            Transition::Released
         } else {
-            ButtonState::Pressed
+            Transition::Pressed
         };
         (Some((button(code)?, state)), Scroll::default())
     };

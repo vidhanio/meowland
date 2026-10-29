@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use meowland_protocol::{Input, KEY_INSERT, KEY_V, Modifiers};
+use meowland_protocol::{Input, KEY_INSERT, KEY_V, Modifiers, Transition};
 
 use super::input::{Key, Kind};
 
@@ -37,7 +37,11 @@ impl Keyboard {
         }
         Some(Input::Key {
             key: event.code,
-            pressed,
+            state: if pressed {
+                Transition::Pressed
+            } else {
+                Transition::Released
+            },
             modifiers: event.modifiers,
             text: event.text,
             held,

@@ -9,6 +9,7 @@ use std::{
 
 use meowland_protocol::{
     self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowId, WindowInfo,
+    WindowState,
 };
 use meowland_terminal as terminal;
 use usage_rs::{Args, Cli, Subcommands, ValueEnum};
@@ -201,7 +202,10 @@ pub(crate) fn run(command: Commands) -> Result<()> {
                     window.id,
                     protocol::sanitize(&window.app_id),
                     protocol::sanitize(&window.title),
-                    if window.active { "active" } else { "" }
+                    match window.state {
+                        WindowState::Active => "active",
+                        WindowState::Inactive => "",
+                    }
                 )?;
             }
             Ok(())

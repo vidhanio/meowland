@@ -8,8 +8,15 @@ use std::{
 
 use meowland_protocol::{FrameBand, SharedFrame};
 
+/// How long to wait for the terminal to unlink a shared object before falling
+/// back to inline transport.
 const TIMEOUT: Duration = Duration::from_millis(250);
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// First consumption check delay. The terminal usually unlinks within one
+/// frame, so a short first delay beats a fixed 1 ms loop.
+const INITIAL_POLL_DELAY: Duration = Duration::from_millis(1);
+/// Upper bound on the delay between consumption checks, keeping the worst-case
+/// detection latency well inside [`TIMEOUT`].
+const MAXIMUM_POLL_DELAY: Duration = Duration::from_millis(16);
 
 pub(super) enum Consumption {
     Waiting(Instant),
@@ -21,6 +28,7 @@ pub(super) struct SharedPresentation {
     pub(super) frame: SharedFrame,
     file: File,
     deadline: Instant,
+    poll_delay: Duration,
     pub(super) consumed: bool,
 }
 
@@ -31,10 +39,12 @@ impl SharedPresentation {
             frame,
             file,
             deadline: Instant::now() + TIMEOUT,
+            poll_delay: INITIAL_POLL_DELAY,
             consumed: false,
         })
     }
 
+    /// Check consumption, backing off so a slow terminal costs few syscalls.
     pub(super) fn poll(&mut self) -> Consumption {
         match self.frame.exists() {
             Ok(false) => {
@@ -42,7 +52,9 @@ impl SharedPresentation {
                 Consumption::Complete
             }
             Ok(true) if Instant::now() < self.deadline => {
-                Consumption::Waiting((Instant::now() + POLL_INTERVAL).min(self.deadline))
+                let next = (Instant::now() + self.poll_delay).min(self.deadline);
+                self.poll_delay = (self.poll_delay * 2).min(MAXIMUM_POLL_DELAY);
+                Consumption::Waiting(next)
             }
             Ok(true) => Consumption::Expired,
             Err(error) => {

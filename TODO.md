@@ -148,7 +148,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   column range but only reports changed *rows*. `FrameBand` and the Kitty `a=f` edit
   then send full-width rows. A blinking cursor costs `width × 16 × 3` bytes before
   zlib. Carry `x` and `width` in `FrameBand` and use Kitty's `x=`/`w=` edit keys.
-- [ ] **Polling for shared-frame consumption.** `presentation/shared.rs` calls
+- [x] **Polling for shared-frame consumption.** `presentation/shared.rs` calls
   `shm_open` every 1 ms for up to 250 ms to see whether the terminal unlinked the
   object (`SharedFrame::exists`), and each poll allocates the name string
   (`SharedFrame::name()`). Cache the name, and back off exponentially or ack

@@ -137,9 +137,15 @@ fn export_types(advertised: impl IntoIterator<Item = String>, transport: Transpo
     }
 }
 
+struct InFlight {
+    pane: PaneId,
+    generation: u64,
+}
+
 /// Host-owned selection exports, deliveries, and pending transfer state.
 pub struct Bridge<H> {
     exports: [Option<Export<H>>; 2],
+    in_flight: [Option<InFlight>; 2],
     deliveries: HashMap<ClipboardRequestId, Delivery<H>>,
     generations: [u64; 2],
     next: u64,
@@ -149,6 +155,7 @@ impl<H> Default for Bridge<H> {
     fn default() -> Self {
         Self {
             exports: [None, None],
+            in_flight: [None, None],
             deliveries: HashMap::new(),
             generations: [0; 2],
             next: 0,
@@ -198,10 +205,23 @@ impl<H> Bridge<H> {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
-        for (index, export) in self.exports.iter_mut().enumerate() {
-            if export.as_ref().is_some_and(|export| export.pane == pane) {
+        for ((export, in_flight), generation) in self
+            .exports
+            .iter_mut()
+            .zip(&mut self.in_flight)
+            .zip(&mut self.generations)
+        {
+            let detached = if export.as_ref().is_some_and(|export| export.pane == pane) {
                 *export = None;
-                self.generations[index] += 1;
+                true
+            } else {
+                false
+            };
+            let in_flight = in_flight.as_ref().is_some_and(|in_flight| {
+                in_flight.pane == pane && in_flight.generation == *generation
+            });
+            if detached || in_flight {
+                *generation += 1;
             }
         }
     }
@@ -308,10 +328,24 @@ fn schedule_export<H: Host>(host: &mut H, target: SelectionTarget, id: u64) {
 }
 
 fn export_next<H: Host>(host: &mut H, target: SelectionTarget) {
-    let Some(mut export) = host.bridge().take_export(target) else {
+    let Some(export) = host.bridge().take_export(target) else {
         return;
     };
     let generation = host.bridge().generation(target);
+    host.bridge().in_flight[target_index(target)] = Some(InFlight {
+        pane: export.pane,
+        generation,
+    });
+    export_attempt(host, target, export, generation);
+    host.bridge().in_flight[target_index(target)] = None;
+}
+
+fn export_attempt<H: Host>(
+    host: &mut H,
+    target: SelectionTarget,
+    mut export: Export<H>,
+    generation: u64,
+) {
     if export.deadline.expired() || !host.contains_pane(export.pane) {
         return;
     }
@@ -430,10 +464,11 @@ fn export_source<H: Host>(
             )
             .map_err(io::Error::other)?,
     );
-    host.request_selection(target, requested_mime, write)?;
+    let request = host.request_selection(target, requested_mime, write);
     if host.bridge().generation(target) != generation || !host.contains_pane(export.pane) {
         return Ok(None);
     }
+    request?;
     Ok(Some(sources))
 }
 
@@ -661,4 +696,145 @@ pub fn paste<H: Host>(host: &mut H, pane: PaneId, text: &str) {
     let mimes = data.items.iter().map(|item| item.mime.clone()).collect();
     host.set_selection(SelectionTarget::Clipboard, mimes, Source::Local(data));
     host.paste(pane);
+}
+
+#[cfg(test)]
+mod tests {
+    use calloop::EventLoop;
+
+    use super::*;
+
+    type RequestAction = Box<dyn FnOnce(&mut FakeHost) -> io::Result<()>>;
+
+    struct FakeHost {
+        handle: Handle<Self>,
+        bridge: Bridge<Self>,
+        contains: bool,
+        on_request: Option<RequestAction>,
+        requests: Vec<String>,
+        emitted: Vec<(PaneId, ServerToPane)>,
+    }
+
+    impl FakeHost {
+        fn new() -> Self {
+            let event_loop: &'static EventLoop<'static, Self> =
+                Box::leak(Box::new(EventLoop::try_new().expect("event loop")));
+            let handle = Handle::new(event_loop.handle(), |host| host);
+            Self {
+                handle,
+                bridge: Bridge::default(),
+                contains: true,
+                on_request: None,
+                requests: Vec::new(),
+                emitted: Vec::new(),
+            }
+        }
+
+        fn attach_export(&mut self, pane: PaneId, mimes: &[&str]) {
+            let target = SelectionTarget::Clipboard;
+            let id = self.bridge.id();
+            self.bridge.set_export(
+                target,
+                Some(Export {
+                    id,
+                    target,
+                    pane,
+                    mimes: mimes.iter().map(|mime| (*mime).to_owned()).collect(),
+                    active: None,
+                    data: ClipboardData::default(),
+                    bytes: 0,
+                    limit: MAX_BYTES,
+                    deadline: Deadline::new(TRANSFER_TIMEOUT),
+                }),
+            );
+        }
+    }
+
+    impl Host for FakeHost {
+        fn handle(&self) -> &Handle<Self> {
+            &self.handle
+        }
+
+        fn bridge(&mut self) -> &mut Bridge<Self> {
+            &mut self.bridge
+        }
+
+        fn emit(&mut self, pane: PaneId, message: ServerToPane) {
+            self.emitted.push((pane, message));
+        }
+
+        fn selection_pane(&self) -> Option<PaneId> {
+            Some(PaneId::from(1))
+        }
+
+        fn pane_transport(&self, _pane: PaneId) -> Option<Transport> {
+            Some(Transport::Kitty)
+        }
+
+        fn contains_pane(&self, _pane: PaneId) -> bool {
+            self.contains
+        }
+
+        fn pane_has_window(&self, _pane: PaneId) -> bool {
+            true
+        }
+
+        fn request_selection(
+            &mut self,
+            _target: SelectionTarget,
+            mime: String,
+            _fd: OwnedFd,
+        ) -> io::Result<()> {
+            self.requests.push(mime);
+            self.on_request.take().map_or(Ok(()), |action| action(self))
+        }
+
+        fn set_selection(
+            &mut self,
+            _target: SelectionTarget,
+            _mimes: Vec<String>,
+            _source: Source,
+        ) {
+        }
+
+        fn paste(&mut self, _pane: PaneId) {}
+    }
+
+    #[test]
+    fn reentrant_requests_discard_in_flight_export() {
+        let pane = PaneId::from(7);
+        let target = SelectionTarget::Clipboard;
+        let mut host = FakeHost::new();
+
+        host.attach_export(pane, &["text/plain", "text/html"]);
+        host.on_request = Some(Box::new(move |host| {
+            host.bridge.detach(pane);
+            Ok(())
+        }));
+        export_next(&mut host, target);
+        assert_eq!(host.requests.len(), 1);
+        assert!(host.bridge.export(target).is_none());
+        assert!(host.emitted.is_empty());
+
+        host.requests.clear();
+        host.attach_export(pane, &["text/plain", "text/html"]);
+        host.on_request = Some(Box::new(move |host| {
+            host.bridge.set_export(target, None);
+            Err(io::Error::other("request failed"))
+        }));
+        export_next(&mut host, target);
+        assert_eq!(host.requests.len(), 1);
+        assert!(host.bridge.export(target).is_none());
+
+        host.requests.clear();
+        host.attach_export(pane, &["text/plain", "text/html"]);
+        host.on_request = Some(Box::new(|_| Err(io::Error::other("request failed"))));
+        export_next(&mut host, target);
+        assert_eq!(
+            host.requests.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["text/plain", "text/html"]
+        );
+        assert!(host.bridge.export(target).is_some());
+        assert!(host.emitted.is_empty());
+    }
 }

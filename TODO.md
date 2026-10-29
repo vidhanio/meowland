@@ -210,7 +210,7 @@ These follow the `rust-best-practices` skill.
   `PaneId(pub u64)` and `WindowId(pub u64)` expose their fields.
 - [ ] **Bool fields in the protocol.** `ClipboardOffer.paste`, `Input::Key.pressed`,
   and `WindowInfo.active` should be enums.
-- [ ] **Pair related probe fields.** `ProbeInfo` stores `pixel_width`/`pixel_height`
+- [x] **Pair related probe fields.** `ProbeInfo` stores `pixel_width`/`pixel_height`
   and `cell_width`/`cell_height` as independent `Option`s. Use
   `Option<(u32, u32)>`, or reuse `FrameSize`.
 - [x] **Remove dead or over-public items.**

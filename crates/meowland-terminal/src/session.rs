@@ -375,9 +375,9 @@ impl TerminalSession {
         {
             return Err(Error::KeyboardUnsupported);
         }
-        self.cell = probe.cell_width.zip(probe.cell_height).or(self.cell);
+        self.cell = probe.cell.or(self.cell);
         let (width, height) = terminal::pane_pixels(
-            probe.pixel_width.zip(probe.pixel_height),
+            probe.pixels,
             terminal::window_pixels(),
             terminal::cells(),
             self.cell.unwrap_or(FALLBACK_CELL),

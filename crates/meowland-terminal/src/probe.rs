@@ -33,10 +33,10 @@ const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?5522$p\x1b[?u\x1b[c";
 /// Terminal capabilities discovered during the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProbeInfo {
-    pub pixel_width: Option<u32>,
-    pub pixel_height: Option<u32>,
-    pub cell_width: Option<u16>,
-    pub cell_height: Option<u16>,
+    /// Pane size in physical pixels, if the terminal reported it.
+    pub pixels: Option<(u32, u32)>,
+    /// Cell size in physical pixels, if the terminal reported it.
+    pub cell: Option<(u16, u16)>,
     pub frame_edits: bool,
     pub shared_memory: bool,
     pub sgr_pixels: bool,
@@ -51,7 +51,8 @@ impl ProbeInfo {
     pub(crate) fn log_capabilities(&self, width: u32, height: u32) {
         tracing::info!(
             width, height,
-            cell = ?self.cell_width.zip(self.cell_height),
+            cell = ?self.cell,
+            pixels = ?self.pixels,
             terminal = ?self.name,
             frame_edits = self.frame_edits,
             shared_memory = self.shared_memory,
@@ -222,14 +223,8 @@ fn probe_csi(params: &[CsiParam], byte: u8, out: &mut ProbeInfo) {
                 && width != 0
             {
                 match first {
-                    4 => {
-                        out.pixel_height = Some(height);
-                        out.pixel_width = Some(width);
-                    }
-                    6 => {
-                        out.cell_height = u16::try_from(height).ok();
-                        out.cell_width = u16::try_from(width).ok();
-                    }
+                    4 => out.pixels = Some((width, height)),
+                    6 => out.cell = u16::try_from(width).ok().zip(u16::try_from(height).ok()),
                     _ => {}
                 }
             }

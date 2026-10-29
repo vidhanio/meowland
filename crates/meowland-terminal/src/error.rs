@@ -12,7 +12,7 @@ pub enum Error {
     Io(#[from] io::Error),
     /// The pane socket could not be reached.
     #[error(
-        "could not reach the pane socket {} (is the server running?)",
+        "could not reach the pane socket {} (is the server running?): {source}",
         .path.display()
     )]
     Connect {

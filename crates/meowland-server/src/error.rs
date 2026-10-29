@@ -12,7 +12,7 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
     /// An I/O failure annotated with the operation that failed.
-    #[error("{action}")]
+    #[error("{action}: {source}")]
     IoContext {
         /// Description of the attempted operation.
         action: String,
@@ -49,7 +49,10 @@ impl Error {
         let mut report = self.to_string();
         let mut source = std::error::Error::source(self);
         while let Some(error) = source {
-            let _ = write!(report, ": {error}");
+            let rendered = error.to_string();
+            if !report.ends_with(&rendered) {
+                let _ = write!(report, ": {rendered}");
+            }
             source = std::error::Error::source(error);
         }
         report
@@ -58,3 +61,25 @@ impl Error {
 
 /// Result of a server operation.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_renders_each_source_once() {
+        let error = Error::IoContext {
+            action: "binding the control socket".into(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "binding the control socket: permission denied"
+        );
+        assert_eq!(
+            error.report(),
+            "binding the control socket: permission denied"
+        );
+    }
+}

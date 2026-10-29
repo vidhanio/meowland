@@ -124,7 +124,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 - [x] **Listener capacity depends on array order.** `update_listeners` computes
   capacity with `usize::from(index == 1)`, while `accepted` uses
   `ConnectionKind::Pane`. Store the `ConnectionKind` in `Listener`.
-- [ ] **Encode readback phases in types.** `readback.rs` `submit` and `complete`
+- [x] **Encode readback phases in types.** `readback.rs` `submit` and `complete`
   `unreachable!()` on the wrong `Phase`. Keep acquiring and reading operations in
   separate maps, or pass the phase payload to the callback directly.
 - [ ] **Move benchmarks out of the shipping crate.** The `benchmarks` feature,

@@ -180,30 +180,36 @@ impl Drop for BufferUse {
     }
 }
 
-enum Phase {
-    Acquiring(Dmabuf),
-    Reading {
-        readback: Readback,
-        submitted: Instant,
-    },
-}
-
+/// Bookkeeping for one buffer that must stay alive until its readback ends.
 struct Operation {
     surface: Weak<WlSurface>,
     client: Client,
     slot: Arc<Slot>,
     buffer: BufferUse,
-    phase: Phase,
     sources: Sources,
+    bound: Option<(u32, u32)>,
+}
+
+/// A reader waiting for the buffer's writers before the GPU can sample it.
+struct Acquiring {
+    operation: Operation,
+    dmabuf: Dmabuf,
     acquire_sources: Vec<Sources>,
     acquire_pending: usize,
-    bound: Option<(u32, u32)>,
+}
+
+/// A submitted GPU readback waiting for its completion fence.
+struct Reading {
+    operation: Operation,
+    readback: Readback,
+    submitted: Instant,
 }
 
 #[derive(Default)]
 pub(crate) struct Readbacks {
     next: u64,
-    operations: HashMap<u64, Operation>,
+    acquiring: HashMap<u64, Acquiring>,
+    reading: HashMap<u64, Reading>,
     buffers: HashMap<ObjectId, SyncWeak<BufferReaders>>,
     budget: Arc<Budget>,
     stats: ReadbackStats,
@@ -308,56 +314,50 @@ pub(crate) fn prepare(state: &mut State, surface: &WlSurface, buffer: &WlBuffer,
     });
     state.readbacks.next += 1;
     let id = state.readbacks.next;
-    state.readbacks.operations.insert(
+    state.readbacks.acquiring.insert(
         id,
-        Operation {
-            surface: surface.downgrade(),
-            client,
-            slot,
-            buffer: BufferUse {
-                readers,
-                submitted: false,
-                finished: false,
+        Acquiring {
+            operation: Operation {
+                surface: surface.downgrade(),
+                client,
+                slot,
+                buffer: BufferUse {
+                    readers,
+                    submitted: false,
+                    finished: false,
+                },
+                sources: Sources::new(&state.handle),
+                bound,
             },
-            phase: Phase::Acquiring(dmabuf.clone()),
-            sources: Sources::new(&state.handle),
+            dmabuf: dmabuf.clone(),
             acquire_sources: Vec::new(),
             acquire_pending: 0,
-            bound,
         },
     );
     fences::watch(state, id, dmabuf);
 }
 
 fn submit(state: &mut State, id: u64) {
-    let Some(mut operation) = state.readbacks.operations.remove(&id) else {
+    let Some(mut acquiring) = state.readbacks.acquiring.remove(&id) else {
         return;
     };
-    if operation.surface.upgrade().is_err() {
-        let client = operation.client.clone();
-        drop(operation);
+    if acquiring.operation.surface.upgrade().is_err() {
+        let client = acquiring.operation.client.clone();
+        drop(acquiring);
         notify(state, &client);
         return;
     }
-    let Phase::Acquiring(dmabuf) = &operation.phase else {
-        unreachable!();
-    };
+    acquiring.acquire_sources.clear();
     let Some(gpu) = &mut state.gpu else {
-        let client = operation.client.clone();
-        drop(operation);
+        let client = acquiring.operation.client.clone();
+        drop(acquiring);
         notify(state, &client);
         return;
     };
-    operation.acquire_sources.clear();
     let submitted = Instant::now();
-    operation.buffer.submitted = true;
-    let submission = gpu.submit(dmabuf, operation.bound);
-    match submission {
+    acquiring.operation.buffer.submitted = true;
+    match gpu.submit(&acquiring.dmabuf, acquiring.operation.bound) {
         Ok(Submission { fd, readback }) => {
-            operation.phase = Phase::Reading {
-                readback,
-                submitted,
-            };
             match state.handle.insert_source(
                 Generic::new(fd, Interest::READ, Mode::Level),
                 move |_, _, state| {
@@ -366,8 +366,16 @@ fn submit(state: &mut State, id: u64) {
                 },
             ) {
                 Ok(token) => {
+                    let Acquiring { mut operation, .. } = acquiring;
                     operation.sources.io = Some(token);
-                    state.readbacks.operations.insert(id, operation);
+                    state.readbacks.reading.insert(
+                        id,
+                        Reading {
+                            operation,
+                            readback,
+                            submitted,
+                        },
+                    );
                 }
                 Err(error) => {
                     tracing::error!(%error, "Cannot register GPU completion; stopping without releasing the buffer");
@@ -376,31 +384,29 @@ fn submit(state: &mut State, id: u64) {
             }
         }
         Err(error) => {
-            operation.buffer.finished = error.release_safe();
+            acquiring.operation.buffer.finished = error.release_safe();
             tracing::warn!(%error, release_safe = error.release_safe(), "Cannot submit DMA-BUF readback");
             if !error.release_safe() {
                 state.shutdown = true;
             }
-            let client = operation.client.clone();
-            drop(operation);
+            let client = acquiring.operation.client.clone();
+            drop(acquiring);
             notify(state, &client);
         }
     }
 }
 
 fn complete(state: &mut State, id: u64) {
-    let Some(mut operation) = state.readbacks.operations.remove(&id) else {
+    let Some(Reading {
+        mut operation,
+        readback,
+        submitted,
+    }) = state.readbacks.reading.remove(&id)
+    else {
         return;
     };
     operation.sources.io = None;
     let ready = Instant::now();
-    let Phase::Reading {
-        readback,
-        submitted,
-    } = operation.phase
-    else {
-        unreachable!();
-    };
     operation.buffer.finished = true;
     if let Some(gpu) = &mut state.gpu
         && operation.surface.upgrade().is_ok()
@@ -428,11 +434,9 @@ fn complete(state: &mut State, id: u64) {
 
 pub(crate) fn destroyed(state: &mut State, surface: &WlSurface) {
     let mut clients = Vec::new();
-    state.readbacks.operations.retain(|_, operation| {
-        if operation.surface == surface.downgrade()
-            && matches!(operation.phase, Phase::Acquiring(_))
-        {
-            clients.push(operation.client.clone());
+    state.readbacks.acquiring.retain(|_, acquiring| {
+        if acquiring.operation.surface == surface.downgrade() {
+            clients.push(acquiring.operation.client.clone());
             false
         } else {
             true

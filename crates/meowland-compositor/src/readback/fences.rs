@@ -15,7 +15,7 @@ pub(super) fn watch(state: &mut State, id: u64, dmabuf: &Dmabuf) {
     if let Some(fences) = snapshot(dmabuf) {
         state
             .readbacks
-            .operations
+            .acquiring
             .get_mut(&id)
             .expect("operation exists during acquire setup")
             .acquire_pending = fences.len();
@@ -40,7 +40,7 @@ pub(super) fn watch(state: &mut State, id: u64, dmabuf: &Dmabuf) {
     } else {
         state
             .readbacks
-            .operations
+            .acquiring
             .get_mut(&id)
             .expect("operation exists during acquire setup")
             .acquire_pending = 1;
@@ -65,7 +65,7 @@ fn add_source(state: &mut State, id: u64, token: RegistrationToken) {
     sources.io = Some(token);
     state
         .readbacks
-        .operations
+        .acquiring
         .get_mut(&id)
         .expect("operation remains registered during acquire setup")
         .acquire_sources
@@ -73,20 +73,20 @@ fn add_source(state: &mut State, id: u64, token: RegistrationToken) {
 }
 
 fn acquired(state: &mut State, id: u64, index: usize) {
-    let Some(operation) = state.readbacks.operations.get_mut(&id) else {
+    let Some(acquiring) = state.readbacks.acquiring.get_mut(&id) else {
         return;
     };
-    operation.acquire_sources[index].io = None;
-    operation.acquire_pending -= 1;
-    if operation.acquire_pending == 0 {
+    acquiring.acquire_sources[index].io = None;
+    acquiring.acquire_pending -= 1;
+    if acquiring.acquire_pending == 0 {
         super::submit(state, id);
     }
 }
 
 fn abandon(state: &mut State, id: u64) {
-    if let Some(operation) = state.readbacks.operations.remove(&id) {
-        let client = operation.client.clone();
-        drop(operation);
+    if let Some(acquiring) = state.readbacks.acquiring.remove(&id) {
+        let client = acquiring.operation.client.clone();
+        drop(acquiring);
         super::notify(state, &client);
     }
 }

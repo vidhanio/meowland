@@ -118,15 +118,6 @@ impl Clipboard {
         }
     }
 
-    /// Cancel metadata refreshes without cancelling explicit representation
-    /// reads.
-    pub fn cancel_refresh(&mut self) {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.cancel_refresh(),
-            Transport::Text(clipboard) => clipboard.cancel_refresh(),
-        }
-    }
-
     /// Supersede queued refreshes for one selection after an explicit paste or
     /// copy.
     pub fn cancel_refresh_selection(&mut self, selection: Selection) {

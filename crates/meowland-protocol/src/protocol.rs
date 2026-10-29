@@ -361,8 +361,6 @@ pub type ServerToPane = PanePacket<crate::FrameBand>;
 /// One-shot request sent over the control socket.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ControlRequest {
-    /// Check whether the server is responsive.
-    Ping,
     /// Launch a process connected to the compositor.
     Run {
         /// Executable followed by its arguments, preserving non-UTF-8 OS

@@ -27,7 +27,7 @@ impl Paths {
     ///
     /// # Errors
     /// Returns an error when the directory does not exist.
-    pub fn in_runtime_dir(runtime: impl Into<PathBuf>) -> Result<Self> {
+    fn in_runtime_dir(runtime: impl Into<PathBuf>) -> Result<Self> {
         let runtime = runtime.into();
         if !runtime.is_dir() {
             return Err(Error::RuntimeDirectoryInvalid(runtime));

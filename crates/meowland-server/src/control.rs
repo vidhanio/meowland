@@ -19,7 +19,6 @@ impl Server {
             return;
         }
         let response = match request {
-            ControlRequest::Ping => ControlResponse::Ok,
             ControlRequest::List => ControlResponse::Windows(self.compositor.window_list()),
             ControlRequest::Kill(show) => self.compositor.close_window(&show).map_or_else(
                 |error| ControlResponse::Error(error.to_string()),

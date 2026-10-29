@@ -141,6 +141,7 @@ fn export_types(advertised: impl IntoIterator<Item = String>, transport: Transpo
 pub struct Bridge<H> {
     exports: [Option<Export<H>>; 2],
     deliveries: HashMap<ClipboardRequestId, Delivery<H>>,
+    generations: [u64; 2],
     next: u64,
 }
 
@@ -149,6 +150,7 @@ impl<H> Default for Bridge<H> {
         Self {
             exports: [None, None],
             deliveries: HashMap::new(),
+            generations: [0; 2],
             next: 0,
         }
     }
@@ -182,8 +184,13 @@ impl<H> Bridge<H> {
         self.exports[target_index(target)].take()
     }
 
+    const fn generation(&self, target: SelectionTarget) -> u64 {
+        self.generations[target_index(target)]
+    }
+
     fn set_export(&mut self, target: SelectionTarget, export: Option<Export<H>>) {
         self.exports[target_index(target)] = export;
+        self.generations[target_index(target)] += 1;
     }
 
     /// Forget every delivery and export owned by a detached pane.
@@ -191,9 +198,10 @@ impl<H> Bridge<H> {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
-        for export in &mut self.exports {
+        for (index, export) in self.exports.iter_mut().enumerate() {
             if export.as_ref().is_some_and(|export| export.pane == pane) {
                 *export = None;
+                self.generations[index] += 1;
             }
         }
     }
@@ -231,10 +239,10 @@ pub trait Host: Sized + 'static {
     fn paste(&mut self, pane: PaneId);
 }
 
-/// Handle a changed seat selection.
+/// Handle a changed seat selection from the host's `new_selection` callback.
 ///
-/// The compositor calls this from its selection handler after Smithay has
-/// updated the seat selection.
+/// Smithay invokes this before it updates the seat selection, so exports are
+/// requested from an immediate timer rather than synchronously.
 pub fn selection<H: Host>(host: &mut H, target: SelectionTarget, source: Option<SelectionSource>) {
     host.bridge().set_export(target, None);
     let Some(pane) = host.selection_pane() else {
@@ -303,19 +311,27 @@ fn export_next<H: Host>(host: &mut H, target: SelectionTarget) {
     let Some(mut export) = host.bridge().take_export(target) else {
         return;
     };
+    let generation = host.bridge().generation(target);
     if export.deadline.expired() || !host.contains_pane(export.pane) {
         return;
     }
+    if host.bridge().generation(target) != generation {
+        return;
+    }
     while let Some(mime) = export.mimes.pop_front() {
-        let result = export_source(host, &export, mime.clone());
+        let result = export_source(host, &export, mime.clone(), generation);
         match result {
-            Ok(sources) => {
+            Ok(Some(sources)) => {
                 export.active = Some(sources);
                 host.bridge().set_export(target, Some(export));
                 return;
             }
+            Ok(None) => return,
             Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
         }
+    }
+    if host.bridge().generation(target) != generation || !host.contains_pane(export.pane) {
+        return;
     }
     host.emit(
         export.pane,
@@ -330,7 +346,8 @@ fn export_source<H: Host>(
     host: &mut H,
     export: &Export<H>,
     mime: String,
-) -> io::Result<Sources<H>> {
+    generation: u64,
+) -> io::Result<Option<Sources<H>>> {
     let (read, write) = rustix::pipe::pipe()?;
     nonblocking(&read)?;
     let mut sources = Sources::new(host.handle());
@@ -414,7 +431,10 @@ fn export_source<H: Host>(
             .map_err(io::Error::other)?,
     );
     host.request_selection(target, requested_mime, write)?;
-    Ok(sources)
+    if host.bridge().generation(target) != generation || !host.contains_pane(export.pane) {
+        return Ok(None);
+    }
+    Ok(Some(sources))
 }
 
 fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io::Result<bool> {

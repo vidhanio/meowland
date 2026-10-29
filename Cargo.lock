@@ -587,7 +587,6 @@ name = "meowland"
 version = "0.1.0"
 dependencies = [
  "dirs",
- "meowland-compositor",
  "meowland-core",
  "meowland-protocol",
  "meowland-server",

@@ -10,7 +10,11 @@ use futures::{
     channel::{mpsc, oneshot},
     future::AbortHandle,
 };
-use meowland_compositor::{Command, Compositor, Event, PaneId, Runtime, Settings};
+use meowland_compositor::{Command, Compositor, Event, PaneId, Runtime};
+pub use meowland_compositor::{
+    InvalidOutputSize, InvalidRepeatDelay, InvalidRepeatRate, KeyboardSettings, RepeatDelay,
+    RepeatRate, Settings,
+};
 use meowland_core::Result;
 use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
 

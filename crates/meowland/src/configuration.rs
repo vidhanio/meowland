@@ -1,7 +1,7 @@
 use std::{fs, io, path::Path};
 
-use meowland_compositor::Settings;
 use meowland_core::{Error, Result};
+use meowland_server::Settings;
 
 pub(crate) fn load(path: Option<&Path>) -> Result<Settings> {
     let default_path;

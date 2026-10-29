@@ -33,7 +33,6 @@ wayland-client = { workspace = true, optional = true }
 wayland-protocols = { workspace = true, optional = true, features = ["client"] }
 dirs = { workspace = true }
 meowland-core = { workspace = true }
-meowland-compositor = { workspace = true }
 meowland-protocol = { workspace = true }
 meowland-server = { workspace = true }
 meowland-terminal = { workspace = true }

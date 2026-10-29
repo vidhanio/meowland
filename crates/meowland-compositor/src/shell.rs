@@ -29,7 +29,9 @@ impl XdgShellHandler for Compositor {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let (app_id, title) = metadata(&surface);
         let id = self.windows.catalog.insert(app_id, title);
-        self.windows.ids.insert(surface.wl_surface().clone(), id);
+        self.windows
+            .id_by_surface
+            .insert(surface.wl_surface().clone(), id);
         self.windows.by_id.insert(
             id,
             Window {
@@ -113,7 +115,12 @@ impl XdgShellHandler for Compositor {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self
+            .windows
+            .id_by_surface
+            .get(surface.wl_surface())
+            .copied()
+        else {
             return;
         };
         self.remove_window(id);
@@ -124,7 +131,12 @@ impl XdgShellHandler for Compositor {
         surface: ToplevelSurface,
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
-        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self
+            .windows
+            .id_by_surface
+            .get(surface.wl_surface())
+            .copied()
+        else {
             return;
         };
         let Some(window) = self.windows.by_id.get_mut(&id) else {
@@ -140,7 +152,12 @@ impl XdgShellHandler for Compositor {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self
+            .windows
+            .id_by_surface
+            .get(surface.wl_surface())
+            .copied()
+        else {
             return;
         };
         if let Some(window) = self.windows.by_id.get_mut(&id) {
@@ -150,13 +167,23 @@ impl XdgShellHandler for Compositor {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() {
+        if let Some(id) = self
+            .windows
+            .id_by_surface
+            .get(surface.wl_surface())
+            .copied()
+        {
             self.apply_window_state(id);
         }
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
-        let Some(id) = self.windows.ids.get(surface.wl_surface()).copied() else {
+        let Some(id) = self
+            .windows
+            .id_by_surface
+            .get(surface.wl_surface())
+            .copied()
+        else {
             return;
         };
         let (app_id, title) = metadata(&surface);

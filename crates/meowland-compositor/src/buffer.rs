@@ -230,9 +230,10 @@ impl CompositorHandler for Compositor {
                         render::SurfaceDamage::new(&damage, &geometry)
                     }
                 });
-            self.attachments.for_each_showing_mut(window, |_, entry| {
-                entry.presentation.damage(surface, damage, changed);
-            });
+            self.attachments
+                .for_each_showing_mut(window, |_, presentation| {
+                    presentation.damage(surface, damage, changed);
+                });
         }
     }
 
@@ -244,7 +245,7 @@ impl CompositorHandler for Compositor {
         self.windows.surface_cache.forget(surface);
         readback::destroyed(self, surface);
         if let Some(window) = window {
-            if self.windows.ids.get(surface) == Some(&window) {
+            if self.windows.id_by_surface.get(surface) == Some(&window) {
                 self.unmap_window(window);
             } else {
                 self.touch(window);

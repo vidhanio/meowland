@@ -145,7 +145,7 @@ impl XdgActivationHandler for Compositor {
             self.cancel_activation(token.as_str(), "activation token expired");
             return;
         }
-        let Some(window) = self.windows.ids.get(&surface).copied() else {
+        let Some(window) = self.windows.id_by_surface.get(&surface).copied() else {
             return;
         };
         self.protocols.activation.remove_token(&token);

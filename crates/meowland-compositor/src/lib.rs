@@ -135,7 +135,7 @@ struct Input {
 /// Window map, surface index, and frame-callback pacing shared by windows.
 struct Windows {
     by_id: HashMap<WindowId, Window>,
-    ids: HashMap<WlSurface, WindowId>,
+    id_by_surface: HashMap<WlSurface, WindowId>,
     callback_deadline: Option<Instant>,
     surface_cache: buffer::SurfaceCache,
     catalog: WindowCatalog,
@@ -233,39 +233,18 @@ impl Compositor {
                 true
             });
         let gpu = DmabufBackend::discover();
-        let mut dmabuf = DmabufState::new();
-        if let Some(gpu) = &gpu {
-            match DmabufFeedbackBuilder::new(gpu.device(), gpu.formats().iter().copied()).build() {
-                Ok(feedback) => {
-                    dmabuf.create_global_with_default_feedback::<Self>(&display_handle, &feedback);
-                }
-                Err(error) => tracing::warn!(%error, "DMA-BUF feedback initialization failed"),
-            }
-        }
+        let (protocols, bell) = Self::protocol_globals(
+            &display_handle,
+            gpu.as_ref(),
+            output_manager,
+            data_control,
+            ext_data_control,
+            primary_selection,
+            text_input,
+        );
         Self {
             handle,
-            protocols: Protocols {
-                surfaces: CompositorState::new::<Self>(&display_handle),
-                shm: ShmState::new::<Self>(&display_handle, vec![]),
-                dmabuf,
-                xdg: XdgShellState::new::<Self>(&display_handle),
-                activation: XdgActivationState::new::<Self>(&display_handle),
-                launches: HashMap::new(),
-                activation_deadline: None,
-                _decoration: XdgDecorationState::new::<Self>(&display_handle),
-                kde_decoration: decoration::kde(&display_handle),
-                _viewporter: ViewporterState::new::<Self>(&display_handle),
-                _fractional_scale: FractionalScaleManagerState::new::<Self>(&display_handle),
-                _single_pixel_buffer: SinglePixelBufferState::new::<Self>(&display_handle),
-                _output_manager: output_manager,
-                data_device: DataDeviceState::new::<Self>(&display_handle),
-                data_control,
-                ext_data_control,
-                primary_selection,
-                _cursor_shape: CursorShapeManagerState::new::<Self>(&display_handle),
-                _text_input: text_input,
-                toplevels: toplevels::Toplevels::new(&display_handle),
-            },
+            protocols,
             input: Input {
                 seats: seat_state,
                 seat,
@@ -280,7 +259,7 @@ impl Compositor {
             },
             windows: Windows {
                 by_id: HashMap::new(),
-                ids: HashMap::new(),
+                id_by_surface: HashMap::new(),
                 callback_deadline: None,
                 surface_cache: buffer::SurfaceCache::default(),
                 catalog: WindowCatalog::default(),
@@ -291,7 +270,7 @@ impl Compositor {
             readbacks: readback::Readbacks::default(),
             attachments: Attachments::default(),
             clipboard: clipboard::Bridge::default(),
-            bell: bell::Bell::new(&display_handle),
+            bell,
             scale,
             refresh_rate: settings.refresh_rate,
             output,
@@ -308,6 +287,68 @@ impl Compositor {
             shutdown: false,
             display: display_handle,
         }
+    }
+
+    /// Build the protocol globals in registration order, plus the bell.
+    ///
+    /// Registry announcement order follows registration order, so keep new
+    /// globals below the existing ones when extending this constructor.
+    fn protocol_globals(
+        display_handle: &DisplayHandle,
+        gpu: Option<&DmabufBackend>,
+        output_manager: OutputManagerState,
+        data_control: WlrDataControlState,
+        ext_data_control: ExtDataControlState,
+        primary_selection: PrimarySelectionState,
+        text_input: TextInputManagerState,
+    ) -> (Protocols, bell::Bell) {
+        let mut dmabuf = DmabufState::new();
+        if let Some(gpu) = gpu {
+            match DmabufFeedbackBuilder::new(gpu.device(), gpu.formats().iter().copied()).build() {
+                Ok(feedback) => {
+                    dmabuf.create_global_with_default_feedback::<Self>(display_handle, &feedback);
+                }
+                Err(error) => tracing::warn!(%error, "DMA-BUF feedback initialization failed"),
+            }
+        }
+        let surfaces = CompositorState::new::<Self>(display_handle);
+        let shm = ShmState::new::<Self>(display_handle, vec![]);
+        let xdg = XdgShellState::new::<Self>(display_handle);
+        let activation = XdgActivationState::new::<Self>(display_handle);
+        let decoration = XdgDecorationState::new::<Self>(display_handle);
+        let kde_decoration = decoration::kde(display_handle);
+        let viewporter = ViewporterState::new::<Self>(display_handle);
+        let fractional_scale = FractionalScaleManagerState::new::<Self>(display_handle);
+        let single_pixel_buffer = SinglePixelBufferState::new::<Self>(display_handle);
+        let data_device = DataDeviceState::new::<Self>(display_handle);
+        let cursor_shape = CursorShapeManagerState::new::<Self>(display_handle);
+        let bell = bell::Bell::new(display_handle);
+        let toplevels = toplevels::Toplevels::new(display_handle);
+        (
+            Protocols {
+                surfaces,
+                shm,
+                dmabuf,
+                xdg,
+                activation,
+                launches: HashMap::new(),
+                activation_deadline: None,
+                _decoration: decoration,
+                kde_decoration,
+                _viewporter: viewporter,
+                _fractional_scale: fractional_scale,
+                _single_pixel_buffer: single_pixel_buffer,
+                _output_manager: output_manager,
+                data_device,
+                data_control,
+                ext_data_control,
+                primary_selection,
+                _cursor_shape: cursor_shape,
+                _text_input: text_input,
+                toplevels,
+            },
+            bell,
+        )
     }
 
     /// Logical buffer limit: twice the widest and tallest attached
@@ -331,7 +372,7 @@ impl Compositor {
     }
 
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
-        if let Some(window) = self.windows.ids.get(surface) {
+        if let Some(window) = self.windows.id_by_surface.get(surface) {
             return Some(*window);
         }
         if let Some(window) = cached_owner(surface) {
@@ -341,7 +382,7 @@ impl Compositor {
         for _ in 0..64 {
             let owner = self
                 .windows
-                .ids
+                .id_by_surface
                 .get(&current)
                 .copied()
                 .or_else(|| cached_owner(&current));
@@ -364,7 +405,7 @@ impl Compositor {
 
     fn touch(&mut self, window: WindowId) {
         self.attachments
-            .for_each_showing_mut(window, |_, entry| entry.presentation.mark_dirty());
+            .for_each_showing_mut(window, |_, presentation| presentation.mark_dirty());
     }
 
     fn send_title(&mut self, pane: PaneId, window: WindowId) {

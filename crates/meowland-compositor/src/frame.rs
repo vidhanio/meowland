@@ -336,24 +336,25 @@ impl Compositor {
         if self.attachments.due_frames() == 0 {
             return;
         }
-        for (&pane, entry) in self.attachments.iter_mut() {
-            if !entry.presentation.due() {
-                continue;
-            }
-            let root = entry
-                .window()
-                .filter(|&id| self.windows.catalog.drawable(id))
-                .and_then(|id| self.windows.by_id.get(&id))
-                .map(|window| window.surface.wl_surface());
-            if let Some(message) = entry.presentation.frame(
-                &mut self.renderer,
-                root,
-                &self.windows.surface_cache.snapshots,
-                self.scale.factor(),
-            ) {
-                self.events.push(Event { pane, message });
-            }
-        }
+        let renderer = &mut self.renderer;
+        let windows = &self.windows;
+        let scale = self.scale.factor();
+        let events = &mut self.events;
+        self.attachments
+            .for_each_presentation_mut(|pane, window, presentation| {
+                if !presentation.due() {
+                    return;
+                }
+                let root = window
+                    .filter(|&id| windows.catalog.drawable(id))
+                    .and_then(|id| windows.by_id.get(&id))
+                    .map(|window| window.surface.wl_surface());
+                if let Some(message) =
+                    presentation.frame(renderer, root, &windows.surface_cache.snapshots, scale)
+                {
+                    events.push(Event { pane, message });
+                }
+            });
         self.attachments.clear_due();
     }
 }

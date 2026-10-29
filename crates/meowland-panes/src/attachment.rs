@@ -56,6 +56,12 @@ pub enum Policy {
 ///
 /// The compositor supplies the concrete presentation type but delegates pane
 /// bookkeeping to [`Attachments`], which only needs these operations.
+///
+/// [`Attachments`] re-reads [`due`](Presentation::due) after every mutation it
+/// performs, including [`set_size`](Presentation::set_size) and
+/// [`set_transport`](Presentation::set_transport), so implementations may
+/// change their dirty state in those methods without desynchronizing the
+/// dirty-frame count.
 pub trait Presentation {
     /// Create the presentation for a new pane at the given size.
     fn new(size: FrameSize) -> Self;
@@ -224,22 +230,18 @@ impl<P: Presentation> Attachments<P> {
         self.panes.iter()
     }
 
-    /// Iterate mutably over attached panes in pane-identity order.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&PaneId, &mut AttachedPane<P>)> {
-        self.panes.iter_mut()
-    }
-
     /// Attach a pane, replacing any previous attachment with the same ID.
     pub fn insert(&mut self, pane: PaneId, show: Show, window: Option<WindowId>, size: FrameSize) {
-        let entry = AttachedPane::new(show, window, size);
+        let entry = AttachedPane::<P>::new(show, window, size);
+        let new_due = entry.presentation.due();
         let window = entry.window();
         if let Some(previous) = self.panes.insert(pane, entry) {
-            if previous.presentation.due() {
-                self.due -= 1;
-            }
+            track_due(&mut self.due, previous.presentation.due(), new_due);
             if let Some(previous) = previous.window() {
                 self.unlink(previous, pane);
             }
+        } else if new_due {
+            self.due += 1;
         }
         if let Some(window) = window {
             self.link(window, pane);
@@ -365,16 +367,35 @@ impl<P: Presentation> Attachments<P> {
         }
     }
 
+    /// Visit every attached pane's presentation in pane-identity order.
+    ///
+    /// The callback receives the pane ID, the window it shows (if any), and
+    /// only its presentation, so it cannot disturb the window index. The
+    /// dirty-frame count is updated after each callback.
+    pub fn for_each_presentation_mut(
+        &mut self,
+        mut visit: impl FnMut(PaneId, Option<WindowId>, &mut P),
+    ) {
+        for (&pane, entry) in &mut self.panes {
+            let was = entry.presentation.due();
+            visit(pane, entry.window(), &mut entry.presentation);
+            track_due(&mut self.due, was, entry.presentation.due());
+        }
+    }
+
     /// Visit every pane showing a window and keep the dirty-frame count exact.
+    ///
+    /// The callback cannot disturb the window index; the dirty-frame count is
+    /// updated after each callback.
     pub fn for_each_showing_mut(
         &mut self,
         window: WindowId,
-        mut visit: impl FnMut(PaneId, &mut AttachedPane<P>),
+        mut visit: impl FnMut(PaneId, &mut P),
     ) {
         for &pane in self.by_window.get(&window).into_iter().flatten() {
             if let Some(entry) = self.panes.get_mut(&pane) {
                 let was = entry.presentation.due();
-                visit(pane, entry);
+                visit(pane, &mut entry.presentation);
                 track_due(&mut self.due, was, entry.presentation.due());
             }
         }
@@ -407,9 +428,12 @@ impl<P: Presentation> Attachments<P> {
 
     /// Record the transport a pane wants frames on.
     pub fn set_transport(&mut self, pane: PaneId, transport: FrameTransport) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.presentation.set_transport(transport);
-        }
+        let Some(entry) = self.panes.get_mut(&pane) else {
+            return;
+        };
+        let was = entry.presentation.due();
+        entry.presentation.set_transport(transport);
+        track_due(&mut self.due, was, entry.presentation.due());
     }
 
     /// Record the clipboard transport a pane's terminal supports.

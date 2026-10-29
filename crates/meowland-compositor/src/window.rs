@@ -38,7 +38,7 @@ impl Window {
 
 impl Compositor {
     pub(crate) fn refresh_window_mapping(&mut self, surface: &WlSurface) {
-        let Some(id) = self.windows.ids.get(surface).copied() else {
+        let Some(id) = self.windows.id_by_surface.get(surface).copied() else {
             return;
         };
         if self.windows.surface_cache.snapshots.contains_key(surface) {
@@ -130,7 +130,9 @@ impl Compositor {
         }
         if let Some(window) = self.windows.by_id.remove(&id) {
             window.with_surfaces(clear_owner);
-            self.windows.ids.remove(window.surface.wl_surface());
+            self.windows
+                .id_by_surface
+                .remove(window.surface.wl_surface());
         }
         self.refresh_callback_deadline();
         self.protocols.toplevels.remove(id);

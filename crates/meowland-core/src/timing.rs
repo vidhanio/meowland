@@ -1,10 +1,17 @@
 //! The virtual output's shared refresh policy.
 
-use std::{io, time::Duration};
+use std::time::Duration;
+
+use thiserror::Error;
 
 /// A validated virtual output refresh rate between 1 and 1000 hertz.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefreshRate(u16);
+
+/// A refresh rate outside the supported 1 to 1000 hertz range.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("refresh rate must be between 1 and 1000 Hz")]
+pub struct InvalidRefreshRate;
 
 impl Default for RefreshRate {
     fn default() -> Self {
@@ -25,15 +32,13 @@ impl RefreshRate {
 }
 
 impl TryFrom<u32> for RefreshRate {
-    type Error = io::Error;
+    type Error = InvalidRefreshRate;
 
     fn try_from(hertz: u32) -> Result<Self, Self::Error> {
         if !(1..=1000).contains(&hertz) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refresh rate must be between 1 and 1000 Hz",
-            ));
+            return Err(InvalidRefreshRate);
         }
-        u16::try_from(hertz).map(Self).map_err(io::Error::other)
+        let hertz = u16::try_from(hertz).map_err(|_| InvalidRefreshRate)?;
+        Ok(Self(hertz))
     }
 }

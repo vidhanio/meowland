@@ -135,18 +135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "config"
-version = "0.15.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38e9fbc53afcec54441422f1c596cd054655b32e70e1cbac956651b7b175a404"
-dependencies = [
- "pathdiff",
- "serde_core",
- "toml",
- "winnow",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -595,13 +583,14 @@ dependencies = [
 name = "meowland"
 version = "0.1.0"
 dependencies = [
- "config",
  "dirs",
+ "meowland-compositor",
  "meowland-core",
  "meowland-protocol",
  "meowland-server",
  "meowland-terminal",
  "rustix 1.1.5",
+ "toml",
  "tracing-journald",
  "tracing-subscriber",
  "usage-rs",
@@ -618,6 +607,7 @@ dependencies = [
  "meowland-protocol",
  "meowland-render",
  "rustix 1.1.5",
+ "serde",
  "smithay",
  "thiserror",
  "tracing",
@@ -809,12 +799,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pin-project-lite"
@@ -1693,9 +1677,6 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "xkbcommon"

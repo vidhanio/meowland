@@ -107,11 +107,11 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   terminal capabilities (`PixelMouseUnsupported`, `KeyboardUnsupported`), CLI response
   handling (`UnexpectedWindowListResponse`), and server startup. Give each library
   crate its own error type. The `meowland` binary should use `anyhow`-style context.
-- [ ] **Stop using `io::Error` as the validation error.** `UiScale::from_str`,
+- [x] **Stop using `io::Error` as the validation error.** `UiScale::from_str`,
   `RefreshRate::try_from`, and `Config::into_settings` return
   `io::ErrorKind::InvalidInput`. Use dedicated `thiserror` types such as
   `InvalidScale` and `InvalidRefreshRate`.
-- [ ] **Remove the duplicate config schema.** `meowland-server::Config`,
+- [x] **Remove the duplicate config schema.** `meowland-server::Config`,
   `OutputConfig`, and `KeyboardConfig` mirror `meowland-compositor::Settings` and
   `KeyboardSettings` field by field, and repeat-rate validation exists in both
   `configuration.rs` and `runtime.rs`. Make `Settings` deserialize directly (validated
@@ -219,7 +219,7 @@ These follow the `rust-best-practices` skill.
 - [ ] **Logging setup sits in the wrong module.** `cli::start` calls back into
   `crate::init_logging`, and `main.rs` owns a `LogDestination` enum only `cli` uses.
   Move logging into its own module and call it from `main`.
-- [ ] **The `config` crate is overkill for one TOML file.**
+- [x] **The `config` crate is overkill for one TOML file.**
   `meowland/src/configuration.rs` reads the file itself and then routes it through
   `config::Config::builder()`. `toml::from_str` does the same with a much smaller
   dependency tree.

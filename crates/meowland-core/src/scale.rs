@@ -1,10 +1,17 @@
 //! Validated compositor UI scale in Wayland's 120ths of a logical pixel.
 
-use std::{fmt, io, str::FromStr};
+use std::{fmt, str::FromStr};
+
+use thiserror::Error;
 
 /// A server-wide UI scale shared by every pane, between 0.5 and 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiScale(u32);
+
+/// A scale that is not finite or outside the supported 0.5 to 4 range.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("ui scale must be between 0.5 and 4")]
+pub struct InvalidScale;
 
 impl Default for UiScale {
     fn default() -> Self {
@@ -32,8 +39,8 @@ impl UiScale {
     }
 }
 
-impl FromStr for UiScale {
-    type Err = io::Error;
+impl TryFrom<f64> for UiScale {
+    type Error = InvalidScale;
 
     #[expect(
         clippy::as_conversions,
@@ -41,20 +48,20 @@ impl FromStr for UiScale {
         clippy::cast_sign_loss,
         reason = "the validated 0.5..=4.0 scale rounds to an integer in 60..=480"
     )]
+    fn try_from(scale: f64) -> Result<Self, Self::Error> {
+        if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
+            return Err(InvalidScale);
+        }
+        Ok(Self((scale * 120.0).round() as u32))
+    }
+}
+
+impl FromStr for UiScale {
+    type Err = InvalidScale;
+
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let scale = value
-            .parse::<f64>()
-            .ok()
-            .filter(|scale| scale.is_finite() && (0.5..=4.0).contains(scale));
-        scale.map_or_else(
-            || {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "UI scale must be between 0.5 and 4",
-                ))
-            },
-            |scale| Ok(Self((scale * 120.0).round() as u32)),
-        )
+        let scale = value.parse::<f64>().map_err(|_| InvalidScale)?;
+        Self::try_from(scale)
     }
 }
 

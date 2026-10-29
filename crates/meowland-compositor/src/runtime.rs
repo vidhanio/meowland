@@ -39,19 +39,13 @@ impl Runtime {
     /// Bind a Wayland socket and register its sources on the host loop.
     ///
     /// # Errors
-    /// Returns an error for invalid keyboard settings or display, socket,
-    /// source, renderer, or keymap initialization failure.
+    /// Returns an error for display, socket, source, renderer, or keymap
+    /// initialization failure.
     pub fn with_settings(
         name: &str,
         settings: &Settings,
         handle: &CompositorHandle,
     ) -> io::Result<(Self, State)> {
-        if settings.keyboard.repeat_delay < 0 || settings.keyboard.repeat_rate < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "keyboard repeat delay and rate must be nonnegative",
-            ));
-        }
         let display = Display::<State>::new().map_err(io::Error::other)?;
         let mut state = State::new(display.handle(), handle.clone(), settings);
         let keyboard = &settings.keyboard;
@@ -64,7 +58,11 @@ impl Runtime {
         state.keyboard = Some(
             state
                 .seat
-                .add_keyboard(keymap, keyboard.repeat_delay, keyboard.repeat_rate)
+                .add_keyboard(
+                    keymap,
+                    keyboard.repeat_delay.milliseconds(),
+                    keyboard.repeat_rate.hertz(),
+                )
                 .map_err(io::Error::other)?,
         );
         let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;

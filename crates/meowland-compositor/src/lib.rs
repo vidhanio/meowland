@@ -71,7 +71,10 @@ pub use event_loop::CompositorHandle;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;
 pub use runtime::Runtime;
-pub use settings::{KeyboardSettings, Settings};
+pub use settings::{
+    InvalidOutputSize, InvalidRepeatDelay, InvalidRepeatRate, KeyboardSettings, RepeatDelay,
+    RepeatRate, Settings,
+};
 
 /// An owned notification ready for delivery to one terminal pane.
 #[derive(Debug)]

@@ -10,19 +10,17 @@ use futures::{
     channel::{mpsc, oneshot},
     future::AbortHandle,
 };
-use meowland_compositor::{Command, Compositor, Event, PaneId, Runtime};
-use meowland_core::{Error, Result};
+use meowland_compositor::{Command, Compositor, Event, PaneId, Runtime, Settings};
+use meowland_core::Result;
 use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
 
 mod actor;
-mod configuration;
 mod control;
 mod lifecycle;
 mod process;
 mod sockets;
 mod transport;
 
-pub use configuration::{Config, KeyboardConfig, OutputConfig};
 use lifecycle::Shutdown;
 use transport::PaneTransport;
 
@@ -67,7 +65,7 @@ struct Server {
     error: Option<io::Error>,
 }
 
-/// Run the single-owner server with output and keyboard configuration.
+/// Run the single-owner server with output and keyboard settings.
 ///
 /// Binds the supplied paths unless listeners are provided by socket activation.
 /// Shutdown gives clients a bounded Wayland-close grace period. With the
@@ -76,13 +74,9 @@ struct Server {
 /// closure.
 ///
 /// # Errors
-/// Returns an error if validation, startup, socket I/O, or dispatch fails.
-/// Configuration is validated before sockets bind.
-pub fn serve(paths: &Paths, config: Config) -> Result<()> {
-    let settings = config
-        .into_settings()
-        .map_err(|error| Error::io("validating configuration", error))?;
-    actor::serve(paths, &settings)
+/// Returns an error if startup, socket I/O, or dispatch fails.
+pub fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
+    actor::serve(paths, settings)
 }
 
 fn notify(state: &[sd_notify::NotifyState<'_>]) {

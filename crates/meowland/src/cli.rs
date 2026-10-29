@@ -184,8 +184,8 @@ pub(crate) fn start() -> Result<()> {
     match command {
         Commands::Server(args) => {
             let paths = Paths::discover()?;
-            let config = crate::configuration::load(args.config.as_deref())?;
-            meowland_server::serve(&paths, config)
+            let settings = crate::configuration::load(args.config.as_deref())?;
+            meowland_server::serve(&paths, &settings)
         }
         Commands::List => {
             let paths = Paths::discover()?;

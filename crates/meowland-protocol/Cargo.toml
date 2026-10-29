@@ -16,7 +16,7 @@ bitflags = { workspace = true, features = ["serde"] }
 getrandom = { workspace = true }
 futures = { workspace = true, optional = true }
 meowland-async = { workspace = true, optional = true }
-meowland-core = { workspace = true }
+meowland-core = { workspace = true, features = ["serde"] }
 postcard = { workspace = true, features = ["use-std"] }
 rustix = { workspace = true, features = ["time", "shm", "fs"] }
 serde = { workspace = true, features = ["derive"] }

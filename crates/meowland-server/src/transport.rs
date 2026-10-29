@@ -10,7 +10,6 @@ use futures::{
 };
 use meowland_async::asynchronous::timeout;
 use meowland_compositor::PaneId;
-use meowland_core::pixels::FrameSize;
 use meowland_protocol::{
     self as protocol, ControlRequest, PaneToServer, ServerToPane,
     asynchronous::{Outgoing, Reader},
@@ -81,20 +80,17 @@ async fn pane(
     handle: &LoopHandle<'static, Server>,
 ) -> io::Result<()> {
     let mut reader = Reader::new(reader);
-    let hello = match timeout(handle, protocol::REQUEST_TIMEOUT, reader.read()).await {
-        Ok(PaneToServer::Hello(hello)) if FrameSize::new(hello.width, hello.height).is_some() => {
-            hello
-        }
-        _ => {
-            let reason = "invalid or timed-out pane hello";
-            let _ = timeout(
-                handle,
-                protocol::REQUEST_TIMEOUT,
-                send(&mut writer, &ServerToPane::Reject(reason.into())),
-            )
-            .await;
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
-        }
+    let Ok(PaneToServer::Hello(hello)) =
+        timeout(handle, protocol::REQUEST_TIMEOUT, reader.read()).await
+    else {
+        let reason = "invalid or timed-out pane hello";
+        let _ = timeout(
+            handle,
+            protocol::REQUEST_TIMEOUT,
+            send(&mut writer, &ServerToPane::Reject(reason.into())),
+        )
+        .await;
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
     };
     let pane = PaneId::from(id);
     let (sender, messages) = mpsc::unbounded();

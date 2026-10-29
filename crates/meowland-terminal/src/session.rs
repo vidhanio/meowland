@@ -113,15 +113,12 @@ impl TerminalSession {
         let cell = terminal::derived_cell(pixels, cells);
         let (width, height) =
             terminal::pane_pixels(None, pixels, cells, cell.unwrap_or(FALLBACK_CELL));
+        let size = terminal::frame_size(width, height)?;
         let termination = signals::Termination::new(&handle)?;
         let resize = signals::Signal::new(&handle, &[UnixSignal::SIGWINCH])?;
         let input = input::Reader::new(&handle)?;
         let mut tx = Outgoing::default();
-        tx.send(&PaneToServer::Hello(Hello {
-            width,
-            height,
-            show,
-        }))?;
+        tx.send(&PaneToServer::Hello(Hello { size, show }))?;
         Ok(Self {
             receiver,
             writer,
@@ -382,6 +379,7 @@ impl TerminalSession {
             terminal::cells(),
             self.cell.unwrap_or(FALLBACK_CELL),
         );
+        let size = terminal::frame_size(width, height)?;
         let transport = if probe.shared_memory {
             FrameTransport::Shared
         } else {
@@ -412,7 +410,7 @@ impl TerminalSession {
             .clipboard
             .refresh(Selection::Primary, Refresh::Background);
         self.tx
-            .send(&PaneToServer::Action(PaneAction::Resize { width, height }))?;
+            .send(&PaneToServer::Action(PaneAction::Resize { size }))?;
         probe.log_capabilities(width, height);
         self.lifecycle = Lifecycle::Active(mode);
         Ok(())

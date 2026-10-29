@@ -21,10 +21,8 @@ pub enum Command {
         pane: PaneId,
         /// Window to select or follow.
         show: Show,
-        /// Physical-pixel width, validated before attachment.
-        width: u32,
-        /// Physical-pixel height, validated before attachment.
-        height: u32,
+        /// Physical-pixel bounds, validated during deserialization.
+        size: FrameSize,
     },
     /// Remove pane state without closing its Wayland window.
     Detach {
@@ -48,19 +46,7 @@ impl State {
     /// Apply one pane or lifecycle command on the event-loop thread.
     pub fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Attach {
-                pane,
-                show,
-                width,
-                height,
-            } => {
-                let Some(size) = FrameSize::new(width, height) else {
-                    self.emit(
-                        pane,
-                        ServerToPane::Release("invalid pane dimensions".into()),
-                    );
-                    return;
-                };
+            Command::Attach { pane, show, size } => {
                 self.attach_pane(pane, show, size);
             }
             Command::Detach { pane } => self.release_pane_window(pane),
@@ -75,11 +61,7 @@ impl State {
 
     fn pane_action(&mut self, pane: PaneId, action: PaneAction) {
         match action {
-            PaneAction::Resize { width, height } => {
-                if let Some(size) = FrameSize::new(width, height) {
-                    self.resize_pane(pane, size);
-                }
-            }
+            PaneAction::Resize { size } => self.resize_pane(pane, size),
             PaneAction::Input(event) => {
                 if let Input::Key {
                     key,

@@ -27,6 +27,14 @@ pub enum Error {
     /// The server did not answer the initial pane handshake in time.
     #[error("pane handshake timed out")]
     PaneHandshakeTimeout,
+    /// Computed pane dimensions exceed the compositor's frame limits.
+    #[error("pane dimensions {width}x{height} are outside the supported limits")]
+    InvalidPaneSize {
+        /// Width in physical pixels.
+        width: u32,
+        /// Height in physical pixels.
+        height: u32,
+    },
 }
 
 impl Error {

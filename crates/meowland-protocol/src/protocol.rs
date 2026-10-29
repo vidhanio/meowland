@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use meowland_core::pixels::FrameSize;
 use serde::{Deserialize, Serialize};
 
 /// Maximum encoded packet body; bounds allocations made for untrusted length
@@ -173,10 +174,8 @@ pub struct WindowInfo {
 /// Initial pane request, sent before any [`PaneAction`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Hello {
-    /// Pane width in physical pixels, validated by the server.
-    pub width: u32,
-    /// Pane height in physical pixels, validated by the server.
-    pub height: u32,
+    /// Pane bounds in physical pixels, validated during deserialization.
+    pub size: FrameSize,
     /// Window selection to bind to this pane.
     pub show: Show,
 }
@@ -279,10 +278,8 @@ pub enum PaneAction {
     Input(Input),
     /// Change the pane's physical-pixel bounds.
     Resize {
-        /// New physical-pixel width.
-        width: u32,
-        /// New physical-pixel height.
-        height: u32,
+        /// New physical-pixel bounds, validated during deserialization.
+        size: FrameSize,
     },
     /// Acknowledge retained pixels or request resynchronization.
     Ack(FrameAck),

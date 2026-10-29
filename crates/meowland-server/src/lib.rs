@@ -117,9 +117,8 @@ impl Server {
                     self.send_to_pane(id, ServerToPane::HelloOk);
                     self.send_command(Command::Attach {
                         pane: id,
+                        size: hello.size,
                         show: hello.show,
-                        width: hello.width,
-                        height: hello.height,
                     });
                 }
             }

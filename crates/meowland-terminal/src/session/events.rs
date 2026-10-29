@@ -68,8 +68,9 @@ impl TerminalSession {
                 self.presentation.set_cell_size(self.cell);
                 let (width, height) =
                     terminal::pane_pixels(None, pixels, cells, self.cell.unwrap_or(FALLBACK_CELL));
+                let size = terminal::frame_size(width, height)?;
                 self.tx
-                    .send(&PaneToServer::Action(PaneAction::Resize { width, height }))?;
+                    .send(&PaneToServer::Action(PaneAction::Resize { size }))?;
             }
             Event::Pointer(input) => self.input_gate.send(input, None, &mut self.tx)?,
             Event::Paste(text) => {

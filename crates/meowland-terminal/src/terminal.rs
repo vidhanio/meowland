@@ -6,7 +6,10 @@ use crossterm::{
     event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     queue, terminal,
 };
+use meowland_core::pixels::FrameSize;
 use meowland_protocol as protocol;
+
+use crate::{Error, Result};
 
 /// Longest sanitized title or status line forwarded to the terminal.
 ///
@@ -56,6 +59,11 @@ pub(crate) fn pane_pixels(
             u32::from(cells.1) * u32::from(cell.1),
         )
     })
+}
+
+/// Validate pane dimensions before sending them to the compositor.
+pub(crate) fn frame_size(width: u32, height: u32) -> Result<FrameSize> {
+    FrameSize::new(width, height).ok_or(Error::InvalidPaneSize { width, height })
 }
 
 /// Recalculate cell size from window pixels after font zoom.

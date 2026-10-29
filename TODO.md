@@ -206,7 +206,7 @@ These follow the `rust-best-practices` skill.
   Use a `bitflags` `Modifiers` type. The crate already decodes Kitty's bit layout by
   hand in `input.rs` `csi()` (`(bits & !6) | …`), which needs a comment or a named
   conversion.
-- [ ] **Validate dimensions at deserialization.** `Hello { width, height }` and
+- [x] **Validate dimensions at deserialization.** `Hello { width, height }` and
   `PaneAction::Resize` carry raw `u32`s that the server validates in three places
   (`transport.rs`, `commands.rs` twice). Send `FrameSize` and validate during
   deserialization, as `FrameBand` and `SharedFrame` already do.

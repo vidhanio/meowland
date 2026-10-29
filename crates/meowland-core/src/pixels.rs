@@ -11,9 +11,53 @@ pub const MAX_SURFACE_PIXELS: usize = 16_000_000;
 
 /// Nonempty dimensions whose pixel count and byte strides fit in `usize`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(try_from = "FrameSizeRepr", into = "FrameSizeRepr")
+)]
 pub struct FrameSize {
     width: NonZeroU16,
     height: NonZeroU16,
+}
+
+/// Deserializable `{ width, height }` form validated by [`FrameSize::new`].
+#[cfg(feature = "serde")]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+struct FrameSizeRepr {
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "serde")]
+impl From<FrameSize> for FrameSizeRepr {
+    fn from(size: FrameSize) -> Self {
+        Self {
+            width: size.width(),
+            height: size.height(),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<FrameSizeRepr> for FrameSize {
+    type Error = InvalidFrameSize;
+
+    fn try_from(repr: FrameSizeRepr) -> Result<Self, Self::Error> {
+        Self::new(repr.width, repr.height).ok_or(InvalidFrameSize {
+            width: repr.width,
+            height: repr.height,
+        })
+    }
+}
+
+/// Dimensions rejected while deserializing a [`FrameSize`].
+#[cfg(feature = "serde")]
+#[derive(Debug, thiserror::Error)]
+#[error("frame dimensions {width}x{height} are outside the supported limits")]
+struct InvalidFrameSize {
+    width: u32,
+    height: u32,
 }
 
 impl FrameSize {

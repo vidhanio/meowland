@@ -65,7 +65,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 - [ ] **Probe query duplicates its ID constant.** `FRAME_EDIT_QUERY` in
   `meowland-terminal/src/probe.rs` hard-codes `i=30` while `FRAME_EDIT_ID = 30` is a
   separate constant. Build the query from the constant, as `query_shared` already does.
-- [ ] **Pane-client logs disappear when journald is unavailable.** `init_logging`
+- [x] **Pane-client logs disappear when journald is unavailable.** `init_logging`
   (`meowland/src/main.rs`) silently installs nothing if `tracing_journald::layer()`
   fails. Fall back to a file in `$XDG_STATE_HOME`. stderr cannot be used because the
   terminal is in raw mode or the alternate screen.
@@ -214,9 +214,9 @@ These follow the `rust-best-practices` skill.
   - `terminal_clipboard::Clipboard::cancel_refresh` has no external callers.
   - `render::popup_origin` and `Paths::in_runtime_dir` should be `pub(crate)` or
     private.
-- [ ] **Duplicate completers.** `meowland/src/cli.rs` `attach_targets` and
+- [x] **Duplicate completers.** `meowland/src/cli.rs` `attach_targets` and
   `window_targets` are identical.
-- [ ] **Logging setup sits in the wrong module.** `cli::start` calls back into
+- [x] **Logging setup sits in the wrong module.** `cli::start` calls back into
   `crate::init_logging`, and `main.rs` owns a `LogDestination` enum only `cli` uses.
   Move logging into its own module and call it from `main`.
 - [x] **The `config` crate is overkill for one TOML file.**

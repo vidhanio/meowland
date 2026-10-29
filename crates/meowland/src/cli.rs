@@ -22,7 +22,7 @@ struct Meowland {
 }
 
 #[derive(Subcommands)]
-enum Commands {
+pub(crate) enum Commands {
     /// Start a client and show its window in this terminal.
     Run(RunArgs),
     /// Show a window in this terminal.
@@ -39,15 +39,26 @@ enum Commands {
     Completions(CompletionArgs),
 }
 
+impl Commands {
+    /// Where tracing events from this command should go.
+    pub(crate) const fn log_destination(&self) -> crate::logging::Destination {
+        match self {
+            Self::Server(_) => crate::logging::Destination::Stderr,
+            Self::Run(_) | Self::Attach(_) => crate::logging::Destination::Journal,
+            Self::Kill(_) | Self::List | Self::Completions(_) => crate::logging::Destination::None,
+        }
+    }
+}
+
 #[derive(Args)]
-struct ServerArgs {
+pub(crate) struct ServerArgs {
     /// Read this TOML file instead of `$XDG_CONFIG_HOME/meowland/config.toml`.
     #[usage(long, short = 'c', env = "MEOWLAND_CONFIG")]
     config: Option<PathBuf>,
 }
 
 #[derive(Args)]
-struct RunArgs {
+pub(crate) struct RunArgs {
     /// Attach by app ID for clients without xdg-activation-v1 support.
     #[usage(long, complete = app_ids)]
     app_id: Option<String>,
@@ -61,14 +72,14 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct AttachArgs {
+pub(crate) struct AttachArgs {
     /// The integer window ID or app ID to show.
-    #[usage(complete = attach_targets)]
+    #[usage(complete = window_targets)]
     window: String,
 }
 
 #[derive(Args)]
-struct WindowArgs {
+pub(crate) struct WindowArgs {
     /// The integer window ID or app ID; omit it to select the focused window.
     #[usage(complete = window_targets)]
     window: Option<String>,
@@ -86,15 +97,8 @@ fn window_target(window: String) -> Show {
         .map_or_else(|_| Show::AppId(window), Show::Id)
 }
 
-fn attach_targets(
-    _partial: &<AttachArgs as usage_rs::spec::CommandArgs>::Partial,
-    _context: &usage_rs::complete::CompleteCtx<'_>,
-) -> Vec<usage_rs::complete::Candidate<'static>> {
-    complete_windows(CompletionTargets::All)
-}
-
-fn window_targets(
-    _partial: &<WindowArgs as usage_rs::spec::CommandArgs>::Partial,
+fn window_targets<P>(
+    _partial: &P,
     _context: &usage_rs::complete::CompleteCtx<'_>,
 ) -> Vec<usage_rs::complete::Candidate<'static>> {
     complete_windows(CompletionTargets::All)
@@ -139,7 +143,7 @@ fn complete_windows(targets: CompletionTargets) -> Vec<usage_rs::complete::Candi
 }
 
 #[derive(Args)]
-struct CompletionArgs {
+pub(crate) struct CompletionArgs {
     /// The shell to generate a completion script for.
     #[usage(value_enum)]
     shell: CompletionShell,
@@ -170,17 +174,16 @@ impl From<CompletionShell> for usage_rs::complete::Shell {
     }
 }
 
-/// Parse the process command line and run the selected meowland command.
+/// Parse the process command line into the selected meowland command.
+pub(crate) fn parse() -> Commands {
+    Meowland::parse().command
+}
+
+/// Run the selected meowland command.
 ///
 /// # Errors
 /// Returns an error when the selected command cannot be completed.
-pub(crate) fn start() -> Result<()> {
-    let Meowland { command } = Meowland::parse();
-    crate::init_logging(match &command {
-        Commands::Server(_) => crate::LogDestination::Stderr,
-        Commands::Run(_) | Commands::Attach(_) => crate::LogDestination::Journal,
-        _ => crate::LogDestination::None,
-    });
+pub(crate) fn run(command: Commands) -> Result<()> {
     match command {
         Commands::Server(args) => {
             let paths = Paths::discover()?;

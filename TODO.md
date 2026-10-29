@@ -171,6 +171,17 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   page faults for every page, and an unlink per frame, because the terminal unlinks
   after reading. Measure against `t=f` with a reusable file, or a small ring of
   objects.
+  - Measured on one 1080p frame: creating, writing and unlinking a fresh object costs
+    ~665 µs, of which `shm_open`/`ftruncate`/`unlink` are 2 µs; rewriting a populated
+    object costs ~205 µs. The whole available win is ~0.45 ms of a 4.6 ms frame.
+  - Reuse stays out for now because our `present_shared` sends `q=2`, so a shared
+    transfer gets no reply; that is a property of the current command, not of `t=f`.
+    Replies are suppressed by us: without `q=2` the terminal answers `OK` or an error
+    after loading, which would allow a reply-driven ring with correlation, error
+    handling, a timeout, and fallback. That round trip and its failure behaviour are
+    unevaluated. Without replies a pty can hold many frames of escapes, so a ring of
+    files cannot be proven free before it is overwritten. Prefaulting the next `t=s`
+    object pays the same 6 MB of writes to avoid the same page faults.
 - [x] **O(windows × panes) scans in hot paths.** `Attachments::visible`, `showing`,
   `owner`, and `first_window` scan every pane. They are called per window in
   `frame_callbacks`, per commit, and on every focus change. Keep a

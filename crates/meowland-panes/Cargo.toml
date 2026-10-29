@@ -11,3 +11,6 @@ workspace = true
 [dependencies]
 meowland-core = { workspace = true }
 meowland-protocol = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

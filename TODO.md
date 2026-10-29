@@ -276,7 +276,7 @@ off most, for when that is requested.
   `cargo fuzz`.
 - [ ] `keyboard::key_code` round-trips, `FrameBand` rectangle edge cases, and
   `protocol` framing (oversize, trailing bytes, cancellation-safe `Reader`).
-- [ ] `catalog.rs` and `attachment.rs` selection and follow policy, which become
+- [x] `catalog.rs` and `attachment.rs` selection and follow policy, which become
   testable without Wayland once split out (see §2).
 - [ ] `render.rs` composition: blending, viewport, transforms, and damage-limited
   recomposition matching full recomposition.

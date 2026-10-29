@@ -118,10 +118,10 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   newtypes with `TryFrom` and `#[serde(try_from)]`) and validate in one place.
   - `self.output.scale.to_string().parse()` converts a float to a string and back to
     build a `UiScale`. Add `UiScale::try_from(f64)`.
-- [ ] **Separate connection IDs from pane IDs.** `Server::accepted` assigns
+- [x] **Separate connection IDs from pane IDs.** `Server::accepted` assigns
   `PaneId(next_connection)` to *control* connections too. Introduce `ConnectionId` and
   create a `PaneId` only after a successful `Hello`.
-- [ ] **Listener capacity depends on array order.** `update_listeners` computes
+- [x] **Listener capacity depends on array order.** `update_listeners` computes
   capacity with `usize::from(index == 1)`, while `accepted` uses
   `ConnectionKind::Pane`. Store the `ConnectionKind` in `Listener`.
 - [ ] **Encode readback phases in types.** `readback.rs` `submit` and `complete`
@@ -177,7 +177,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 - [ ] **Framing buffers never shrink.** `protocol::send`/`recv` use a thread-local
   `SCRATCH`, and `asynchronous::Reader::body` keeps its high-water mark (up to
   64 MiB). Shrink after oversized messages.
-- [ ] **One `Outgoing` per message.** `pane_writer` allocates a fresh `Outgoing` for
+- [x] **One `Outgoing` per message.** `pane_writer` allocates a fresh `Outgoing` for
   every message (`transport.rs`). Reuse one.
 - [ ] **`yield_now()` on every session iteration.** `TerminalSession::run` yields at the
   end of every loop iteration, on top of the per-chunk yields in `Reader::read` and

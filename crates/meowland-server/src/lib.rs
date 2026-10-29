@@ -22,12 +22,28 @@ mod sockets;
 mod transport;
 
 use lifecycle::Shutdown;
-use transport::PaneTransport;
+use transport::{ConnectionKind, PaneTransport};
 
 /// One socket budget, with the last slot reserved for control traffic.
 const MAX_CONNECTIONS: usize = 256;
 
 type IncomingSender = mpsc::Sender<Incoming>;
+
+/// Identity of one accepted socket, minted before it proves it carries a pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ConnectionId(u64);
+
+impl From<ConnectionId> for PaneId {
+    fn from(connection: ConnectionId) -> Self {
+        Self(connection.0)
+    }
+}
+
+impl From<PaneId> for ConnectionId {
+    fn from(pane: PaneId) -> Self {
+        Self(pane.0)
+    }
+}
 
 enum Incoming {
     Control(ControlRequest, oneshot::Sender<ControlResponse>),
@@ -37,11 +53,12 @@ enum Incoming {
 
 enum Completion {
     Incoming(Option<Incoming>, mpsc::Receiver<Incoming>),
-    Connection(PaneId, io::Result<()>),
+    Connection(ConnectionId, io::Result<()>),
 }
 
 struct Listener {
     token: RegistrationToken,
+    kind: ConnectionKind,
     enabled: bool,
 }
 
@@ -57,7 +74,7 @@ struct Server {
     )>,
     incoming: IncomingSender,
     listeners: Vec<Listener>,
-    connections: HashMap<PaneId, AbortHandle>,
+    connections: HashMap<ConnectionId, AbortHandle>,
     panes: HashMap<PaneId, PaneTransport>,
     next_connection: u64,
     children: Vec<Child>,
@@ -90,7 +107,8 @@ impl Server {
         match message {
             Incoming::Control(request, reply) => self.control(request, reply),
             Incoming::Attach(id, hello, pane) => {
-                if self.shutdown.running() && self.connections.contains_key(&id) {
+                if self.shutdown.running() && self.connections.contains_key(&ConnectionId::from(id))
+                {
                     self.panes.insert(id, pane);
                     self.send_to_pane(id, ServerToPane::HelloOk);
                     self.send_command(Command::Attach {
@@ -128,7 +146,7 @@ impl Server {
             .is_some_and(|pane| pane.active() && !pane.send(message))
         {
             tracing::warn!(?id, "pane output exceeded its byte budget or disconnected");
-            if let Some(task) = self.connections.remove(&id) {
+            if let Some(task) = self.connections.remove(&ConnectionId::from(id)) {
                 task.abort();
             }
             self.pane_gone(id);
@@ -145,9 +163,9 @@ impl Server {
         }
     }
 
-    fn connection_finished(&mut self, id: PaneId, result: io::Result<()>) {
+    fn connection_finished(&mut self, id: ConnectionId, result: io::Result<()>) {
         self.connections.remove(&id);
-        self.pane_gone(id);
+        self.pane_gone(id.into());
         if let Err(error) = result {
             tracing::debug!(?id, %error, "connection ended");
         }

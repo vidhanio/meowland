@@ -16,7 +16,7 @@ use meowland_protocol::{
 };
 use serde::Serialize;
 
-use super::{Incoming, IncomingSender, Server};
+use super::{ConnectionId, Incoming, IncomingSender, Server};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ConnectionKind {
@@ -31,7 +31,7 @@ pub(crate) enum ConnectionKind {
 pub(crate) async fn connection(
     socket: UnixStream,
     kind: ConnectionKind,
-    id: PaneId,
+    id: ConnectionId,
     incoming: IncomingSender,
     handle: LoopHandle<'static, Server>,
 ) -> io::Result<()> {
@@ -75,7 +75,7 @@ async fn control(
 async fn pane(
     reader: impl futures::io::AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
-    id: PaneId,
+    id: ConnectionId,
     mut incoming: IncomingSender,
     handle: &LoopHandle<'static, Server>,
 ) -> io::Result<()> {
@@ -95,6 +95,7 @@ async fn pane(
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
     };
+    let pane = PaneId::from(id);
     let (sender, messages) = mpsc::unbounded();
     let (release, reason) = oneshot::channel();
     let output = PaneTransport {
@@ -103,7 +104,7 @@ async fn pane(
         bytes: Rc::new(Cell::new(0)),
     };
     incoming
-        .send(Incoming::Attach(id, hello, output))
+        .send(Incoming::Attach(pane, hello, output))
         .await
         .map_err(io::Error::other)?;
     let receiving = async {
@@ -115,7 +116,7 @@ async fn pane(
                 ));
             };
             incoming
-                .send(Incoming::PaneMessage(id, action))
+                .send(Incoming::PaneMessage(pane, action))
                 .await
                 .map_err(io::Error::other)?;
         }
@@ -195,17 +196,18 @@ async fn pane_writer(
     mut messages: mpsc::UnboundedReceiver<Queued>,
     reason: oneshot::Receiver<String>,
 ) -> io::Result<()> {
+    let mut outgoing = Outgoing::default();
     while let Some(Queued {
         message,
         _reservation,
     }) = messages.next().await
     {
-        let mut outgoing = Outgoing::default();
         outgoing.send_pane(message)?;
         outgoing.flush_to(writer).await?;
     }
     if let Ok(reason) = reason.await {
-        send(writer, &ServerToPane::Release(reason)).await?;
+        outgoing.send(&ServerToPane::Release(reason))?;
+        outgoing.flush_to(writer).await?;
     }
     Ok(())
 }

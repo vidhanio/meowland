@@ -12,12 +12,12 @@ use calloop::{
     generic::Generic,
     signals::{Signal, Signals},
 };
-use meowland_compositor::{CompositorHandle, PaneId, Runtime, Settings};
+use meowland_compositor::{CompositorHandle, Runtime, Settings};
 use meowland_core::Result;
 use meowland_protocol::Paths;
 
 use super::{
-    Completion, Listener, MAX_CONNECTIONS, Server,
+    Completion, ConnectionId, Listener, MAX_CONNECTIONS, Server,
     lifecycle::Shutdown,
     notify, sockets,
     transport::{self, ConnectionKind},
@@ -80,6 +80,7 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
             .map_err(|error| io::Error::from(error.error))?;
         registered.push(Listener {
             token,
+            kind,
             enabled: true,
         });
     }
@@ -156,8 +157,9 @@ impl Server {
     }
 
     fn update_listeners(&mut self) -> io::Result<()> {
-        for (index, listener) in self.listeners.iter_mut().enumerate() {
-            let capacity = MAX_CONNECTIONS - usize::from(index == 1);
+        for listener in &mut self.listeners {
+            let capacity =
+                MAX_CONNECTIONS - usize::from(matches!(listener.kind, ConnectionKind::Pane));
             let enabled = self.shutdown.running() && self.connections.len() < capacity;
             if enabled != listener.enabled {
                 if enabled {
@@ -194,7 +196,7 @@ impl Server {
                 return;
             }
         };
-        let id = PaneId(self.next_connection);
+        let id = ConnectionId(self.next_connection);
         self.next_connection += 1;
         let incoming = self.incoming.clone();
         let handle = self.handle.clone();

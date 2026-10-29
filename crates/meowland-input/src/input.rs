@@ -1,7 +1,11 @@
 //! Nonblocking terminal input with signed SGR pixel mouse decoding and
 //! `vtparse`.
 
-use std::{collections::VecDeque, io};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use calloop::LoopHandle;
 use futures::io::AsyncReadExt;
@@ -12,6 +16,7 @@ use vtparse::{CsiParam, VTActor, VTParser};
 
 const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
 const MAX_MUTED: usize = MAX_CONTROL * 4;
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const MOUSE_PREFIX: &[u8] = b"\x1b[<";
 const MAX_MOUSE: usize = 64;
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -104,6 +109,21 @@ impl Reader {
         !self.parser.decoder.events.is_empty()
     }
 
+    /// Deadline by which a muted control sequence must return to ground.
+    #[must_use]
+    pub const fn recovery_deadline(&self) -> Option<Instant> {
+        self.parser.muted_deadline
+    }
+
+    /// Fail if a muted control sequence has exceeded its recovery deadline.
+    ///
+    /// # Errors
+    /// Returns an input error when the recovery deadline has elapsed.
+    pub fn check_recovery(&self) -> io::Result<()> {
+        self.parser.check_recovery(Instant::now())?;
+        Ok(())
+    }
+
     /// Pop a decoded terminal event.
     pub fn next_event(&mut self) -> Option<Event> {
         self.parser.decoder.events.pop_front()
@@ -119,6 +139,7 @@ impl Reader {
         reason = "terminal input belongs to the calloop owner thread"
     )]
     pub async fn read_ready(&mut self) -> io::Result<()> {
+        self.check_recovery()?;
         if !self.parser.decoder.events.is_empty() {
             return Ok(());
         }
@@ -161,10 +182,11 @@ struct Parser {
     mouse: Vec<u8>,
     control_bytes: usize,
     muted_bytes: usize,
+    muted_deadline: Option<Instant>,
 }
 
 /// An oversized control sequence that did not return to ground within the
-/// muted recovery limit.
+/// recovery limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct InputError;
 
@@ -172,8 +194,7 @@ impl std::fmt::Display for InputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "terminal input contained an unterminated control sequence longer than {} bytes",
-            MAX_CONTROL + MAX_MUTED
+            "terminal input contained an unterminated control sequence that exceeded the recovery limit"
         )
     }
 }
@@ -194,7 +215,41 @@ impl Parser {
             mouse: Vec::new(),
             control_bytes: 0,
             muted_bytes: 0,
+            muted_deadline: None,
         }
+    }
+
+    fn begin_muted(&mut self) {
+        if self.decoder.muted {
+            return;
+        }
+        self.decoder.muted = true;
+        self.muted_bytes = 0;
+        self.muted_deadline = Some(Instant::now() + RECOVERY_TIMEOUT);
+        tracing::warn!("Discarding oversized terminal control sequence");
+    }
+
+    const fn end_muted(&mut self) {
+        self.decoder.muted = false;
+        self.muted_bytes = 0;
+        self.muted_deadline = None;
+    }
+
+    fn check_recovery(&self, now: Instant) -> Result<(), InputError> {
+        if self.muted_deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(InputError);
+        }
+        Ok(())
+    }
+
+    fn discard_mouse(&mut self, byte: u8) -> Result<(), InputError> {
+        let mut pending = std::mem::take(&mut self.mouse);
+        self.begin_muted();
+        pending.push(byte);
+        for byte in pending {
+            self.terminal_byte(byte)?;
+        }
+        Ok(())
     }
 
     fn push(&mut self, byte: u8) -> Result<(), InputError> {
@@ -213,12 +268,16 @@ impl Parser {
                         if let Some(event) = mouse(&self.mouse) {
                             self.decoder.events.push_back(event);
                         }
+                        self.mouse.clear();
+                    } else {
+                        return self.discard_mouse(byte);
                     }
-                    self.mouse.clear();
                 }
                 b'0'..=b'9' | b';' | b'-' => {
                     if self.mouse.len() < MAX_MOUSE {
                         self.mouse.push(byte);
+                    } else {
+                        return self.discard_mouse(byte);
                     }
                 }
                 _ => {
@@ -255,9 +314,7 @@ impl Parser {
 
     fn terminal_byte(&mut self, byte: u8) -> Result<(), InputError> {
         if !self.decoder.muted && !self.terminal.is_ground() && self.control_bytes >= MAX_CONTROL {
-            self.decoder.muted = true;
-            self.muted_bytes = 0;
-            tracing::warn!("Discarding oversized terminal control sequence");
+            self.begin_muted();
         }
         self.terminal.parse_byte(byte, &mut self.decoder);
         self.control_bytes = if self.terminal.is_ground() {
@@ -268,8 +325,7 @@ impl Parser {
         if self.decoder.muted {
             self.muted_bytes += 1;
             if self.terminal.is_ground() {
-                self.decoder.muted = false;
-                self.muted_bytes = 0;
+                self.end_muted();
             } else if self.muted_bytes > MAX_MUTED {
                 return Err(InputError);
             }
@@ -583,6 +639,12 @@ mod tests {
         let mut bytes = unterminated(prefix, filler);
         bytes.extend_from_slice(terminator);
         bytes.extend_from_slice(b"\x1b[I");
+        bytes
+    }
+
+    fn oversized_mouse(extra: usize) -> Vec<u8> {
+        let mut bytes = MOUSE_PREFIX.to_vec();
+        bytes.extend(std::iter::repeat_n(b'1', MAX_MOUSE + 1 + extra));
         bytes
     }
 
@@ -1227,6 +1289,51 @@ mod tests {
             bytes.extend_from_slice(b"\x1b\\\x1b[I");
             assert_focus_only(&format!("OSC payload {payload}"), &bytes);
         }
+    }
+
+    #[test]
+    fn parser_recovers_when_mouse_reports_exceed_the_fast_path() {
+        let mut terminated = oversized_mouse(0);
+        terminated.extend_from_slice(b"M\x1b[I");
+        assert_focus_only("mouse M", &terminated);
+
+        for (name, cancel) in [("mouse CAN", 0x18), ("mouse SUB", 0x1a)] {
+            let mut bytes = oversized_mouse(0);
+            bytes.push(cancel);
+            bytes.extend_from_slice(b"\x1b[I");
+            assert_focus_only(name, &bytes);
+        }
+    }
+
+    #[test]
+    fn parser_fails_closed_when_oversized_mouse_never_terminates() {
+        let mut bytes = oversized_mouse(MAX_MUTED);
+        bytes.extend_from_slice(b"\x1b[I");
+        let (result, events) = parse_result(&bytes);
+        let error = result.expect_err("unterminated mouse report must fail");
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(io::Error::from(error).kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parser_enforces_the_muted_recovery_deadline() {
+        let mut parser = Parser::new();
+        for &byte in &oversized_mouse(0) {
+            parser.push(byte).expect("muted mouse report");
+        }
+        let deadline = parser.muted_deadline.expect("muted after mouse overflow");
+        let before = deadline
+            .checked_sub(Duration::from_millis(1))
+            .expect("deadline has margin");
+        assert!(parser.check_recovery(before).is_ok());
+        assert_eq!(parser.check_recovery(deadline), Err(InputError));
+
+        let mut recovered = Parser::new();
+        for &byte in &oversized_mouse(0) {
+            recovered.push(byte).expect("muted mouse report");
+        }
+        recovered.push(b'M').expect("terminated mouse report");
+        assert!(recovered.muted_deadline.is_none());
     }
 
     #[test]

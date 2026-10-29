@@ -151,6 +151,9 @@ impl TerminalSession {
         let mut turns = TURNS_PER_YIELD;
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             self.prepare_pending_work()?;
+            if let Err(error) = self.input.check_recovery() {
+                return self.finish_after_input_error(error).await;
+            }
             let active = matches!(self.lifecycle, Lifecycle::Active(_));
             let pending_output = active && self.presentation.pending();
             let pending_input = self.input.pending();
@@ -171,8 +174,7 @@ impl TerminalSession {
             .await;
             match ready {
                 Ready::Input(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
-                    self.close(None).await?;
-                    return Err(error.into());
+                    return self.finish_after_input_error(error).await;
                 }
                 Ready::Terminate | Ready::Input(Err(_)) => return self.close(None).await,
                 Ready::Resize => self.send_event(input::Event::Resize)?,
@@ -199,6 +201,15 @@ impl TerminalSession {
             }
         }
         Ok(())
+    }
+
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn finish_after_input_error(&mut self, error: io::Error) -> Result<()> {
+        self.close(None).await?;
+        Err(error.into())
     }
 
     #[expect(
@@ -240,6 +251,7 @@ impl TerminalSession {
         };
         handshake
             .into_iter()
+            .chain(self.input.recovery_deadline())
             .chain(self.input_gate.deadline())
             .chain(self.presentation.deadline())
             .chain(self.clipboard.deadline())

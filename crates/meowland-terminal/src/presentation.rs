@@ -129,6 +129,11 @@ impl PanePresentation {
         self.pending.append(bytes);
     }
 
+    /// Drop queued terminal bytes that a stalled terminal never accepted.
+    pub(crate) fn discard(&mut self) {
+        self.pending.discard();
+    }
+
     /// Scratch space for terminal output that is not part of a frame.
     pub(crate) const fn buffer(&mut self) -> &mut Vec<u8> {
         self.pending.buffer()

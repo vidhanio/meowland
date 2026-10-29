@@ -50,6 +50,13 @@ const EVENTS_PER_TURN: usize = 64;
 /// loop was pending.
 const TURNS_PER_YIELD: usize = 16;
 
+/// Longest shutdown waits for queued terminal output before restoring modes.
+///
+/// A terminal that stops accepting bytes (flow control, a suspended emulator,
+/// or a closed window) would otherwise keep the pane alive forever, because the
+/// restore sequence shares the queue with the frames still ahead of it.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 enum Lifecycle {
     Handshaking { deadline: Instant },
     Waiting,
@@ -422,36 +429,66 @@ impl TerminalSession {
         Ok(())
     }
 
-    /// Restore terminal modes after frame output drains, then report a reason.
+    /// Restore terminal modes after a bounded drain, then report a reason.
     ///
     /// The restore sequence is appended to the same ordered queue as frames, so
-    /// a half-written frame can never interleave with it.
+    /// a half-written frame can never interleave with it. If the terminal stops
+    /// accepting output, queued frames are discarded and the restore sequence
+    /// is written directly, best effort, so shutdown always finishes.
     #[expect(
         clippy::future_not_send,
         reason = "the terminal session runs on calloop's local executor"
     )]
     async fn close(&mut self, reason: Option<&str>) -> Result<()> {
+        let mut restore = Vec::new();
         let mut failure = if let Lifecycle::Active(mut mode) =
             std::mem::replace(&mut self.lifecycle, Lifecycle::Closed)
         {
-            mode.restore_into(self.presentation.buffer())
-                .err()
-                .map(Error::from)
+            mode.restore_into(&mut restore).err().map(Error::from)
         } else {
             None
         };
         if let Some(reason) = reason {
             let clean = protocol::sanitize_with_limit(reason, terminal::MAX_TEXT_CHARS);
-            self.presentation
-                .append(format!("meowland: {clean}\n").as_bytes());
+            restore.extend_from_slice(format!("meowland: {clean}\n").as_bytes());
         }
-        if let Err(error) = self.flush_output().await {
-            failure = failure.or(Some(error));
+        self.presentation.append(&restore);
+        let drained = self.drain_until(Instant::now() + CLOSE_DRAIN_TIMEOUT).await;
+        let complete = match drained {
+            Ok(complete) => complete,
+            Err(error) => {
+                failure = failure.or(Some(error));
+                false
+            }
+        };
+        if !complete {
+            tracing::warn!("queued terminal output did not drain before shutdown");
+            self.presentation.discard();
+            output::write_best_effort(&restore);
         }
         failure.map_or(Ok(()), Err)
     }
 
-    /// Write every queued terminal byte in order before the session ends.
+    /// Write queued bytes until the deadline, reporting whether the queue
+    /// emptied.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn drain_until(&mut self, deadline: Instant) -> Result<bool> {
+        while self.presentation.pending() && Instant::now() < deadline {
+            futures::select! {
+                result = self.presentation.drain(&mut self.stdout).fuse() => result?,
+                result = sleep_until(&self.handle, Some(deadline)).fuse() => result?,
+            }
+        }
+        Ok(!self.presentation.pending())
+    }
+
+    /// Write every queued terminal byte in order before continuing.
+    ///
+    /// Startup uses this so mode changes reach the terminal before probing and
+    /// before the first frame shares their queue.
     #[expect(
         clippy::future_not_send,
         reason = "the terminal session runs on calloop's local executor"

@@ -19,6 +19,24 @@ pub(crate) fn open() -> io::Result<File> {
     .map_err(Into::into)
 }
 
+/// Write bytes without waiting for the terminal to accept them.
+///
+/// Shutdown uses this after a stalled drain, so a terminal that stops reading
+/// cannot keep the pane alive. A partial write leaves escape sequences
+/// truncated, which is the price of a bounded exit.
+pub(crate) fn write_best_effort(bytes: &[u8]) {
+    let Ok(file) = open() else {
+        return;
+    };
+    let mut written = 0;
+    while written < bytes.len() {
+        match rustix::io::write(&file, &bytes[written..]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => written += count,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Output {
     bytes: Vec<u8>,
@@ -39,6 +57,12 @@ impl Output {
 
     pub(crate) const fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Drop every queued byte instead of writing it.
+    pub(crate) fn discard(&mut self) {
+        self.bytes.clear();
+        self.offset = 0;
     }
 
     /// Never monopolize the input loop, even when the terminal is writable.

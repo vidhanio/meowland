@@ -592,3 +592,368 @@ impl Renderer {
         hit
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use smithay::{
+        utils::{Logical, Point, Rectangle, Size, Transform},
+        wayland::viewporter::ViewportCachedState,
+    };
+
+    use super::*;
+    use crate::{geometry::SurfaceGeometry, snapshot::Opacity};
+
+    fn snapshot(width: u32, height: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Snapshot {
+        let len = usize::try_from(width)
+            .unwrap()
+            .checked_mul(usize::try_from(height).unwrap())
+            .unwrap()
+            .checked_mul(4)
+            .unwrap();
+        let mut pixels = Vec::with_capacity(len);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&pixel(x, y));
+            }
+        }
+        Snapshot::from_rgba(width, height, pixels, Opacity::Source)
+    }
+
+    fn mixed(x: u32, y: u32) -> [u8; 4] {
+        let alpha = match (x + y) % 3 {
+            0 => 0,
+            1 => 128,
+            _ => 255,
+        };
+        [alpha / 2, alpha / 3, alpha / 4, alpha]
+    }
+
+    fn opaque(x: u32, y: u32) -> [u8; 4] {
+        let red = u8::try_from(x).unwrap().wrapping_mul(37);
+        let green = u8::try_from(y).unwrap().wrapping_mul(53);
+        let blue = red.wrapping_add(green).wrapping_mul(3);
+        [red, green, blue, 255]
+    }
+
+    fn background(width: i32, height: i32) -> Vec<u8> {
+        vec![0x55; usize::try_from(width).unwrap() * usize::try_from(height).unwrap() * 3]
+    }
+
+    fn direct(snapshot: &Snapshot) -> SurfaceGeometry {
+        SurfaceGeometry::new(
+            snapshot,
+            1,
+            Transform::Normal,
+            ViewportCachedState::default(),
+        )
+    }
+
+    fn compose_direct(
+        snapshot: &Snapshot,
+        geometry: &SurfaceGeometry,
+        origin: Point<i32, Logical>,
+        size: (i32, i32),
+    ) -> Vec<u8> {
+        let mut pixels = background(size.0, size.1);
+        {
+            let mut target = Target {
+                pixels: &mut pixels,
+                columns: 0..size.0,
+                rows: 0..size.1,
+            };
+            blit(snapshot, geometry, origin, &mut target, 1.0);
+        }
+        pixels
+    }
+
+    fn compose_scaled(
+        snapshot: &Snapshot,
+        geometry: &SurfaceGeometry,
+        origin: Point<i32, Logical>,
+        size: (i32, i32),
+    ) -> Vec<u8> {
+        let mut pixels = background(size.0, size.1);
+        let Some(dst) = placement(origin, geometry.dst, 1.0) else {
+            return pixels;
+        };
+        let left = dst.left.max(0);
+        let top = dst.top.max(0);
+        let right = dst.left.saturating_add(dst.width).min(size.0);
+        let bottom = dst.top.saturating_add(dst.height).min(size.1);
+        if right > left && bottom > top {
+            let clip = Rectangle::new((left, top).into(), (right - left, bottom - top).into());
+            let mut target = Target {
+                pixels: &mut pixels,
+                columns: 0..size.0,
+                rows: 0..size.1,
+            };
+            if snapshot.opaque() {
+                blit_scaled::<true>(snapshot, geometry, dst, clip, &mut target);
+            } else {
+                blit_scaled::<false>(snapshot, geometry, dst, clip, &mut target);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn blending_matches_a_rounded_reference_formula() {
+        for alpha in 0..=u8::MAX {
+            for source in 0..=u8::MAX {
+                for under in 0..=u8::MAX {
+                    let underneath = [under, under.wrapping_add(40), under.wrapping_sub(50)];
+                    let source_rgb = [source, source.wrapping_mul(5), source.wrapping_add(77)];
+                    let mut rgb = underneath;
+                    blend_pixel(
+                        [source_rgb[0], source_rgb[1], source_rgb[2], alpha],
+                        &mut rgb,
+                    );
+                    for channel in 0..3 {
+                        let expected = match alpha {
+                            0 => underneath[channel],
+                            255 => source_rgb[channel],
+                            _ => {
+                                let alpha = u32::from(alpha);
+                                let numerator = u32::from(source_rgb[channel]) * 255
+                                    + u32::from(underneath[channel]) * (255 - alpha)
+                                    + 127;
+                                u8::try_from((numerator / 255).min(255)).unwrap()
+                            }
+                        };
+                        assert_eq!(
+                            rgb[channel], expected,
+                            "alpha {alpha}, source {source}, under {under}, channel {channel}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_direct_pixels_copy_exactly() {
+        let snapshot = snapshot(2, 2, opaque);
+        let geometry = direct(&snapshot);
+        let pixels = compose_direct(&snapshot, &geometry, (0, 0).into(), (2, 2));
+
+        assert_eq!(pixels, vec![0, 0, 0, 37, 0, 111, 0, 53, 159, 37, 53, 14]);
+    }
+
+    #[test]
+    fn unscaled_and_sampled_paths_agree_at_scale_one() {
+        let mixed = snapshot(5, 4, mixed);
+        let opaque = snapshot(5, 4, opaque);
+        let origins = [(-3, -2), (0, 0), (2, 1), (4, 3), (6, 4)];
+
+        for snapshot in [&mixed, &opaque] {
+            let geometry = direct(snapshot);
+            for origin in origins {
+                let origin = Point::from(origin);
+                let direct_pixels = compose_direct(snapshot, &geometry, origin, (7, 5));
+                let sampled_pixels = compose_scaled(snapshot, &geometry, origin, (7, 5));
+                assert_eq!(
+                    direct_pixels,
+                    sampled_pixels,
+                    "origin {origin:?}, opaque {}",
+                    snapshot.opaque()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_top_layer_makes_partial_recomposition_match_full_composition() {
+        let size = (6, 4);
+        let bottom = snapshot(6, 4, mixed);
+        let top = snapshot(6, 4, opaque);
+        let bottom_geometry = direct(&bottom);
+        let top_geometry = direct(&top);
+
+        let mut full = compose_direct(&bottom, &bottom_geometry, (0, 0).into(), size);
+        {
+            let mut target = Target {
+                pixels: &mut full,
+                columns: 0..size.0,
+                rows: 0..size.1,
+            };
+            blit(&top, &top_geometry, (0, 0).into(), &mut target, 1.0);
+        }
+        let shortcut = compose_direct(&top, &top_geometry, (0, 0).into(), size);
+        assert_eq!(full, shortcut);
+
+        let partial = snapshot(3, 2, opaque);
+        let partial_geometry = direct(&partial);
+        let shortcut = compose_direct(&partial, &partial_geometry, (0, 0).into(), size);
+        assert_ne!(full, shortcut);
+    }
+
+    fn pixel_at(pixels: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
+        let index = (y * width + x) * 3;
+        pixels[index..index + 3].try_into().unwrap()
+    }
+
+    fn compose_band(bottom: &Snapshot, top: &Snapshot, region: Rectangle<i32, Logical>) -> Vec<u8> {
+        let width = usize::try_from(region.size.w).unwrap();
+        let height = usize::try_from(region.size.h).unwrap();
+        let mut pixels = vec![0x55; width * height * 3];
+        {
+            let mut target = Target {
+                pixels: &mut pixels,
+                columns: region.loc.x..region.loc.x + region.size.w,
+                rows: region.loc.y..region.loc.y + region.size.h,
+            };
+            blit(bottom, &direct(bottom), (0, 0).into(), &mut target, 1.0);
+            blit(top, &direct(top), (0, 0).into(), &mut target, 1.0);
+        }
+        pixels
+    }
+
+    fn patch_band(
+        frame: &mut [u8],
+        frame_width: i32,
+        band: &[u8],
+        region: Rectangle<i32, Logical>,
+    ) {
+        let band_width = usize::try_from(region.size.w).unwrap() * 3;
+        for row in 0..region.size.h {
+            let from = usize::try_from(row).unwrap() * band_width;
+            let to =
+                usize::try_from((region.loc.y + row) * frame_width + region.loc.x).unwrap() * 3;
+            frame[to..to + band_width].copy_from_slice(&band[from..from + band_width]);
+        }
+    }
+
+    #[test]
+    fn viewport_crops_and_scales_samples() {
+        let source = snapshot(4, 2, |x, y| {
+            [
+                u8::try_from(x).unwrap() * 10,
+                u8::try_from(y).unwrap() * 20,
+                0,
+                255,
+            ]
+        });
+        let viewport = ViewportCachedState {
+            src: Some(Rectangle::new((1.0, 0.0).into(), (2.0, 2.0).into())),
+            dst: Some(Size::from((4, 4))),
+        };
+        let geometry = SurfaceGeometry::new(&source, 1, Transform::Normal, viewport);
+        let pixels = compose_scaled(&source, &geometry, (0, 0).into(), (4, 4));
+
+        assert_eq!(pixel_at(&pixels, 4, 0, 0), [10, 0, 0]);
+        assert_eq!(pixel_at(&pixels, 4, 3, 0), [20, 0, 0]);
+        assert_eq!(pixel_at(&pixels, 4, 0, 1), [10, 0, 0]);
+        assert_eq!(pixel_at(&pixels, 4, 0, 2), [10, 20, 0]);
+        assert_eq!(pixel_at(&pixels, 4, 3, 3), [20, 20, 0]);
+    }
+
+    #[test]
+    fn rotated_buffers_sample_in_transform_order() {
+        let source = snapshot(2, 1, |x, _| {
+            if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 255, 0, 255]
+            }
+        });
+        let geometry =
+            SurfaceGeometry::new(&source, 1, Transform::_90, ViewportCachedState::default());
+        assert_eq!(geometry.dst, Size::from((1, 2)));
+        let pixels = compose_scaled(&source, &geometry, (0, 0).into(), (1, 2));
+
+        assert_eq!(pixel_at(&pixels, 1, 0, 0), [0, 255, 0]);
+        assert_eq!(pixel_at(&pixels, 1, 0, 1), [255, 0, 0]);
+    }
+
+    proptest! {
+        #[test]
+        fn damage_limited_recomposition_matches_a_full_recomposition(
+            damage in (0i32..6, 0i32..4).prop_flat_map(|(x, y)| {
+                (Just(x), Just(y), 1..=(6 - x), 1..=(4 - y))
+                    .prop_map(|(x, y, width, height)| {
+                        Rectangle::new((x, y).into(), (width, height).into())
+                    })
+            })
+        ) {
+            let bottom = snapshot(6, 4, mixed);
+            let changed = |x: u32, y: u32| {
+                let x = i32::try_from(x).unwrap();
+                let y = i32::try_from(y).unwrap();
+                x >= damage.loc.x
+                    && x < damage.loc.x + damage.size.w
+                    && y >= damage.loc.y
+                    && y < damage.loc.y + damage.size.h
+            };
+            let old_top = snapshot(6, 4, |x, y| {
+                if changed(x, y) {
+                    [0, 0, 0, 0]
+                } else {
+                    [10, 200, 30, 64]
+                }
+            });
+            let new_top = snapshot(6, 4, |x, y| {
+                if changed(x, y) {
+                    [200, 10, 20, 128]
+                } else {
+                    [10, 200, 30, 64]
+                }
+            });
+            let full = Rectangle::new((0, 0).into(), (6, 4).into());
+
+            let old_frame = compose_band(&bottom, &old_top, full);
+            let new_frame = compose_band(&bottom, &new_top, full);
+            let mut incremental = old_frame.clone();
+            let band = compose_band(&bottom, &new_top, damage);
+            patch_band(&mut incremental, 6, &band, damage);
+
+            prop_assert_ne!(&old_frame, &new_frame, "damage {:?}", damage);
+            prop_assert_eq!(&incremental, &new_frame, "damage {:?}", damage);
+        }
+    }
+
+    fn assert_placement(got: Option<Placement>, want: (i32, i32, i32, i32), description: &str) {
+        let got = got.unwrap_or_else(|| panic!("{description}: no placement"));
+        assert_eq!(
+            (got.left, got.top, got.width, got.height),
+            want,
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn placement_rounds_scaled_edges() {
+        assert_placement(
+            placement(Point::from((1, 2)), Size::from((3, 4)), 1.0),
+            (1, 2, 3, 4),
+            "unscaled",
+        );
+        assert_placement(
+            placement(Point::from((1, 1)), Size::from((3, 3)), 0.5),
+            (1, 1, 1, 1),
+            "half-scale offset",
+        );
+        assert_placement(
+            placement(Point::from((0, 0)), Size::from((3, 3)), 0.5),
+            (0, 0, 2, 2),
+            "half-scale rounding",
+        );
+        assert_placement(
+            placement(Point::from((0, 0)), Size::from((1, 1)), 1.5),
+            (0, 0, 2, 2),
+            "edge rounding",
+        );
+    }
+
+    #[test]
+    fn placement_rejects_empty_or_saturated_destinations() {
+        assert!(
+            placement(Point::from((0, 0)), Size::from((0, 4)), 1.0).is_none(),
+            "zero-width destination"
+        );
+        assert!(
+            placement(Point::from((i32::MAX, i32::MAX)), Size::from((10, 10)), 2.0).is_none(),
+            "saturated destination"
+        );
+    }
+}

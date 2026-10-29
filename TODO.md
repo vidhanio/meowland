@@ -278,7 +278,7 @@ off most, for when that is requested.
   `protocol` framing (oversize, trailing bytes, cancellation-safe `Reader`).
 - [x] `catalog.rs` and `attachment.rs` selection and follow policy, which become
   testable without Wayland once split out (see §2).
-- [ ] `render.rs` composition: blending, viewport, transforms, and damage-limited
+- [x] `render.rs` composition: blending, viewport, transforms, and damage-limited
   recomposition matching full recomposition.
 
 ## 6. Tooling, CI, Nix

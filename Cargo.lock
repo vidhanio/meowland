@@ -785,6 +785,7 @@ version = "0.1.0"
 dependencies = [
  "libloading 0.9.0",
  "meowland-core",
+ "proptest",
  "smithay",
  "thiserror",
  "tracing",

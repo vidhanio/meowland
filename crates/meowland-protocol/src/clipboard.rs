@@ -117,7 +117,10 @@ pub fn valid_mime(mime: &str) -> bool {
         && mime != "."
         && mime.len() <= MAX_MIME_LENGTH
         && mime.bytes().all(|byte| byte.is_ascii_graphic())
-        && (!mime.contains('/') || mime.parse::<mime::Mime>().is_ok())
+        && (!mime.contains('/')
+            || mime
+                .parse::<mime::Mime>()
+                .is_ok_and(|media| !media.subtype().as_str().is_empty()))
 }
 
 /// Filter invalid or duplicate types, preserving order and retaining at most

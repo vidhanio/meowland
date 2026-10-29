@@ -72,15 +72,16 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 
 ## 2. Architecture
 
-- [ ] **Split `meowland-compositor`** (4.5k lines, 4.5× the AGENTS.md guideline).
-  Natural seams:
-  - `readback.rs` + `readback/fences.rs` (about 600 lines): DMA-BUF acquire, fence
+- [x] **Split `meowland-compositor`** (5.1k lines, 5.1× the AGENTS.md guideline).
+  Remaining seams:
+  - [ ] `readback.rs` + `readback/fences.rs` (about 600 lines): DMA-BUF acquire, fence
     export, and the GPU submit/complete state machine. Move it next to
-    `meowland-render::dmabuf` or into a `meowland-readback` crate.
-  - `clipboard.rs` (550 lines): the Wayland ↔ terminal selection bridge. It is an
+    `meowland-render::dmabuf` or into a `meowland-readback` crate. Needs the
+    event-loop projection moved first.
+  - [ ] `clipboard.rs` (550 lines): the Wayland ↔ terminal selection bridge. It is an
     independent state machine with its own sources and timers.
-  - `catalog.rs` + `attachment.rs`: pure policy that never touches Wayland. As a
-    separate crate it could be unit-tested without Smithay.
+  - [x] `catalog.rs` + `attachment.rs`: now the `meowland-panes` crate. `Attachments<P>`
+    is generic over a `Presentation` trait, so pane policy has no Smithay dependency.
 - [x] **Break up the `Compositor` god struct.** It has about 45 fields, and every
   submodule reaches into all of them through `impl State`. Group them into
   sub-structs (`Protocols`, `Seat`, `Windows`, `Panes`, `Selection`), so borrows split

@@ -3,18 +3,21 @@
 
 use std::collections::HashMap;
 
-use meowland_protocol::{Show, WindowInfo, WindowState};
+use meowland_protocol::{Show, WindowId, WindowInfo, WindowState};
 
-use super::WindowId;
-
+#[derive(Debug)]
 struct Metadata {
     app_id: String,
     title: String,
     mapped_at: Option<u64>,
 }
 
-#[derive(Default)]
-pub(crate) struct WindowCatalog {
+/// Window identities, mapping order, focus, and selection policy.
+///
+/// The catalog deliberately knows nothing about Wayland resources, so
+/// selection and focus can be exercised without a display.
+#[derive(Debug, Default)]
+pub struct WindowCatalog {
     windows: HashMap<WindowId, Metadata>,
     next: u64,
     mapping_order: u64,
@@ -23,7 +26,8 @@ pub(crate) struct WindowCatalog {
 }
 
 impl WindowCatalog {
-    pub(crate) fn insert(&mut self, app_id: String, title: String) -> WindowId {
+    /// Register an unmapped window and return its identity.
+    pub fn insert(&mut self, app_id: String, title: String) -> WindowId {
         self.next += 1;
         let id = WindowId::from(self.next);
         self.windows.insert(
@@ -37,14 +41,16 @@ impl WindowCatalog {
         id
     }
 
-    pub(crate) fn update(&mut self, id: WindowId, app_id: String, title: String) {
+    /// Replace a registered window's application ID and title.
+    pub fn update(&mut self, id: WindowId, app_id: String, title: String) {
         if let Some(window) = self.windows.get_mut(&id) {
             window.app_id = app_id;
             window.title = title;
         }
     }
 
-    pub(crate) fn map(&mut self, id: WindowId) -> bool {
+    /// Mark a window as drawable, returning whether that changed.
+    pub fn map(&mut self, id: WindowId) -> bool {
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
@@ -57,7 +63,8 @@ impl WindowCatalog {
         true
     }
 
-    pub(crate) fn unmap(&mut self, id: WindowId) -> bool {
+    /// Mark a window as no longer drawable, returning whether that changed.
+    pub fn unmap(&mut self, id: WindowId) -> bool {
         let changed = self
             .windows
             .get_mut(&id)
@@ -72,26 +79,31 @@ impl WindowCatalog {
         changed
     }
 
-    pub(crate) fn drawable(&self, id: WindowId) -> bool {
+    /// Whether the window is mapped and may be shown in a pane.
+    pub fn drawable(&self, id: WindowId) -> bool {
         self.windows
             .get(&id)
             .is_some_and(|window| window.mapped_at.is_some())
     }
 
-    pub(crate) const fn newest(&self) -> Option<WindowId> {
+    /// Most recently mapped drawable window.
+    pub const fn newest(&self) -> Option<WindowId> {
         self.newest
     }
 
-    pub(crate) const fn focused(&self) -> Option<WindowId> {
+    /// Window that currently has focus.
+    pub const fn focused(&self) -> Option<WindowId> {
         self.focused
     }
 
-    pub(crate) fn focus(&mut self, window: Option<WindowId>) -> Option<WindowId> {
+    /// Focus a drawable window and return the previously focused window.
+    pub fn focus(&mut self, window: Option<WindowId>) -> Option<WindowId> {
         let window = window.filter(|&id| self.drawable(id));
         std::mem::replace(&mut self.focused, window)
     }
 
-    pub(crate) fn info(&self, id: WindowId) -> WindowInfo {
+    /// Public description of a window for pane clients.
+    pub fn info(&self, id: WindowId) -> WindowInfo {
         let (app_id, title) = self
             .windows
             .get(&id)
@@ -108,13 +120,15 @@ impl WindowCatalog {
         }
     }
 
-    pub(crate) fn title(&self, id: WindowId) -> &str {
+    /// Current title of a window, or an empty string when it is unknown.
+    pub fn title(&self, id: WindowId) -> &str {
         self.windows
             .get(&id)
             .map_or("", |window| window.title.as_str())
     }
 
-    pub(crate) fn select(&self, show: &Show, activation: Option<WindowId>) -> Option<WindowId> {
+    /// Resolve a pane selector to a drawable window.
+    pub fn select(&self, show: &Show, activation: Option<WindowId>) -> Option<WindowId> {
         let window = match show {
             Show::Id(id) => Some(*id),
             Show::Newest => self.newest,
@@ -125,7 +139,8 @@ impl WindowCatalog {
         self.drawable(window).then_some(window)
     }
 
-    pub(crate) fn remove(&mut self, window: WindowId) {
+    /// Forget a window entirely.
+    pub fn remove(&mut self, window: WindowId) {
         self.unmap(window);
         self.windows.remove(&window);
     }

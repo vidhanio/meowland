@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 meowland-render = { workspace = true }
 meowland-core = { workspace = true }
+meowland-panes = { workspace = true }
 meowland-protocol = { workspace = true }
 calloop = { workspace = true }
 rustix = { workspace = true, features = ["event", "fs", "pipe"] }

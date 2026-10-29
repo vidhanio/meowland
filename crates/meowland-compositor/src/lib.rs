@@ -39,10 +39,8 @@ use smithay::{
 };
 
 mod activation;
-mod attachment;
 mod bell;
 mod buffer;
-mod catalog;
 mod clipboard;
 mod commands;
 mod decoration;
@@ -63,9 +61,11 @@ mod text;
 mod toplevels;
 mod window;
 
-pub use attachment::PaneId;
-use attachment::{AttachedPane, Attachments, Policy, Selection};
-use catalog::WindowCatalog;
+pub use meowland_panes::PaneId;
+use meowland_panes::{Policy, Selection, WindowCatalog};
+
+pub(crate) type AttachedPane = meowland_panes::AttachedPane<frame::PaneState>;
+pub(crate) type Attachments = meowland_panes::Attachments<frame::PaneState>;
 pub use commands::{CloseWindowError, Command};
 pub use event_loop::CompositorHandle;
 pub use meowland_protocol::WindowId;

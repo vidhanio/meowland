@@ -622,6 +622,7 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "meowland-core",
+ "meowland-panes",
  "meowland-protocol",
  "meowland-render",
  "rustix 1.1.5",
@@ -658,6 +659,14 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "flate2",
+ "meowland-core",
+ "meowland-protocol",
+]
+
+[[package]]
+name = "meowland-panes"
+version = "0.1.0"
+dependencies = [
  "meowland-core",
  "meowland-protocol",
 ]

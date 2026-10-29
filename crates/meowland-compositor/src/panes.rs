@@ -1,10 +1,12 @@
 //! Pane attachment, window rebinding, and presentation ownership.
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::Show;
+use meowland_protocol::{FrameAck, FrameTransport, Show};
 use smithay::utils::{Logical, Size};
 
-use super::{AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, input};
+use super::{
+    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, frame::PaneState, input,
+};
 
 impl Compositor {
     /// The last-used pane decides the window's size; otherwise use the first
@@ -156,5 +158,35 @@ impl Compositor {
         for (pane, window) in ready {
             self.show_pane_window(pane, window);
         }
+    }
+}
+
+impl meowland_panes::Presentation for PaneState {
+    fn new(size: FrameSize) -> Self {
+        Self::new(size)
+    }
+
+    fn size(&self) -> FrameSize {
+        self.size
+    }
+
+    fn set_size(&mut self, size: FrameSize) {
+        self.size = size;
+    }
+
+    fn set_transport(&mut self, transport: FrameTransport) {
+        self.transport = transport;
+    }
+
+    fn due(&self) -> bool {
+        Self::due(self)
+    }
+
+    fn mark_dirty(&mut self) {
+        Self::mark_dirty(self);
+    }
+
+    fn ack(&mut self, pane: PaneId, ack: FrameAck) {
+        Self::ack(self, pane, ack);
     }
 }

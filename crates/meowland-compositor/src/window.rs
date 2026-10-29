@@ -68,6 +68,7 @@ impl State {
             return;
         }
         self.toplevels.remove(id);
+        self.popups_dirty = true;
         self.leave_output(id);
         self.clear_window_pointer(id);
         self.touch(id);
@@ -128,9 +129,11 @@ impl State {
             window.with_surfaces(clear_owner);
             self.ids.remove(window.surface.wl_surface());
         }
+        self.refresh_callback_deadline();
         self.toplevels.remove(id);
         self.attachments.forget_window(id);
         self.catalog.remove(id);
         self.popups.cleanup();
+        self.popups_dirty = false;
     }
 }

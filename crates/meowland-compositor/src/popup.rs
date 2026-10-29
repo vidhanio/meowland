@@ -8,7 +8,11 @@ use super::State;
 
 impl State {
     pub(crate) fn refresh_popup_grab(&mut self) {
+        if self.popup_grab.is_none() && !self.popups_dirty {
+            return;
+        }
         self.popups.cleanup();
+        self.popups_dirty = false;
         let Some(grab) = self.popup_grab.take_if(|grab| grab.has_ended()) else {
             return;
         };

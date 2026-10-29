@@ -93,8 +93,8 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   sources on a loop whose data is `Server`. Simpler options: make `Compositor` the loop
   data and keep server state inside it, or make registration generic over
   `D: AsMut<Compositor>`.
-- [ ] **The run loop does a full pass on every wakeup.** `actor::run` calls
-  `wayland.dispatch`, which runs `frame_callbacks` (all windows), `dispatch_frames`
+- [x] **The run loop does a full pass on every wakeup.** `actor::run` calls
+  `wayland.dispatch`, which ran `frame_callbacks` (all windows), `dispatch_frames`
   (all panes), `expire_activation_tokens`, and `refresh_popup_grab`, after *any* event,
   including a single control request. The duplicated display fd is registered with a
   no-op callback just to force wakeups. Track dirty and due state, and only walk the

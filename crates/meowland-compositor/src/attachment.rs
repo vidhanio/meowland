@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{Show, clipboard::Transport};
+use meowland_protocol::{FrameAck, FrameTransport, Show, clipboard::Transport};
 
 use super::frame::PaneState;
 
@@ -109,6 +109,7 @@ pub(crate) struct Attachments {
     panes: BTreeMap<PaneId, AttachedPane>,
     by_window: HashMap<WindowId, BTreeSet<PaneId>>,
     deciding: HashMap<WindowId, PaneId>,
+    due: usize,
 }
 
 impl Attachments {
@@ -124,10 +125,15 @@ impl Attachments {
         self.panes.get(&pane)
     }
 
-    /// Borrow a pane for presentation changes; binding changes belong to
-    /// [`Attachments::show`] and [`Attachments::clear`].
-    pub(crate) fn get_mut(&mut self, pane: PaneId) -> Option<&mut AttachedPane> {
-        self.panes.get_mut(&pane)
+    /// Number of panes whose frame is dirty and waiting for dispatch.
+    pub(crate) const fn due_frames(&self) -> usize {
+        self.due
+    }
+
+    /// Reset after every dirty frame was handed to
+    /// [`super::frame::PaneState::frame`].
+    pub(crate) const fn clear_due(&mut self) {
+        self.due = 0;
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&PaneId, &AttachedPane)> {
@@ -148,10 +154,13 @@ impl Attachments {
     ) {
         let entry = AttachedPane::new(show, window, size);
         let window = entry.window();
-        if let Some(previous) = self.panes.insert(pane, entry)
-            && let Some(previous) = previous.window()
-        {
-            self.unlink(previous, pane);
+        if let Some(previous) = self.panes.insert(pane, entry) {
+            if previous.presentation.due() {
+                self.due -= 1;
+            }
+            if let Some(previous) = previous.window() {
+                self.unlink(previous, pane);
+            }
         }
         if let Some(window) = window {
             self.link(window, pane);
@@ -162,8 +171,10 @@ impl Attachments {
     /// for.
     pub(crate) fn show(&mut self, pane: PaneId, window: WindowId) -> Option<String> {
         let entry = self.panes.get_mut(&pane)?;
+        let was = entry.presentation.due();
         let previous = entry.window();
         let token = entry.show(window);
+        track_due(&mut self.due, was, entry.presentation.due());
         if previous != Some(window) {
             if let Some(previous) = previous {
                 self.unlink(previous, pane);
@@ -178,8 +189,10 @@ impl Attachments {
         let Some(entry) = self.panes.get_mut(&pane) else {
             return;
         };
+        let was = entry.presentation.due();
         let previous = entry.window();
         entry.clear();
+        track_due(&mut self.due, was, entry.presentation.due());
         if let Some(previous) = previous {
             self.unlink(previous, pane);
         }
@@ -188,6 +201,9 @@ impl Attachments {
     pub(crate) fn remove(&mut self, pane: PaneId) -> Option<AttachedPane> {
         self.deciding.retain(|_, owner| *owner != pane);
         let removed = self.panes.remove(&pane)?;
+        if removed.presentation.due() {
+            self.due -= 1;
+        }
         if let Some(window) = removed.window() {
             self.unlink(window, pane);
         }
@@ -265,8 +281,39 @@ impl Attachments {
     ) {
         for &pane in self.by_window.get(&window).into_iter().flatten() {
             if let Some(entry) = self.panes.get_mut(&pane) {
+                let was = entry.presentation.due();
                 visit(pane, entry);
+                track_due(&mut self.due, was, entry.presentation.due());
             }
+        }
+    }
+
+    pub(crate) fn ack(&mut self, pane: PaneId, ack: FrameAck) {
+        let Some(entry) = self.panes.get_mut(&pane) else {
+            return;
+        };
+        let was = entry.presentation.due();
+        entry.presentation.ack(pane, ack);
+        track_due(&mut self.due, was, entry.presentation.due());
+    }
+
+    pub(crate) fn resize(&mut self, pane: PaneId, size: FrameSize) -> Option<WindowId> {
+        let entry = self.panes.get_mut(&pane)?;
+        if entry.presentation.size == size {
+            return None;
+        }
+        let was = entry.presentation.due();
+        entry.presentation.size = size;
+        entry.presentation.mark_dirty();
+        let now = entry.presentation.due();
+        let window = entry.window();
+        track_due(&mut self.due, was, now);
+        window
+    }
+
+    pub(crate) fn set_transport(&mut self, pane: PaneId, transport: FrameTransport) {
+        if let Some(entry) = self.panes.get_mut(&pane) {
+            entry.presentation.transport = transport;
         }
     }
 
@@ -285,5 +332,17 @@ impl Attachments {
                 self.by_window.remove(&window);
             }
         }
+    }
+}
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "the flags are the pane's before and after dirty state"
+)]
+const fn track_due(due: &mut usize, was: bool, now: bool) {
+    match (was, now) {
+        (true, false) => *due -= 1,
+        (false, true) => *due += 1,
+        _ => {}
     }
 }

@@ -158,8 +158,8 @@ impl CompositorHandler for State {
             )
         });
         let new_buffer = matches!(assignment, Some(BufferAssignment::NewBuffer(_)));
-        if callbacks && let Some(window) = window.and_then(|id| self.windows.get_mut(&id)) {
-            window.callback_pending = true;
+        if callbacks && let Some(window) = window {
+            self.request_callback(window);
         }
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
@@ -235,6 +235,7 @@ impl CompositorHandler for State {
     /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
         let window = self.window_for_surface(surface);
+        self.popups_dirty = true;
         self.surface_cache.forget(surface);
         readback::destroyed(self, surface);
         if let Some(window) = window {

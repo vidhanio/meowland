@@ -126,9 +126,7 @@ impl State {
             }
             PaneAction::Ack(ack) => self.pane_ack(pane, ack),
             PaneAction::FrameTransport(transport) => {
-                if let Some(entry) = self.attachments.get_mut(pane) {
-                    entry.presentation.transport = transport;
-                }
+                self.attachments.set_transport(pane, transport);
             }
         }
     }

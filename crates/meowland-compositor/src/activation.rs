@@ -32,12 +32,14 @@ impl State {
                 expires,
             },
         );
+        self.refresh_activation_deadline();
         token
     }
 
     pub(crate) fn forget_activation(&mut self, token: &str) {
         self.launches.remove(token);
         self.activation.remove_token(&token.to_owned().into());
+        self.refresh_activation_deadline();
     }
 
     /// Revoke a launch token and release panes waiting for it.
@@ -69,8 +71,10 @@ impl State {
         }
     }
 
-    pub(crate) fn next_activation_deadline(&self) -> Option<Instant> {
-        self.launches
+    /// Recompute the earliest launch or external-token expiry.
+    pub(crate) fn refresh_activation_deadline(&mut self) {
+        self.activation_deadline = self
+            .launches
             .values()
             .map(|launch| launch.expires)
             .chain(
@@ -78,12 +82,18 @@ impl State {
                     .tokens()
                     .map(|(_, data)| data.timestamp + TOKEN_LIFETIME),
             )
-            .min()
+            .min();
     }
 
     /// Expiry is scheduled by the readiness loop, not window-detection polling.
     pub(crate) fn expire_activation_tokens(&mut self) {
         let now = Instant::now();
+        if self
+            .activation_deadline
+            .is_none_or(|deadline| now < deadline)
+        {
+            return;
+        }
         let expired: Vec<_> = self
             .launches
             .iter()
@@ -98,6 +108,7 @@ impl State {
         }
         self.activation
             .retain_tokens(|_, data| now < data.timestamp + TOKEN_LIFETIME);
+        self.refresh_activation_deadline();
     }
 }
 
@@ -132,6 +143,7 @@ impl XdgActivationHandler for State {
         if let Some(launch) = self.launches.get_mut(token.as_str()) {
             launch.window = Some(window);
         }
+        self.refresh_activation_deadline();
         self.resolve_pending_panes();
         if self.catalog.drawable(window) {
             self.focus_window(window);

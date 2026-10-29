@@ -50,6 +50,7 @@ impl XdgShellHandler for State {
         {
             return;
         }
+        self.popups_dirty = true;
         place_popup(self, &surface, positioner);
         let _ = surface.send_configure();
     }

@@ -80,15 +80,7 @@ impl State {
     }
 
     pub(crate) fn resize_pane(&mut self, pane: PaneId, size: FrameSize) {
-        let Some(entry) = self.attachments.get_mut(pane) else {
-            return;
-        };
-        if entry.presentation.size == size {
-            return;
-        }
-        entry.presentation.size = size;
-        entry.presentation.mark_dirty();
-        if let Some(window) = entry.window() {
+        if let Some(window) = self.attachments.resize(pane, size) {
             self.apply_window_state(window);
         }
     }

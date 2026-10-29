@@ -111,7 +111,7 @@ impl PaneState {
         self.schedule(changed);
     }
 
-    fn ack(&mut self, pane: PaneId, ack: FrameAck) {
+    pub(crate) fn ack(&mut self, pane: PaneId, ack: FrameAck) {
         let Presentation::InFlight { changed, sent } = self.presentation else {
             return;
         };
@@ -126,7 +126,7 @@ impl PaneState {
         }
     }
 
-    const fn due(&self) -> bool {
+    pub(crate) const fn due(&self) -> bool {
         matches!(self.presentation, Presentation::Dirty)
     }
 
@@ -197,21 +197,15 @@ impl State {
     /// Wait for frame or activation deadlines; transfers wake through readiness
     /// sources.
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
-        if self
-            .attachments
-            .iter()
-            .any(|(_, pane)| pane.presentation.due())
-        {
+        if self.attachments.due_frames() > 0 {
             return Some(Duration::ZERO);
         }
-        self.next_activation_deadline()
+        self.activation_deadline
             .map(|deadline| deadline.saturating_duration_since(now))
             .into_iter()
             .chain(
-                self.windows
-                    .values()
-                    .filter(|window| window.callback_pending)
-                    .map(|window| window.callback_due.saturating_duration_since(now)),
+                self.callback_deadline
+                    .map(|deadline| deadline.saturating_duration_since(now)),
             )
             .min()
     }
@@ -220,6 +214,9 @@ impl State {
     /// at one Hz.
     pub(crate) fn frame_callbacks(&mut self) {
         let now = Instant::now();
+        if self.callback_deadline.is_none_or(|deadline| now < deadline) {
+            return;
+        }
         let time = self.started.elapsed();
         for (&id, window) in &mut self.windows {
             if !window.callback_pending || now < window.callback_due {
@@ -238,6 +235,31 @@ impl State {
             window.callback_pending = false;
             window.send_frame(&self.output, time);
         }
+        self.refresh_callback_deadline();
+    }
+
+    /// Recompute the earliest pending callback after a window is added,
+    /// removed, or acknowledges a frame.
+    pub(crate) fn refresh_callback_deadline(&mut self) {
+        self.callback_deadline = self
+            .windows
+            .values()
+            .filter(|window| window.callback_pending)
+            .map(|window| window.callback_due)
+            .min();
+    }
+
+    /// Queue a frame callback at the window's paced deadline.
+    pub(crate) fn request_callback(&mut self, window: super::WindowId) {
+        let Some(entry) = self.windows.get_mut(&window) else {
+            return;
+        };
+        entry.callback_pending = true;
+        let due = entry.callback_due;
+        self.callback_deadline = Some(
+            self.callback_deadline
+                .map_or(due, |deadline| deadline.min(due)),
+        );
     }
 
     pub(crate) fn resume_callbacks(&mut self, window: super::WindowId) {
@@ -247,16 +269,24 @@ impl State {
             window.callback_due = window
                 .callback_due
                 .min(Instant::now() + self.refresh_rate.interval());
+            if window.callback_pending {
+                let due = window.callback_due;
+                self.callback_deadline = Some(
+                    self.callback_deadline
+                        .map_or(due, |deadline| deadline.min(due)),
+                );
+            }
         }
     }
 
     pub(crate) fn pane_ack(&mut self, pane: super::PaneId, ack: FrameAck) {
-        if let Some(entry) = self.attachments.get_mut(pane) {
-            entry.presentation.ack(pane, ack);
-        }
+        self.attachments.ack(pane, ack);
     }
 
     pub(crate) fn dispatch_frames(&mut self) {
+        if self.attachments.due_frames() == 0 {
+            return;
+        }
         for (&pane, entry) in self.attachments.iter_mut() {
             if !entry.presentation.due() {
                 continue;
@@ -275,5 +305,6 @@ impl State {
                 self.events.push(Event { pane, message });
             }
         }
+        self.attachments.clear_due();
     }
 }

@@ -2,7 +2,7 @@
 
 Meowland is a Rust Wayland compositor that displays graphical apps in terminal panes using the Kitty graphics protocol.
 
-Do not create any unit tests or integration tests unless explicitly asked.
+Tests are allowed, but never tautological. Every test must have a purpose: it guards a real invariant, edge case, regression, or contract that could plausibly break. Do not write tests that restate constants, mirror the implementation, or only exercise trivial accessors. Before adding a test, be able to say in one sentence what bug it would catch.
 Do not add comments unless explicitly asked. Documentation comments are allowed and encouraged.
 Do not update README.md unless explicitly asked.
 

@@ -14,6 +14,7 @@ meowland-core = { workspace = true }
 meowland-loop = { workspace = true }
 meowland-panes = { workspace = true }
 meowland-protocol = { workspace = true }
+meowland-selection = { workspace = true }
 calloop = { workspace = true }
 rustix = { workspace = true, features = ["event", "fs", "pipe"] }
 serde = { workspace = true, features = ["derive"] }

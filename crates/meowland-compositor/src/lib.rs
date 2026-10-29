@@ -41,7 +41,6 @@ use smithay::{
 mod activation;
 mod bell;
 mod buffer;
-mod clipboard;
 mod commands;
 mod decoration;
 mod frame;
@@ -53,6 +52,7 @@ mod readback;
 mod runtime;
 mod scaling;
 mod seat;
+mod selection;
 mod settings;
 mod shell;
 mod text;
@@ -71,6 +71,7 @@ pub type CompositorHandle = meowland_loop::Handle<Compositor>;
 pub(crate) type Sources = meowland_loop::Sources<Compositor>;
 pub use meowland_protocol::WindowId;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
+use meowland_selection as clipboard;
 use runtime::ClientState;
 pub use runtime::Runtime;
 pub use settings::{
@@ -154,7 +155,7 @@ pub struct Compositor {
     gpu: Option<DmabufBackend>,
     readbacks: readback::Readbacks,
     attachments: Attachments,
-    clipboard: clipboard::Bridge,
+    clipboard: clipboard::Bridge<Self>,
     bell: bell::Bell,
     scale: UiScale,
     refresh_rate: RefreshRate,

@@ -78,8 +78,10 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
     export, and the GPU submit/complete state machine. Move it next to
     `meowland-render::dmabuf` or into a `meowland-readback` crate. Needs the
     event-loop projection moved first.
-  - [ ] `clipboard.rs` (550 lines): the Wayland ↔ terminal selection bridge. It is an
-    independent state machine with its own sources and timers.
+  - [x] `clipboard.rs` (550 lines): the Wayland ↔ terminal selection bridge. It is an
+    independent state machine with its own sources and timers. Extracted to
+    `meowland-selection` behind a `Host` trait; the compositor owns the bridge state
+    and supplies the seat calls, pane routing, and paste action.
   - [x] `catalog.rs` + `attachment.rs`: now the `meowland-panes` crate. `Attachments<P>`
     is generic over a `Presentation` trait, so pane policy has no Smithay dependency.
 - [x] **Break up the `Compositor` god struct.** It has about 45 fields, and every

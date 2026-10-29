@@ -1,0 +1,18 @@
+[package]
+name = "meowland-selection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+meowland-loop = { workspace = true }
+meowland-panes = { workspace = true }
+meowland-protocol = { workspace = true }
+calloop = { workspace = true }
+rustix = { workspace = true, features = ["fs", "pipe"] }
+smithay = { workspace = true, features = ["wayland_frontend"] }
+tracing = { workspace = true }

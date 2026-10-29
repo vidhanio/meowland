@@ -626,6 +626,7 @@ dependencies = [
  "meowland-panes",
  "meowland-protocol",
  "meowland-render",
+ "meowland-selection",
  "rustix 1.1.5",
  "serde",
  "smithay",
@@ -703,6 +704,19 @@ dependencies = [
  "meowland-core",
  "smithay",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "meowland-selection"
+version = "0.1.0"
+dependencies = [
+ "calloop",
+ "meowland-loop",
+ "meowland-panes",
+ "meowland-protocol",
+ "rustix 1.1.5",
+ "smithay",
  "tracing",
 ]
 

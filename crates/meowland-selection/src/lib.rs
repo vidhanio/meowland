@@ -1,8 +1,11 @@
 //! Readiness-driven Wayland selection exports and terminal-backed deliveries.
+//!
+//! The bridge owns no Wayland state. A host supplies the seat selection calls,
+//! pane routing, and event-loop projection through [`Host`].
 
 use std::{
     collections::{HashMap, VecDeque},
-    io,
+    fmt, io,
     os::fd::OwnedFd,
     sync::Arc,
 };
@@ -12,8 +15,10 @@ use calloop::{
     generic::Generic,
     timer::{TimeoutAction, Timer},
 };
+use meowland_loop::{Handle, Sources};
+use meowland_panes::PaneId;
 use meowland_protocol::{
-    ClipboardOfferId, ClipboardRequestId, OfferIntent,
+    ClipboardOfferId, ClipboardRequestId, OfferIntent, ServerToPane,
     clipboard::{
         ClipboardData, Deadline, Item, MAX_BYTES, MAX_TEXT, Selection as ClipboardSelection,
         TRANSFER_TIMEOUT, Transport, mime_types,
@@ -23,29 +28,28 @@ use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
     io::Errno,
 };
-use smithay::wayland::selection::{
-    SelectionSource, SelectionTarget,
-    data_device::{request_data_device_client_selection, set_data_device_selection},
-    primary_selection::{request_primary_client_selection, set_primary_selection},
-};
+use smithay::wayland::selection::{SelectionSource, SelectionTarget};
 
-use super::{Compositor, PaneId, ServerToPane, Sources, input::paste_action};
-
+/// How the current Wayland selection is backed.
 #[derive(Clone, Debug)]
 pub enum Source {
+    /// Representations held by the bridge itself.
     Local(Arc<ClipboardData>),
+    /// An offer whose data the terminal pane provides on request.
     Terminal {
+        /// Pane that made the offer.
         pane: PaneId,
+        /// Offer identifier the pane assigned.
         offer: ClipboardOfferId,
     },
 }
 
-struct Export {
+struct Export<H> {
     id: u64,
     target: SelectionTarget,
     pane: PaneId,
     mimes: VecDeque<String>,
-    active: Option<Sources>,
+    active: Option<Sources<H>>,
     data: ClipboardData,
     bytes: usize,
     /// Aggregate bytes this transport can use, from [`export_limit`].
@@ -58,10 +62,10 @@ enum DeliveryPhase {
     Writing,
 }
 
-struct Delivery {
+struct Delivery<H> {
     phase: DeliveryPhase,
     deadline: Deadline,
-    sources: Sources,
+    sources: Sources<H>,
 }
 
 const fn target_index(target: SelectionTarget) -> usize {
@@ -133,36 +137,57 @@ fn export_types(advertised: impl IntoIterator<Item = String>, transport: Transpo
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Bridge {
-    exports: [Option<Export>; 2],
-    deliveries: HashMap<ClipboardRequestId, Delivery>,
+/// Host-owned selection exports, deliveries, and pending transfer state.
+pub struct Bridge<H> {
+    exports: [Option<Export<H>>; 2],
+    deliveries: HashMap<ClipboardRequestId, Delivery<H>>,
     next: u64,
 }
 
-impl Bridge {
+impl<H> Default for Bridge<H> {
+    fn default() -> Self {
+        Self {
+            exports: [None, None],
+            deliveries: HashMap::new(),
+            next: 0,
+        }
+    }
+}
+
+impl<H> fmt::Debug for Bridge<H> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Bridge")
+            .field("exports", &self.exports.iter().flatten().count())
+            .field("deliveries", &self.deliveries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<H> Bridge<H> {
     const fn id(&mut self) -> u64 {
         self.next += 1;
         self.next
     }
 
-    const fn export(&self, target: SelectionTarget) -> Option<&Export> {
+    const fn export(&self, target: SelectionTarget) -> Option<&Export<H>> {
         self.exports[target_index(target)].as_ref()
     }
 
-    const fn export_mut(&mut self, target: SelectionTarget) -> Option<&mut Export> {
+    const fn export_mut(&mut self, target: SelectionTarget) -> Option<&mut Export<H>> {
         self.exports[target_index(target)].as_mut()
     }
 
-    const fn take_export(&mut self, target: SelectionTarget) -> Option<Export> {
+    const fn take_export(&mut self, target: SelectionTarget) -> Option<Export<H>> {
         self.exports[target_index(target)].take()
     }
 
-    fn set_export(&mut self, target: SelectionTarget, export: Option<Export>) {
+    fn set_export(&mut self, target: SelectionTarget, export: Option<Export<H>>) {
         self.exports[target_index(target)] = export;
     }
 
-    pub(crate) fn detach(&mut self, pane: PaneId) {
+    /// Forget every delivery and export owned by a detached pane.
+    pub fn detach(&mut self, pane: PaneId) {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
@@ -174,28 +199,49 @@ impl Bridge {
     }
 }
 
-pub(crate) fn selection(
-    state: &mut Compositor,
-    target: SelectionTarget,
-    source: Option<SelectionSource>,
-) {
-    state.clipboard.set_export(target, None);
-    let focused = state.windows.catalog.focused();
-    let pane = state
-        .input
-        .last_input_pane
-        .filter(|pane| {
-            state
-                .attachments
-                .get(*pane)
-                .is_some_and(|pane| pane.window().is_some() && pane.window() == focused)
-        })
-        .or_else(|| focused.and_then(|focused| state.attachments.first_showing(focused)));
-    let Some(pane) = pane else {
+/// Compositor operations the selection bridge needs from its host.
+pub trait Host: Sized + 'static {
+    /// Event-loop projection for selection timers and transfers.
+    fn handle(&self) -> &Handle<Self>;
+    /// Host-owned bridge state.
+    fn bridge(&mut self) -> &mut Bridge<Self>;
+    /// Send a protocol message to a pane.
+    fn emit(&mut self, pane: PaneId, message: ServerToPane);
+    /// Pane that should own the focused window's selection.
+    fn selection_pane(&self) -> Option<PaneId>;
+    /// Clipboard transport of an attached pane.
+    fn pane_transport(&self, pane: PaneId) -> Option<Transport>;
+    /// Whether a pane is attached.
+    fn contains_pane(&self, pane: PaneId) -> bool;
+    /// Whether a pane currently shows a window.
+    fn pane_has_window(&self, pane: PaneId) -> bool;
+    /// Ask the client that owns the selection for one representation.
+    ///
+    /// # Errors
+    /// Returns an error when the seat cannot request the selection.
+    fn request_selection(
+        &mut self,
+        target: SelectionTarget,
+        mime: String,
+        fd: OwnedFd,
+    ) -> io::Result<()>;
+    /// Offer representations to the seat selection.
+    fn set_selection(&mut self, target: SelectionTarget, mimes: Vec<String>, source: Source);
+    /// Run the terminal paste shortcut in a pane.
+    fn paste(&mut self, pane: PaneId);
+}
+
+/// Handle a changed seat selection.
+///
+/// The compositor calls this from its selection handler after Smithay has
+/// updated the seat selection.
+pub fn selection<H: Host>(host: &mut H, target: SelectionTarget, source: Option<SelectionSource>) {
+    host.bridge().set_export(target, None);
+    let Some(pane) = host.selection_pane() else {
         return;
     };
     let Some(source) = source else {
-        state.emit(
+        host.emit(
             pane,
             ServerToPane::ClipboardWrite {
                 selection: wire_selection(target),
@@ -204,12 +250,9 @@ pub(crate) fn selection(
         );
         return;
     };
-    let id = state.clipboard.id();
-    let transport = state
-        .attachments
-        .get(pane)
-        .map_or(Transport::Kitty, |pane| pane.clipboard);
-    state.clipboard.set_export(
+    let id = host.bridge().id();
+    let transport = host.pane_transport(pane).unwrap_or(Transport::Kitty);
+    host.bridge().set_export(
         target,
         Some(Export {
             id,
@@ -223,58 +266,58 @@ pub(crate) fn selection(
             deadline: Deadline::new(TRANSFER_TIMEOUT),
         }),
     );
-    schedule_export(state, target, id);
+    schedule_export(host, target, id);
 }
 
 /// Smithay updates the seat selection after returning from `new_selection`.
-fn schedule_export(state: &mut Compositor, target: SelectionTarget, id: u64) {
-    let mut sources = Sources::new(&state.handle);
-    match state
-        .handle
-        .insert_source(Timer::immediate(), move |_, (), state| {
-            if let Some(export) = state.clipboard.export_mut(target)
+fn schedule_export<H: Host>(host: &mut H, target: SelectionTarget, id: u64) {
+    let mut sources = Sources::new(host.handle());
+    match host
+        .handle()
+        .insert_source(Timer::immediate(), move |_, (), host| {
+            if let Some(export) = host.bridge().export_mut(target)
                 && export.id == id
             {
                 if let Some(sources) = &mut export.active {
                     sources.timer = None;
                 }
                 export.active = None;
-                export_next(state, target);
+                export_next(host, target);
             }
             TimeoutAction::Drop
         }) {
         Ok(token) => {
             sources.timer = Some(token);
-            if let Some(export) = state.clipboard.export_mut(target) {
+            if let Some(export) = host.bridge().export_mut(target) {
                 export.active = Some(sources);
             }
         }
         Err(error) => {
             tracing::warn!(%error, "Cannot schedule clipboard export");
-            state.clipboard.set_export(target, None);
+            host.bridge().set_export(target, None);
         }
     }
 }
 
-fn export_next(state: &mut Compositor, target: SelectionTarget) {
-    let Some(mut export) = state.clipboard.take_export(target) else {
+fn export_next<H: Host>(host: &mut H, target: SelectionTarget) {
+    let Some(mut export) = host.bridge().take_export(target) else {
         return;
     };
-    if export.deadline.expired() || !state.attachments.contains(export.pane) {
+    if export.deadline.expired() || !host.contains_pane(export.pane) {
         return;
     }
     while let Some(mime) = export.mimes.pop_front() {
-        let result = export_source(state, &export, mime.clone());
+        let result = export_source(host, &export, mime.clone());
         match result {
             Ok(sources) => {
                 export.active = Some(sources);
-                state.clipboard.set_export(target, Some(export));
+                host.bridge().set_export(target, Some(export));
                 return;
             }
             Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
         }
     }
-    state.emit(
+    host.emit(
         export.pane,
         ServerToPane::ClipboardWrite {
             selection: wire_selection(target),
@@ -283,10 +326,14 @@ fn export_next(state: &mut Compositor, target: SelectionTarget) {
     );
 }
 
-fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Result<Sources> {
+fn export_source<H: Host>(
+    host: &mut H,
+    export: &Export<H>,
+    mime: String,
+) -> io::Result<Sources<H>> {
     let (read, write) = rustix::pipe::pipe()?;
     nonblocking(&read)?;
-    let mut sources = Sources::new(&state.handle);
+    let mut sources = Sources::new(host.handle());
     let id = export.id;
     let target = export.target;
     let deadline = export.deadline;
@@ -294,20 +341,19 @@ fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Resul
     let mut bytes = Vec::new();
     let requested_mime = mime.clone();
     sources.io = Some(
-        state
-            .handle
+        host.handle()
             .insert_source(
                 Generic::new(read, Interest::READ, Mode::Level),
-                move |_, fd, state| {
-                    if state
-                        .clipboard
+                move |_, fd, host| {
+                    if host
+                        .bridge()
                         .export(target)
                         .is_none_or(|export| export.id != id)
                     {
                         return Ok(PostAction::Remove);
                     }
                     if deadline.expired() {
-                        if let Some(mut export) = state.clipboard.take_export(target)
+                        if let Some(mut export) = host.bridge().take_export(target)
                             && let Some(sources) = &mut export.active
                         {
                             sources.io = None;
@@ -318,7 +364,7 @@ fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Resul
                     if matches!(result, Ok(false)) {
                         return Ok(PostAction::Continue);
                     }
-                    let Some(export) = state.clipboard.export_mut(target) else {
+                    let Some(export) = host.bridge().export_mut(target) else {
                         return Ok(PostAction::Remove);
                     };
                     if let Some(sources) = &mut export.active {
@@ -332,15 +378,15 @@ fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Resul
                                 mime: mime.clone(),
                                 data: std::mem::take(&mut bytes),
                             });
-                            export_next(state, target);
+                            export_next(host, target);
                         }
                         Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
                             tracing::warn!(%error, "Clipboard export exceeds size limit");
-                            state.clipboard.set_export(target, None);
+                            host.bridge().set_export(target, None);
                         }
                         Err(error) => {
                             tracing::warn!(%error, "Client clipboard transfer failed");
-                            export_next(state, target);
+                            export_next(host, target);
                         }
                         Ok(false) => unreachable!(),
                     }
@@ -350,12 +396,11 @@ fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Resul
             .map_err(io::Error::other)?,
     );
     sources.timer = Some(
-        state
-            .handle
+        host.handle()
             .insert_source(
                 Timer::from_duration(export.deadline.remaining()),
-                move |_, (), state| {
-                    if let Some(mut export) = state.clipboard.exports[target_index(target)]
+                move |_, (), host| {
+                    if let Some(mut export) = host.bridge().exports[target_index(target)]
                         .take_if(|export| export.id == id)
                     {
                         if let Some(sources) = &mut export.active {
@@ -368,16 +413,7 @@ fn export_source(state: &Compositor, export: &Export, mime: String) -> io::Resul
             )
             .map_err(io::Error::other)?,
     );
-    match target {
-        SelectionTarget::Clipboard => {
-            request_data_device_client_selection(&state.input.seat, requested_mime, write)
-                .map_err(io::Error::other)?;
-        }
-        SelectionTarget::Primary => {
-            request_primary_client_selection(&state.input.seat, requested_mime, write)
-                .map_err(io::Error::other)?;
-        }
-    }
+    host.request_selection(target, requested_mime, write)?;
     Ok(sources)
 }
 
@@ -400,26 +436,27 @@ fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io
     Ok(false)
 }
 
-pub(crate) fn send(state: &mut Compositor, fd: OwnedFd, mime: &str, source: &Source) {
-    if state.clipboard.deliveries.len() >= 16 {
+/// Deliver one representation of the seat selection to a client.
+pub fn send<H: Host>(host: &mut H, fd: OwnedFd, mime: &str, source: &Source) {
+    if host.bridge().deliveries.len() >= 16 {
         return;
     }
     let deadline = Deadline::new(TRANSFER_TIMEOUT);
     match source {
         Source::Local(data) => {
             if let Some(item) = data.items.iter().find(|item| item.mime == mime) {
-                write(state, fd, Arc::from(item.data.as_slice()), deadline);
+                write(host, fd, Arc::from(item.data.as_slice()), deadline);
             }
         }
         Source::Terminal { pane, offer } => {
-            if !state.attachments.contains(*pane) {
+            if !host.contains_pane(*pane) {
                 return;
             }
-            let request = ClipboardRequestId::from(state.clipboard.id());
-            let Ok(sources) = delivery_timer(state, request, deadline) else {
+            let request = ClipboardRequestId::from(host.bridge().id());
+            let Ok(sources) = delivery_timer(host, request, deadline) else {
                 return;
             };
-            state.clipboard.deliveries.insert(
+            host.bridge().deliveries.insert(
                 request,
                 Delivery {
                     phase: DeliveryPhase::AwaitingTerminal { pane: *pane, fd },
@@ -427,7 +464,7 @@ pub(crate) fn send(state: &mut Compositor, fd: OwnedFd, mime: &str, source: &Sou
                     sources,
                 },
             );
-            state.emit(
+            host.emit(
                 *pane,
                 ServerToPane::ClipboardRead {
                     request,
@@ -440,22 +477,21 @@ pub(crate) fn send(state: &mut Compositor, fd: OwnedFd, mime: &str, source: &Sou
     }
 }
 
-fn delivery_timer(
-    state: &Compositor,
+fn delivery_timer<H: Host>(
+    host: &H,
     request: ClipboardRequestId,
     deadline: Deadline,
-) -> io::Result<Sources> {
-    let mut sources = Sources::new(&state.handle);
+) -> io::Result<Sources<H>> {
+    let mut sources = Sources::new(host.handle());
     sources.timer = Some(
-        state
-            .handle
+        host.handle()
             .insert_source(
                 Timer::from_duration(deadline.remaining()),
-                move |_, (), state| {
-                    if let Some(mut delivery) = state.clipboard.deliveries.remove(&request) {
+                move |_, (), host| {
+                    if let Some(mut delivery) = host.bridge().deliveries.remove(&request) {
                         delivery.sources.timer = None;
                         if let DeliveryPhase::AwaitingTerminal { pane, .. } = delivery.phase {
-                            state.emit(pane, ServerToPane::ClipboardCancel { request });
+                            host.emit(pane, ServerToPane::ClipboardCancel { request });
                         }
                     }
                     TimeoutAction::Drop
@@ -471,24 +507,22 @@ fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn write(state: &mut Compositor, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
+fn write<H: Host>(host: &mut H, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
     if data.is_empty() || data.len() > MAX_BYTES || deadline.expired() {
         return;
     }
-    let request = ClipboardRequestId::from(state.clipboard.id());
-    let result = (|| -> io::Result<Sources> {
+    let request = ClipboardRequestId::from(host.bridge().id());
+    let result = (|| -> io::Result<Sources<H>> {
         nonblocking(&fd)?;
-        let mut sources = delivery_timer(state, request, deadline)?;
+        let mut sources = delivery_timer(host, request, deadline)?;
         let mut sent = 0;
         sources.io = Some(
-            state
-                .handle
+            host.handle()
                 .insert_source(
                     Generic::new(fd, Interest::WRITE, Mode::Level),
-                    move |_, fd, state| {
+                    move |_, fd, host| {
                         if deadline.expired() {
-                            if let Some(mut delivery) = state.clipboard.deliveries.remove(&request)
-                            {
+                            if let Some(mut delivery) = host.bridge().deliveries.remove(&request) {
                                 delivery.sources.io = None;
                             }
                             return Ok(PostAction::Remove);
@@ -502,14 +536,16 @@ fn write(state: &mut Compositor, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadlin
                                     sent += written;
                                     budget -= written;
                                 }
-                                Err(Errno::AGAIN | Errno::INTR) => return Ok(PostAction::Continue),
+                                Err(Errno::AGAIN | Errno::INTR) => {
+                                    return Ok(PostAction::Continue);
+                                }
                                 Err(_) => break,
                             }
                         }
                         if sent < data.len() && budget == 0 {
                             return Ok(PostAction::Continue);
                         }
-                        if let Some(mut delivery) = state.clipboard.deliveries.remove(&request) {
+                        if let Some(mut delivery) = host.bridge().deliveries.remove(&request) {
                             delivery.sources.io = None;
                         }
                         Ok(PostAction::Remove)
@@ -521,7 +557,7 @@ fn write(state: &mut Compositor, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadlin
     })();
     match result {
         Ok(sources) => {
-            state.clipboard.deliveries.insert(
+            host.bridge().deliveries.insert(
                 request,
                 Delivery {
                     phase: DeliveryPhase::Writing,
@@ -534,84 +570,75 @@ fn write(state: &mut Compositor, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadlin
     }
 }
 
-pub(crate) fn reply(
-    state: &mut Compositor,
+/// Complete a terminal-backed delivery with the pane's reply.
+pub fn reply<H: Host>(
+    host: &mut H,
     pane: PaneId,
     request: ClipboardRequestId,
     data: Option<Vec<u8>>,
 ) {
-    if state.clipboard.deliveries.get(&request).is_none_or(|delivery| {
-        !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
-    }) {
+    if host
+        .bridge()
+        .deliveries
+        .get(&request)
+        .is_none_or(|delivery| {
+            !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
+        })
+    {
         return;
     }
-    if let Some(delivery) = state.clipboard.deliveries.remove(&request) {
+    if let Some(delivery) = host.bridge().deliveries.remove(&request) {
         let DeliveryPhase::AwaitingTerminal { fd, .. } = delivery.phase else {
             unreachable!();
         };
         drop(delivery.sources);
         if let Some(data) = data.filter(|data| data.len() <= MAX_BYTES) {
-            write(state, fd, data.into(), delivery.deadline);
+            write(host, fd, data.into(), delivery.deadline);
         }
     }
 }
 
-pub(crate) struct TerminalOffer {
+/// A selection a terminal pane wants to make available to Wayland clients.
+#[derive(Debug)]
+pub struct TerminalOffer {
+    /// Which seat selection the offer replaces.
     pub selection: ClipboardSelection,
+    /// Offer identifier the pane assigned.
     pub id: ClipboardOfferId,
+    /// Representations the pane can provide.
     pub mimes: Vec<String>,
+    /// What the pane expects to happen after offering.
     pub intent: OfferIntent,
 }
 
-pub(crate) fn offer(state: &mut Compositor, pane: PaneId, offer: TerminalOffer) {
+/// Replace the seat selection with a terminal pane's offer.
+pub fn offer<H: Host>(host: &mut H, pane: PaneId, offer: TerminalOffer) {
     let TerminalOffer {
         selection,
         id: offer,
         mimes,
         intent,
     } = offer;
-    if !state.attachments.contains(pane) {
+    if !host.contains_pane(pane) {
         return;
     }
     let target = wayland_selection(selection);
     let mimes = mime_types(mimes);
-    state.clipboard.set_export(target, None);
-    match target {
-        SelectionTarget::Clipboard => set_data_device_selection(
-            &state.display,
-            &state.input.seat,
-            mimes,
-            Source::Terminal { pane, offer },
-        ),
-        SelectionTarget::Primary => set_primary_selection(
-            &state.display,
-            &state.input.seat,
-            mimes,
-            Source::Terminal { pane, offer },
-        ),
-    }
+    host.bridge().set_export(target, None);
+    host.set_selection(target, mimes, Source::Terminal { pane, offer });
     if intent == OfferIntent::Paste && target == SelectionTarget::Clipboard {
-        paste_action(state, pane);
+        host.paste(pane);
     }
 }
 
-pub(crate) fn paste(state: &mut Compositor, pane: PaneId, text: &str) {
-    if text.len() > meowland_protocol::clipboard::MAX_TEXT
-        || state
-            .attachments
-            .get(pane)
-            .is_none_or(|pane| pane.window().is_none())
-    {
+/// Replace the seat clipboard with local text and paste it into a pane.
+pub fn paste<H: Host>(host: &mut H, pane: PaneId, text: &str) {
+    if text.len() > MAX_TEXT || !host.pane_has_window(pane) {
         return;
     }
-    state.clipboard.set_export(SelectionTarget::Clipboard, None);
+    host.bridge().set_export(SelectionTarget::Clipboard, None);
     let data = Arc::new(ClipboardData::text(text));
     let mimes = data.items.iter().map(|item| item.mime.clone()).collect();
-    set_data_device_selection(
-        &state.display,
-        &state.input.seat,
-        mimes,
-        Source::Local(data),
-    );
-    paste_action(state, pane);
+    host.set_selection(SelectionTarget::Clipboard, mimes, Source::Local(data));
+    host.paste(pane);
 }

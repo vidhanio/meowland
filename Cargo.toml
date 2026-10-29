@@ -19,6 +19,7 @@ meowland-loop = { path = "crates/meowland-loop" }
 meowland-panes = { path = "crates/meowland-panes" }
 meowland-terminal-clipboard = { path = "crates/meowland-terminal-clipboard" }
 meowland-render = { path = "crates/meowland-render" }
+meowland-selection = { path = "crates/meowland-selection" }
 meowland-protocol = { path = "crates/meowland-protocol" }
 meowland-kitty = { path = "crates/meowland-kitty" }
 meowland-terminal = { path = "crates/meowland-terminal" }

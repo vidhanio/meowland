@@ -153,10 +153,12 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   object (`SharedFrame::exists`), and each poll allocates the name string
   (`SharedFrame::name()`). Cache the name, and back off exponentially or ack
   optimistically.
-- [ ] **A shared-memory frame costs a full read on the next band.** After a shared
+- [x] **A shared-memory frame costs a full read on the next band.** After a shared
   frame, the next inline band forces `SharedPresentation::into_band` to read the whole
   frame back from shm. Read it lazily in the background, or keep the server on shared
   transport for the following update.
+  - The pane copies a consumed frame back in bounded chunks from its own scheduling
+    turns, so the following band normally finds the pixels ready.
 - [ ] **A new shm object for every frame.** `SharedObject::create` costs a `shm_open`,
   page faults for every page, and an unlink per frame, because the terminal unlinks
   after reading. Measure against `t=f` with a reusable file, or a small ring of

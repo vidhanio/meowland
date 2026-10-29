@@ -1,4 +1,9 @@
 //! Pane frame presentation, acknowledgement, and throughput accounting.
+//!
+//! A shared frame is acknowledged as soon as the terminal confirms consumption,
+//! then copied into memory a bounded chunk per scheduling turn. The inline band
+//! that follows usually finds those pixels ready, so it never pays for a full
+//! read of the shared object on its own critical path.
 
 use std::time::{Duration, Instant};
 
@@ -145,8 +150,22 @@ impl PanePresentation {
         }
     }
 
+    /// Next deadline: a pending repaint, or the next background readback turn.
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.retry.filter(|_| !self.pending())
+        if self.pending() {
+            return None;
+        }
+        if let Some(deadline) = self.retry {
+            return Some(deadline);
+        }
+        self.readback_pending().then(Instant::now)
+    }
+
+    /// Whether a consumed shared frame still needs to be copied into memory.
+    fn readback_pending(&self) -> bool {
+        self.shared_frame
+            .as_ref()
+            .is_some_and(|shared| shared.consumed && !shared.retained())
     }
 
     pub(crate) fn draw(&mut self, band: FrameBand, tx: &mut Outgoing) -> Result<()> {
@@ -241,9 +260,13 @@ impl PanePresentation {
             }
             return Ok(());
         }
-        if self
-            .deadline()
-            .is_some_and(|deadline| Instant::now() >= deadline)
+        if let Some(error) = self.retain_shared() {
+            tracing::warn!(%error, "retained upstream frame could not be read");
+            self.shared_frame = None;
+        }
+        if let Some(deadline) = self.retry
+            && !self.pending()
+            && Instant::now() >= deadline
         {
             let started = Instant::now();
             self.presenter.repaint_into(self.pending.buffer());
@@ -255,6 +278,14 @@ impl PanePresentation {
             self.finish(tx)?;
         }
         Ok(())
+    }
+
+    /// Copy one bounded chunk of a consumed shared frame off the critical path.
+    fn retain_shared(&mut self) -> Option<std::io::Error> {
+        match self.shared_frame.as_mut() {
+            Some(shared) if !shared.retained() => shared.retain_step().err(),
+            _ => None,
+        }
     }
 
     pub(crate) async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {

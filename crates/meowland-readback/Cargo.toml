@@ -1,0 +1,18 @@
+[package]
+name = "meowland-readback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+meowland-core = { workspace = true }
+meowland-loop = { workspace = true }
+meowland-render = { workspace = true }
+calloop = { workspace = true }
+rustix = { workspace = true, features = ["event"] }
+smithay = { workspace = true, features = ["backend_drm", "wayland_frontend"] }
+tracing = { workspace = true }

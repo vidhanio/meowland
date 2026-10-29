@@ -48,7 +48,7 @@ mod input;
 mod keymap;
 mod panes;
 mod popup;
-mod readback;
+mod readback_host;
 mod runtime;
 mod scaling;
 mod seat;
@@ -68,8 +68,8 @@ pub use commands::{CloseWindowError, Command};
 /// A compositor projection of a host event loop.
 pub type CompositorHandle = meowland_loop::Handle<Compositor>;
 
-pub(crate) type Sources = meowland_loop::Sources<Compositor>;
 pub use meowland_protocol::WindowId;
+use meowland_readback as readback;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use meowland_selection as clipboard;
 use runtime::ClientState;
@@ -153,7 +153,7 @@ pub struct Compositor {
     input: Input,
     windows: Windows,
     gpu: Option<DmabufBackend>,
-    readbacks: readback::Readbacks,
+    readbacks: readback::Readbacks<Self>,
     attachments: Attachments,
     clipboard: clipboard::Bridge<Self>,
     bell: bell::Bell,

@@ -625,6 +625,7 @@ dependencies = [
  "meowland-loop",
  "meowland-panes",
  "meowland-protocol",
+ "meowland-readback",
  "meowland-render",
  "meowland-selection",
  "rustix 1.1.5",
@@ -694,6 +695,19 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_bytes",
+]
+
+[[package]]
+name = "meowland-readback"
+version = "0.1.0"
+dependencies = [
+ "calloop",
+ "meowland-core",
+ "meowland-loop",
+ "meowland-render",
+ "rustix 1.1.5",
+ "smithay",
+ "tracing",
 ]
 
 [[package]]

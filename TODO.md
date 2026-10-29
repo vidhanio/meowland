@@ -74,10 +74,10 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 
 - [x] **Split `meowland-compositor`** (5.1k lines, 5.1× the AGENTS.md guideline).
   Remaining seams:
-  - [ ] `readback.rs` + `readback/fences.rs` (about 600 lines): DMA-BUF acquire, fence
-    export, and the GPU submit/complete state machine. Move it next to
-    `meowland-render::dmabuf` or into a `meowland-readback` crate. Needs the
-    event-loop projection moved first.
+  - [x] `readback.rs` + `readback/fences.rs` (about 600 lines): DMA-BUF acquire, fence
+    export, and the GPU submit/complete state machine. Extracted to
+    `meowland-readback` behind a `Host` trait; the compositor supplies the GPU
+    backend, pane bounds, spare snapshots, client wakeups, and shutdown.
   - [x] `clipboard.rs` (550 lines): the Wayland ↔ terminal selection bridge. It is an
     independent state machine with its own sources and timers. Extracted to
     `meowland-selection` behind a `Host` trait; the compositor owns the bridge state

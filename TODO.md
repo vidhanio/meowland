@@ -271,7 +271,8 @@ off most, for when that is requested.
 - [x] **No headless smoke test.** CI only runs `meowland --help`. A test that starts
   `meowland server` in a temporary `XDG_RUNTIME_DIR`, runs the benchmark workload, and
   checks `meowland list` would catch most integration breakage.
-- [ ] **Repo hygiene.**
+- [ ] **Repo hygiene.** Needs the owner: these are untracked local files and a
+  history rewrite, not code changes.
   - `docs/` is an empty directory.
   - `result` is a stale symlink in the working tree.
   - Recent history contains commits named `commit`, `comit`, and `cmt`. Squash them or

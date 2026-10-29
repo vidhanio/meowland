@@ -263,7 +263,7 @@ off most, for when that is requested.
 - [ ] **CI duplicates the flake checks.** The GitHub `check` job and `nix flake check`
   both run clippy, fmt, docs, and tests with different toolchains. Keep one source of
   truth, probably the flake.
-- [ ] **CI library setup is incomplete.** The CI `apt-get` installs only
+- [x] **CI library setup is incomplete.** The CI `apt-get` installs only
   `libxkbcommon-dev`, while Nix also needs `libglvnd` and `libgbm`. The job works only
   because it never links the EGL paths at runtime.
 - [ ] **No headless smoke test.** CI only runs `meowland --help`. A test that starts

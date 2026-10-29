@@ -69,7 +69,7 @@ impl State {
                     state: Transition::Pressed,
                     ..
                 } = &event
-                    && let Some(shortcut) = Shortcut::from_key(*key, *modifiers)
+                    && let Some(shortcut) = self.shortcuts.action(*key, *modifiers)
                 {
                     match shortcut {
                         Shortcut::CloseWindow => self.close_shown(pane),

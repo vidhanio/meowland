@@ -65,6 +65,10 @@
                       repeat_delay = 600;
                       repeat_rate = 25;
                     };
+                    shortcuts = {
+                      close_window = "alt+q";
+                      detach_pane = "alt+w";
+                    };
                   };
                   description = ''
                     Configuration written to
@@ -76,8 +80,12 @@
                     terminal panes resize. Keyboard settings are the XKB `layout`,
                     `variant`, and `options` strings, plus `repeat_delay`
                     in milliseconds and `repeat_rate` in events per second
-                    (zero disables repeat). Unspecified settings use Meowland's
-                    defaults. Changes take effect when the service restarts.
+                    (zero disables repeat). Shortcut settings are
+                    `close_window` and `detach_pane`, strings such as
+                    `ctrl+shift+q`; an empty string disables a binding, and
+                    omitting the `shortcuts` table keeps the Alt+Q and Alt+W
+                    defaults. Unspecified settings use Meowland's defaults.
+                    Changes take effect when the service restarts.
                   '';
                 };
               };

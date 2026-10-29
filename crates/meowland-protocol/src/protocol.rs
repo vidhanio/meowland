@@ -89,48 +89,93 @@ impl Modifiers {
         }
         modifiers
     }
+}
 
-    /// Whether a key carrying these modifiers is a compositor binding.
+/// One compositor key binding: a Kitty key identity plus required modifiers.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct KeyBinding {
+    /// Kitty key identity: an unshifted Unicode code point or a functional key
+    /// number.
+    pub key: u32,
+    /// Modifiers that must be held, excluding Caps Lock and Num Lock.
+    pub modifiers: Modifiers,
+}
+
+impl KeyBinding {
+    /// Whether a key transition matches this binding.
     ///
-    /// Shift and lock state are allowed; other shortcut modifiers are not.
+    /// Required modifiers must be held. Extra Shift and lock state do not
+    /// matter, but any other shortcut modifier prevents a match.
     #[must_use]
-    pub const fn alt_only(self) -> bool {
-        self.contains(Self::ALT) && !self.intersects(Self::SHORTCUT.difference(Self::ALT))
+    pub const fn matches(self, key: u32, modifiers: Modifiers) -> bool {
+        let lock = Modifiers::CAPS_LOCK.union(Modifiers::NUM_LOCK);
+        let held = modifiers.difference(lock);
+        let required = self.modifiers.difference(lock);
+        self.key == key
+            && held.contains(required)
+            && !held.intersects(Modifiers::SHORTCUT.difference(required))
     }
 }
 
-/// Kitty key identity for Q, used by the close-window binding.
-pub const KEY_Q: u32 = 0x71;
-/// Kitty key identity for W, used by the detach-pane binding.
-pub const KEY_W: u32 = 0x77;
+/// Compositor bindings every pane intercepts before forwarding input.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Shortcuts {
+    /// Ask the displayed Wayland window to close; `None` disables the binding.
+    pub close_window: Option<KeyBinding>,
+    /// Release the terminal pane without closing its window; `None` disables
+    /// the binding.
+    pub detach_pane: Option<KeyBinding>,
+}
+
+impl Default for Shortcuts {
+    fn default() -> Self {
+        Self {
+            close_window: Some(KeyBinding {
+                key: u32::from(b'q'),
+                modifiers: Modifiers::ALT,
+            }),
+            detach_pane: Some(KeyBinding {
+                key: u32::from(b'w'),
+                modifiers: Modifiers::ALT,
+            }),
+        }
+    }
+}
+
+impl Shortcuts {
+    /// Resolve a key transition to the configured shortcut action.
+    #[must_use]
+    pub fn action(self, key: u32, modifiers: Modifiers) -> Option<Shortcut> {
+        if self
+            .close_window
+            .is_some_and(|binding| binding.matches(key, modifiers))
+        {
+            Some(Shortcut::CloseWindow)
+        } else if self
+            .detach_pane
+            .is_some_and(|binding| binding.matches(key, modifiers))
+        {
+            Some(Shortcut::DetachPane)
+        } else {
+            None
+        }
+    }
+}
+
 /// Kitty key identity for V, used by the clipboard paste binding.
 pub const KEY_V: u32 = 0x76;
 /// Kitty functional-key number for Insert, used by the alternate paste
 /// binding.
 pub const KEY_INSERT: u32 = 57348;
 
-/// Compositor bindings shared by terminal release interception and dispatch.
+/// Compositor shortcut actions shared by terminal release interception and
+/// dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shortcut {
     /// Ask the displayed Wayland window to close.
     CloseWindow,
     /// Release the terminal pane without closing its window.
     DetachPane,
-}
-
-impl Shortcut {
-    /// Recognize an Alt binding from a Kitty key identity and modifiers.
-    #[must_use]
-    pub const fn from_key(key: u32, modifiers: Modifiers) -> Option<Self> {
-        if !modifiers.alt_only() {
-            return None;
-        }
-        match key {
-            KEY_Q => Some(Self::CloseWindow),
-            KEY_W => Some(Self::DetachPane),
-            _ => None,
-        }
-    }
 }
 
 /// Whether retained pixels remain a valid basis for subsequent frame bands.
@@ -398,8 +443,11 @@ pub enum PaneAction {
 /// Server packets share one schema for owned frames and split frame headers.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum PanePacket<F> {
-    /// The initial handshake succeeded.
-    HelloOk,
+    /// The initial handshake succeeded with the compositor's active bindings.
+    HelloOk {
+        /// Shortcuts the pane must intercept before forwarding key events.
+        shortcuts: Shortcuts,
+    },
     /// The handshake was rejected with a human-readable reason.
     Reject(String),
     /// A validated RGB band, or its explicit header during split transmission.

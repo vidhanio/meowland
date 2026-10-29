@@ -19,7 +19,8 @@ use meowland_input::{
     {self as input},
 };
 use meowland_protocol::{
-    self as protocol, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane, Show,
+    self as protocol, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane, Shortcuts,
+    Show,
     asynchronous::{Outgoing, Reader},
     clipboard::{Selection, Transport},
 };
@@ -91,6 +92,7 @@ pub(crate) struct TerminalSession {
     input: input::Reader,
     stdout: Descriptor,
     keyboard: Keyboard,
+    shortcuts: Shortcuts,
     input_gate: InputGate,
     clipboard: Clipboard,
     presentation: PanePresentation,
@@ -127,6 +129,7 @@ impl TerminalSession {
             stdout: Descriptor::new(output::open()?.into(), &handle)?,
             handle,
             keyboard: Keyboard::default(),
+            shortcuts: Shortcuts::default(),
             input_gate: InputGate::default(),
             clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
             presentation: PanePresentation::new(cell, FrameTransport::Inline),
@@ -250,8 +253,9 @@ impl TerminalSession {
     )]
     async fn handle_server_message(&mut self, message: ServerToPane) -> Result<()> {
         match message {
-            ServerToPane::HelloOk => {
+            ServerToPane::HelloOk { shortcuts } => {
                 if matches!(self.lifecycle, Lifecycle::Handshaking { .. }) {
+                    self.shortcuts = shortcuts;
                     self.lifecycle = Lifecycle::Waiting;
                     writeln!(
                         io::stderr(),

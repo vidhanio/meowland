@@ -6,7 +6,7 @@
 use std::{collections::HashMap, sync::Mutex, time::Instant};
 
 use meowland_core::{scale::UiScale, timing::RefreshRate};
-use meowland_protocol::{ServerToPane, WindowInfo};
+use meowland_protocol::{ServerToPane, Shortcuts, WindowInfo};
 use smithay::{
     delegate_dispatch2,
     desktop::{PopupGrab, PopupKind, PopupManager},
@@ -130,6 +130,7 @@ pub struct Compositor {
     seat: Seat<Self>,
     keyboard: Option<KeyboardHandle<Self>>,
     keyboard_state: input::KeyboardState,
+    shortcuts: Shortcuts,
     keymap: keymap::Keymap,
     pointer: Option<PointerHandle<Self>>,
     output: Output,
@@ -261,6 +262,7 @@ impl State {
             seat,
             keyboard: None,
             keyboard_state: input::KeyboardState::default(),
+            shortcuts: settings.shortcuts,
             keymap: keymap::Keymap::default(),
             pointer,
             output,

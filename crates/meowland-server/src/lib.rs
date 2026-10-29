@@ -16,7 +16,9 @@ pub use meowland_compositor::{
     RepeatRate, Settings,
 };
 use meowland_core::Result;
-use meowland_protocol::{ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane};
+use meowland_protocol::{
+    ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane, Shortcuts,
+};
 
 mod actor;
 mod control;
@@ -81,6 +83,7 @@ struct Server {
     connections: HashMap<ConnectionId, AbortHandle>,
     panes: HashMap<PaneId, PaneTransport>,
     next_connection: u64,
+    shortcuts: Shortcuts,
     children: Vec<Child>,
     shutdown: Shutdown,
     error: Option<io::Error>,
@@ -114,7 +117,12 @@ impl Server {
                 if self.shutdown.running() && self.connections.contains_key(&ConnectionId::from(id))
                 {
                     self.panes.insert(id, pane);
-                    self.send_to_pane(id, ServerToPane::HelloOk);
+                    self.send_to_pane(
+                        id,
+                        ServerToPane::HelloOk {
+                            shortcuts: self.shortcuts,
+                        },
+                    );
                     self.send_command(Command::Attach {
                         pane: id,
                         size: hello.size,

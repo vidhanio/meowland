@@ -2,7 +2,7 @@
 
 use meowland_input::{Event, keyboard};
 use meowland_protocol::{
-    self as protocol, Input, OfferIntent, PaneAction, PaneToServer, Shortcut, Transition,
+    self as protocol, Input, OfferIntent, PaneAction, PaneToServer, Transition,
     clipboard::{MAX_TEXT, Selection},
 };
 use meowland_terminal_clipboard::{Action, Focus, Refresh};
@@ -27,7 +27,7 @@ impl TerminalSession {
                 ) = self.keyboard.input(event)
                 {
                     let pressed = state == Transition::Pressed;
-                    if pressed && Shortcut::from_key(key, modifiers).is_some() {
+                    if pressed && self.shortcuts.action(key, modifiers).is_some() {
                         self.keyboard.intercept(key);
                     }
                     let defer = if pressed && keyboard::paste(key, modifiers) {

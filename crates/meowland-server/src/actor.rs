@@ -97,6 +97,7 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
         connections: HashMap::new(),
         panes: HashMap::new(),
         next_connection: 1,
+        shortcuts: settings.shortcuts,
         children: Vec::new(),
         shutdown: Shutdown::Running,
         error: None,

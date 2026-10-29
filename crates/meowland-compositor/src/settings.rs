@@ -2,6 +2,7 @@
 //! starts.
 
 use meowland_core::{pixels::FrameSize, scale::UiScale, timing::RefreshRate};
+use meowland_protocol::{KeyBinding, Modifiers, Shortcuts};
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
@@ -21,6 +22,8 @@ pub struct Settings {
     pub refresh_rate: RefreshRate,
     /// XKB keymap and Wayland key repeat policy.
     pub keyboard: KeyboardSettings,
+    /// Compositor key bindings shared with panes.
+    pub shortcuts: Shortcuts,
 }
 
 impl Default for Settings {
@@ -30,6 +33,7 @@ impl Default for Settings {
             scale: UiScale::default(),
             refresh_rate: RefreshRate::default(),
             keyboard: KeyboardSettings::default(),
+            shortcuts: Shortcuts::default(),
         }
     }
 }
@@ -39,6 +43,17 @@ impl Default for Settings {
 struct SettingsRepr {
     output: OutputRepr,
     keyboard: KeyboardSettings,
+    shortcuts: Option<ShortcutsRepr>,
+}
+
+/// Shortcut strings; a present table disables bindings it omits.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ShortcutsRepr {
+    #[serde(deserialize_with = "binding")]
+    close_window: Option<KeyBinding>,
+    #[serde(deserialize_with = "binding")]
+    detach_pane: Option<KeyBinding>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -73,11 +88,16 @@ impl TryFrom<SettingsRepr> for Settings {
                 width: repr.output.width,
                 height: repr.output.height,
             })?;
+        let shortcuts = repr.shortcuts.map_or_default(|shortcuts| Shortcuts {
+            close_window: shortcuts.close_window,
+            detach_pane: shortcuts.detach_pane,
+        });
         Ok(Self {
             output_size,
             scale: repr.output.scale,
             refresh_rate: repr.output.refresh_rate,
             keyboard: repr.keyboard,
+            shortcuts,
         })
     }
 }
@@ -206,3 +226,61 @@ impl TryFrom<i32> for RepeatRate {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("key repeat rate must be nonnegative")]
 pub struct InvalidRepeatRate;
+
+fn binding<'de, D>(deserializer: D) -> Result<Option<KeyBinding>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    parse_binding(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+}
+
+fn parse_binding(value: &str) -> Result<Option<KeyBinding>, InvalidShortcut> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = value.split('+').map(str::trim);
+    let key = parts
+        .next_back()
+        .ok_or_else(|| InvalidShortcut::new(value))?;
+    let mut modifiers = Modifiers::empty();
+    for part in parts {
+        let modifier = match part.to_ascii_lowercase().as_str() {
+            "shift" => Modifiers::SHIFT,
+            "ctrl" | "control" => Modifiers::CONTROL,
+            "alt" => Modifiers::ALT,
+            "super" => Modifiers::SUPER,
+            "hyper" => Modifiers::HYPER,
+            "meta" => Modifiers::META,
+            _ => return Err(InvalidShortcut::new(value)),
+        };
+        modifiers |= modifier;
+    }
+    let mut characters = key.chars();
+    let Some(character) = characters.next() else {
+        return Err(InvalidShortcut::new(value));
+    };
+    if characters.next().is_some() || character.is_control() {
+        return Err(InvalidShortcut::new(value));
+    }
+    let key = if character.is_ascii() {
+        u32::from(character.to_ascii_lowercase())
+    } else {
+        u32::from(character)
+    };
+    Ok(Some(KeyBinding { key, modifiers }))
+}
+
+#[derive(Debug, Error)]
+#[error("invalid shortcut `{value}`; use modifiers joined to one key, such as `ctrl+shift+q`")]
+struct InvalidShortcut {
+    value: String,
+}
+
+impl InvalidShortcut {
+    fn new(value: &str) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+}

@@ -238,9 +238,11 @@ These follow the `rust-best-practices` skill.
   (`terminal-clipboard/src/kitty.rs`), `SCROLL_FACTOR`, `15.0 / 120.0`, and button
   codes `0x110…0x113` (use `BTN_LEFT` and friends). Give each a named constant with a
   short reason.
-- [ ] **Hard-coded Alt+Q / Alt+W shortcuts.** They are fixed in
+- [x] **Hard-coded Alt+Q / Alt+W shortcuts.** They are fixed in
   `meowland-protocol/src/protocol.rs` and silently steal those keys from applications.
-  Make them configurable, and allow disabling them.
+  Make them configurable, and allow disabling them. The server config now has a
+  `[shortcuts]` table with `close_window` and `detach_pane` key strings, sent to
+  panes in `HelloOk`; empty strings disable either binding.
 
 ## 5. Testing
 

@@ -165,7 +165,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   `owner`, and `first_window` scan every pane. They are called per window in
   `frame_callbacks`, per commit, and on every focus change. Keep a
   `HashMap<WindowId, SmallVec<PaneId>>` index.
-- [ ] **`window_for_surface` runs three times per commit.**
+- [x] **`window_for_surface` runs three times per commit.**
   `CompositorHandler::commit` calls it three times, and each call walks up to 64
   parents. Compute it once and cache the owner in the surface `data_map` instead of
   `SurfaceCache::owners`.

@@ -3,7 +3,7 @@
 //! Client buffers are copied on commit so later client writes cannot tear a
 //! frame in transit to a terminal.
 
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, sync::Mutex, time::Instant};
 
 use meowland_core::{scale::UiScale, timing::RefreshRate};
 use meowland_protocol::{ServerToPane, WindowInfo};
@@ -15,7 +15,7 @@ use smithay::{
     reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
     utils::{Logical, Size},
     wayland::{
-        compositor::{CompositorState, get_parent},
+        compositor::{CompositorState, get_parent, with_states},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         fractional_scale::FractionalScaleManagerState,
@@ -156,6 +156,39 @@ impl std::fmt::Debug for Compositor {
     }
 }
 
+/// Cached toplevel ownership of one surface, stored in its data map.
+///
+/// Surface data maps are append-only, so the value is mutable in place and
+/// can be cleared when the owning window goes away.
+#[derive(Debug, Default)]
+struct SurfaceOwner(Mutex<Option<WindowId>>);
+
+fn cached_owner(surface: &WlSurface) -> Option<WindowId> {
+    with_states(surface, |states| {
+        let owner = states.data_map.get::<SurfaceOwner>()?;
+        *owner.0.lock().expect("surface owner lock poisoned")
+    })
+}
+
+fn cache_owner(surface: &WlSurface, window: WindowId) {
+    with_states(surface, |states| {
+        *states
+            .data_map
+            .get_or_insert(SurfaceOwner::default)
+            .0
+            .lock()
+            .expect("surface owner lock poisoned") = Some(window);
+    });
+}
+
+fn clear_owner(surface: &WlSurface) {
+    with_states(surface, |states| {
+        if let Some(owner) = states.data_map.get::<SurfaceOwner>() {
+            *owner.0.lock().expect("surface owner lock poisoned") = None;
+        }
+    });
+}
+
 impl State {
     fn new(display_handle: DisplayHandle, handle: CompositorHandle, settings: &Settings) -> Self {
         let scale = settings.scale;
@@ -270,24 +303,28 @@ impl State {
     }
 
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
-        let mut surface = surface.clone();
+        if let Some(window) = self.ids.get(surface) {
+            return Some(*window);
+        }
+        if let Some(window) = cached_owner(surface) {
+            return Some(window);
+        }
+        let mut current = surface.clone();
         for _ in 0..64 {
-            if let Some(id) = self
+            let owner = self
                 .ids
-                .get(&surface)
-                .or_else(|| self.surface_cache.owners.get(&surface))
-            {
-                return Some(*id);
+                .get(&current)
+                .copied()
+                .or_else(|| cached_owner(&current));
+            if let Some(window) = owner {
+                cache_owner(surface, window);
+                return Some(window);
             }
-            if let Some(popup) = self.popups.find_popup(&surface) {
-                let parent = match popup {
-                    PopupKind::Xdg(popup) => popup.get_parent_surface(),
-                    PopupKind::InputMethod(_) => None,
-                };
-                surface = parent?;
-                continue;
-            }
-            surface = get_parent(&surface)?;
+            current = match self.popups.find_popup(&current) {
+                Some(PopupKind::Xdg(popup)) => popup.get_parent_surface()?,
+                Some(PopupKind::InputMethod(_)) => return None,
+                None => get_parent(&current)?,
+            };
         }
         None
     }

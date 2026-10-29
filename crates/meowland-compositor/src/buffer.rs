@@ -21,30 +21,11 @@ use smithay::{
     },
 };
 
-use super::{Snapshot, State, WindowId, readback, render, runtime::ClientState};
+use super::{Snapshot, State, readback, render, runtime::ClientState};
 
 #[derive(Default)]
 pub(crate) struct SurfaceCache {
     pub snapshots: HashMap<WlSurface, Snapshot>,
-    pub owners: HashMap<WlSurface, WindowId>,
-}
-
-impl SurfaceCache {
-    fn remove(&mut self, surface: &WlSurface) {
-        self.snapshots.remove(surface);
-        self.owners.remove(surface);
-    }
-
-    pub(crate) fn remove_window(&mut self, id: WindowId) {
-        let surfaces: Vec<_> = self
-            .owners
-            .iter()
-            .filter_map(|(surface, &owner)| (owner == id).then_some(surface.clone()))
-            .collect();
-        for surface in surfaces {
-            self.remove(&surface);
-        }
-    }
 }
 
 impl BufferHandler for State {
@@ -120,9 +101,7 @@ impl CompositorHandler for State {
     )]
     fn commit(&mut self, surface: &WlSurface) {
         self.popups.commit(surface);
-        if let Some(window) = self.window_for_surface(surface) {
-            self.surface_cache.owners.insert(surface.clone(), window);
-        }
+        let window = self.window_for_surface(surface);
         let changed = readback::prepared_at(surface).unwrap_or_else(Instant::now);
         let (assignment, damage, scale, transform, callbacks) = with_states(surface, |states| {
             let mut cached = states.cached_state.get::<SurfaceAttributes>();
@@ -136,11 +115,7 @@ impl CompositorHandler for State {
             )
         });
         let new_buffer = matches!(assignment, Some(BufferAssignment::NewBuffer(_)));
-        if callbacks
-            && let Some(window) = self
-                .window_for_surface(surface)
-                .and_then(|id| self.windows.get_mut(&id))
-        {
+        if callbacks && let Some(window) = window.and_then(|id| self.windows.get_mut(&id)) {
             window.callback_pending = true;
         }
         match assignment {
@@ -178,7 +153,7 @@ impl CompositorHandler for State {
             None => {}
         }
         self.refresh_window_mapping(surface);
-        if let Some(window) = self.window_for_surface(surface) {
+        if let Some(window) = window {
             if self.attachments.visible(window) && self.catalog.drawable(window) {
                 self.output.enter(surface);
             }
@@ -206,7 +181,7 @@ impl CompositorHandler for State {
     /// snapshot here rather than relying on toplevel cleanup.
     fn destroyed(&mut self, surface: &WlSurface) {
         let window = self.window_for_surface(surface);
-        self.surface_cache.remove(surface);
+        self.surface_cache.snapshots.remove(surface);
         readback::destroyed(self, surface);
         if let Some(window) = window {
             if self.ids.get(surface) == Some(&window) {

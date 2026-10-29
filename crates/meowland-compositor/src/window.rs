@@ -10,7 +10,7 @@ use smithay::{
     output::Output,
 };
 
-use super::{Policy, ServerToPane, State, Window, WindowId, WlSurface, input};
+use super::{Policy, ServerToPane, State, Window, WindowId, WlSurface, clear_owner, input};
 
 impl Window {
     fn with_surface_trees(&self, mut visit: impl FnMut(&WlSurface)) {
@@ -111,8 +111,18 @@ impl State {
             self.remove_pane(pane);
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }
-        self.surface_cache.remove_window(id);
+        let surfaces: Vec<_> = self
+            .surface_cache
+            .snapshots
+            .keys()
+            .filter(|surface| self.window_for_surface(surface) == Some(id))
+            .cloned()
+            .collect();
+        for surface in surfaces {
+            self.surface_cache.snapshots.remove(&surface);
+        }
         if let Some(window) = self.windows.remove(&id) {
+            window.with_surfaces(clear_owner);
             self.ids.remove(window.surface.wl_surface());
         }
         self.toplevels.remove(id);

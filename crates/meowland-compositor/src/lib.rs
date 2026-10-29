@@ -44,7 +44,6 @@ mod buffer;
 mod clipboard;
 mod commands;
 mod decoration;
-mod event_loop;
 mod frame;
 mod input;
 mod keymap;
@@ -56,7 +55,6 @@ mod scaling;
 mod seat;
 mod settings;
 mod shell;
-mod sources;
 mod text;
 mod toplevels;
 mod window;
@@ -67,7 +65,10 @@ use meowland_panes::{Policy, Selection, WindowCatalog};
 pub(crate) type AttachedPane = meowland_panes::AttachedPane<frame::PaneState>;
 pub(crate) type Attachments = meowland_panes::Attachments<frame::PaneState>;
 pub use commands::{CloseWindowError, Command};
-pub use event_loop::CompositorHandle;
+/// A compositor projection of a host event loop.
+pub type CompositorHandle = meowland_loop::Handle<Compositor>;
+
+pub(crate) type Sources = meowland_loop::Sources<Compositor>;
 pub use meowland_protocol::WindowId;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use runtime::ClientState;

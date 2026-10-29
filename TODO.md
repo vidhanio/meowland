@@ -99,7 +99,8 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   `D: AsMut<Compositor>`.
   Evaluated and kept: both alternatives either make `Compositor` generic throughout the
   crate or still need an erased late-registration handle, so the current machinery is
-  the smallest viable design.
+  the smallest viable design. It now lives in `meowland-loop`, generic over the
+  projected state, so other crates can register sources without owning the loop data.
 - [x] **The run loop does a full pass on every wakeup.** `actor::run` calls
   `wayland.dispatch`, which ran `frame_callbacks` (all windows), `dispatch_frames`
   (all panes), `expire_activation_tokens`, and `refresh_popup_grab`, after *any* event,

@@ -622,6 +622,7 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "meowland-core",
+ "meowland-loop",
  "meowland-panes",
  "meowland-protocol",
  "meowland-render",
@@ -661,6 +662,13 @@ dependencies = [
  "flate2",
  "meowland-core",
  "meowland-protocol",
+]
+
+[[package]]
+name = "meowland-loop"
+version = "0.1.0"
+dependencies = [
+ "calloop",
 ]
 
 [[package]]

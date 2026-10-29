@@ -29,7 +29,7 @@ use smithay::wayland::selection::{
     primary_selection::{request_primary_client_selection, set_primary_selection},
 };
 
-use super::{Compositor, PaneId, ServerToPane, input::paste_action, sources::Sources};
+use super::{Compositor, PaneId, ServerToPane, Sources, input::paste_action};
 
 #[derive(Clone, Debug)]
 pub enum Source {

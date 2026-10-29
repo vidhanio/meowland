@@ -15,6 +15,7 @@ publish = false
 meowland-core = { path = "crates/meowland-core" }
 meowland-async = { path = "crates/meowland-async" }
 meowland-input = { path = "crates/meowland-input" }
+meowland-loop = { path = "crates/meowland-loop" }
 meowland-panes = { path = "crates/meowland-panes" }
 meowland-terminal-clipboard = { path = "crates/meowland-terminal-clipboard" }
 meowland-render = { path = "crates/meowland-render" }

@@ -23,7 +23,7 @@ use smithay::{
     },
 };
 
-use super::{ClientState, Compositor, Snapshot, WlSurface, sources::Sources};
+use super::{ClientState, Compositor, Snapshot, Sources, WlSurface};
 
 mod fences;
 

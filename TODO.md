@@ -266,7 +266,7 @@ off most, for when that is requested.
 - [x] **CI library setup is incomplete.** The CI `apt-get` installs only
   `libxkbcommon-dev`, while Nix also needs `libglvnd` and `libgbm`. The job works only
   because it never links the EGL paths at runtime.
-- [ ] **No headless smoke test.** CI only runs `meowland --help`. A test that starts
+- [x] **No headless smoke test.** CI only runs `meowland --help`. A test that starts
   `meowland server` in a temporary `XDG_RUNTIME_DIR`, runs the benchmark workload, and
   checks `meowland list` would catch most integration breakage.
 - [ ] **Repo hygiene.**

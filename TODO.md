@@ -174,7 +174,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   32 MiB) from the app on every selection change, so copying an image in a browser
   pulls every format. Prioritise text and image types and cap the total. The OSC 5522
   write does need the data up front, but not all of it.
-- [ ] **Framing buffers never shrink.** `protocol::send`/`recv` use a thread-local
+- [x] **Framing buffers never shrink.** `protocol::send`/`recv` use a thread-local
   `SCRATCH`, and `asynchronous::Reader::body` keeps its high-water mark (up to
   64 MiB). Shrink after oversized messages.
 - [x] **One `Outgoing` per message.** `pane_writer` allocates a fresh `Outgoing` for

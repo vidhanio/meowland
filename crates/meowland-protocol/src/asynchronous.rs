@@ -83,7 +83,9 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         }
         self.header_read = 0;
         self.body_read = 0;
-        decode(&self.body[..self.body_size]).map(Some)
+        let decoded = decode(&self.body[..self.body_size]);
+        crate::protocol::release_oversized(&mut self.body);
+        decoded.map(Some)
     }
 }
 

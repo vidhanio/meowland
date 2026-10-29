@@ -20,6 +20,13 @@ pub const MAX_INPUT_TEXT: usize = 4096;
 
 pub(crate) const HEADER: usize = 4;
 
+/// Largest framing buffer retained for reuse after a message is handled.
+///
+/// Buffers grow to the largest message seen. A single maximum-size frame would
+/// otherwise pin `MAX_MESSAGE` bytes for the life of the process, so anything
+/// above this is trimmed once its message has been written or decoded.
+pub(crate) const RETAINED_BUFFER: usize = 1024 * 1024;
+
 thread_local! {
     /// Reuse a message buffer across frames to avoid megabyte-scale allocations.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -315,33 +322,43 @@ pub enum ControlResponse {
 /// [`MAX_MESSAGE`], or when the writer fails.
 pub fn send<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
     SCRATCH.with_borrow_mut(|buffer| {
-        loop {
-            if buffer.len() < HEADER {
-                buffer.resize(HEADER, 0);
-            }
-            match postcard::to_slice(value, &mut buffer[HEADER..]).map(|encoded| encoded.len()) {
-                Ok(size) => {
-                    let length = u32::try_from(size)
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    buffer[..HEADER].copy_from_slice(&length.to_le_bytes());
-                    return writer.write_all(&buffer[..HEADER + size]);
-                }
-                Err(postcard::Error::SerializeBufferFull) => {
-                    let maximum = HEADER + MAX_MESSAGE;
-                    if buffer.len() == maximum {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "message too large",
-                        ));
-                    }
-                    let grown = (buffer.len() * 2).clamp(1024, maximum);
-                    buffer.reserve_exact(grown - buffer.len());
-                    buffer.resize(grown, 0);
-                }
-                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-            }
-        }
+        let result = write_message(buffer, writer, value);
+        release_oversized(buffer);
+        result
     })
+}
+
+fn write_message<T: Serialize>(
+    buffer: &mut Vec<u8>,
+    writer: &mut impl Write,
+    value: &T,
+) -> io::Result<()> {
+    loop {
+        if buffer.len() < HEADER {
+            buffer.resize(HEADER, 0);
+        }
+        match postcard::to_slice(value, &mut buffer[HEADER..]).map(|encoded| encoded.len()) {
+            Ok(size) => {
+                let length = u32::try_from(size)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                buffer[..HEADER].copy_from_slice(&length.to_le_bytes());
+                return writer.write_all(&buffer[..HEADER + size]);
+            }
+            Err(postcard::Error::SerializeBufferFull) => {
+                let maximum = HEADER + MAX_MESSAGE;
+                if buffer.len() == maximum {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "message too large",
+                    ));
+                }
+                let grown = (buffer.len() * 2).clamp(1024, maximum);
+                buffer.reserve_exact(grown - buffer.len());
+                buffer.resize(grown, 0);
+            }
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        }
+    }
 }
 
 /// Read one length-prefixed message.
@@ -355,12 +372,33 @@ pub fn recv<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<
     reader.read_exact(&mut header)?;
     let size = message_size(header)?;
     SCRATCH.with_borrow_mut(|buffer| {
-        if buffer.len() < size {
-            buffer.resize(size, 0);
-        }
-        reader.read_exact(&mut buffer[..size])?;
-        decode(&buffer[..size])
+        let result = read_message(buffer, reader, size);
+        release_oversized(buffer);
+        result
     })
+}
+
+fn read_message<T: for<'de> Deserialize<'de>>(
+    buffer: &mut Vec<u8>,
+    reader: &mut impl Read,
+    size: usize,
+) -> io::Result<T> {
+    if buffer.len() < size {
+        buffer.resize(size, 0);
+    }
+    reader.read_exact(&mut buffer[..size])?;
+    decode(&buffer[..size])
+}
+
+/// Trim a framing buffer back to [`RETAINED_BUFFER`] after a larger message.
+///
+/// The retained window stays usable, so only messages above the threshold pay
+/// for a fresh allocation on the way back up.
+pub(crate) fn release_oversized(buffer: &mut Vec<u8>) {
+    if buffer.len() > RETAINED_BUFFER {
+        buffer.truncate(RETAINED_BUFFER);
+        buffer.shrink_to(RETAINED_BUFFER);
+    }
 }
 
 pub(crate) fn message_size(header: [u8; HEADER]) -> io::Result<usize> {

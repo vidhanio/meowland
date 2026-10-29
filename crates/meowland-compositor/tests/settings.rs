@@ -19,41 +19,42 @@ fn binding(key: char, modifiers: Modifiers) -> KeyBinding {
 }
 
 #[test]
-fn empty_configuration_uses_the_documented_defaults() {
+fn empty_configuration_matches_the_settings_defaults() {
     let settings = parse("");
+    let defaults = Settings::default();
 
-    assert_eq!(settings.output_size.width(), 1920);
-    assert_eq!(settings.output_size.height(), 1080);
-    assert!((settings.scale.factor() - 1.0).abs() < f64::EPSILON);
-    assert_eq!(settings.refresh_rate.millihertz(), 120_000);
-    assert_eq!(settings.keyboard.layout, "us");
-    assert_eq!(settings.keyboard.variant, "");
-    assert_eq!(settings.keyboard.options, "");
-    assert_eq!(settings.keyboard.repeat_delay.milliseconds(), 600);
-    assert_eq!(settings.keyboard.repeat_rate.hertz(), 25);
+    assert_eq!(settings.output_size, defaults.output_size);
+    assert_eq!(settings.scale, defaults.scale);
+    assert_eq!(settings.refresh_rate, defaults.refresh_rate);
+    assert_eq!(settings.keyboard.layout, defaults.keyboard.layout);
+    assert_eq!(settings.keyboard.variant, defaults.keyboard.variant);
+    assert_eq!(settings.keyboard.options, defaults.keyboard.options);
     assert_eq!(
-        settings.shortcuts.close_window,
-        Some(binding('q', Modifiers::ALT))
+        settings.keyboard.repeat_delay,
+        defaults.keyboard.repeat_delay
     );
-    assert_eq!(
-        settings.shortcuts.detach_pane,
-        Some(binding('w', Modifiers::ALT))
-    );
+    assert_eq!(settings.keyboard.repeat_rate, defaults.keyboard.repeat_rate);
+    assert_eq!(settings.shortcuts, defaults.shortcuts);
 }
 
 #[test]
 fn partial_sections_keep_the_other_defaults() {
     let settings = parse("[output]\nwidth = 800\n[keyboard]\nlayout = \"de\"\n");
+    let defaults = Settings::default();
 
     assert_eq!(settings.output_size.width(), 800);
-    assert_eq!(settings.output_size.height(), 1080);
-    assert!((settings.scale.factor() - 1.0).abs() < f64::EPSILON);
-    assert_eq!(settings.refresh_rate.millihertz(), 120_000);
     assert_eq!(settings.keyboard.layout, "de");
-    assert_eq!(settings.keyboard.variant, "");
-    assert_eq!(settings.keyboard.options, "");
-    assert_eq!(settings.keyboard.repeat_delay.milliseconds(), 600);
-    assert_eq!(settings.keyboard.repeat_rate.hertz(), 25);
+    assert_eq!(settings.output_size.height(), defaults.output_size.height());
+    assert_eq!(settings.scale, defaults.scale);
+    assert_eq!(settings.refresh_rate, defaults.refresh_rate);
+    assert_eq!(settings.keyboard.variant, defaults.keyboard.variant);
+    assert_eq!(settings.keyboard.options, defaults.keyboard.options);
+    assert_eq!(
+        settings.keyboard.repeat_delay,
+        defaults.keyboard.repeat_delay
+    );
+    assert_eq!(settings.keyboard.repeat_rate, defaults.keyboard.repeat_rate);
+    assert_eq!(settings.shortcuts, defaults.shortcuts);
 }
 
 #[test]

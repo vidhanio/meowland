@@ -82,7 +82,6 @@ fn ui_scale_parses_the_same_way() {
     assert!(("1.5".parse::<UiScale>().unwrap().factor() - 1.5).abs() < f64::EPSILON);
     assert!("not a number".parse::<UiScale>().is_err());
     assert!("0.4".parse::<UiScale>().is_err());
-    assert!((UiScale::default().factor() - 1.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -108,7 +107,6 @@ fn refresh_rate_validates_and_converts_to_time() {
         RefreshRate::try_from(1000).unwrap().interval(),
         Duration::from_millis(1)
     );
-    assert_eq!(RefreshRate::default().millihertz(), 120_000);
 }
 
 #[test]

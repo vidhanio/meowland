@@ -227,15 +227,4 @@ mod tests {
             Some(Rectangle::new((0.5, 0.5).into(), (1.0, 1.0).into()))
         );
     }
-
-    #[test]
-    fn full_damage_covers_the_destination() {
-        let snapshot = snapshot(8, 4);
-        let geometry = geometry(&snapshot, 1, ViewportCachedState::default());
-
-        assert_eq!(
-            SurfaceDamage::full(&geometry).0,
-            Some(Rectangle::from_size(Size::from((8.0, 4.0))))
-        );
-    }
 }

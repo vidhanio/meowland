@@ -15,6 +15,15 @@ use super::{Action, Focus, Refresh};
 
 const MAX_REQUESTS: usize = 16;
 const MAX_OFFERS: usize = 16;
+/// Kitty's OSC 5522 payload limit per escape, applied before base64 encoding.
+///
+/// The protocol asks senders to split a representation into chunks of no more
+/// than this and to finish one MIME type before starting the next; receivers
+/// use the same bound to reject oversized packets. It also bounds the decoded
+/// metadata fields, which arrive as single chunks.
+const MAX_CHUNK_BYTES: usize = 4096;
+/// Outgoing data chunk size, one byte below the protocol limit.
+const WRITE_CHUNK_BYTES: usize = MAX_CHUNK_BYTES - 1;
 /// Room for every accepted MIME type at its maximum length plus a separator.
 const MAX_TYPE_LIST: usize = MAX_TYPES * 257;
 
@@ -56,7 +65,7 @@ impl Reading {
             }
             "DATA" if self.started && packet.mime.as_deref() == Some(expected) => {
                 let data = STANDARD.decode(packet.payload).ok()?;
-                if data.len() > 4096 || self.bytes.len() + data.len() > limit {
+                if data.len() > MAX_CHUNK_BYTES || self.bytes.len() + data.len() > limit {
                     return None;
                 }
                 self.bytes.extend_from_slice(&data);
@@ -385,7 +394,7 @@ impl Clipboard {
                         if item.data.is_empty() {
                             packet(output, &metadata, b"");
                         }
-                        for chunk in item.data.chunks(4095) {
+                        for chunk in item.data.chunks(WRITE_CHUNK_BYTES) {
                             packet(output, &metadata, chunk);
                         }
                     }
@@ -576,7 +585,7 @@ impl<'a> Packet<'a> {
         }
         let decode = |key| {
             let decoded = STANDARD.decode(fields.get(key)?).ok()?;
-            if decoded.len() > 4096 {
+            if decoded.len() > MAX_CHUNK_BYTES {
                 return None;
             }
             String::from_utf8(decoded).ok()

@@ -223,7 +223,7 @@ These follow the `rust-best-practices` skill.
   `meowland/src/configuration.rs` reads the file itself and then routes it through
   `config::Config::builder()`. `toml::from_str` does the same with a much smaller
   dependency tree.
-- [ ] **Name the magic numbers.** Examples: 256 deferred inputs (`input_gate.rs`), 16
+- [x] **Name the magic numbers.** Examples: 256 deferred inputs (`input_gate.rs`), 16
   deliveries (`clipboard.rs`), 64 events per turn, 4096/4095 chunk sizes
   (`terminal-clipboard/src/kitty.rs`), `SCROLL_FACTOR`, `15.0 / 120.0`, and button
   codes `0x110…0x113` (use `BTN_LEFT` and friends). Give each a named constant with a

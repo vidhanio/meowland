@@ -4,6 +4,14 @@ use std::time::Instant;
 
 use meowland_protocol::{Input, PaneAction, PaneToServer, asynchronous::Outgoing};
 
+/// Deferred terminal inputs allowed while a clipboard refresh is pending.
+///
+/// A refresh can wait for the terminal for up to `TRANSFER_TIMEOUT`, so without
+/// a bound a stalled terminal could buffer input indefinitely. Past this many
+/// events the gate forwards what it has: latency stays bounded, at the cost of
+/// letting the paste that triggered the refresh use the previous selection.
+const MAX_DEFERRED_INPUTS: usize = 256;
+
 #[derive(Default)]
 pub(crate) struct InputGate {
     pending: Option<Deferred>,
@@ -43,7 +51,7 @@ impl InputGate {
                 deadline,
             });
             pending.inputs.push(input);
-            if pending.inputs.len() >= 256 {
+            if pending.inputs.len() >= MAX_DEFERRED_INPUTS {
                 tracing::warn!(
                     "Clipboard refresh deferred too much input; forwarding original events"
                 );

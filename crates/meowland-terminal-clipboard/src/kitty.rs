@@ -691,7 +691,7 @@ mod tests {
     fn packet_rejects_invalid_base64_and_utf8() {
         for bytes in [
             &b"type=read:status=OK:mime=%%%;"[..],
-            &b"type=read:status=OK:pw=%%%:"[..],
+            &b"type=read:status=OK:pw=%%%;"[..],
             &b"type=read:status=OK:mime=/w==;"[..],
             &b"type=read:status=OK:pw=/w==;"[..],
             &b"type=read:status=OK;\xff"[..],

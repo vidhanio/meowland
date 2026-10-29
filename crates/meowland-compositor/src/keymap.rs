@@ -225,6 +225,8 @@ mod tests {
         assert_eq!(text(u32::from('a')), Some("a".to_owned()));
         assert_eq!(text(u32::from('é')), Some("é".to_owned()));
         assert_eq!(text(0x1f600), Some("😀".to_owned()));
+        assert_eq!(text(63743), None);
+        assert!(text(63744).is_some());
 
         for key in [0, 9, 27, 0x7f, 0x80, 57344, 0xd800, 0x11_0000] {
             assert_eq!(text(key), None, "key {key}");
@@ -245,6 +247,8 @@ mod tests {
         keysyms.insert(xkb::utf32_to_keysym(u32::from('q')), 16);
         keysyms.insert(xkb::utf32_to_keysym(u32::from('é')), 18);
         keysyms.insert(xkb::utf32_to_keysym(0x1f600), 19);
+        keysyms.insert(xkb::utf32_to_keysym(63743), 20);
+        keysyms.insert(xkb::utf32_to_keysym(63744), 21);
         let keymap = Keymap {
             keysyms,
             layout: Layout::default(),
@@ -253,6 +257,8 @@ mod tests {
         assert_eq!(keymap.lookup(u32::from('q')), Some(16));
         assert_eq!(keymap.lookup(u32::from('é')), Some(18));
         assert_eq!(keymap.lookup(0x1f600), Some(19));
+        assert_eq!(keymap.lookup(63743), None);
+        assert_eq!(keymap.lookup(63744), Some(21));
         assert_eq!(keymap.lookup(u32::from('a')), None);
     }
 

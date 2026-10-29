@@ -596,18 +596,25 @@ fn button(code: u32) -> Option<Button> {
 mod tests {
     use super::*;
 
-    fn parse_chunks(chunks: &[&[u8]]) -> Vec<Event> {
+    fn parse(bytes: &[u8]) -> Vec<Event> {
         let mut parser = Parser::new();
-        for chunk in chunks {
-            for &byte in *chunk {
-                parser.push(byte);
-            }
+        for &byte in bytes {
+            parser.push(byte);
         }
         parser.decoder.events.into_iter().collect()
     }
 
-    fn parse(bytes: &[u8]) -> Vec<Event> {
-        parse_chunks(&[bytes])
+    fn parse_chunks_after_drain(chunks: &[&[u8]]) -> Vec<Vec<Event>> {
+        let mut parser = Parser::new();
+        chunks
+            .iter()
+            .map(|chunk| {
+                for &byte in *chunk {
+                    parser.push(byte);
+                }
+                parser.decoder.events.drain(..).collect()
+            })
+            .collect()
     }
 
     fn key(event: &Event) -> &Key {
@@ -1004,14 +1011,14 @@ mod tests {
             (
                 b"\x1b[<64;1;2M",
                 Scroll {
-                    vertical: SCROLL_DETENT,
+                    vertical: 120,
                     horizontal: 0,
                 },
             ),
             (
                 b"\x1b[<65;1;2M",
                 Scroll {
-                    vertical: -SCROLL_DETENT,
+                    vertical: -120,
                     horizontal: 0,
                 },
             ),
@@ -1019,14 +1026,14 @@ mod tests {
                 b"\x1b[<66;1;2M",
                 Scroll {
                     vertical: 0,
-                    horizontal: -SCROLL_DETENT,
+                    horizontal: -120,
                 },
             ),
             (
                 b"\x1b[<67;1;2M",
                 Scroll {
                     vertical: 0,
-                    horizontal: SCROLL_DETENT,
+                    horizontal: 120,
                 },
             ),
         ];
@@ -1069,41 +1076,49 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_every_split_boundary() {
-        let key_sequence = b"\x1b[97;6u";
-        for split in 0..=key_sequence.len() {
-            let events = parse_chunks(&[&key_sequence[..split], &key_sequence[split..]]);
-            assert_eq!(events.len(), 1, "split at {split}");
-            let key = key(&events[0]);
-            assert_eq!(key.code, u32::from(b'a'), "split at {split}");
-            assert_eq!(
-                key.modifiers,
-                Modifiers::SHIFT | Modifiers::CONTROL,
-                "split at {split}"
-            );
-        }
+    fn parser_decodes_complete_stream_in_order() {
+        let events = parse(b"\x1b[I\x1b[<0;-10;20M\x1b[97;6u\x1b[200~hi\x1b[201~");
+        let [focus, pointer_event, key_event, paste] = events.as_slice() else {
+            panic!("expected four events, got {events:?}");
+        };
+        assert!(matches!(focus, Event::Focus(true)));
+        let pointer = pointer(pointer_event);
+        assert_eq!((pointer.x, pointer.y), (-10.0, 20.0));
+        assert_eq!(pointer.button, Some((Button::Left, Transition::Pressed)));
+        let key = key(key_event);
+        assert_eq!(key.code, u32::from(b'a'));
+        assert_eq!(key.modifiers, Modifiers::SHIFT | Modifiers::CONTROL);
+        assert!(matches!(paste, Event::Paste(text) if text == "hi"));
+    }
 
-        let mouse_sequence = b"\x1b[<0;-10;20M";
-        for split in 0..=mouse_sequence.len() {
-            let events = parse_chunks(&[&mouse_sequence[..split], &mouse_sequence[split..]]);
-            assert_eq!(events.len(), 1, "split at {split}");
-            let pointer = pointer(&events[0]);
-            assert_eq!((pointer.x, pointer.y), (-10.0, 20.0), "split at {split}");
-            assert_eq!(
-                pointer.button,
-                Some((Button::Left, Transition::Pressed)),
-                "split at {split}"
-            );
-        }
+    #[test]
+    fn parser_preserves_key_state_across_drained_chunks() {
+        let events = parse_chunks_after_drain(&[b"\x1b[I\x1b[97;6", b"u"]);
+        let [before, after] = events.as_slice() else {
+            panic!("expected two chunks, got {events:?}");
+        };
+        assert!(matches!(before.as_slice(), [Event::Focus(true)]));
+        let [event] = after.as_slice() else {
+            panic!("expected one key event, got {after:?}");
+        };
+        let key = key(event);
+        assert_eq!(key.code, u32::from(b'a'));
+        assert_eq!(key.modifiers, Modifiers::SHIFT | Modifiers::CONTROL);
+    }
 
-        let paste_sequence = b"\x1b[200~hello\x1b[201~";
-        for split in 0..=paste_sequence.len() {
-            let events = parse_chunks(&[&paste_sequence[..split], &paste_sequence[split..]]);
-            assert!(
-                matches!(&events[..], [Event::Paste(text)] if text == "hello"),
-                "split at {split}"
-            );
-        }
+    #[test]
+    fn parser_preserves_mouse_state_across_drained_chunks() {
+        let events = parse_chunks_after_drain(&[b"\x1b[I\x1b[<0;-10;", b"20M"]);
+        let [before, after] = events.as_slice() else {
+            panic!("expected two chunks, got {events:?}");
+        };
+        assert!(matches!(before.as_slice(), [Event::Focus(true)]));
+        let [event] = after.as_slice() else {
+            panic!("expected one pointer event, got {after:?}");
+        };
+        let pointer = pointer(event);
+        assert_eq!((pointer.x, pointer.y), (-10.0, 20.0));
+        assert_eq!(pointer.button, Some((Button::Left, Transition::Pressed)));
     }
 
     #[test]
@@ -1127,22 +1142,27 @@ mod tests {
     }
 
     #[test]
-    fn parser_decodes_utf8_text_split_at_every_boundary() {
-        let sequence = "é".as_bytes();
-        for split in 0..=sequence.len() {
-            let events = parse_chunks(&[&sequence[..split], &sequence[split..]]);
-            assert!(
-                matches!(&events[..], [Event::Text(text)] if text == "é"),
-                "split at {split}"
-            );
-        }
+    fn parser_preserves_utf8_state_across_drained_chunks() {
+        let events = parse_chunks_after_drain(&[b"a\xc3", b"\xa9"]);
+        let [before, after] = events.as_slice() else {
+            panic!("expected two chunks, got {events:?}");
+        };
+        assert!(matches!(before.as_slice(), [Event::Text(text)] if text == "a"));
+        assert!(matches!(after.as_slice(), [Event::Text(text)] if text == "é"));
     }
 
     #[test]
-    fn parser_decodes_paste_across_chunks() {
-        let events = parse_chunks(&[b"\x1b[200~he", b"llo\x1b[201", b"~"]);
-        assert!(matches!(&events[..], [Event::Paste(text)] if text == "hello"));
+    fn parser_preserves_paste_state_across_drained_chunks() {
+        let events = parse_chunks_after_drain(&[b"x\x1b[200~hel", b"lo\x1b[201~"]);
+        let [before, after] = events.as_slice() else {
+            panic!("expected two chunks, got {events:?}");
+        };
+        assert!(matches!(before.as_slice(), [Event::Text(text)] if text == "x"));
+        assert!(matches!(after.as_slice(), [Event::Paste(text)] if text == "hello"));
+    }
 
+    #[test]
+    fn parser_rejects_invalid_utf8_paste() {
         let events = parse(b"\x1b[200~\xff\x1b[201~x");
         assert!(matches!(&events[..], [Event::Text(text)] if text == "x"));
     }

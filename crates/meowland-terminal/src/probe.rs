@@ -13,7 +13,7 @@ use meowland_core::{
     signals,
 };
 use meowland_input as input;
-use meowland_kitty::query_shared;
+use meowland_kitty::{query_frame_edits, query_shared};
 use meowland_protocol::SharedObject;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
@@ -25,7 +25,6 @@ const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
 const FRAME_EDIT_ID: u32 = 30;
 const SHARED_ID: u32 = 32;
-const FRAME_EDIT_QUERY: &[u8] = b"\x1b_Ga=t,f=24,s=1,v=1,i=30,q=2;AAAA\x1b\\\x1b_Ga=f,f=24,s=1,v=1,i=30,r=1;AAAA\x1b\\\x1b_Ga=d,d=I,i=30,q=2;\x1b\\";
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q";
 /// Query device attributes last so their reply starts the handshake's quiet
 /// window.
@@ -78,7 +77,7 @@ pub(crate) async fn terminal_probe(
     let shared_probe = shared_probe();
     let mut pending = output::Output::default();
     pending.append(PROBE_QUERY);
-    pending.append(FRAME_EDIT_QUERY);
+    pending.append(&query_frame_edits(FRAME_EDIT_ID));
     if let Some((_, command)) = &shared_probe {
         pending.append(command);
     }

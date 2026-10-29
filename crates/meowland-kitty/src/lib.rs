@@ -4,4 +4,4 @@
 mod encoding;
 mod presenter;
 
-pub use presenter::{PresentOutcome, Presenter, present_shared, query_shared};
+pub use presenter::{PresentOutcome, Presenter, present_shared, query_frame_edits, query_shared};

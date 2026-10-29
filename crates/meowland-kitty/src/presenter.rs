@@ -168,6 +168,18 @@ pub fn query_shared(frame: &SharedFrame, id: u32) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Query in-place frame edits by transmitting, editing, then deleting a
+/// one-pixel image under `id`.
+#[must_use]
+pub fn query_frame_edits(id: u32) -> Vec<u8> {
+    format!(
+        "\x1b_Ga=t,f=24,s=1,v=1,i={id},q=2;AAAA\x1b\\\
+         \x1b_Ga=f,f=24,s=1,v=1,i={id},r=1;AAAA\x1b\\\
+         \x1b_Ga=d,d=I,i={id},q=2;\x1b\\"
+    )
+    .into_bytes()
+}
+
 fn begin_image(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[?2026h\x1b[2J\x1b[H");
 }

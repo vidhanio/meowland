@@ -62,7 +62,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   `io::stdout()`. Frames go through a separate nonblocking descriptor
   (`output::open`). A restore can interleave with a half-drained frame. Route mode
   changes through the same `Output` queue, or drain it before `restore()`.
-- [ ] **Probe query duplicates its ID constant.** `FRAME_EDIT_QUERY` in
+- [x] **Probe query duplicates its ID constant.** `FRAME_EDIT_QUERY` in
   `meowland-terminal/src/probe.rs` hard-codes `i=30` while `FRAME_EDIT_ID = 30` is a
   separate constant. Build the query from the constant, as `query_shared` already does.
 - [x] **Pane-client logs disappear when journald is unavailable.** `init_logging`

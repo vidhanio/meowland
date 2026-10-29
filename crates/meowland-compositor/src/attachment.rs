@@ -317,6 +317,12 @@ impl Attachments {
         }
     }
 
+    pub(crate) fn set_clipboard_transport(&mut self, pane: PaneId, transport: Transport) {
+        if let Some(entry) = self.panes.get_mut(&pane) {
+            entry.clipboard = transport;
+        }
+    }
+
     pub(crate) fn forget_window(&mut self, window: WindowId) {
         self.deciding.remove(&window);
     }

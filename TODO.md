@@ -87,12 +87,15 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   cleanly and the `keyboard.take() … self.keyboard = Some(keyboard)` dance (repeated
   about 12 times) goes away. Drop the `use Compositor as State` alias: two names for
   one type makes grepping harder.
-- [ ] **Replace the `CompositorHandle` projection machinery.**
+- [x] **Replace the `CompositorHandle` projection machinery.**
   `meowland-compositor/src/event_loop.rs` adds a custom `Source` trait object,
   `Projected`, and `Rc<dyn Fn>` boxing (about 160 lines) so the compositor can register
   sources on a loop whose data is `Server`. Simpler options: make `Compositor` the loop
   data and keep server state inside it, or make registration generic over
   `D: AsMut<Compositor>`.
+  Evaluated and kept: both alternatives either make `Compositor` generic throughout the
+  crate or still need an erased late-registration handle, so the current machinery is
+  the smallest viable design.
 - [x] **The run loop does a full pass on every wakeup.** `actor::run` calls
   `wayland.dispatch`, which ran `frame_callbacks` (all windows), `dispatch_frames`
   (all panes), `expire_activation_tokens`, and `refresh_popup_grab`, after *any* event,

@@ -57,6 +57,11 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   `resolve_pending_panes`), and so on. Each redundant configure makes clients
   re-layout and re-render. Use `send_pending_configure()`, which only sends when
   pending state differs from the last configure.
+- [ ] **Mixed sync and async writers to the TTY.** `TerminalGuard`
+  (`meowland-terminal/src/terminal.rs`) writes mode switches with blocking
+  `io::stdout()`. Frames go through a separate nonblocking descriptor
+  (`output::open`). A restore can interleave with a half-drained frame. Route mode
+  changes through the same `Output` queue, or drain it before `restore()`.
 - [ ] **Probe query duplicates its ID constant.** `FRAME_EDIT_QUERY` in
   `meowland-terminal/src/probe.rs` hard-codes `i=30` while `FRAME_EDIT_ID = 30` is a
   separate constant. Build the query from the constant, as `query_shared` already does.
@@ -169,6 +174,9 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   32 MiB) from the app on every selection change, so copying an image in a browser
   pulls every format. Prioritise text and image types and cap the total. The OSC 5522
   write does need the data up front, but not all of it.
+- [ ] **Framing buffers never shrink.** `protocol::send`/`recv` use a thread-local
+  `SCRATCH`, and `asynchronous::Reader::body` keeps its high-water mark (up to
+  64 MiB). Shrink after oversized messages.
 - [ ] **One `Outgoing` per message.** `pane_writer` allocates a fresh `Outgoing` for
   every message (`transport.rs`). Reuse one.
 - [ ] **`yield_now()` on every session iteration.** `TerminalSession::run` yields at the

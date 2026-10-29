@@ -149,10 +149,13 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   - [ ] Restrict the GPU blit and `copy_framebuffer` to the damage. Smithay's
     renderer has no per-rectangle mapping export, so this needs a separate target
     texture and copy per damaged region.
-- [ ] **Updates are sent as row bands, not rectangles.** `Renderer::update` computes a
+- [x] **Updates are sent as row bands, not rectangles.** `Renderer::update` computes a
   column range but only reports changed *rows*. `FrameBand` and the Kitty `a=f` edit
   then send full-width rows. A blinking cursor costs `width × 16 × 3` bytes before
   zlib. Carry `x` and `width` in `FrameBand` and use Kitty's `x=`/`w=` edit keys.
+  - Rectangles inside the frame travel as `x`/`width`, and the edit uses Kitty's
+    `a=f,x=…,y=…` offset with `s`/`v` for the payload size (not `x=`/`w=`). Rectangles
+    at least 75% of the frame width are still sent as full rows.
 - [x] **Polling for shared-frame consumption.** `presentation/shared.rs` calls
   `shm_open` every 1 ms for up to 250 ms to see whether the terminal unlinked the
   object (`SharedFrame::exists`), and each poll allocates the name string
@@ -253,7 +256,7 @@ off most, for when that is requested.
   (split escape sequences, signed coordinates), `probe.rs` `ProbeParser`, and
   `terminal-clipboard` `Packet::parse`. These are good targets for property tests and
   `cargo fuzz`.
-- [ ] `keyboard::key_code` round-trips, `FrameSize::rgb_band` edge cases, and
+- [ ] `keyboard::key_code` round-trips, `FrameBand` rectangle edge cases, and
   `protocol` framing (oversize, trailing bytes, cancellation-safe `Reader`).
 - [ ] `catalog.rs` and `attachment.rs` selection and follow policy, which become
   testable without Wayland once split out (see §2).

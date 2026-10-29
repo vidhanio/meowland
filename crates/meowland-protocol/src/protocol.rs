@@ -450,7 +450,8 @@ pub enum PanePacket<F> {
     },
     /// The handshake was rejected with a human-readable reason.
     Reject(String),
-    /// A validated RGB band, or its explicit header during split transmission.
+    /// A validated RGB rectangle, or its explicit header during split
+    /// transmission.
     Frame(F),
     /// The pane is detached; restore terminal modes and report this reason.
     Release(String),

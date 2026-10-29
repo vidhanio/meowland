@@ -139,7 +139,7 @@ impl Outgoing {
         let size = prefix + frame.rgb().len();
         self.reserve_packet(size)?;
         let packet = self.encode_packet(&header, prefix, size)?;
-        let (_, _, rgb) = frame.into_parts();
+        let rgb = frame.into_rgb();
         self.push(packet);
         self.push(rgb);
         Ok(())

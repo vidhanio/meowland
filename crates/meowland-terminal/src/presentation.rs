@@ -174,7 +174,7 @@ impl PanePresentation {
             "previous frame must finish before accepting another band"
         );
         let started = Instant::now();
-        if band.y() == 0 && band.rgb().len() == band.size().rgb_len() {
+        if band.is_whole() {
             self.shared_frame = None;
         }
         if let Some(shared) = self.shared_frame.take() {

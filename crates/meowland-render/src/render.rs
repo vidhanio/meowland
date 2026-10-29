@@ -48,9 +48,22 @@ impl std::fmt::Debug for Renderer {
     }
 }
 
+/// Changed pixel rectangle of a recomposed pane frame.
+///
+/// Columns are the recomposed damage range rather than a per-pixel comparison:
+/// the renderer already samples every pixel in that range, and narrowing it
+/// would need a second pass over the composed rows.
+#[derive(Clone, Debug)]
+pub struct Changed {
+    /// Recomposed columns, left-inclusive.
+    pub columns: Range<u32>,
+    /// Rows whose pixels changed, top-inclusive.
+    pub rows: Range<u32>,
+}
+
 impl Renderer {
-    /// Recompose damaged rectangles into a retained pane and return changed
-    /// rows.
+    /// Recompose damaged rectangles into a retained pane and return the changed
+    /// rectangle.
     ///
     /// Changes in surface order, placement, dimensions, viewport, scale, or
     /// transform invalidate the scene and force full composition. Otherwise
@@ -69,7 +82,7 @@ impl Renderer {
         size: FrameSize,
         scale: f64,
         mut publish: impl FnMut(Option<&Range<usize>>, &[u8]),
-    ) -> Option<Range<usize>> {
+    ) -> Option<Changed> {
         scene.pixels.resize(size.rgb_len(), 0);
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
@@ -123,7 +136,12 @@ impl Renderer {
                 usize::try_from(bottom).expect("clipped row is nonnegative") * size.rgb_stride();
             publish(changed.as_ref(), &scene.pixels[..ready]);
         }
-        changed
+        changed.map(|rows| Changed {
+            columns: u32::try_from(columns.start).expect("clipped column is nonnegative")
+                ..u32::try_from(columns.end).expect("clipped column is nonnegative"),
+            rows: u32::try_from(rows.start).expect("clipped row is nonnegative")
+                ..u32::try_from(rows.end).expect("clipped row is nonnegative"),
+        })
     }
 
     fn prepare(

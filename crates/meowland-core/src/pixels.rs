@@ -1,6 +1,6 @@
 //! Validated dimensions shared by surface snapshots and terminal frames.
 
-use std::{num::NonZeroU16, ops::Range};
+use std::num::NonZeroU16;
 
 /// Maximum supported width or height; bounds per-row work and graphics
 /// allocations.
@@ -117,17 +117,5 @@ impl FrameSize {
     #[must_use]
     pub fn fits(self, bound: Option<(u32, u32)>) -> bool {
         bound.is_none_or(|(width, height)| self.width() <= width && self.height() <= height)
-    }
-
-    /// Validate a nonempty RGB row band before indexing the composed frame.
-    #[must_use]
-    pub fn rgb_band(self, y: u32, bytes: usize) -> Option<Range<usize>> {
-        let stride = self.rgb_stride();
-        if y >= self.height() || bytes == 0 || !bytes.is_multiple_of(stride) {
-            return None;
-        }
-        let start = usize::try_from(y).ok()? * stride;
-        let end = start.checked_add(bytes)?;
-        (end <= self.rgb_len()).then_some(start..end)
     }
 }

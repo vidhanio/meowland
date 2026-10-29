@@ -58,47 +58,56 @@ impl Presenter {
 
     /// Adopt a complete frame already displayed through an upstream transfer.
     ///
-    /// Returns false for partial bands, leaving the presenter unchanged.
+    /// Returns false for partial rectangles, leaving the presenter unchanged.
     pub fn retain_frame(&mut self, band: FrameBand) -> bool {
-        if band.y() != 0 || band.rgb().len() != band.size().rgb_len() {
+        if !band.is_whole() {
             return false;
         }
-        let (size, _, pixels) = band.into_parts();
-        self.image = pixels;
+        let size = band.size();
+        self.image = band.into_rgb();
         self.size = Some(size);
         self.displayed = true;
         true
     }
 
-    /// Retain a validated row band and encode its terminal update.
+    /// Retain a validated RGB rectangle and encode its terminal update.
     ///
     /// # Panics
-    /// Panics if a validated band height does not fit in `u32`.
+    /// Panics if a validated rectangle does not fit in `usize` offsets.
     pub fn present_into(&mut self, band: FrameBand, out: &mut Vec<u8>) -> PresentOutcome {
         out.clear();
-        let (size, y, pixels) = band.into_parts();
-        let Some(bytes) = size.rgb_band(y, pixels.len()) else {
-            return PresentOutcome::NeedsKeyframe;
-        };
-        let whole = bytes.start == 0 && bytes.end == size.rgb_len();
+        let whole = band.is_whole();
+        let size = band.size();
+        let (x, y, width) = (band.x(), band.y(), band.width());
+        let height = band.height();
+        let pixels = band.into_rgb();
         let matching = self.size == Some(size);
         if !whole && !matching {
             return PresentOutcome::NeedsKeyframe;
         }
-        if matching && self.image[bytes.clone()] == pixels {
+        let row_bytes = usize::try_from(width).expect("validated band width fits usize") * 3;
+        let offset = usize::try_from(y).expect("validated band row fits usize") * size.rgb_stride()
+            + usize::try_from(x).expect("validated band column fits usize") * 3;
+        if matching
+            && pixels
+                .chunks_exact(row_bytes)
+                .enumerate()
+                .all(|(row, pixels)| {
+                    let start = offset + row * size.rgb_stride();
+                    self.image[start..start + row_bytes] == *pixels
+                })
+        {
             return self.repaint_into(out);
         }
         let edit = matching && self.displayed && !whole;
         if edit {
-            let height = u32::try_from(pixels.len() / size.rgb_stride())
-                .expect("band height fits validated frame height");
             out.extend_from_slice(b"\x1b[?2026h");
             self.encoder.image(
                 out,
                 SCREEN_ID,
-                (size.width(), height),
+                (width, height),
                 &pixels,
-                Placement::Edit { y },
+                Placement::Edit { x, y },
             );
             out.extend_from_slice(b"\x1b[?2026l");
         }
@@ -106,7 +115,10 @@ impl Presenter {
             self.image = pixels;
             self.size = Some(size);
         } else {
-            self.image[bytes].copy_from_slice(&pixels);
+            for (row, pixels) in pixels.chunks_exact(row_bytes).enumerate() {
+                let start = offset + row * size.rgb_stride();
+                self.image[start..start + row_bytes].copy_from_slice(pixels);
+            }
         }
         if edit {
             PresentOutcome::Encoded
@@ -187,7 +199,7 @@ fn begin_image(out: &mut Vec<u8>) {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Placement {
     Whole,
-    Edit { y: u32 },
+    Edit { x: u32, y: u32 },
 }
 
 impl Placement {
@@ -203,9 +215,9 @@ impl Placement {
 pub(crate) fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, placement: Placement) {
     match placement {
         Placement::Whole => write!(out, "a=T,f=24,s={width},v={height},i={id},p=1,z=1,C=1,q=2"),
-        Placement::Edit { y } => write!(
+        Placement::Edit { x, y } => write!(
             out,
-            "a=f,f=24,s={width},v={height},i={id},r=1,x=0,y={y},X=1,q=2"
+            "a=f,f=24,s={width},v={height},i={id},r=1,x={x},y={y},X=1,q=2"
         ),
     }
     .expect("writing to Vec cannot fail");

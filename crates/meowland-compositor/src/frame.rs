@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use meowland_core::{latency::Latency, pixels::FrameSize};
 use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
-use meowland_render::{Renderer, Scene, Snapshot, SurfaceDamage};
+use meowland_render::{Changed, Renderer, Scene, Snapshot, SurfaceDamage};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use super::{Event, PaneId, ServerToPane, State};
@@ -65,6 +65,14 @@ impl FrameStats {
         }
     }
 }
+
+/// Rectangles at least this wide, as a percentage of the frame width, are sent
+/// as full rows.
+///
+/// Narrow rectangles save bytes and terminal-side work, but wide ones gain
+/// little: zlib finds fewer cross-row matches, the terminal copies a row per
+/// row instead of a block, and the metadata overhead is unchanged.
+const FULL_ROW_PERCENT: u32 = 75;
 
 pub(crate) struct PaneState {
     pub size: FrameSize,
@@ -141,7 +149,7 @@ impl PaneState {
         let changed = self.changed.take().unwrap_or(started);
         self.presentation = Presentation::Clean;
         let mut publication = Publication::new(self.size, self.transport, self.sent_size);
-        let rows = renderer.update(
+        let rect = renderer.update(
             &mut self.scene,
             root,
             snapshots,
@@ -149,10 +157,13 @@ impl PaneState {
             scale,
             |changed, ready| publication.rows(changed, ready),
         );
-        let rows = if self.sent_size == Some(self.size) {
-            rows?
+        let rect = if self.sent_size == Some(self.size) {
+            rect?
         } else {
-            0..usize::try_from(self.size.height()).expect("validated height fits usize")
+            Changed {
+                columns: 0..self.size.width(),
+                rows: 0..self.size.height(),
+            }
         };
         self.stats
             .render
@@ -170,7 +181,7 @@ impl PaneState {
             self.shared = Some(object);
             ServerToPane::SharedFrame(frame)
         } else {
-            self.band(rows)
+            self.band(&rect)
         };
         self.stats.publish.record(streamed + publishing.elapsed());
         self.presentation = Presentation::InFlight {
@@ -180,15 +191,32 @@ impl PaneState {
         Some(message)
     }
 
-    fn band(&self, rows: std::ops::Range<usize>) -> ServerToPane {
-        let bytes = rows.start * self.size.rgb_stride()..rows.end * self.size.rgb_stride();
+    fn band(&self, rect: &Changed) -> ServerToPane {
+        let width = rect.columns.end - rect.columns.start;
+        let whole_rows = width * 100 >= self.size.width() * FULL_ROW_PERCENT;
+        let (x, width) = if whole_rows {
+            (0, self.size.width())
+        } else {
+            (rect.columns.start, width)
+        };
+        let stride = self.size.rgb_stride();
+        let row_bytes = usize::try_from(width).expect("validated width fits usize") * 3;
+        let rows = rect.rows.end - rect.rows.start;
+        let start = usize::try_from(rect.rows.start).expect("row offset fits validated height")
+            * stride
+            + usize::try_from(x).expect("validated column fits usize") * 3;
+        let mut rgb = Vec::with_capacity(
+            row_bytes * usize::try_from(rows).expect("validated height fits usize"),
+        );
+        let pixels = self.scene.pixels();
+        for row in 0..rows {
+            let offset =
+                start + usize::try_from(row).expect("row offset fits validated height") * stride;
+            rgb.extend_from_slice(&pixels[offset..offset + row_bytes]);
+        }
         ServerToPane::Frame(
-            FrameBand::new(
-                self.size,
-                u32::try_from(rows.start).expect("row offset fits validated height"),
-                self.scene.pixels()[bytes].to_vec(),
-            )
-            .expect("composed row band fits its frame"),
+            FrameBand::new(self.size, x, rect.rows.start, width, rgb)
+                .expect("composed rectangle fits its frame"),
         )
     }
 }

@@ -147,6 +147,7 @@ impl SharedPresentation {
 }
 
 fn whole_band(frame: &SharedFrame, pixels: Vec<u8>) -> io::Result<FrameBand> {
-    FrameBand::new(frame.size(), 0, pixels)
+    let size = frame.size();
+    FrameBand::new(size, 0, 0, size.width(), pixels)
         .ok_or_else(|| io::Error::other("invalid retained shared frame"))
 }

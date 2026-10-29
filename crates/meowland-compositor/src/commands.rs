@@ -119,6 +119,11 @@ impl State {
             PaneAction::ClipboardReply { request, data } => {
                 clipboard::reply(self, pane, request, data);
             }
+            PaneAction::ClipboardTransport(transport) => {
+                if let Some(entry) = self.attachments.get_mut(pane) {
+                    entry.clipboard = transport;
+                }
+            }
             PaneAction::Ack(ack) => self.pane_ack(pane, ack),
             PaneAction::FrameTransport(transport) => {
                 if let Some(entry) = self.attachments.get_mut(pane) {

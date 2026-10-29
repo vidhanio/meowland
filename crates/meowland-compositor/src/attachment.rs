@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::Show;
+use meowland_protocol::{Show, clipboard::Transport};
 
 use super::frame::PaneState;
 
@@ -39,6 +39,11 @@ pub(crate) struct AttachedPane {
     binding: Binding,
     pub policy: Policy,
     pub presentation: PaneState,
+    /// Clipboard transport the pane's terminal reported after probing.
+    ///
+    /// Exports assume full MIME support until a pane reports otherwise, so a
+    /// selection change before the first frame still reaches the terminal.
+    pub clipboard: Transport,
 }
 
 impl AttachedPane {
@@ -62,6 +67,7 @@ impl AttachedPane {
             binding,
             policy,
             presentation: PaneState::new(size),
+            clipboard: Transport::Kitty,
         }
     }
 

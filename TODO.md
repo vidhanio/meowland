@@ -171,11 +171,14 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   `CompositorHandler::commit` calls it three times, and each call walks up to 64
   parents. Compute it once and cache the owner in the surface `data_map` instead of
   `SurfaceCache::owners`.
-- [ ] **Clipboard export reads every MIME type eagerly.**
+- [x] **Clipboard export reads every MIME type eagerly.**
   `meowland-compositor/src/clipboard.rs` reads every representation (up to 64 types and
   32 MiB) from the app on every selection change, so copying an image in a browser
   pulls every format. Prioritise text and image types and cap the total. The OSC 5522
   write does need the data up front, but not all of it.
+  - Exports follow a short allowlist in preference order, and a pane that reports the
+    OSC 52 transport is offered only the first plain-text representation it has, capped
+    at `MAX_TEXT` instead of `MAX_BYTES`.
 - [x] **Framing buffers never shrink.** `protocol::send`/`recv` use a thread-local
   `SCRATCH`, and `asynchronous::Reader::body` keeps its high-water mark (up to
   64 MiB). Shrink after oversized messages.

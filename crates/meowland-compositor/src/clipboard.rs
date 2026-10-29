@@ -13,8 +13,8 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 use meowland_protocol::clipboard::{
-    ClipboardData, Deadline, Item, MAX_BYTES, Selection as ClipboardSelection, TRANSFER_TIMEOUT,
-    mime_types,
+    ClipboardData, Deadline, Item, MAX_BYTES, MAX_TEXT, Selection as ClipboardSelection,
+    TRANSFER_TIMEOUT, Transport, mime_types,
 };
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
@@ -42,6 +42,8 @@ struct Export {
     active: Option<Sources>,
     data: ClipboardData,
     bytes: usize,
+    /// Aggregate bytes this transport can use, from [`export_limit`].
+    limit: usize,
     deadline: Deadline,
 }
 
@@ -74,6 +76,54 @@ const fn wayland_selection(selection: ClipboardSelection) -> SelectionTarget {
     match selection {
         ClipboardSelection::Clipboard => SelectionTarget::Clipboard,
         ClipboardSelection::Primary => SelectionTarget::Primary,
+    }
+}
+
+/// Plain-text representations exported to every pane, most useful first.
+///
+/// Text leads because it is what a terminal pastes, and because legacy OSC 52
+/// panes can paste nothing else.
+const TEXT_EXPORT_MIMES: [&str; 5] = [
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+];
+
+/// Representations exported only to MIME-aware Kitty panes.
+///
+/// `text/uri-list` carries file-manager copies, which are text and cheaper to
+/// read than the image fallback that follows them.
+const RICH_EXPORT_MIMES: [&str; 3] = ["text/html", "text/uri-list", "image/png"];
+
+/// Aggregate bytes an export may copy from the application.
+///
+/// OSC 52 panes paste at most [`MAX_TEXT`] bytes of one text representation, so
+/// reading more would only transfer data the pane discards.
+const fn export_limit(transport: Transport) -> usize {
+    match transport {
+        Transport::Kitty => MAX_BYTES,
+        Transport::Osc52 => MAX_TEXT,
+    }
+}
+
+/// Select the representations to export over a pane's clipboard transport.
+///
+/// Any other type an application advertises is skipped rather than transferred:
+/// copying an image in a browser would otherwise pull every format the
+/// application can produce. OSC 52 carries a single text representation, so
+/// asking for more only copies data the pane has to discard.
+fn export_types(advertised: impl IntoIterator<Item = String>, transport: Transport) -> Vec<String> {
+    let offered = mime_types(advertised);
+    let usable = |mime: &&str| offered.iter().any(|offered| offered == mime);
+    let text = TEXT_EXPORT_MIMES.into_iter().filter(usable);
+    match transport {
+        Transport::Kitty => text
+            .chain(RICH_EXPORT_MIMES.into_iter().filter(usable))
+            .map(str::to_owned)
+            .collect(),
+        Transport::Osc52 => text.take(1).map(str::to_owned).collect(),
     }
 }
 
@@ -148,16 +198,21 @@ pub(crate) fn selection(
         return;
     };
     let id = state.clipboard.id();
+    let transport = state
+        .attachments
+        .get(pane)
+        .map_or(Transport::Kitty, |pane| pane.clipboard);
     state.clipboard.set_export(
         target,
         Some(Export {
             id,
             target,
             pane,
-            mimes: mime_types(source.mime_types()).into(),
+            mimes: export_types(source.mime_types(), transport).into(),
             active: None,
             data: ClipboardData::default(),
             bytes: 0,
+            limit: export_limit(transport),
             deadline: Deadline::new(TRANSFER_TIMEOUT),
         }),
     );
@@ -228,7 +283,7 @@ fn export_source(state: &State, export: &Export, mime: String) -> io::Result<Sou
     let id = export.id;
     let target = export.target;
     let deadline = export.deadline;
-    let limit = MAX_BYTES - export.bytes;
+    let limit = export.limit.saturating_sub(export.bytes);
     let mut bytes = Vec::new();
     let requested_mime = mime.clone();
     sources.io = Some(

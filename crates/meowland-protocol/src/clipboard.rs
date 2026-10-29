@@ -26,6 +26,16 @@ pub enum Selection {
     Primary,
 }
 
+/// Terminal clipboard transport, deciding which representations an export
+/// needs.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Transport {
+    /// MIME-aware, permission-aware OSC 5522 transfers.
+    Kitty,
+    /// Legacy OSC 52 plain-text transfers.
+    Osc52,
+}
+
 /// One MIME representation of clipboard contents, validated by the receiving
 /// transport.
 #[derive(Clone, Debug, Deserialize, Serialize)]

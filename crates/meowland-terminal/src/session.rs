@@ -21,7 +21,7 @@ use meowland_input::{
 use meowland_protocol::{
     self as protocol, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane, Show,
     asynchronous::{Outgoing, Reader},
-    clipboard::Selection,
+    clipboard::{Selection, Transport},
 };
 use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
 type Socket = Async<'static, UnixStream>;
@@ -395,11 +395,16 @@ impl TerminalSession {
         self.flush_output().await?;
         self.tx
             .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
-        self.clipboard = Clipboard::new(if probe.clipboard.is_some() {
+        let protocol = if probe.clipboard.is_some() {
             ClipboardProtocol::Kitty
         } else {
             ClipboardProtocol::Osc52
-        })?;
+        };
+        self.tx
+            .send(&PaneToServer::Action(PaneAction::ClipboardTransport(
+                clipboard_transport(protocol),
+            )))?;
+        self.clipboard = Clipboard::new(protocol)?;
         let _ = self
             .clipboard
             .refresh(Selection::Clipboard, Refresh::Background);
@@ -499,6 +504,14 @@ impl TerminalSession {
         }
         self.stdout.flush().await?;
         Ok(())
+    }
+}
+
+/// Report the probed clipboard protocol as the transport hint for the server.
+const fn clipboard_transport(protocol: ClipboardProtocol) -> Transport {
+    match protocol {
+        ClipboardProtocol::Kitty => Transport::Kitty,
+        ClipboardProtocol::Osc52 => Transport::Osc52,
     }
 }
 

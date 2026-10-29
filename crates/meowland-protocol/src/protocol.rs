@@ -307,6 +307,11 @@ pub enum PaneAction {
         #[serde(with = "serde_bytes")]
         data: Option<Vec<u8>>,
     },
+    /// Report the clipboard transport the terminal accepted while probing.
+    ///
+    /// The server reads only representations the pane can apply, so a legacy
+    /// OSC 52 pane never pays for image transfers.
+    ClipboardTransport(crate::clipboard::Transport),
     /// Select pixel transport after terminal probing or shared-memory failure.
     FrameTransport(crate::FrameTransport),
 }

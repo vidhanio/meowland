@@ -57,7 +57,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
   `resolve_pending_panes`), and so on. Each redundant configure makes clients
   re-layout and re-render. Use `send_pending_configure()`, which only sends when
   pending state differs from the last configure.
-- [ ] **Mixed sync and async writers to the TTY.** `TerminalGuard`
+- [x] **Mixed sync and async writers to the TTY.** `TerminalGuard`
   (`meowland-terminal/src/terminal.rs`) writes mode switches with blocking
   `io::stdout()`. Frames go through a separate nonblocking descriptor
   (`output::open`). A restore can interleave with a half-drained frame. Route mode

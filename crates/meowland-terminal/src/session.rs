@@ -7,7 +7,7 @@ use std::{
 };
 
 use calloop::{LoopHandle, io::Async, signals::Signal as UnixSignal};
-use futures::FutureExt;
+use futures::{FutureExt, io::AsyncWriteExt};
 use meowland_core::{
     asynchronous::{Descriptor, sleep_until, when},
     future::yield_now,
@@ -147,7 +147,7 @@ impl TerminalSession {
                 () = when((pending_input && !pending_tx).then(yield_now)).fuse() => Ready::BufferedInput,
             };
             match ready {
-                Ready::Terminate => return self.close(None),
+                Ready::Terminate => return self.close(None).await,
                 Ready::Resize => self.send_event(input::Event::Resize)?,
                 Ready::Server(result) => self.handle_server_message(result?).await?,
                 Ready::Output(result) => {
@@ -157,7 +157,7 @@ impl TerminalSession {
                 Ready::Transmit(Err(error)) => return self.finish_after_write_error(error).await,
                 Ready::Input(result) => {
                     if result.is_err() {
-                        return self.close(None);
+                        return self.close(None).await;
                     }
                 }
                 Ready::Transmit(Ok(())) | Ready::Deadline | Ready::BufferedInput => {}
@@ -178,10 +178,10 @@ impl TerminalSession {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             futures::select! {
-                _ = self.termination.recv().fuse() => return self.close(None),
+                _ = self.termination.recv().fuse() => return self.close(None).await,
                 result = sleep_until(&self.handle, Some(deadline)).fuse() => { result?; return Err(error.into()); },
                 result = self.receiver.read::<ServerToPane>().fuse() => match result {
-                    Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)),
+                    Ok(ServerToPane::Release(reason) | ServerToPane::Reject(reason)) => return self.close(Some(&reason)).await,
                     Err(_) => return Err(error.into()),
                     Ok(_) => {}
                 }
@@ -231,7 +231,7 @@ impl TerminalSession {
                 }
             }
             ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
-                return self.close(Some(&reason));
+                return self.close(Some(&reason)).await;
             }
             ServerToPane::Bell => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
@@ -316,7 +316,8 @@ impl TerminalSession {
         reason = "the terminal session runs on calloop's local executor"
     )]
     async fn start_presentation(&mut self) -> Result<()> {
-        let mut mode = TerminalGuard::enter()?;
+        let mut mode = TerminalGuard::enter(self.presentation.buffer())?;
+        self.flush_output().await?;
         let Some(probe) = terminal_probe(
             &mut self.input,
             &mut self.stdout,
@@ -325,8 +326,10 @@ impl TerminalSession {
         )
         .await?
         else {
-            mode.restore()?;
-            return self.close(None);
+            let raw = mode.restore_into(self.presentation.buffer());
+            self.close(None).await?;
+            raw?;
+            return Ok(());
         };
         if !probe.frame_edits {
             return Err(Error::GraphicsUnsupported);
@@ -339,10 +342,6 @@ impl TerminalSession {
             .is_none_or(|flags| !flags.contains(KEYBOARD_FLAGS))
         {
             return Err(Error::KeyboardUnsupported);
-        }
-        mode.enable_mouse()?;
-        if let Some(previous) = probe.clipboard {
-            mode.enable_clipboard(previous)?;
         }
         self.cell = probe.cell_width.zip(probe.cell_height).or(self.cell);
         let (width, height) = terminal::pane_pixels(
@@ -357,6 +356,11 @@ impl TerminalSession {
             FrameTransport::Inline
         };
         self.presentation = PanePresentation::new(self.cell, transport);
+        mode.enable_mouse(self.presentation.buffer());
+        if let Some(previous) = probe.clipboard {
+            mode.enable_clipboard(previous, self.presentation.buffer());
+        }
+        self.flush_output().await?;
         self.tx
             .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
         self.clipboard = Clipboard::new(if probe.clipboard.is_some() {
@@ -393,17 +397,45 @@ impl TerminalSession {
         Ok(())
     }
 
-    fn close(&mut self, reason: Option<&str>) -> Result<()> {
-        let restored = match std::mem::replace(&mut self.lifecycle, Lifecycle::Closed) {
-            Lifecycle::Active(mut mode) => mode.restore(),
-            _ => Ok(()),
+    /// Restore terminal modes after frame output drains, then report a reason.
+    ///
+    /// The restore sequence is appended to the same ordered queue as frames, so
+    /// a half-written frame can never interleave with it.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn close(&mut self, reason: Option<&str>) -> Result<()> {
+        let mut failure = if let Lifecycle::Active(mut mode) =
+            std::mem::replace(&mut self.lifecycle, Lifecycle::Closed)
+        {
+            mode.restore_into(self.presentation.buffer())
+                .err()
+                .map(Error::from)
+        } else {
+            None
         };
-        let printed = reason.map_or(Ok(()), |reason| {
-            let clean = protocol::sanitize_with_limit(reason, 512);
-            writeln!(io::stdout(), "meowland: {clean}")
-        });
-        restored?;
-        printed?;
+        if let Some(reason) = reason {
+            let clean = protocol::sanitize_with_limit(reason, terminal::MAX_TEXT_CHARS);
+            self.presentation
+                .append(format!("meowland: {clean}\n").as_bytes());
+        }
+        if let Err(error) = self.flush_output().await {
+            failure = failure.or(Some(error));
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Write every queued terminal byte in order before the session ends.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn flush_output(&mut self) -> Result<()> {
+        while self.presentation.pending() {
+            self.presentation.drain(&mut self.stdout).await?;
+        }
+        self.stdout.flush().await?;
         Ok(())
     }
 }

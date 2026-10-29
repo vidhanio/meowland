@@ -4,9 +4,17 @@ use std::io::{self, Write};
 
 use crossterm::{
     event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
-    execute, terminal,
+    queue, terminal,
 };
 use meowland_protocol as protocol;
+
+/// Longest sanitized title or status line forwarded to the terminal.
+///
+/// Titles and close reasons come from the server, so this bounds how much one
+/// untrusted control sequence can add to the output queue.
+pub(crate) const MAX_TEXT_CHARS: usize = 512;
+/// Longest pointer-shape name forwarded to the terminal.
+const MAX_CURSOR_NAME_CHARS: usize = 64;
 
 /// Cell size assumed when the terminal reports none.
 pub(crate) const FALLBACK_CELL: (u16, u16) = (10, 20);
@@ -65,7 +73,7 @@ pub(crate) fn derived_cell(pixels: Option<(u32, u32)>, cells: (u16, u16)) -> Opt
 }
 
 pub(crate) fn title_bytes(title: &str) -> Vec<u8> {
-    let clean = protocol::sanitize_with_limit(title, 512);
+    let clean = protocol::sanitize_with_limit(title, MAX_TEXT_CHARS);
     format!("\x1b]2;{clean}\x07").into_bytes()
 }
 
@@ -75,7 +83,7 @@ pub(crate) fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
         .unwrap_or_default()
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(64)
+        .take(MAX_CURSOR_NAME_CHARS)
         .collect();
     format!("\x1b]22;{name}\x1b\\").into_bytes()
 }
@@ -94,81 +102,88 @@ pub(crate) struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    pub(crate) fn enter() -> io::Result<Self> {
+    /// Enter raw mode and append the sequences that switch pane modes on.
+    ///
+    /// Escape sequences are appended to `out`, the session's ordered output
+    /// queue, so they can never interleave with a partially written frame. Raw
+    /// mode itself is a termios change and takes effect immediately.
+    pub(crate) fn enter(out: &mut Vec<u8>) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self {
             active: true,
             mouse: false,
             clipboard: None,
         };
-        execute!(
-            io::stdout(),
+        queue!(
+            out,
             terminal::EnterAlternateScreen,
             crossterm::cursor::Hide,
             PushKeyboardEnhancementFlags(REQUESTED_KEYBOARD_FLAGS),
             event::EnableFocusChange
-        )?;
-        io::stdout().write_all(b"\x1b[?7l\x1b[?25l\x1b[?2004h")?;
-        io::stdout().flush()?;
+        )
+        .expect("writing terminal commands to a byte buffer cannot fail");
+        out.extend_from_slice(b"\x1b[?7l\x1b[?25l\x1b[?2004h");
         Ok(guard)
     }
 
-    pub(crate) fn enable_mouse(&mut self) -> io::Result<()> {
+    pub(crate) fn enable_mouse(&mut self, out: &mut Vec<u8>) {
         self.mouse = true;
-        io::stdout().write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h")?;
-        io::stdout().flush()?;
-        Ok(())
+        out.extend_from_slice(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h");
     }
 
-    pub(crate) fn enable_clipboard(&mut self, previous: ClipboardMode) -> io::Result<()> {
+    pub(crate) fn enable_clipboard(&mut self, previous: ClipboardMode, out: &mut Vec<u8>) {
         self.clipboard = Some(previous);
-        io::stdout().write_all(b"\x1b[?5522h")?;
-        io::stdout().flush()
+        out.extend_from_slice(b"\x1b[?5522h");
     }
 
+    /// Append the sequences that undo this guard and disable raw mode.
+    ///
     /// Cancel interrupted control strings and end synchronized updates before
-    /// restoring modes. Attempt every step even if an earlier one fails.
-    pub(crate) fn restore(&mut self) -> io::Result<()> {
+    /// restoring modes. Every step is appended even though disabling raw mode
+    /// can fail; the first failure is returned once all bytes are queued.
+    pub(crate) fn restore_into(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         if !self.active {
             return Ok(());
         }
         self.active = false;
-        let mut failure = None;
-        let mut note = |result: io::Result<()>| {
-            if failure.is_none() {
-                failure = result.err();
-            }
-        };
-        note(terminal::disable_raw_mode());
-        note(io::stdout().write_all(b"\x18\x1b\\"));
-        note(execute!(io::stdout(), terminal::EndSynchronizedUpdate));
+        let raw = terminal::disable_raw_mode();
+        out.extend_from_slice(b"\x18\x1b\\");
+        queue!(out, terminal::EndSynchronizedUpdate)
+            .expect("writing terminal commands to a byte buffer cannot fail");
         if self.mouse {
             self.mouse = false;
-            note(io::stdout().write_all(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l"));
+            out.extend_from_slice(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
         }
         if let Some(previous) = self.clipboard.take() {
-            note(
-                io::stdout().write_all(if previous == ClipboardMode::Enabled {
-                    b"\x1b[?5522h"
-                } else {
-                    b"\x1b[?5522l"
-                }),
-            );
+            out.extend_from_slice(if previous == ClipboardMode::Enabled {
+                b"\x1b[?5522h"
+            } else {
+                b"\x1b[?5522l"
+            });
         }
-        note(io::stdout().write_all(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\"));
-        note(execute!(
-            io::stdout(),
+        out.extend_from_slice(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\");
+        queue!(
+            out,
             event::DisableFocusChange,
             event::PopKeyboardEnhancementFlags,
             crossterm::cursor::Show,
             terminal::LeaveAlternateScreen
-        ));
-        failure.map_or(Ok(()), Err)
+        )
+        .expect("writing terminal commands to a byte buffer cannot fail");
+        raw
+    }
+
+    /// Best-effort synchronous restore for unwinding or error paths.
+    fn restore_blocking(&mut self) {
+        let mut bytes = Vec::new();
+        let _ = self.restore_into(&mut bytes);
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(&bytes).and_then(|()| stdout.flush());
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = self.restore();
+        self.restore_blocking();
     }
 }

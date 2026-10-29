@@ -133,7 +133,8 @@ impl Reader {
     ///
     /// # Errors
     /// Returns an error on EOF, input failure, or an unterminated control
-    /// sequence that exceeds the recovery limit.
+    /// sequence that exceeds the recovery limit, including one whose deadline
+    /// elapsed while this read was waiting.
     #[expect(
         clippy::future_not_send,
         reason = "terminal input belongs to the calloop owner thread"
@@ -147,6 +148,7 @@ impl Reader {
         if read == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
+        self.check_recovery()?;
         for &byte in &self.bytes[..read] {
             self.parser.push(byte)?;
         }
@@ -229,10 +231,12 @@ impl Parser {
         tracing::warn!("Discarding oversized terminal control sequence");
     }
 
-    const fn end_muted(&mut self) {
+    fn end_muted(&mut self, now: Instant) -> Result<(), InputError> {
+        self.check_recovery(now)?;
         self.decoder.muted = false;
         self.muted_bytes = 0;
         self.muted_deadline = None;
+        Ok(())
     }
 
     fn check_recovery(&self, now: Instant) -> Result<(), InputError> {
@@ -325,7 +329,7 @@ impl Parser {
         if self.decoder.muted {
             self.muted_bytes += 1;
             if self.terminal.is_ground() {
-                self.end_muted();
+                self.end_muted(Instant::now())?;
             } else if self.muted_bytes > MAX_MUTED {
                 return Err(InputError);
             }
@@ -609,6 +613,14 @@ fn button(code: u32) -> Option<Button> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        io::Write,
+        os::unix::net::UnixStream,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
     use super::*;
 
     fn parse_result(bytes: &[u8]) -> (Result<(), InputError>, Vec<Event>) {
@@ -646,6 +658,15 @@ mod tests {
         let mut bytes = MOUSE_PREFIX.to_vec();
         bytes.extend(std::iter::repeat_n(b'1', MAX_MOUSE + 1 + extra));
         bytes
+    }
+
+    fn muted_parser() -> Parser {
+        let mut parser = Parser::new();
+        for &byte in &oversized_mouse(0) {
+            parser.push(byte).expect("muted mouse report");
+        }
+        assert!(parser.muted_deadline.is_some(), "parser must be muted");
+        parser
     }
 
     fn assert_focus_only(name: &str, bytes: &[u8]) {
@@ -1317,10 +1338,7 @@ mod tests {
 
     #[test]
     fn parser_enforces_the_muted_recovery_deadline() {
-        let mut parser = Parser::new();
-        for &byte in &oversized_mouse(0) {
-            parser.push(byte).expect("muted mouse report");
-        }
+        let parser = muted_parser();
         let deadline = parser.muted_deadline.expect("muted after mouse overflow");
         let before = deadline
             .checked_sub(Duration::from_millis(1))
@@ -1328,12 +1346,72 @@ mod tests {
         assert!(parser.check_recovery(before).is_ok());
         assert_eq!(parser.check_recovery(deadline), Err(InputError));
 
-        let mut recovered = Parser::new();
-        for &byte in &oversized_mouse(0) {
-            recovered.push(byte).expect("muted mouse report");
-        }
+        let mut recovered = muted_parser();
         recovered.push(b'M').expect("terminated mouse report");
         assert!(recovered.muted_deadline.is_none());
+        for &byte in b"\x1b[I" {
+            recovered.push(byte).expect("input after recovery");
+        }
+        assert!(matches!(
+            recovered.decoder.events.front(),
+            Some(Event::Focus(true))
+        ));
+        assert_eq!(recovered.decoder.events.len(), 1);
+    }
+
+    #[test]
+    fn parser_fails_closed_when_a_terminator_arrives_after_the_recovery_deadline() {
+        let mut parser = muted_parser();
+        parser.muted_deadline = Some(Instant::now());
+        assert_eq!(parser.push(b'M'), Err(InputError));
+        assert!(
+            parser.muted_deadline.is_some(),
+            "an expired deadline must not be cleared"
+        );
+        assert!(parser.decoder.events.is_empty());
+    }
+
+    #[test]
+    fn reader_fails_closed_when_a_read_completes_after_the_recovery_deadline() {
+        const RACE_MARGIN: Duration = Duration::from_millis(200);
+
+        fn poll_once(
+            future: &mut Pin<Box<impl Future<Output = io::Result<()>>>>,
+        ) -> Poll<io::Result<()>> {
+            let mut context = Context::from_waker(Waker::noop());
+            future.as_mut().poll(&mut context)
+        }
+
+        let event_loop: calloop::EventLoop<'static, ()> =
+            calloop::EventLoop::try_new().expect("event loop");
+        let (read, mut write) = UnixStream::pair().expect("socket pair");
+        let fd = Descriptor::new(read.into(), &event_loop.handle()).expect("descriptor");
+        let mut reader = Reader {
+            fd,
+            parser: muted_parser(),
+            bytes: vec![0; 16 * 1024].into_boxed_slice(),
+        };
+        let deadline = Instant::now() + RACE_MARGIN;
+        reader.parser.muted_deadline = Some(deadline);
+
+        let mut read_ready = Box::pin(reader.read_ready());
+        assert!(
+            poll_once(&mut read_ready).is_pending(),
+            "the read must wait for input before the deadline"
+        );
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        write.write_all(b"1").expect("write a continuation byte");
+        let result = match poll_once(&mut read_ready) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("the read must complete after the continuation byte"),
+        };
+        let error = result.expect_err("a read completing after the recovery deadline must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(read_ready);
+        assert!(reader.parser.muted_deadline.is_some());
+        assert!(!reader.pending());
     }
 
     #[test]

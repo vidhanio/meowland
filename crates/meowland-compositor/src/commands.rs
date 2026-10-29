@@ -42,8 +42,6 @@ pub enum Command {
     /// Ask all windows to close while continuing to dispatch their shutdown
     /// work.
     CloseAll,
-    /// Ask windows to close and stop event-loop dispatch.
-    Shutdown,
 }
 
 impl State {
@@ -67,11 +65,10 @@ impl State {
             }
             Command::Detach { pane } => self.release_pane_window(pane),
             Command::Pane { pane, action } => self.pane_action(pane, action),
-            command @ (Command::CloseAll | Command::Shutdown) => {
+            Command::CloseAll => {
                 for window in self.windows.values() {
                     window.surface.send_close();
                 }
-                self.shutdown |= matches!(command, Command::Shutdown);
             }
         }
     }

@@ -234,7 +234,7 @@ pub fn window_geometry(surface: &WlSurface) -> Point<i32, Logical> {
 /// Convert a popup's window-geometry position to its surface origin in the
 /// pane.
 #[must_use]
-pub fn popup_origin(
+fn popup_origin(
     parent_geometry: Point<i32, Logical>,
     location: Point<i32, Logical>,
     popup: &PopupKind,

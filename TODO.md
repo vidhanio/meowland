@@ -209,11 +209,11 @@ These follow the `rust-best-practices` skill.
   and `cell_width`/`cell_height` as independent `Option`s. Use
   `Option<(u32, u32)>`, or reuse `FrameSize`.
 - [ ] **Remove dead or over-public items.**
-  - `Command::Shutdown` is never constructed.
-  - `ControlRequest::Ping` is never sent by the CLI.
-  - `terminal_clipboard::Clipboard::cancel_refresh` has no external callers.
-  - `render::popup_origin` and `Paths::in_runtime_dir` should be `pub(crate)` or
-    private.
+  - [x] `Command::Shutdown` is never constructed.
+  - [ ] `ControlRequest::Ping` is never sent by the CLI.
+  - [ ] `terminal_clipboard::Clipboard::cancel_refresh` has no external callers.
+  - [x] `render::popup_origin` is private.
+  - [ ] `Paths::in_runtime_dir` should be `pub(crate)` or private.
 - [x] **Duplicate completers.** `meowland/src/cli.rs` `attach_targets` and
   `window_targets` are identical.
 - [x] **Logging setup sits in the wrong module.** `cli::start` calls back into

@@ -36,8 +36,9 @@ pub enum Kind {
     Release,
 }
 
-/// Logical key identity and modifier state reported by the Kitty protocol.
-#[derive(Clone, Copy, Debug)]
+/// Logical key identity, modifier state, and associated text reported by the
+/// Kitty protocol.
+#[derive(Clone, Debug)]
 pub struct Key {
     /// Unicode code point or Kitty functional-key number.
     pub code: u32,
@@ -45,6 +46,8 @@ pub struct Key {
     pub modifiers: Modifiers,
     /// Press, repeat, or release transition.
     pub kind: Kind,
+    /// Text the terminal associated with the transition, if reported.
+    pub text: Option<String>,
 }
 
 /// Decoded terminal event, with bounded text and control-sequence payloads.
@@ -420,6 +423,7 @@ fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
         code,
         modifiers,
         kind,
+        text,
     }))
 }
 

@@ -82,6 +82,7 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
             key,
             pressed,
             modifiers,
+            ref text,
             ref held,
         } => {
             keymap::refresh(state);
@@ -99,6 +100,7 @@ pub(crate) fn pane_input(state: &mut State, pane: PaneId, event: &Input) {
                     KeyState::Released
                 },
                 modifiers,
+                text.as_deref(),
             );
         }
         Input::KeyboardEnter {
@@ -152,7 +154,13 @@ fn valid_keys(keys: &[u32]) -> bool {
 }
 
 /// Route one key transition through the active layout or the text fallback.
-fn key_transition(state: &mut State, key: u32, transition: KeyState, modifiers: Modifiers) {
+fn key_transition(
+    state: &mut State,
+    key: u32,
+    transition: KeyState,
+    modifiers: Modifiers,
+    text: Option<&str>,
+) {
     let code = state.keymap.lookup(key);
     if transition == KeyState::Pressed {
         if let Some(code) = code {
@@ -160,7 +168,7 @@ fn key_transition(state: &mut State, key: u32, transition: KeyState, modifiers: 
                 inject_key(&keyboard, state, key, code, transition, modifiers);
                 state.keyboard = Some(keyboard);
             }
-        } else if let Some(text) = key_text(key, modifiers) {
+        } else if let Some(text) = key_text(key, text, modifiers) {
             text::commit(state, &text);
         } else if modifiers.intersects(Modifiers::SHORTCUT) {
             tracing::debug!(
@@ -180,12 +188,12 @@ fn key_transition(state: &mut State, key: u32, transition: KeyState, modifiers: 
     }
 }
 
-/// Text an unmapped printable key commits when no shortcut owns it.
-fn key_text(key: u32, bits: Modifiers) -> Option<String> {
+/// Text an unmapped key commits when no shortcut owns it.
+fn key_text(key: u32, text: Option<&str>, bits: Modifiers) -> Option<String> {
     if bits.intersects(Modifiers::SHORTCUT) {
         return None;
     }
-    keymap::text(key)
+    text.map(str::to_owned).or_else(|| keymap::text(key))
 }
 
 fn pointer_input(

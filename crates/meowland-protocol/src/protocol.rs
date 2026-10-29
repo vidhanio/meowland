@@ -229,6 +229,10 @@ pub enum Input {
         pressed: bool,
         /// [`Modifiers`] snapshot, including lock state.
         modifiers: Modifiers,
+        /// Text the terminal associated with the transition, when it reported
+        /// any; at most [`MAX_INPUT_TEXT`] bytes and without control
+        /// characters.
+        text: Option<String>,
         /// Client-known held keys immediately before this transition.
         held: Vec<u32>,
     },

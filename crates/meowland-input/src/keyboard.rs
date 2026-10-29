@@ -39,6 +39,7 @@ impl Keyboard {
             key: event.code,
             pressed,
             modifiers: event.modifiers,
+            text: event.text,
             held,
         })
     }

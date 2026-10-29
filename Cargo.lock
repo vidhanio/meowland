@@ -591,12 +591,18 @@ dependencies = [
  "meowland-protocol",
  "meowland-server",
  "meowland-terminal",
- "rustix 1.1.5",
  "thiserror",
  "toml",
  "tracing-journald",
  "tracing-subscriber",
  "usage-rs",
+]
+
+[[package]]
+name = "meowland-bench"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.5",
  "wayland-client",
  "wayland-protocols",
 ]

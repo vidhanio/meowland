@@ -1,7 +1,7 @@
 # TODO
 
 Inventory and backlog from a full read of the workspace (about 13.4k lines of Rust in
-10 crates, plus about 1.4k lines of Python benchmarks). See the README for the
+11 crates, plus about 1.4k lines of Python benchmarks). See the README for the
 architecture diagrams. Items are ordered by impact within each section. File paths are
 relative to `crates/` unless stated otherwise.
 
@@ -9,7 +9,8 @@ relative to `crates/` unless stated otherwise.
 
 | Crate | Lines | Role |
 |---|---|---|
-| `meowland` | 860 | CLI (`usage-rs`), config loading, logging, benchmark workload bin |
+| `meowland` | 443 | CLI (`usage-rs`), config loading, logging |
+| `meowland-bench` | 538 | Benchmark workload binary and cargo bench shim |
 | `meowland-server` | 1068 | Owns the `calloop` loop: sockets, socket activation, child processes, shutdown |
 | `meowland-compositor` | 4557 | Smithay state: shell, seat, input injection, panes, clipboard bridge, DMA-BUF readback, frame pacing |
 | `meowland-render` | 1421 | CPU compositor (RGBA to RGB, viewport, scale), damage, EGL/GLES DMA-BUF backend |
@@ -126,7 +127,7 @@ nightly, and deduplicating the systemd units (Home Manager needs its own copy).
 - [x] **Encode readback phases in types.** `readback.rs` `submit` and `complete`
   `unreachable!()` on the wrong `Phase`. Keep acquiring and reading operations in
   separate maps, or pass the phase payload to the callback directly.
-- [ ] **Move benchmarks out of the shipping crate.** The `benchmarks` feature,
+- [x] **Move benchmarks out of the shipping crate.** The `benchmarks` feature,
   `[[bin]] meowland-workload`, `[[bench]] suite`, and the optional
   `wayland-client`/`wayland-protocols`/`rustix` dependencies make
   `crates/meowland/Cargo.toml` mostly about benchmarks. Create a

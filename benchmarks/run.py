@@ -298,7 +298,7 @@ def metadata(args):
     root = Path(__file__).resolve().parent.parent
     binary = Path(os.environ["MEOWLAND_BENCH_BINARY"])
     sources = sorted((root / "benchmarks").glob("*.py")) + sorted(
-        (root / "crates/meowland/benchmarks").rglob("*.rs")
+        (root / "crates/meowland-bench").rglob("*.rs")
     )
     harness_hash = hashlib.sha256(
         b"".join(source.read_bytes() for source in sources)
@@ -543,7 +543,7 @@ def main():
         or "MEOWLAND_BENCH_WORKLOAD" not in os.environ
     ):
         parser.error(
-            "launch through cargo bench -p meowland --features benchmarks --bench suite -- [options]"
+            "launch through cargo bench -p meowland-bench --bench suite -- [options]"
         )
     path = args.output or Path("target/benchmarks") / (
         datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ") + ".json"

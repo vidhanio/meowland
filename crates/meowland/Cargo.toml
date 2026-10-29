@@ -9,28 +9,7 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-benchmarks = ["dep:rustix", "dep:wayland-client", "dep:wayland-protocols"]
-
-[[bin]]
-name = "meowland-workload"
-path = "benchmarks/workload/main.rs"
-required-features = ["benchmarks"]
-
-[[bench]]
-name = "suite"
-path = "benchmarks/suite.rs"
-harness = false
-required-features = ["benchmarks"]
-
 [dependencies]
-rustix = { workspace = true, optional = true, features = [
-  "event",
-  "fs",
-  "time",
-] }
-wayland-client = { workspace = true, optional = true }
-wayland-protocols = { workspace = true, optional = true, features = ["client"] }
 dirs = { workspace = true }
 meowland-core = { workspace = true }
 meowland-protocol = { workspace = true }

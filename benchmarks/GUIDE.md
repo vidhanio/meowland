@@ -7,17 +7,18 @@ runner uses only Python's standard library. No benchmark service is installed.
 
 ## Commands
 
-Quick iteration, including rebuilding the real executables when necessary:
+Quick iteration; the shim rebuilds the release `meowland` binary in the same
+target directory before starting the harness:
 
 ```sh
-cargo bench -p meowland --features benchmarks --bench suite
+cargo bench -p meowland-bench --bench suite
 ```
 
 This runs six cases with 3 warmups, 12 operations, and one fresh process tree per
 case. For a focused, less noisy measurement:
 
 ```sh
-cargo bench -p meowland --features benchmarks --bench suite -- \
+cargo bench -p meowland-bench --bench suite -- \
   --filter sparse --samples 120 --warmup 8 --runs 3
 ```
 
@@ -26,33 +27,35 @@ additional high-resolution, transport, backpressure, attachment, and structural
 cases:
 
 ```sh
-cargo bench -p meowland --features benchmarks --bench suite -- --full
-cargo bench -p meowland --features benchmarks --bench suite -- --full --list
+cargo bench -p meowland-bench --bench suite -- --full
+cargo bench -p meowland-bench --bench suite -- --full --list
 ```
 
 `--filter` selects a case-name substring before starting processes. Explicit
 `--samples`, `--warmup`, and `--runs` override the quick/full defaults. Cargo's
-bench profile is optimized. The `benchmarks` feature builds the workload helper;
-it is not part of the normal executable or installed Nix package.
+bench profile is optimized. The `meowland-bench` package builds the workload
+helper; it is not part of the normal executable or installed Nix package.
 
 ### Comparing commits
 
 Run the same harness and settings on each revision. Save JSON outside the
 checkout if switching branches, or use separate worktrees with their own Cargo
 target directories. There is no executable-path selection or two-binary mode:
-Cargo supplies both executable paths through `CARGO_BIN_EXE_*`.
+Cargo supplies the workload path through `CARGO_BIN_EXE_meowland-workload`. The
+suite shim builds the release `meowland` binary in the same target directory and
+passes both paths to the harness.
 
 On the baseline revision:
 
 ```sh
-cargo bench -p meowland --features benchmarks --bench suite -- \
+cargo bench -p meowland-bench --bench suite -- \
   --full --output /tmp/meowland-before.json
 ```
 
 On the candidate revision:
 
 ```sh
-cargo bench -p meowland --features benchmarks --bench suite -- \
+cargo bench -p meowland-bench --bench suite -- \
   --full --output /tmp/meowland-after.json --compare /tmp/meowland-before.json
 ```
 
@@ -78,7 +81,7 @@ workload plus a small cell-rounding margin:
 
 ```sh
 nix shell nixpkgs#kitty nixpkgs#xdotool nixpkgs#imagemagick -c \
-  cargo bench -p meowland --features benchmarks --bench suite -- \
+  cargo bench -p meowland-bench --bench suite -- \
   --terminal kitty --filter input --samples 30 --output /tmp/meowland-kitty.json
 ```
 
@@ -93,7 +96,7 @@ nix shell nixpkgs#kitty nixpkgs#xdotool nixpkgs#imagemagick nixpkgs#xorg-server 
     trap "kill $display_pid; wait $display_pid 2>/dev/null" EXIT
     sleep 1
     DISPLAY=:199 LIBGL_ALWAYS_SOFTWARE=1 \
-      cargo bench -p meowland --features benchmarks --bench suite -- \
+      cargo bench -p meowland-bench --bench suite -- \
       --terminal kitty --samples 12 --output /tmp/meowland-kitty-software.json
   '
 ```
@@ -133,7 +136,7 @@ consumption latency.
 
 ```sh
 nix shell nixpkgs#vulkan-tools -c \
-  cargo bench -p meowland --features benchmarks --bench suite -- \
+  cargo bench -p meowland-bench --bench suite -- \
   --gpu --filter vulkan --output /tmp/meowland-vulkan.json
 ```
 

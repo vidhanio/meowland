@@ -1,0 +1,23 @@
+[package]
+name = "meowland-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "meowland-workload"
+path = "src/main.rs"
+
+[[bench]]
+name = "suite"
+path = "benches/suite.rs"
+harness = false
+
+[dependencies]
+rustix = { workspace = true, features = ["event", "fs", "time"] }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }

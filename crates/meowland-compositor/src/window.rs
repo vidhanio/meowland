@@ -11,7 +11,7 @@ use smithay::{
     wayland::compositor::SurfaceData,
 };
 
-use super::{Compositor, Policy, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
+use super::{Compositor, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
 
 impl Window {
     fn with_surface_trees(&self, mut visit: impl FnMut(&WlSurface)) {
@@ -61,7 +61,6 @@ impl Compositor {
             .toplevels
             .announce(id, &info.title, &info.app_id);
         self.touch(id);
-        self.follow_panes(id);
         self.resolve_pending_panes();
         self.apply_window_state(id);
         self.enter_output(id);
@@ -85,22 +84,7 @@ impl Compositor {
             self.refresh_popup_grab();
             input::reset_keyboard(self);
         }
-        for pane in self.panes_showing(id) {
-            if self
-                .attachments
-                .get(pane)
-                .is_none_or(|entry| entry.policy != Policy::FollowNewest)
-            {
-                continue;
-            }
-            if let Some(next) = self.windows.catalog.newest() {
-                self.bind_pane_window(pane, next);
-            } else {
-                self.attachments.clear(pane);
-                self.emit(pane, ServerToPane::Title(String::new()));
-                self.send_pane_cursor(pane);
-            }
-        }
+        self.unbind_following_panes(id);
         if focused {
             let next = self
                 .attachments

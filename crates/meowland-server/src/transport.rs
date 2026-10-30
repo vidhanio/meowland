@@ -101,7 +101,7 @@ async fn pane(
         bytes: Rc::new(Cell::new(0)),
     };
     incoming
-        .send(Incoming::Attach(pane, hello, output))
+        .send(Incoming::Focus(pane, hello, output))
         .await
         .map_err(io::Error::other)?;
     let receiving = async {

@@ -60,7 +60,7 @@ mod toplevels;
 mod window;
 
 pub use meowland_panes::PaneId;
-use meowland_panes::{Policy, Selection, WindowCatalog};
+use meowland_panes::{Matcher, Selection, WindowCatalog, WindowId};
 
 pub(crate) type AttachedPane = meowland_panes::AttachedPane<frame::PaneState>;
 pub(crate) type Attachments = meowland_panes::Attachments<frame::PaneState>;
@@ -68,7 +68,6 @@ pub use commands::{CloseWindowError, Command};
 /// A compositor projection of a host event loop.
 pub type CompositorHandle = meowland_loop::Handle<Compositor>;
 
-pub use meowland_protocol::WindowId;
 use meowland_readback as readback;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use meowland_selection as clipboard;
@@ -441,11 +440,11 @@ impl Compositor {
             .windows
             .by_id
             .keys()
-            .filter(|&&id| self.windows.catalog.drawable(id))
-            .map(|&id| self.window_info(id))
+            .copied()
+            .filter(|&id| self.windows.catalog.drawable(id))
             .collect();
-        windows.sort_unstable_by_key(|window| window.id);
-        windows
+        windows.sort_unstable();
+        windows.into_iter().map(|id| self.window_info(id)).collect()
     }
 
     /// Whether the host should stop dispatching this compositor.

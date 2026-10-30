@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use meowland_core::pixels::FrameSize;
-use meowland_panes::{Attachments, PaneId, Policy, Presentation, Selection};
-use meowland_protocol::{FrameAck, FrameTransport, Show, WindowId, clipboard::Transport};
+use meowland_panes::{Attachments, Matcher, PaneId, Presentation, Selection, WindowId};
+use meowland_protocol::{Follow, FrameAck, FrameTransport, clipboard::Transport};
 use proptest::prelude::*;
 
 fn frame_size(width: u32, height: u32) -> FrameSize {
@@ -17,6 +17,33 @@ fn pane_id(value: u64) -> PaneId {
 
 fn window_id(value: u64) -> WindowId {
     WindowId::from(value)
+}
+
+fn matching(app_id: &str) -> Selection {
+    Selection::Matching(Matcher::ExactAppId(app_id.into()))
+}
+
+fn activation(token: &str) -> Selection {
+    Selection::Activation(token.into())
+}
+
+fn waits_for_app(selection: Option<&Selection>, app_id: &str) -> bool {
+    matches!(selection, Some(Selection::Matching(matcher)) if matcher.matches(None, app_id, ""))
+}
+
+fn waits_for_token(selection: Option<&Selection>, token: &str) -> bool {
+    matches!(selection, Some(Selection::Activation(waiting)) if waiting == token)
+}
+
+fn shown<P: Presentation>(
+    attachments: &mut Attachments<P>,
+    pane: PaneId,
+    selection: Selection,
+    window: WindowId,
+    size: FrameSize,
+) {
+    attachments.insert(pane, selection, Follow::First, size);
+    attachments.show(pane, window);
 }
 
 #[derive(Debug)]
@@ -72,63 +99,82 @@ impl<const DIRTY_ON_NEW: bool, const DIRTY_ON_SIZE: bool> Presentation
 }
 
 #[test]
-fn insert_records_policy_and_waiting_selector() {
+fn panes_wait_on_their_selection_until_shown() {
     let size = frame_size(80, 24);
-    let cases = [
-        (Show::Id(window_id(1)), None, Policy::Fixed),
-        (Show::Newest, None, Policy::FollowNewest),
-        (Show::Focused, None, Policy::FollowNewest),
-        (Show::AppId("terminal".into()), None, Policy::Fixed),
-        (Show::Activation("token".into()), None, Policy::Fixed),
-        (Show::Id(window_id(1)), Some(window_id(1)), Policy::Fixed),
-        (Show::Newest, Some(window_id(1)), Policy::FollowNewest),
-        (Show::Focused, Some(window_id(1)), Policy::Fixed),
-        (
-            Show::AppId("terminal".into()),
-            Some(window_id(1)),
-            Policy::Fixed,
-        ),
-        (
-            Show::Activation("token".into()),
-            Some(window_id(1)),
-            Policy::Fixed,
-        ),
-    ];
+    let mut attachments = Attachments::<Fake>::default();
+    attachments.insert(pane_id(1), matching("terminal"), Follow::Every, size);
+    attachments.insert(pane_id(2), activation("token"), Follow::Current, size);
 
-    for (index, (show, resolved, policy)) in cases.into_iter().enumerate() {
-        let pane = pane_id(u64::try_from(index).unwrap());
-        let mut attachments = Attachments::<Fake>::default();
-        attachments.insert(pane, show.clone(), resolved, size);
-
+    for pane in [pane_id(1), pane_id(2)] {
         let entry = attachments.get(pane).unwrap();
-        assert_eq!(entry.policy, policy, "selector {show:?}");
-        assert_eq!(entry.window(), resolved, "selector {show:?}");
+        assert_eq!(entry.window(), None);
         assert_eq!(entry.clipboard, Transport::Kitty);
-        assert_eq!(attachments.due_frames(), 0);
-        match (&show, resolved) {
-            (Show::AppId(app_id), None) => {
-                assert!(
-                    matches!(entry.waiting(), Some(Selection::AppId(waiting)) if waiting == app_id),
-                    "selector {show:?}"
-                );
-            }
-            (Show::Activation(token), None) => {
-                assert!(
-                    matches!(entry.waiting(), Some(Selection::Activation(waiting)) if waiting == token),
-                    "selector {show:?}"
-                );
-            }
-            _ => assert!(entry.waiting().is_none(), "selector {show:?}"),
-        }
     }
+    assert_eq!(attachments.get(pane_id(1)).unwrap().follow, Follow::Every);
+    assert!(waits_for_app(
+        attachments.get(pane_id(1)).unwrap().waiting(),
+        "terminal"
+    ));
+    assert!(waits_for_token(
+        attachments.get(pane_id(2)).unwrap().waiting(),
+        "token"
+    ));
+    assert_eq!(attachments.due_frames(), 0);
+    assert_eq!(attachments.first_window(), None);
+
+    assert_eq!(attachments.show(pane_id(1), window_id(1)), None);
+    assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
+
+    assert_eq!(
+        attachments.show(pane_id(2), window_id(2)),
+        Some("token".into())
+    );
+    assert!(attachments.get(pane_id(2)).unwrap().waiting().is_none());
+    assert_eq!(attachments.show(pane_id(2), window_id(3)), None);
+    assert_eq!(attachments.show(pane_id(2), window_id(3)), None);
+
+    attachments.unbind(pane_id(2));
+    let entry = attachments.get(pane_id(2)).unwrap();
+    assert_eq!(entry.window(), None);
+    assert!(waits_for_token(entry.waiting(), "token"));
+    assert!(!attachments.visible(window_id(3)));
+    assert_eq!(attachments.showing(window_id(3)), Vec::new());
+    assert_eq!(
+        attachments.show(pane_id(2), window_id(2)),
+        Some("token".into())
+    );
+
+    attachments.reselect(pane_id(1), activation("other"));
+    assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
+    assert!(matches!(
+        attachments.get(pane_id(1)).unwrap().selection(),
+        Selection::Activation(token) if token == "other"
+    ));
+    attachments.unbind(pane_id(1));
+    assert!(waits_for_token(
+        attachments.get(pane_id(1)).unwrap().waiting(),
+        "other"
+    ));
+    assert_eq!(attachments.showing(window_id(1)), Vec::new());
+
+    attachments.reselect(pane_id(1), matching("browser"));
+    assert!(waits_for_app(
+        attachments.get(pane_id(1)).unwrap().waiting(),
+        "browser"
+    ));
+    assert!(!waits_for_app(
+        attachments.get(pane_id(1)).unwrap().waiting(),
+        "terminal"
+    ));
+    assert_eq!(attachments.show(pane_id(1), window_id(1)), None);
 }
 
 #[test]
 fn show_resolves_waiting_tokens_and_updates_the_index() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::AppId("terminal".into()), None, size);
-    attachments.insert(pane_id(2), Show::Activation("token".into()), None, size);
+    attachments.insert(pane_id(1), matching("terminal"), Follow::First, size);
+    attachments.insert(pane_id(2), activation("token"), Follow::First, size);
     assert_eq!(attachments.due_frames(), 0);
     assert_eq!(attachments.showing(window_id(1)), Vec::new());
     assert!(!attachments.visible(window_id(1)));
@@ -140,7 +186,6 @@ fn show_resolves_waiting_tokens_and_updates_the_index() {
         attachments.get(pane_id(1)).unwrap().window(),
         Some(window_id(1))
     );
-    assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
 
     assert_eq!(
         attachments.show(pane_id(2), window_id(2)),
@@ -162,25 +207,31 @@ fn show_resolves_waiting_tokens_and_updates_the_index() {
 }
 
 #[test]
-fn clear_keeps_the_pane_attached_and_marks_it_dirty() {
+fn unbind_keeps_the_pane_attached_and_marks_it_dirty() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
+    attachments.ack(pane_id(1), FrameAck::Retained);
     assert_eq!(attachments.due_frames(), 0);
 
-    attachments.clear(pane_id(1));
+    attachments.unbind(pane_id(1));
     assert_eq!(attachments.due_frames(), 1);
     assert_eq!(attachments.len(), 1);
     assert!(attachments.contains(pane_id(1)));
     assert_eq!(attachments.get(pane_id(1)).unwrap().window(), None);
-    assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
     assert!(!attachments.visible(window_id(1)));
     assert_eq!(attachments.showing(window_id(1)), Vec::new());
 
-    attachments.clear(pane_id(1));
+    attachments.unbind(pane_id(1));
     assert_eq!(attachments.due_frames(), 1);
 
-    attachments.clear(pane_id(99));
+    attachments.unbind(pane_id(99));
     assert_eq!(attachments.due_frames(), 1);
 }
 
@@ -188,16 +239,27 @@ fn clear_keeps_the_pane_attached_and_marks_it_dirty() {
 fn remove_returns_the_pane_and_clears_its_index_entries() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.insert(pane_id(2), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.show(pane_id(2), window_id(1));
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
+    shown(
+        &mut attachments,
+        pane_id(2),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
     attachments.decide(window_id(1), pane_id(2));
-    assert_eq!(attachments.due_frames(), 1);
+    assert_eq!(attachments.due_frames(), 2);
     assert_eq!(attachments.owner(window_id(1)), Some(pane_id(2)));
 
     let removed = attachments.remove(pane_id(2)).unwrap();
     assert_eq!(removed.window(), Some(window_id(1)));
-    assert_eq!(attachments.due_frames(), 0);
+    assert_eq!(attachments.due_frames(), 1);
     assert_eq!(attachments.showing(window_id(1)), vec![pane_id(1)]);
     assert_eq!(attachments.owner(window_id(1)), Some(pane_id(1)));
 
@@ -205,6 +267,7 @@ fn remove_returns_the_pane_and_clears_its_index_entries() {
         attachments.remove(pane_id(1)).unwrap().window(),
         Some(window_id(1))
     );
+    assert_eq!(attachments.due_frames(), 0);
     assert_eq!(attachments.showing(window_id(1)), Vec::new());
     assert_eq!(attachments.owner(window_id(1)), None);
     assert!(attachments.remove(pane_id(1)).is_none());
@@ -214,9 +277,27 @@ fn remove_returns_the_pane_and_clears_its_index_entries() {
 fn ordering_and_owner_are_deterministic() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(3), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.insert(pane_id(1), Show::Id(window_id(2)), Some(window_id(2)), size);
-    attachments.insert(pane_id(2), Show::Id(window_id(1)), Some(window_id(1)), size);
+    shown(
+        &mut attachments,
+        pane_id(3),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(2),
+        size,
+    );
+    shown(
+        &mut attachments,
+        pane_id(2),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
 
     assert_eq!(
         attachments.showing(window_id(1)),
@@ -247,28 +328,17 @@ fn ordering_and_owner_are_deterministic() {
 }
 
 #[test]
-fn following_lists_only_following_panes_in_identity_order() {
-    let size = frame_size(80, 24);
-    let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(4), Show::Newest, None, size);
-    attachments.insert(pane_id(1), Show::Newest, Some(window_id(1)), size);
-    attachments.insert(pane_id(3), Show::Focused, None, size);
-    attachments.insert(pane_id(2), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.insert(pane_id(5), Show::Focused, Some(window_id(2)), size);
-
-    assert_eq!(
-        attachments.following(),
-        vec![pane_id(1), pane_id(3), pane_id(4)]
-    );
-    assert_eq!(attachments.first_window(), Some(window_id(1)));
-    assert_eq!(attachments.showing(window_id(2)), vec![pane_id(5)]);
-}
-
-#[test]
 fn resize_only_dirties_when_the_size_changes() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
+    attachments.ack(pane_id(1), FrameAck::Retained);
 
     assert_eq!(attachments.resize(pane_id(1), size), None);
     assert_eq!(attachments.due_frames(), 0);
@@ -292,7 +362,14 @@ fn resize_only_dirties_when_the_size_changes() {
 fn transport_and_clipboard_updates_track_dirty_state() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
+    attachments.ack(pane_id(1), FrameAck::Retained);
 
     attachments.set_transport(pane_id(1), FrameTransport::Shared);
     assert_eq!(attachments.due_frames(), 1);
@@ -322,8 +399,13 @@ fn transport_and_clipboard_updates_track_dirty_state() {
 fn acknowledgements_clear_the_due_state() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.show(pane_id(1), window_id(1));
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
     assert_eq!(attachments.due_frames(), 1);
 
     attachments.ack(pane_id(1), FrameAck::Resync);
@@ -343,9 +425,21 @@ fn acknowledgements_clear_the_due_state() {
 fn presentation_visitors_keep_the_due_count_exact() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.insert(pane_id(2), Show::Id(window_id(2)), Some(window_id(2)), size);
-    attachments.insert(pane_id(3), Show::Newest, None, size);
+    shown(
+        &mut attachments,
+        pane_id(1),
+        matching("terminal"),
+        window_id(1),
+        size,
+    );
+    shown(
+        &mut attachments,
+        pane_id(2),
+        matching("terminal"),
+        window_id(2),
+        size,
+    );
+    attachments.insert(pane_id(3), matching("terminal"), Follow::Every, size);
 
     let mut seen = Vec::new();
     attachments.for_each_presentation_mut(|pane, window, presentation| {
@@ -384,24 +478,34 @@ fn presentation_visitors_keep_the_due_count_exact() {
 fn insert_replaces_an_existing_attachment() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
-    attachments.insert(pane_id(1), Show::Id(window_id(1)), Some(window_id(1)), size);
-    attachments.show(pane_id(1), window_id(1));
+    shown(
+        &mut attachments,
+        pane_id(1),
+        activation("token"),
+        window_id(1),
+        size,
+    );
     assert_eq!(attachments.due_frames(), 1);
 
-    attachments.insert(pane_id(1), Show::Id(window_id(2)), Some(window_id(2)), size);
+    attachments.insert(pane_id(1), matching("terminal"), Follow::First, size);
     assert_eq!(attachments.len(), 1);
     assert_eq!(attachments.due_frames(), 0);
     assert_eq!(attachments.showing(window_id(1)), Vec::new());
-    assert_eq!(attachments.showing(window_id(2)), vec![pane_id(1)]);
-
-    attachments.insert(pane_id(1), Show::AppId("terminal".into()), None, size);
-    assert_eq!(attachments.showing(window_id(2)), Vec::new());
-    assert!(matches!(
+    assert!(!attachments.visible(window_id(1)));
+    assert!(waits_for_app(
         attachments.get(pane_id(1)).unwrap().waiting(),
-        Some(Selection::AppId(app_id)) if app_id == "terminal"
+        "terminal"
     ));
 
-    attachments.insert(pane_id(1), Show::Id(window_id(3)), Some(window_id(3)), size);
+    assert_eq!(attachments.show(pane_id(1), window_id(2)), None);
+    assert_eq!(attachments.showing(window_id(2)), vec![pane_id(1)]);
+
+    attachments.insert(pane_id(1), activation("again"), Follow::First, size);
+    assert_eq!(attachments.showing(window_id(2)), Vec::new());
+    assert_eq!(
+        attachments.show(pane_id(1), window_id(3)),
+        Some("again".into())
+    );
     assert_eq!(attachments.showing(window_id(3)), vec![pane_id(1)]);
 }
 
@@ -416,16 +520,19 @@ enum VisitAction {
 enum Operation {
     Insert {
         pane: PaneId,
-        show: Show,
-        resolved: Option<WindowId>,
+        selection: Selection,
         size: FrameSize,
     },
     Show {
         pane: PaneId,
         window: WindowId,
     },
-    Clear {
+    Unbind {
         pane: PaneId,
+    },
+    Reselect {
+        pane: PaneId,
+        selection: Selection,
     },
     Remove {
         pane: PaneId,
@@ -474,14 +581,18 @@ fn token_strategy() -> impl Strategy<Value = String> {
     prop_oneof![Just("first".to_owned()), Just("second".to_owned())]
 }
 
-fn show_strategy() -> impl Strategy<Value = Show> {
+fn selection_strategy() -> impl Strategy<Value = Selection> {
     prop_oneof![
-        window_strategy().prop_map(Show::Id),
-        Just(Show::Newest),
-        Just(Show::Focused),
-        app_id_strategy().prop_map(Show::AppId),
-        token_strategy().prop_map(Show::Activation),
+        app_id_strategy().prop_map(|app_id| matching(&app_id)),
+        token_strategy().prop_map(Selection::Activation),
     ]
+}
+
+fn token_of(selection: &Selection) -> Option<String> {
+    match selection {
+        Selection::Activation(token) => Some(token.clone()),
+        Selection::Matching(_) => None,
+    }
 }
 
 fn ack_strategy() -> impl Strategy<Value = FrameAck> {
@@ -502,21 +613,18 @@ fn visit_strategy() -> impl Strategy<Value = VisitAction> {
 
 fn operation_strategy() -> impl Strategy<Value = Operation> {
     prop_oneof![
-        (
-            pane_strategy(),
-            show_strategy(),
-            proptest::option::of(window_strategy()),
-            size_strategy(),
-        )
-            .prop_map(|(pane, show, resolved, size)| Operation::Insert {
+        (pane_strategy(), selection_strategy(), size_strategy()).prop_map(
+            |(pane, selection, size)| Operation::Insert {
                 pane,
-                show,
-                resolved,
+                selection,
                 size,
-            }),
+            }
+        ),
         (pane_strategy(), window_strategy())
             .prop_map(|(pane, window)| Operation::Show { pane, window }),
-        pane_strategy().prop_map(|pane| Operation::Clear { pane }),
+        pane_strategy().prop_map(|pane| Operation::Unbind { pane }),
+        (pane_strategy(), selection_strategy())
+            .prop_map(|(pane, selection)| Operation::Reselect { pane, selection }),
         pane_strategy().prop_map(|pane| Operation::Remove { pane }),
         (pane_strategy(), size_strategy())
             .prop_map(|(pane, size)| Operation::Resize { pane, size }),
@@ -545,37 +653,53 @@ proptest! {
         let mut sizes = HashMap::new();
         let mut dirty = HashMap::new();
         let mut deciding = HashMap::new();
+        let mut tokens: HashMap<PaneId, Option<String>> = HashMap::new();
 
         for (step, operation) in operations.iter().enumerate() {
             match operation {
                 Operation::Insert {
                     pane,
-                    show,
-                    resolved,
+                    selection,
                     size,
                 } => {
-                    attachments.insert(*pane, show.clone(), *resolved, *size);
-                    bound.insert(*pane, *resolved);
+                    attachments.insert(*pane, selection.clone(), Follow::Every, *size);
+                    bound.insert(*pane, None);
+                    tokens.insert(*pane, token_of(selection));
                     sizes.insert(*pane, *size);
                     dirty.insert(*pane, true);
                 }
                 Operation::Show { pane, window } => {
-                    attachments.show(*pane, *window);
-                    if let Some(binding) = bound.get_mut(pane) {
-                        *binding = Some(*window);
+                    let token = attachments.show(*pane, *window);
+                    let expected_token = bound.get_mut(pane).and_then(|binding| {
+                        let was_waiting = binding.replace(*window).is_none();
                         dirty.insert(*pane, true);
-                    }
+                        tokens.get(pane).cloned().flatten().filter(|_| was_waiting)
+                    });
+                    prop_assert_eq!(
+                        token,
+                        expected_token,
+                        "step {} operation {:?} token",
+                        step,
+                        operation
+                    );
                 }
-                Operation::Clear { pane } => {
-                    attachments.clear(*pane);
+                Operation::Unbind { pane } => {
+                    attachments.unbind(*pane);
                     if let Some(binding) = bound.get_mut(pane) {
                         *binding = None;
                         dirty.insert(*pane, true);
                     }
                 }
+                Operation::Reselect { pane, selection } => {
+                    attachments.reselect(*pane, selection.clone());
+                    if let Some(token) = tokens.get_mut(pane) {
+                        *token = token_of(selection);
+                    }
+                }
                 Operation::Remove { pane } => {
                     attachments.remove(*pane);
                     bound.remove(pane);
+                    tokens.remove(pane);
                     sizes.remove(pane);
                     dirty.remove(pane);
                     deciding.retain(|_, owner| *owner != *pane);

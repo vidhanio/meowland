@@ -143,9 +143,6 @@ impl XdgShellHandler for Compositor {
             return;
         };
         window.fullscreen = true;
-        if self.windows.catalog.drawable(id) {
-            self.follow_panes(id);
-        }
         self.enter_output(id);
         self.focus_window(id);
         self.apply_window_state(id);

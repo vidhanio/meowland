@@ -1,35 +1,51 @@
 use std::{
-    collections::BTreeMap,
-    ffi::OsString,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     io::{self, IsTerminal, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::PathBuf,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use clap::{
+    ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueHint, builder::PossibleValuesParser,
+};
+use clap_complete::{
+    CompleteEnv,
+    engine::{
+        ArgValueCandidates, ArgValueCompleter, CompletionCandidate, PathCompleter, ValueCompleter,
+    },
+    env::Shells,
+};
 use meowland_protocol::{
-    self as protocol, ControlRequest, ControlResponse, Paths, Show, WindowId, WindowInfo,
+    self as protocol, ControlRequest, ControlResponse, Follow, Paths, Selector, Target, WindowInfo,
     WindowState,
 };
 use meowland_terminal as terminal;
-use usage_rs::{Args, Cli, Subcommands, ValueEnum};
 
-#[derive(Cli)]
-#[usage(bin = "meowland", version = env!("CARGO_PKG_VERSION"), completion)]
+const BIN: &str = "meowland";
+const COMPLETE_VAR: &str = "COMPLETE";
+
+#[derive(Parser)]
+#[command(name = BIN, version)]
 struct Meowland {
-    #[usage(subcommand)]
+    #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommands)]
+#[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Start a client and show its window in this terminal.
-    Run(RunArgs),
+    /// Launch a client and show its windows in this terminal.
+    Launch(LaunchArgs),
     /// Show a window in this terminal.
-    Attach(AttachArgs),
+    Focus(FocusArgs),
     /// Ask a window to close.
-    Kill(WindowArgs),
+    ///
+    /// Without a selector, closes the focused window.
+    Quit(QuitArgs),
     /// List windows.
     List,
     /// Start the compositor server in the foreground.
@@ -45,8 +61,8 @@ impl Commands {
     pub(crate) const fn log_destination(&self) -> crate::logging::Destination {
         match self {
             Self::Server(_) => crate::logging::Destination::Stderr,
-            Self::Run(_) | Self::Attach(_) => crate::logging::Destination::Journal,
-            Self::Kill(_) | Self::List | Self::Completions(_) => crate::logging::Destination::None,
+            Self::Launch(_) | Self::Focus(_) => crate::logging::Destination::Journal,
+            Self::Quit(_) | Self::List | Self::Completions(_) => crate::logging::Destination::None,
         }
     }
 }
@@ -54,129 +70,193 @@ impl Commands {
 #[derive(Args)]
 pub(crate) struct ServerArgs {
     /// Read this TOML file instead of `$XDG_CONFIG_HOME/meowland/config.toml`.
-    #[usage(long, short = 'c', env = "MEOWLAND_CONFIG")]
+    #[arg(long, short, env = "MEOWLAND_CONFIG")]
     config: Option<PathBuf>,
 }
 
+/// Regular-expression selectors; consumers limit them to one.
 #[derive(Args)]
-pub(crate) struct RunArgs {
-    /// Attach by app ID for clients without xdg-activation-v1 support.
-    #[usage(long, complete = app_ids)]
+#[group(skip)]
+pub(crate) struct MatchArgs {
+    /// Match windows whose app ID matches this regular expression.
+    #[arg(
+        long,
+        value_name = "REGEX",
+        value_parser = regex_source,
+        add = ArgValueCandidates::new(app_id_candidates)
+    )]
     app_id: Option<String>,
-    /// The program and arguments to run.
-    #[usage(
-        required,
-        double_dash = "automatic",
-        value_hint = usage_rs::ValueHint::CommandWithArguments
+    /// Match windows whose title matches this regular expression.
+    #[arg(
+        long,
+        value_name = "REGEX",
+        value_parser = regex_source,
+        add = ArgValueCandidates::new(title_candidates)
+    )]
+    title: Option<String>,
+}
+
+impl MatchArgs {
+    fn into_selector(self) -> Option<Selector> {
+        self.app_id
+            .map(Selector::AppId)
+            .or_else(|| self.title.map(Selector::Title))
+    }
+}
+
+/// A regular-expression selector or a window's unique ID; consumers limit
+/// them to one.
+#[derive(Args)]
+#[group(skip)]
+pub(crate) struct WindowArgs {
+    #[command(flatten)]
+    matching: MatchArgs,
+    /// The unique window ID, as printed by `meowland list`.
+    #[arg(value_name = "ID", add = ArgValueCandidates::new(id_candidates))]
+    id: Option<String>,
+}
+
+impl WindowArgs {
+    fn into_selector(self) -> Option<Selector> {
+        self.id
+            .map(Selector::Id)
+            .or_else(|| self.matching.into_selector())
+    }
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("selector").args(["app_id", "title"])))]
+pub(crate) struct LaunchArgs {
+    #[command(flatten)]
+    matching: MatchArgs,
+    /// Exit when the first shown window closes instead of waiting for the
+    /// next matching window.
+    #[arg(long)]
+    no_follow: bool,
+    /// The program and arguments to launch.
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        num_args = 1..,
+        value_name = "COMMAND",
+        value_hint = ValueHint::CommandWithArguments,
+        add = ArgValueCompleter::new(CommandCompleter)
     )]
     command: Vec<OsString>,
 }
 
 #[derive(Args)]
-pub(crate) struct AttachArgs {
-    /// The integer window ID or app ID to show.
-    #[usage(complete = window_targets)]
-    window: String,
+#[command(group(ArgGroup::new("selector").args(["app_id", "title", "id"]).required(true)))]
+pub(crate) struct FocusArgs {
+    #[command(flatten)]
+    window: WindowArgs,
+    /// Wait for a matching window, and for the next one whenever the shown
+    /// window closes, instead of exiting.
+    #[arg(long, conflicts_with = "id")]
+    follow: bool,
 }
 
 #[derive(Args)]
-pub(crate) struct WindowArgs {
-    /// The integer window ID or app ID; omit it to select the focused window.
-    #[usage(complete = window_targets)]
-    window: Option<String>,
-}
-
-impl WindowArgs {
-    fn show(self) -> Show {
-        self.window.map_or(Show::Focused, window_target)
-    }
-}
-
-fn window_target(window: String) -> Show {
-    window
-        .parse::<u64>()
-        .map_or(Show::AppId(window), |id| Show::Id(WindowId::from(id)))
-}
-
-fn window_targets<P>(
-    _partial: &P,
-    _context: &usage_rs::complete::CompleteCtx<'_>,
-) -> Vec<usage_rs::complete::Candidate<'static>> {
-    complete_windows(CompletionTargets::All)
-}
-
-fn app_ids(
-    _partial: &<RunArgs as usage_rs::spec::CommandArgs>::Partial,
-    _context: &usage_rs::complete::CompleteCtx<'_>,
-) -> Vec<usage_rs::complete::Candidate<'static>> {
-    complete_windows(CompletionTargets::AppIds)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CompletionTargets {
-    All,
-    AppIds,
-}
-
-fn complete_windows(targets: CompletionTargets) -> Vec<usage_rs::complete::Candidate<'static>> {
-    let Ok(paths) = Paths::discover() else {
-        return Vec::new();
-    };
-    let Ok(mut windows) = list_with_timeout(&paths, Duration::from_millis(100)) else {
-        return Vec::new();
-    };
-    windows.sort_unstable_by_key(|window| std::cmp::Reverse(window.id));
-    let include_ids = targets == CompletionTargets::All;
-    let mut targets = BTreeMap::new();
-    for window in windows {
-        let title = protocol::sanitize(&window.title);
-        if include_ids {
-            targets.insert(window.id.to_string(), title.clone());
-        }
-        if !window.app_id.is_empty() {
-            targets.entry(window.app_id).or_insert(title);
-        }
-    }
-    targets
-        .into_iter()
-        .map(|(value, title)| usage_rs::complete::Candidate::described(value, title))
-        .collect()
+#[command(group(ArgGroup::new("selector").args(["app_id", "title", "id"])))]
+pub(crate) struct QuitArgs {
+    #[command(flatten)]
+    window: WindowArgs,
 }
 
 #[derive(Args)]
 pub(crate) struct CompletionArgs {
     /// The shell to generate a completion script for.
-    #[usage(value_enum)]
-    shell: CompletionShell,
+    #[arg(value_parser = PossibleValuesParser::new(Shells::builtins().names()))]
+    shell: String,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CompletionShell {
-    Bash,
-    Elvish,
-    Zsh,
-    Fish,
-    #[usage(visible_alias = "nushell")]
-    Nu,
-    #[usage(name = "powershell", visible_alias = "pwsh")]
-    PowerShell,
+fn regex_source(source: &str) -> Result<String, regex::Error> {
+    regex::Regex::new(source).map(|_| source.to_owned())
 }
 
-impl From<CompletionShell> for usage_rs::complete::Shell {
-    fn from(shell: CompletionShell) -> Self {
-        match shell {
-            CompletionShell::Bash => Self::Bash,
-            CompletionShell::Elvish => Self::Elvish,
-            CompletionShell::Zsh => Self::Zsh,
-            CompletionShell::Fish => Self::Fish,
-            CompletionShell::Nu => Self::Nu,
-            CompletionShell::PowerShell => Self::PowerShell,
+/// Completes an executable on `PATH`, or a path once the value contains `/`
+/// or is clearly an argument.
+#[derive(Clone, Copy)]
+struct CommandCompleter;
+
+impl ValueCompleter for CommandCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        self.complete_at(0, current)
+    }
+
+    fn complete_at(&self, index: usize, current: &OsStr) -> Vec<CompletionCandidate> {
+        let Some(prefix) = current.to_str() else {
+            return Vec::new();
+        };
+        if index > 0 || prefix.contains('/') {
+            return PathCompleter::any().complete(current);
         }
+        let mut names = BTreeSet::new();
+        for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_str().is_some_and(|name| name.starts_with(prefix))
+                    && fs::metadata(entry.path()).is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                {
+                    names.insert(name);
+                }
+            }
+        }
+        names.into_iter().map(CompletionCandidate::new).collect()
     }
 }
 
-/// Parse the process command line into the selected meowland command.
+fn id_candidates() -> Vec<CompletionCandidate> {
+    candidates(|window| Some((window.id, format!("{}: {}", window.app_id, window.title))))
+}
+
+fn app_id_candidates() -> Vec<CompletionCandidate> {
+    candidates(|window| (!window.app_id.is_empty()).then_some((window.app_id, window.title)))
+}
+
+fn title_candidates() -> Vec<CompletionCandidate> {
+    candidates(|window| (!window.title.is_empty()).then_some((window.title, window.app_id)))
+}
+
+/// Complete from the running server's windows, newest first per value.
+fn candidates(
+    describe: impl Fn(WindowInfo) -> Option<(String, String)>,
+) -> Vec<CompletionCandidate> {
+    let Ok(paths) = Paths::discover() else {
+        return Vec::new();
+    };
+    let Ok(windows) = list_with_timeout(&paths, Duration::from_millis(100)) else {
+        return Vec::new();
+    };
+    let mut values = BTreeMap::new();
+    for window in windows.into_iter().rev() {
+        let window = WindowInfo {
+            id: protocol::sanitize(&window.id),
+            app_id: protocol::sanitize(&window.app_id),
+            title: protocol::sanitize(&window.title),
+            ..window
+        };
+        if let Some((value, help)) = describe(window) {
+            values.entry(value).or_insert(help);
+        }
+    }
+    values
+        .into_iter()
+        .map(|(value, help)| CompletionCandidate::new(value).help(Some(help.into())))
+        .collect()
+}
+
+/// Answer shell completion requests, or parse the process command line into
+/// the selected meowland command.
 pub(crate) fn parse() -> Commands {
+    CompleteEnv::with_factory(Meowland::command)
+        .var(COMPLETE_VAR)
+        .complete();
     Meowland::parse().command
 }
 
@@ -199,7 +279,7 @@ pub(crate) fn run(command: Commands) -> Result<()> {
                 writeln!(
                     stdout,
                     "{}\t{}\t{}\t{}",
-                    window.id,
+                    protocol::sanitize(&window.id),
                     protocol::sanitize(&window.app_id),
                     protocol::sanitize(&window.title),
                     match window.state {
@@ -210,41 +290,58 @@ pub(crate) fn run(command: Commands) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Run(RunArgs {
-            app_id,
+        Commands::Launch(LaunchArgs {
+            matching,
+            no_follow,
             command: client,
         }) => {
             let paths = Paths::discover()?;
-            let launch = ControlRequest::Run {
+            let launch = ControlRequest::Launch {
                 args: client,
                 env: std::env::vars_os().collect(),
                 cwd: std::env::current_dir().context("reading launch working directory")?,
             };
-            let ControlResponse::Started(token) = request(&paths, &launch)? else {
+            let ControlResponse::Launched(token) = request(&paths, &launch)? else {
                 bail!("server did not return a launch activation token");
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                let show = app_id.map_or(Show::Activation(token), Show::AppId);
-                terminal::attach(&paths.pane, show)?;
+                let target = matching
+                    .into_selector()
+                    .map_or(Target::Activation(token), Target::Selector);
+                let follow = if no_follow {
+                    Follow::First
+                } else {
+                    Follow::Every
+                };
+                terminal::focus(&paths.pane, target, follow)?;
             }
             Ok(())
         }
-        Commands::Attach(AttachArgs { window }) => {
+        Commands::Focus(FocusArgs { window, follow }) => {
             let paths = Paths::discover()?;
-            terminal::attach(&paths.pane, window_target(window))?;
+            let follow = if follow {
+                Follow::Every
+            } else {
+                Follow::Current
+            };
+            terminal::focus(
+                &paths.pane,
+                Target::Selector(window.into_selector().expect("clap requires one selector")),
+                follow,
+            )?;
             Ok(())
         }
-        Commands::Kill(args) => {
+        Commands::Quit(QuitArgs { window }) => {
             let paths = Paths::discover()?;
-            request(&paths, &ControlRequest::Kill(args.show()))?;
+            request(&paths, &ControlRequest::Quit(window.into_selector()))?;
             Ok(())
         }
         Commands::Completions(CompletionArgs { shell }) => {
-            write!(
-                io::stdout().lock(),
-                "{}",
-                Meowland::completion_script(shell.into())
-            )?;
+            let shells = Shells::builtins();
+            let completer = shells
+                .completer(&shell)
+                .expect("clap restricts the shell to built-in completers");
+            completer.write_registration(COMPLETE_VAR, BIN, BIN, BIN, &mut io::stdout().lock())?;
             Ok(())
         }
     }

@@ -6,7 +6,7 @@ Meowland runs as two kinds of process:
 
 - **Server** (`meowland server`): a headless Wayland compositor. It runs on one thread
   with a single `calloop` loop.
-- **Pane clients** (`meowland run` / `meowland attach`): one per terminal. Each pane
+- **Pane clients** (`meowland launch` / `meowland focus`): one per terminal. Each pane
   client sends terminal input to the server and draws the frames it gets back using the
   Kitty graphics protocol.
 
@@ -78,7 +78,7 @@ flowchart LR
         tty["stdin / stdout"]
     end
 
-    subgraph Pane["Pane client: meowland attach / run"]
+    subgraph Pane["Pane client: meowland focus / launch"]
         probe["probe.rs<br/>capability handshake"]
         session["session.rs<br/>TerminalSession select loop"]
         decode["meowland-input<br/>Reader + Keyboard"]
@@ -92,7 +92,7 @@ flowchart LR
         sockets["sockets.rs<br/>control.sock + pane.sock"]
         transport["transport.rs<br/>per-connection futures"]
         actor["actor.rs run loop<br/>Server owns Compositor"]
-        control["control.rs<br/>Run / List / Kill"]
+        control["control.rs<br/>Launch / List / Quit"]
         proc["process.rs<br/>spawn app with WAYLAND_DISPLAY"]
         subgraph Comp["meowland-compositor"]
             cmds["commands.rs<br/>handle_command"]

@@ -54,7 +54,7 @@ impl From<PaneId> for ConnectionId {
 
 enum Incoming {
     Control(ControlRequest, oneshot::Sender<ControlResponse>),
-    Attach(PaneId, Hello, PaneTransport),
+    Focus(PaneId, Hello, PaneTransport),
     PaneMessage(PaneId, PaneAction),
 }
 
@@ -114,7 +114,7 @@ impl Server {
     fn incoming(&mut self, message: Incoming) {
         match message {
             Incoming::Control(request, reply) => self.control(request, reply),
-            Incoming::Attach(id, hello, pane) => {
+            Incoming::Focus(id, hello, pane) => {
                 if self.shutdown.running() && self.connections.contains_key(&ConnectionId::from(id))
                 {
                     self.panes.insert(id, pane);
@@ -124,10 +124,11 @@ impl Server {
                             shortcuts: self.shortcuts,
                         },
                     );
-                    self.send_command(Command::Attach {
+                    self.send_command(Command::Focus {
                         pane: id,
+                        target: hello.target,
+                        follow: hello.follow,
                         size: hello.size,
-                        show: hello.show,
                     });
                 }
             }

@@ -187,31 +187,6 @@ pub enum FrameAck {
     Resync,
 }
 
-/// Server-assigned identity of a window, stable for its lifetime.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
-pub struct WindowId(u64);
-
-impl WindowId {
-    /// Numeric identity as assigned by the compositor.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for WindowId {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl std::fmt::Display for WindowId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 /// Server-assigned identity of one terminal clipboard read.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
@@ -250,26 +225,45 @@ impl From<u64> for ClipboardOfferId {
     }
 }
 
-/// Window selector used by attachment, launch, and control requests.
+/// Window selector shared by pane and control requests.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum Show {
-    /// Select a particular server-assigned window ID.
-    Id(WindowId),
-    /// Follow the newest mapped window.
-    Newest,
-    /// Select the currently focused window.
-    Focused,
-    /// Select the newest mapped window with this app ID, waiting if necessary.
+pub enum Selector {
+    /// Match the window with this server-assigned unique ID.
+    Id(String),
+    /// Match windows whose application ID matches this regular expression.
     AppId(String),
-    /// Select the window that redeems this launch's activation token.
+    /// Match windows whose title matches this regular expression.
+    Title(String),
+}
+
+/// Windows a pane may show.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum Target {
+    /// Show the newest mapped window matching this selector.
+    Selector(Selector),
+    /// Show the window that redeems this launch's activation token.
     Activation(String),
+}
+
+/// How long a pane keeps matching its [`Target`].
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum Follow {
+    /// Show a window that matches now, and release the pane when it closes.
+    Current,
+    /// Wait for the first matching window, and release the pane when it
+    /// closes.
+    First,
+    /// Wait for matching windows, moving to another match whenever the shown
+    /// window goes away.
+    Every,
 }
 
 /// Window metadata returned by the server's list operation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WindowInfo {
-    /// Server-assigned window ID, stable for the window's lifetime.
-    pub id: WindowId,
+    /// Server-assigned unique ID, `<app id>_<suffix>`, stable for the
+    /// window's lifetime.
+    pub id: String,
     /// Application identity advertised by the Wayland client.
     pub app_id: String,
     /// Client-provided title; sanitize before emitting terminal control
@@ -293,8 +287,10 @@ pub enum WindowState {
 pub struct Hello {
     /// Pane bounds in physical pixels, validated during deserialization.
     pub size: FrameSize,
-    /// Window selection to bind to this pane.
-    pub show: Show,
+    /// Windows to bind to this pane.
+    pub target: Target,
+    /// How long the pane keeps matching its target.
+    pub follow: Follow,
 }
 
 /// Pointer button identity, using X11 button numbers for extra buttons.
@@ -495,7 +491,7 @@ pub type ServerToPane = PanePacket<crate::FrameBand>;
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ControlRequest {
     /// Launch a process connected to the compositor.
-    Run {
+    Launch {
         /// Executable followed by its arguments, preserving non-UTF-8 OS
         /// strings.
         args: Vec<OsString>,
@@ -506,8 +502,9 @@ pub enum ControlRequest {
     },
     /// List mapped windows and their metadata.
     List,
-    /// Request closure of the selected window.
-    Kill(Show),
+    /// Request closure of the selected window, or the focused window when
+    /// no selector is given.
+    Quit(Option<Selector>),
 }
 
 /// Response to one control request; failures retain a user-facing explanation.
@@ -520,7 +517,7 @@ pub enum ControlResponse {
     /// The operation failed with this explanation.
     Error(String),
     /// The client was launched with this `XDG_ACTIVATION_TOKEN`.
-    Started(String),
+    Launched(String),
 }
 
 /// Write one length-prefixed message.

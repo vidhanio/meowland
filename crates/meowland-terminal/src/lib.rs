@@ -4,7 +4,7 @@ use std::path::Path;
 
 use calloop::{Dispatcher, EventLoop, futures::executor};
 use meowland_async::asynchronous::{connect, timeout};
-use meowland_protocol::{Show, asynchronous::Reader};
+use meowland_protocol::{Follow, Target, asynchronous::Reader};
 
 mod error;
 mod input_gate;
@@ -18,7 +18,8 @@ pub use error::{Error, Result};
 #[cfg(feature = "fuzzing")]
 pub use probe::fuzzing;
 
-/// Attach this terminal to a pane until release or disconnection.
+/// Show windows matching a target in this terminal until release or
+/// disconnection.
 ///
 /// This invocation exclusively owns terminal input and raw mode. Terminal
 /// presentation starts with the first frame, leaving normal signal handling
@@ -27,7 +28,7 @@ pub use probe::fuzzing;
 /// # Errors
 /// Returns an error if the terminal cannot be configured or the pane connection
 /// fails. Server-initiated release restores the terminal and returns `Ok`.
-pub fn attach(socket: &Path, show: Show) -> Result<()> {
+pub fn focus(socket: &Path, target: Target, follow: Follow) -> Result<()> {
     let mut event_loop = EventLoop::<()>::try_new().map_err(std::io::Error::from)?;
     let handle = event_loop.handle();
     let (executor, scheduler) = executor().map_err(std::io::Error::from)?;
@@ -56,7 +57,7 @@ pub fn attach(socket: &Path, show: Show) -> Result<()> {
             let writer = handle
                 .adapt_io(stream.get_mut().try_clone()?)
                 .map_err(std::io::Error::from)?;
-            session::TerminalSession::new(Reader::new(stream), writer, show, handle)?
+            session::TerminalSession::new(Reader::new(stream), writer, target, follow, handle)?
                 .run()
                 .await
         })

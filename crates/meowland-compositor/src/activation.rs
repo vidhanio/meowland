@@ -110,7 +110,7 @@ impl Compositor {
         for token in expired {
             self.cancel_activation(
                 &token,
-                "client did not activate a window; use --app-id for clients without xdg-activation-v1 support",
+                "client did not activate a window; use --app-id or --title for clients without xdg-activation-v1 support",
             );
         }
         self.protocols

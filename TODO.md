@@ -15,7 +15,7 @@ benchmark harness and the `fuzz/` crate.
 
 | Crate | Lines | Role |
 |---|---|---|
-| `meowland` | 578 | CLI (`usage-rs`), TOML config loading, logging, `anyhow` error reporting |
+| `meowland` | 578 | CLI (`clap` derive, `clap_complete` dynamic completion), TOML config loading, logging, `anyhow` error reporting |
 | `meowland-server` | 1130 | Owns the `calloop` loop: sockets, socket activation, child processes, shutdown |
 | `meowland-compositor` | 4340 | Smithay state (`Protocols`, `Input`, `Windows`), shell, seat, input injection, keymap, frame pacing |
 | `meowland-loop` | 216 | `CompositorHandle` projection: register calloop sources against a projected state |

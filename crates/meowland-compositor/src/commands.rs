@@ -1,28 +1,37 @@
 //! Pane commands and their Wayland side effects.
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{Input, PaneAction, Shortcut, Show, Transition};
+use meowland_protocol::{Follow, Input, PaneAction, Selector, Shortcut, Target, Transition};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{
-    AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, input::pane_input,
+    AttachedPane, Compositor, Matcher, PaneId, Selection, ServerToPane, WindowId, clipboard,
+    input::pane_input,
 };
 
 /// The requested selector did not identify a mapped window to close.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("no such window")]
-pub struct CloseWindowError;
+#[derive(Debug, thiserror::Error)]
+pub enum CloseWindowError {
+    /// The selector's regular expression is invalid.
+    #[error("invalid selector: {0}")]
+    InvalidSelector(#[from] regex::Error),
+    /// No mapped window matches the selector.
+    #[error("no such window")]
+    NoSuchWindow,
+}
 
 /// Owned operations applied exclusively on the Wayland event-loop thread.
 #[derive(Clone, Debug)]
 pub enum Command {
-    /// Register a terminal pane with a window selector and validated pixel
+    /// Register a terminal pane with a window target and validated pixel
     /// bounds.
-    Attach {
+    Focus {
         /// Host-assigned pane identity.
         pane: PaneId,
-        /// Window to select or follow.
-        show: Show,
+        /// Windows the pane may show.
+        target: Target,
+        /// How long the pane keeps matching its target.
+        follow: Follow,
         /// Physical-pixel bounds, validated during deserialization.
         size: FrameSize,
     },
@@ -48,9 +57,12 @@ impl Compositor {
     /// Apply one pane or lifecycle command on the event-loop thread.
     pub fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Attach { pane, show, size } => {
-                self.attach_pane(pane, show, size);
-            }
+            Command::Focus {
+                pane,
+                target,
+                follow,
+                size,
+            } => self.focus_pane(pane, target, follow, size),
             Command::Detach { pane } => self.release_pane_window(pane),
             Command::Pane { pane, action } => self.pane_action(pane, action),
             Command::CloseAll => {
@@ -126,29 +138,33 @@ impl Compositor {
         }
     }
 
-    /// Ask the selected mapped window to close.
+    /// Ask the selected mapped window, or the focused window, to close.
     ///
     /// # Errors
-    /// Returns an error if the selection does not identify a mapped window.
-    pub fn close_window(&self, show: &Show) -> Result<(), CloseWindowError> {
-        let window = self
-            .selected_window(show)
+    /// Returns an error if the selector is invalid or does not identify a
+    /// mapped window.
+    pub fn close_window(&self, selector: Option<Selector>) -> Result<(), CloseWindowError> {
+        let window = match selector {
+            Some(selector) => self.windows.catalog.select(&Matcher::new(selector)?),
+            None => self.windows.catalog.focused(),
+        };
+        let window = window
             .and_then(|id| self.windows.by_id.get(&id))
-            .ok_or(CloseWindowError)?;
+            .ok_or(CloseWindowError::NoSuchWindow)?;
         window.surface.send_close();
         Ok(())
     }
 
-    pub(crate) fn selected_window(&self, show: &Show) -> Option<WindowId> {
-        let activation = match show {
-            Show::Activation(token) => self
+    pub(crate) fn selected_window(&self, selection: &Selection) -> Option<WindowId> {
+        match selection {
+            Selection::Matching(matcher) => self.windows.catalog.select(matcher),
+            Selection::Activation(token) => self
                 .protocols
                 .launches
                 .get(token)
-                .and_then(|launch| launch.window),
-            _ => None,
-        };
-        self.windows.catalog.select(show, activation)
+                .and_then(|launch| launch.window)
+                .filter(|&window| self.windows.catalog.drawable(window)),
+        }
     }
 
     /// Publish the tiling, activation, and size state the compositor wants

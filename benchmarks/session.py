@@ -111,7 +111,7 @@ class Session:
         self.selector.register(self.listener, selectors.EVENT_READ, "listener")
         launch = [
             self.binary,
-            "run",
+            "launch",
             "--app-id",
             "meowland-workload",
             "--",
@@ -124,7 +124,7 @@ class Session:
         if self.case["kind"] == "gpu":
             launch = [
                 self.binary,
-                "run",
+                "launch",
                 "--",
                 "vkcube",
                 "--wsi",
@@ -142,9 +142,9 @@ class Session:
             )
             launcher.wait(timeout=5)
             if launcher.returncode:
-                raise RuntimeError("meowland run failed before attach")
+                raise RuntimeError("meowland launch failed before focus")
             self.processes.remove(launcher)
-            target = "meowland-workload"
+            focus = ["--follow", "--app-id", "meowland-workload"]
             if self.case["kind"] == "gpu":
                 deadline = time.monotonic() + 5
                 while True:
@@ -157,12 +157,12 @@ class Session:
                         timeout=2,
                     )
                     if listing.returncode == 0 and listing.stdout.strip():
-                        target = listing.stdout.split("\t", 1)[0]
+                        focus = [listing.stdout.split("\t", 1)[0]]
                         break
                     if time.monotonic() > deadline:
                         raise RuntimeError("Vulkan application did not create a window")
                     self.pump(0.01)
-            launch = [self.binary, "attach", target]
+            launch = [self.binary, "focus", *focus]
         if self.args.terminal == "headless":
             master, slave = pty.openpty()
             self.master = master

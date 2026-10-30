@@ -1,12 +1,21 @@
 //! Window identity, mapping order, selection and focus without Wayland
 //! resources.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, RandomState},
+};
 
-use meowland_protocol::{Show, WindowId, WindowInfo, WindowState};
+use meowland_protocol::{WindowInfo, WindowState};
+
+use crate::{Matcher, WindowId};
+
+const ID_SUFFIX_LEN: usize = 4;
+const ID_SUFFIX_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 #[derive(Debug)]
 struct Metadata {
+    id: Option<String>,
     app_id: String,
     title: String,
     mapped_at: Option<u64>,
@@ -23,6 +32,8 @@ pub struct WindowCatalog {
     mapping_order: u64,
     newest: Option<WindowId>,
     focused: Option<WindowId>,
+    suffixes: RandomState,
+    salt: u64,
 }
 
 impl WindowCatalog {
@@ -33,6 +44,7 @@ impl WindowCatalog {
         self.windows.insert(
             id,
             Metadata {
+                id: None,
                 app_id,
                 title,
                 mapped_at: None,
@@ -50,14 +62,28 @@ impl WindowCatalog {
     }
 
     /// Mark a window as drawable, returning whether that changed.
+    ///
+    /// The first map assigns the window's unique ID from its application ID
+    /// at that time.
     pub fn map(&mut self, id: WindowId) -> bool {
-        let Some(window) = self.windows.get_mut(&id) else {
+        let Some(window) = self.windows.get(&id) else {
             return false;
         };
         if window.mapped_at.is_some() {
             return false;
         }
+        let unique = window
+            .id
+            .is_none()
+            .then(|| id_prefix(&window.app_id))
+            .map(|prefix| self.unique_id(&prefix));
+        let Some(window) = self.windows.get_mut(&id) else {
+            return false;
+        };
         self.mapping_order += 1;
+        if unique.is_some() {
+            window.id = unique;
+        }
         window.mapped_at = Some(self.mapping_order);
         self.newest = Some(id);
         true
@@ -104,12 +130,15 @@ impl WindowCatalog {
 
     /// Public description of a window for pane clients.
     pub fn info(&self, id: WindowId) -> WindowInfo {
-        let (app_id, title) = self
-            .windows
-            .get(&id)
-            .map_or_default(|window| (window.app_id.clone(), window.title.clone()));
+        let (unique, app_id, title) = self.windows.get(&id).map_or_default(|window| {
+            (
+                window.id.clone().unwrap_or_default(),
+                window.app_id.clone(),
+                window.title.clone(),
+            )
+        });
         WindowInfo {
-            id,
+            id: unique,
             app_id,
             title,
             state: if self.focused == Some(id) {
@@ -127,16 +156,19 @@ impl WindowCatalog {
             .map_or("", |window| window.title.as_str())
     }
 
-    /// Resolve a pane selector to a drawable window.
-    pub fn select(&self, show: &Show, activation: Option<WindowId>) -> Option<WindowId> {
-        let window = match show {
-            Show::Id(id) => Some(*id),
-            Show::Newest => self.newest,
-            Show::Focused => self.focused,
-            Show::AppId(app_id) => self.newest_matching(|window| window.app_id == *app_id),
-            Show::Activation(_) => activation,
-        }?;
-        self.drawable(window).then_some(window)
+    /// Current application ID of a window, or an empty string when it is
+    /// unknown.
+    pub fn app_id(&self, id: WindowId) -> &str {
+        self.windows
+            .get(&id)
+            .map_or("", |window| window.app_id.as_str())
+    }
+
+    /// Most recently mapped drawable window matching a selector.
+    pub fn select(&self, matcher: &Matcher) -> Option<WindowId> {
+        self.newest_matching(|window| {
+            matcher.matches(window.id.as_deref(), &window.app_id, &window.title)
+        })
     }
 
     /// Forget a window entirely.
@@ -153,4 +185,40 @@ impl WindowCatalog {
             .max_by_key(|(order, _)| *order)
             .map(|(_, id)| id)
     }
+
+    fn unique_id(&mut self, prefix: &str) -> String {
+        loop {
+            self.salt += 1;
+            let mut bits = self.suffixes.hash_one(self.salt);
+            let mut id = format!("{prefix}_");
+            for _ in 0..ID_SUFFIX_LEN {
+                let digit = usize::try_from(bits % 36).expect("a base-36 digit fits in usize");
+                id.push(char::from(ID_SUFFIX_ALPHABET[digit]));
+                bits /= 36;
+            }
+            if !self
+                .windows
+                .values()
+                .any(|window| window.id.as_deref() == Some(id.as_str()))
+            {
+                return id;
+            }
+        }
+    }
+}
+
+fn id_prefix(app_id: &str) -> String {
+    if app_id.is_empty() {
+        return "window".to_owned();
+    }
+    app_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }

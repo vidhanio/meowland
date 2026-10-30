@@ -102,7 +102,7 @@ nix shell nixpkgs#kitty nixpkgs#xdotool nixpkgs#imagemagick nixpkgs#xorg-server 
 ```
 
 The runner starts a fresh Kitty with no user configuration, launches
-`meowland run` inside it, and reads the Kitty window through X11/ImageMagick. It
+`meowland launch` inside it, and reads the Kitty window through X11/ImageMagick. It
 requires an exact, checksummed frame marker and checks image probes, including
 sparse content. Color channels allow an error of one in readback because OpenGL
 color conversion can round RGB values. Markers remain exact. Kitty's grid is
@@ -141,10 +141,10 @@ nix shell nixpkgs#vulkan-tools -c \
 ```
 
 This discovers an integrated/discrete GPU with `vulkaninfo --summary`, launches
-`vkcube --wsi wayland` through `meowland run`, discovers its window through the
-isolated server's normal `list` command, and attaches the pane. Current vkcube
-has no app ID/activation handoff, so it cannot use the fixture's combined
-launch-and-attach path. The selected source GPU's hardware type must also be
+`vkcube --wsi wayland` through `meowland launch`, discovers its window through the
+isolated server's normal `list` command, and focuses the pane on its ID. Current
+vkcube has no app ID/activation handoff, so it cannot use the fixture's combined
+launch-and-focus path. The selected source GPU's hardware type must also be
 confirmed in vkcube's own diagnostic output; software fallback is never counted
 as GPU work. Enumeration order can differ with presentation environment, so
 both discovery properties and vkcube's observed selection are retained. Missing
@@ -178,7 +178,7 @@ stack.
 | `full-4k` | Full-resolution bandwidth, allocation/copy/readback pressure |
 | `inline-1080p` | Larger inline compression/base64/PTY path |
 | `slow-inline` | 1080p at 120 Hz, 2 ms between PTY reads, reads at most 16 KiB; backpressure/coalescing |
-| `attach` | Launch unattached through `run`, then use the real standalone `attach` command |
+| `attach` | Launch unattached through `launch`, then use the real standalone `focus` command |
 | `resize` | Alternate 640×360 and 320×180 surface buffers; verify cleared background outside the shrunken surface |
 | `vulkan` | Optional hardware source workload, changed-output throughput only |
 

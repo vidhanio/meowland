@@ -19,8 +19,8 @@ use meowland_input::{
     {self as input},
 };
 use meowland_protocol::{
-    self as protocol, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane, Shortcuts,
-    Show,
+    self as protocol, Follow, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane,
+    Shortcuts, Target,
     asynchronous::{Outgoing, Reader},
     clipboard::{Selection, Transport},
 };
@@ -107,7 +107,8 @@ impl TerminalSession {
     pub(crate) fn new(
         receiver: Reader<Socket>,
         writer: Socket,
-        show: Show,
+        target: Target,
+        follow: Follow,
         handle: LoopHandle<'static, ()>,
     ) -> Result<Self> {
         let cells = terminal::cells();
@@ -120,7 +121,11 @@ impl TerminalSession {
         let resize = signals::Signal::new(&handle, &[UnixSignal::SIGWINCH])?;
         let input = input::Reader::new(&handle)?;
         let mut tx = Outgoing::default();
-        tx.send(&PaneToServer::Hello(Hello { size, show }))?;
+        tx.send(&PaneToServer::Hello(Hello {
+            size,
+            target,
+            follow,
+        }))?;
         Ok(Self {
             receiver,
             writer,

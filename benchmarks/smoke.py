@@ -74,18 +74,14 @@ def command(
         raise SmokeError(f"`{' '.join(command_line)}` timed out") from error
 
 
-def windows(meowland: Path, env: dict[str, str], timeout: float) -> dict[int, str]:
+def windows(meowland: Path, env: dict[str, str], timeout: float) -> dict[str, str]:
     listed = command(meowland, env, "list", timeout=timeout)
-    found: dict[int, str] = {}
+    found: dict[str, str] = {}
     for line in listed.stdout.splitlines():
         fields = line.split("\t")
-        if not fields:
+        if not fields[0]:
             continue
-        try:
-            identifier = int(fields[0])
-        except ValueError:
-            continue
-        found[identifier] = fields[1] if len(fields) > 1 else ""
+        found[fields[0]] = fields[1] if len(fields) > 1 else ""
     return found
 
 
@@ -169,7 +165,7 @@ def main() -> int:
             command(
                 meowland,
                 env,
-                "run",
+                "launch",
                 "--",
                 str(workload),
                 str(workload_socket),
@@ -186,7 +182,7 @@ def main() -> int:
             listener.close()
             listener = None
 
-            def workload_window() -> int | None:
+            def workload_window() -> str | None:
                 found = [
                     identifier
                     for identifier, app_id in windows(
@@ -201,7 +197,7 @@ def main() -> int:
             )
             print(f"smoke: window {identifier} mapped")
 
-            command(meowland, env, "kill", str(identifier), timeout=arguments_.timeout)
+            command(meowland, env, "quit", identifier, timeout=arguments_.timeout)
             print(f"smoke: window {identifier} close requested")
 
             def window_closed() -> bool | None:

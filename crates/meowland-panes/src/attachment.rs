@@ -6,7 +6,9 @@ use std::{
 };
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{FrameAck, FrameTransport, Show, WindowId, clipboard::Transport};
+use meowland_protocol::{Follow, FrameAck, FrameTransport, clipboard::Transport};
+
+use crate::{Selection, WindowId};
 
 /// Host-assigned identity of a terminal pane, distinct from a Wayland window
 /// ID.
@@ -25,31 +27,6 @@ impl From<u64> for PaneId {
     fn from(value: u64) -> Self {
         Self(value)
     }
-}
-
-/// How a pane that is waiting for a window identifies it.
-#[derive(Clone, Debug)]
-pub enum Selection {
-    /// Match the newest window with this application ID.
-    AppId(String),
-    /// Match the window claimed by this activation token.
-    Activation(String),
-}
-
-#[derive(Clone, Debug)]
-enum Binding {
-    Waiting(Selection),
-    Empty,
-    Showing(WindowId),
-}
-
-/// Whether a pane stays on its window or follows the newest window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Policy {
-    /// Keep showing the bound window.
-    Fixed,
-    /// Rebind to the newest window when the current one disappears.
-    FollowNewest,
 }
 
 /// Frame pacing state a pane needs from the compositor.
@@ -81,9 +58,10 @@ pub trait Presentation {
 
 /// A pane attached to a window selector.
 pub struct AttachedPane<P> {
-    binding: Binding,
-    /// Whether the pane follows the newest window.
-    pub policy: Policy,
+    selection: Selection,
+    window: Option<WindowId>,
+    /// How long the pane keeps matching its selection.
+    pub follow: Follow,
     /// Frame pacing state for the pane.
     pub presentation: P,
     /// Clipboard transport the pane's terminal reported after probing.
@@ -96,17 +74,19 @@ pub struct AttachedPane<P> {
 impl<P> AttachedPane<P> {
     /// Window the pane currently shows, if any.
     pub const fn window(&self) -> Option<WindowId> {
-        match self.binding {
-            Binding::Showing(window) => Some(window),
-            Binding::Waiting(_) | Binding::Empty => None,
-        }
+        self.window
     }
 
-    /// Selection this pane cannot resolve to a window yet, if any.
+    /// Selection identifying the windows this pane may show.
+    pub const fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    /// Selection this pane is waiting to resolve while showing no window.
     pub const fn waiting(&self) -> Option<&Selection> {
-        match &self.binding {
-            Binding::Waiting(selection) => Some(selection),
-            Binding::Empty | Binding::Showing(_) => None,
+        match self.window {
+            None => Some(&self.selection),
+            Some(_) => None,
         }
     }
 }
@@ -115,49 +95,36 @@ impl<P> fmt::Debug for AttachedPane<P> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AttachedPane")
-            .field("binding", &self.binding)
-            .field("policy", &self.policy)
+            .field("selection", &self.selection)
+            .field("window", &self.window)
+            .field("follow", &self.follow)
             .field("clipboard", &self.clipboard)
             .finish_non_exhaustive()
     }
 }
 
 impl<P: Presentation> AttachedPane<P> {
-    fn new(show: Show, window: Option<WindowId>, size: FrameSize) -> Self {
-        let policy = if matches!(show, Show::Newest)
-            || (window.is_none() && matches!(show, Show::Focused))
-        {
-            Policy::FollowNewest
-        } else {
-            Policy::Fixed
-        };
-        let binding = window.map_or_else(
-            || match show {
-                Show::AppId(id) => Binding::Waiting(Selection::AppId(id)),
-                Show::Activation(token) => Binding::Waiting(Selection::Activation(token)),
-                Show::Id(_) | Show::Newest | Show::Focused => Binding::Empty,
-            },
-            Binding::Showing,
-        );
+    fn new(selection: Selection, follow: Follow, size: FrameSize) -> Self {
         Self {
-            binding,
-            policy,
+            selection,
+            window: None,
+            follow,
             presentation: P::new(size),
             clipboard: Transport::Kitty,
         }
     }
 
     fn show(&mut self, window: WindowId) -> Option<String> {
-        let previous = std::mem::replace(&mut self.binding, Binding::Showing(window));
+        let previous = self.window.replace(window);
         self.presentation.mark_dirty();
-        match previous {
-            Binding::Waiting(Selection::Activation(token)) => Some(token),
+        match (&self.selection, previous) {
+            (Selection::Activation(token), None) => Some(token.clone()),
             _ => None,
         }
     }
 
-    fn clear(&mut self) {
-        self.binding = Binding::Empty;
+    fn unbind(&mut self) {
+        self.window = None;
         self.presentation.mark_dirty();
     }
 }
@@ -225,11 +192,11 @@ impl<P: Presentation> Attachments<P> {
         self.panes.iter()
     }
 
-    /// Attach a pane, replacing any previous attachment with the same ID.
-    pub fn insert(&mut self, pane: PaneId, show: Show, window: Option<WindowId>, size: FrameSize) {
-        let entry = AttachedPane::<P>::new(show, window, size);
+    /// Attach a pane waiting for its selection, replacing any previous
+    /// attachment with the same ID.
+    pub fn insert(&mut self, pane: PaneId, selection: Selection, follow: Follow, size: FrameSize) {
+        let entry = AttachedPane::<P>::new(selection, follow, size);
         let new_due = entry.presentation.due();
-        let window = entry.window();
         if let Some(previous) = self.panes.insert(pane, entry) {
             track_due(&mut self.due, previous.presentation.due(), new_due);
             if let Some(previous) = previous.window() {
@@ -238,8 +205,12 @@ impl<P: Presentation> Attachments<P> {
         } else if new_due {
             self.due += 1;
         }
-        if let Some(window) = window {
-            self.link(window, pane);
+    }
+
+    /// Replace the selection a pane matches against once it next waits.
+    pub fn reselect(&mut self, pane: PaneId, selection: Selection) {
+        if let Some(entry) = self.panes.get_mut(&pane) {
+            entry.selection = selection;
         }
     }
 
@@ -260,14 +231,14 @@ impl<P: Presentation> Attachments<P> {
         token
     }
 
-    /// Leave a pane attached but showing no window.
-    pub fn clear(&mut self, pane: PaneId) {
+    /// Leave a pane attached but showing no window, waiting on its selection.
+    pub fn unbind(&mut self, pane: PaneId) {
         let Some(entry) = self.panes.get_mut(&pane) else {
             return;
         };
         let was = entry.presentation.due();
         let previous = entry.window();
-        entry.clear();
+        entry.unbind();
         track_due(&mut self.due, was, entry.presentation.due());
         if let Some(previous) = previous {
             self.unlink(previous, pane);
@@ -300,14 +271,6 @@ impl<P: Presentation> Attachments<P> {
     /// First window shown by an attached pane, in pane-identity order.
     pub fn first_window(&self) -> Option<WindowId> {
         self.panes.values().find_map(AttachedPane::window)
-    }
-
-    /// Panes that follow the newest window.
-    pub fn following(&self) -> Vec<PaneId> {
-        self.panes
-            .iter()
-            .filter_map(|(&pane, entry)| (entry.policy == Policy::FollowNewest).then_some(pane))
-            .collect()
     }
 
     /// Record the pane that most recently routed input to a window.

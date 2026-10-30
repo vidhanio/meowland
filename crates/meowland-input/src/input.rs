@@ -1,6 +1,8 @@
 //! Nonblocking terminal input with signed SGR pixel mouse decoding and
 //! `vtparse`.
 
+#[cfg(test)]
+use std::{cell::Cell, rc::Rc};
 use std::{
     collections::VecDeque,
     io,
@@ -120,7 +122,7 @@ impl Reader {
     /// # Errors
     /// Returns an input error when the recovery deadline has elapsed.
     pub fn check_recovery(&self) -> io::Result<()> {
-        self.parser.check_recovery(Instant::now())?;
+        self.parser.check_recovery_now()?;
         Ok(())
     }
 
@@ -176,6 +178,37 @@ impl std::fmt::Debug for Reader {
     }
 }
 
+/// Time source for recovery deadlines that tests can freeze.
+#[derive(Clone, Debug)]
+struct Clock {
+    source: fn() -> Instant,
+    #[cfg(test)]
+    frozen: Rc<Cell<Option<Instant>>>,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self {
+            source: Instant::now,
+            #[cfg(test)]
+            frozen: Rc::new(Cell::new(None)),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.frozen.get() {
+            return now;
+        }
+        (self.source)()
+    }
+
+    #[cfg(test)]
+    fn freeze(&self, now: Instant) {
+        self.frozen.set(Some(now));
+    }
+}
+
 /// Decode signed mouse coordinates before the VT parser rejects their minus
 /// signs.
 struct Parser {
@@ -185,6 +218,7 @@ struct Parser {
     control_bytes: usize,
     muted_bytes: usize,
     muted_deadline: Option<Instant>,
+    clock: Clock,
 }
 
 /// An oversized control sequence that did not return to ground within the
@@ -218,6 +252,7 @@ impl Parser {
             control_bytes: 0,
             muted_bytes: 0,
             muted_deadline: None,
+            clock: Clock::new(),
         }
     }
 
@@ -227,12 +262,12 @@ impl Parser {
         }
         self.decoder.muted = true;
         self.muted_bytes = 0;
-        self.muted_deadline = Some(Instant::now() + RECOVERY_TIMEOUT);
+        self.muted_deadline = Some(self.clock.now() + RECOVERY_TIMEOUT);
         tracing::warn!("Discarding oversized terminal control sequence");
     }
 
-    fn end_muted(&mut self, now: Instant) -> Result<(), InputError> {
-        self.check_recovery(now)?;
+    fn end_muted(&mut self) -> Result<(), InputError> {
+        self.check_recovery_now()?;
         self.decoder.muted = false;
         self.muted_bytes = 0;
         self.muted_deadline = None;
@@ -244,6 +279,10 @@ impl Parser {
             return Err(InputError);
         }
         Ok(())
+    }
+
+    fn check_recovery_now(&self) -> Result<(), InputError> {
+        self.check_recovery(self.clock.now())
     }
 
     fn discard_mouse(&mut self, byte: u8) -> Result<(), InputError> {
@@ -329,7 +368,7 @@ impl Parser {
         if self.decoder.muted {
             self.muted_bytes += 1;
             if self.terminal.is_ground() {
-                self.end_muted(Instant::now())?;
+                self.end_muted()?;
             } else if self.muted_bytes > MAX_MUTED {
                 return Err(InputError);
             }
@@ -662,6 +701,7 @@ mod tests {
 
     fn muted_parser() -> Parser {
         let mut parser = Parser::new();
+        parser.clock.freeze(Instant::now());
         for &byte in &oversized_mouse(0) {
             parser.push(byte).expect("muted mouse report");
         }
@@ -1362,7 +1402,7 @@ mod tests {
     #[test]
     fn parser_fails_closed_when_a_terminator_arrives_after_the_recovery_deadline() {
         let mut parser = muted_parser();
-        parser.muted_deadline = Some(Instant::now());
+        parser.muted_deadline = Some(parser.clock.now());
         assert_eq!(parser.push(b'M'), Err(InputError));
         assert!(
             parser.muted_deadline.is_some(),
@@ -1373,8 +1413,6 @@ mod tests {
 
     #[test]
     fn reader_fails_closed_when_a_read_completes_after_the_recovery_deadline() {
-        const RACE_MARGIN: Duration = Duration::from_millis(200);
-
         fn poll_once(
             future: &mut Pin<Box<impl Future<Output = io::Result<()>>>>,
         ) -> Poll<io::Result<()>> {
@@ -1391,17 +1429,18 @@ mod tests {
             parser: muted_parser(),
             bytes: vec![0; 16 * 1024].into_boxed_slice(),
         };
-        let deadline = Instant::now() + RACE_MARGIN;
-        reader.parser.muted_deadline = Some(deadline);
+        let clock = reader.parser.clock.clone();
+        let deadline = reader
+            .parser
+            .muted_deadline
+            .expect("muted after mouse overflow");
 
         let mut read_ready = Box::pin(reader.read_ready());
         assert!(
             poll_once(&mut read_ready).is_pending(),
             "the read must wait for input before the deadline"
         );
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        clock.freeze(deadline + RECOVERY_TIMEOUT);
         write.write_all(b"1").expect("write a continuation byte");
         let result = match poll_once(&mut read_ready) {
             Poll::Ready(result) => result,

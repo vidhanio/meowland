@@ -22,3 +22,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
+wayland-client = { workspace = true }
+wayland-protocols = { workspace = true, features = ["client"] }

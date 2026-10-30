@@ -792,9 +792,12 @@ dependencies = [
  "libloading 0.9.0",
  "meowland-core",
  "proptest",
+ "rustix 1.1.5",
  "smithay",
  "thiserror",
  "tracing",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

@@ -196,7 +196,9 @@ def main() -> int:
                 ]
                 return found[0] if found else None
 
-            identifier = wait_for("workload window", arguments_.timeout, workload_window)
+            identifier = wait_for(
+                "workload window", arguments_.timeout, workload_window
+            )
             print(f"smoke: window {identifier} mapped")
 
             command(meowland, env, "kill", str(identifier), timeout=arguments_.timeout)

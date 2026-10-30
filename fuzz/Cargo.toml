@@ -13,7 +13,9 @@ arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 meowland-input = { path = "../crates/meowland-input", features = ["fuzzing"] }
 meowland-protocol = { path = "../crates/meowland-protocol" }
-meowland-terminal = { path = "../crates/meowland-terminal", features = ["fuzzing"] }
+meowland-terminal = { path = "../crates/meowland-terminal", features = [
+  "fuzzing",
+] }
 meowland-terminal-clipboard = { path = "../crates/meowland-terminal-clipboard" }
 vtparse = "0.7.0"
 

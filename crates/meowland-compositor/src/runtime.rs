@@ -10,7 +10,7 @@ use calloop::{Interest, Mode, PostAction, generic::Generic};
 use smithay::{
     input::keyboard::XkbConfig,
     reexports::wayland_server::{
-        Display, ListeningSocket,
+        BindError, Display, ListeningSocket,
         backend::{ClientData, ClientId, DisconnectReason},
     },
     wayland::compositor::CompositorClientState,
@@ -67,7 +67,7 @@ impl Runtime {
         let keymap = super::keymap::Keymap::new(&keyboard_handle, &mut state);
         state.input.keymap = keymap;
         state.input.keyboard = Some(keyboard_handle);
-        let listener = ListeningSocket::bind(name).map_err(io::Error::other)?;
+        let listener = ListeningSocket::bind(name).map_err(bind_error)?;
         handle.insert_source(
             Generic::new(listener, Interest::READ, Mode::Level),
             |_, listener, state| {
@@ -104,5 +104,33 @@ impl Runtime {
     /// Time remaining until compositor work needs another dispatch turn.
     pub fn next_wakeup(state: &Compositor) -> Option<Duration> {
         state.next_wakeup(Instant::now())
+    }
+}
+
+/// Keep an upstream I/O cause out of a second [`io::Error`] layer.
+fn bind_error(error: BindError) -> io::Error {
+    match error {
+        BindError::Io(source) => source,
+        other => io::Error::other(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_io_error_exposes_its_cause_once() {
+        let cause = io::Error::from_raw_os_error(36);
+        let message = cause.to_string();
+        let error = bind_error(BindError::Io(cause));
+        let mut rendered = vec![error.to_string()];
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            rendered.push(cause.to_string());
+            source = cause.source();
+        }
+
+        assert_eq!(rendered, [message]);
     }
 }

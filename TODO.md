@@ -48,10 +48,9 @@ units), `flake.nix` (crane build, Home Manager module, treefmt),
 
 ### Owner
 
-- [ ] **Repo hygiene.** These are local files and a history rewrite, not code changes:
+- [ ] **Repo hygiene.** These are local files, not code changes:
   - `docs/` is an empty directory.
   - `result` is a stale symlink in the working tree.
-  - Early history contains commits named `commit`, `comit`, and `cmt`.
 
 ## Done
 

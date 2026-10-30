@@ -11,7 +11,7 @@ use smithay::{
     input::keyboard::XkbConfig,
     reexports::wayland_server::{
         BindError, Display, ListeningSocket,
-        backend::{ClientData, ClientId, DisconnectReason},
+        backend::{ClientData, ClientId, DisconnectReason, InitError},
     },
     wayland::compositor::CompositorClientState,
 };
@@ -46,7 +46,7 @@ impl Runtime {
         settings: &Settings,
         handle: &CompositorHandle,
     ) -> io::Result<(Self, Compositor)> {
-        let display = Display::<Compositor>::new().map_err(io::Error::other)?;
+        let display = Display::<Compositor>::new().map_err(init_error)?;
         let mut state = Compositor::new(display.handle(), handle.clone(), settings);
         let keyboard = &settings.keyboard;
         let keymap = XkbConfig {
@@ -108,6 +108,14 @@ impl Runtime {
 }
 
 /// Keep an upstream I/O cause out of a second [`io::Error`] layer.
+fn init_error(error: InitError) -> io::Error {
+    match error {
+        InitError::Io(source) => source,
+        other @ InitError::NoWaylandLib => io::Error::other(other),
+    }
+}
+
+/// Keep an upstream I/O cause out of a second [`io::Error`] layer.
 fn bind_error(error: BindError) -> io::Error {
     match error {
         BindError::Io(source) => source,
@@ -119,18 +127,29 @@ fn bind_error(error: BindError) -> io::Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bind_io_error_exposes_its_cause_once() {
-        let cause = io::Error::from_raw_os_error(36);
-        let message = cause.to_string();
-        let error = bind_error(BindError::Io(cause));
+    fn rendered_chain(error: &io::Error) -> Vec<String> {
         let mut rendered = vec![error.to_string()];
-        let mut source = std::error::Error::source(&error);
+        let mut source = std::error::Error::source(error);
         while let Some(cause) = source {
             rendered.push(cause.to_string());
             source = cause.source();
         }
+        rendered
+    }
 
-        assert_eq!(rendered, [message]);
+    #[test]
+    fn init_io_error_exposes_its_cause_once() {
+        let cause = io::Error::from_raw_os_error(24);
+        let message = cause.to_string();
+
+        assert_eq!(rendered_chain(&init_error(InitError::Io(cause))), [message]);
+    }
+
+    #[test]
+    fn bind_io_error_exposes_its_cause_once() {
+        let cause = io::Error::from_raw_os_error(36);
+        let message = cause.to_string();
+
+        assert_eq!(rendered_chain(&bind_error(BindError::Io(cause))), [message]);
     }
 }

@@ -8,6 +8,7 @@ use smithay::{
         utils::{send_frames_surface_tree, with_surfaces_surface_tree},
     },
     output::Output,
+    wayland::compositor::SurfaceData,
 };
 
 use super::{Compositor, Policy, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
@@ -22,9 +23,12 @@ impl Window {
     }
 
     /// Visit the window's surface trees without building a render stack.
-    pub(crate) fn with_surfaces(&self, mut visit: impl FnMut(&WlSurface)) {
+    ///
+    /// The visitor runs with the surface's state locked and receives that
+    /// state; calling `with_states` on the surface inside it deadlocks.
+    pub(crate) fn with_surfaces(&self, mut visit: impl FnMut(&WlSurface, &SurfaceData)) {
         self.with_surface_trees(|root| {
-            with_surfaces_surface_tree(root, |surface, _| visit(surface));
+            with_surfaces_surface_tree(root, &mut visit);
         });
     }
 
@@ -129,7 +133,7 @@ impl Compositor {
             self.windows.surface_cache.forget(&surface);
         }
         if let Some(window) = self.windows.by_id.remove(&id) {
-            window.with_surfaces(clear_owner);
+            window.with_surfaces(|_, states| clear_owner(states));
             self.windows
                 .id_by_surface
                 .remove(window.surface.wl_surface());

@@ -15,7 +15,7 @@ use smithay::{
     reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
     utils::{Logical, Size},
     wayland::{
-        compositor::{CompositorState, get_parent, with_states},
+        compositor::{CompositorState, SurfaceData, get_parent, with_states},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         fractional_scale::FractionalScaleManagerState,
@@ -204,12 +204,12 @@ fn cache_owner(surface: &WlSurface, window: WindowId) {
     });
 }
 
-fn clear_owner(surface: &WlSurface) {
-    with_states(surface, |states| {
-        if let Some(owner) = states.data_map.get::<SurfaceOwner>() {
-            *owner.0.lock().expect("surface owner lock poisoned") = None;
-        }
-    });
+/// Takes the surface's already-locked state, because surface-tree walks hold
+/// that lock while visiting and re-locking it would deadlock.
+fn clear_owner(states: &SurfaceData) {
+    if let Some(owner) = states.data_map.get::<SurfaceOwner>() {
+        *owner.0.lock().expect("surface owner lock poisoned") = None;
+    }
 }
 
 impl Compositor {
@@ -461,7 +461,7 @@ impl Compositor {
         if let Some(entry) = self.windows.by_id.get(&window)
             && self.windows.catalog.drawable(window)
         {
-            entry.with_surfaces(|surface| self.output.enter(surface));
+            entry.with_surfaces(|surface, _| self.output.enter(surface));
         }
     }
 
@@ -470,7 +470,7 @@ impl Compositor {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window) {
-            entry.with_surfaces(|surface| self.output.leave(surface));
+            entry.with_surfaces(|surface, _| self.output.leave(surface));
         }
     }
 }

@@ -1,307 +1,181 @@
 # TODO
 
-Inventory and backlog from a full read of the workspace (about 13.4k lines of Rust in
-11 crates, plus about 1.4k lines of Python benchmarks). See the README for the
-architecture diagrams. Items are ordered by impact within each section. File paths are
-relative to `crates/` unless stated otherwise.
+Open work comes first. Completed items are condensed under [Done](#done), each with a
+note on any decision a future change should respect. See the README for the
+architecture diagrams. Paths are relative to `crates/` unless stated otherwise.
+
+Out of scope by decision: protocol versioning (the project is pre-release), pinning
+the nightly toolchain, and deduplicating the systemd units (the Home Manager module
+needs its own copy).
 
 ## Inventory
 
+About 20.5k lines of Rust in 16 crates, plus the Python benchmark harness.
+
 | Crate | Lines | Role |
 |---|---|---|
-| `meowland` | 443 | CLI (`usage-rs`), config loading, logging |
-| `meowland-bench` | 538 | Benchmark workload binary and cargo bench shim |
-| `meowland-server` | 1068 | Owns the `calloop` loop: sockets, socket activation, child processes, shutdown |
-| `meowland-compositor` | 4557 | Smithay state: shell, seat, input injection, panes, clipboard bridge, DMA-BUF readback, frame pacing |
-| `meowland-render` | 1421 | CPU compositor (RGBA to RGB, viewport, scale), damage, EGL/GLES DMA-BUF backend |
-| `meowland-protocol` | 1103 | Postcard wire types, sync and async framing, shared-memory frames, clipboard limits |
-| `meowland-terminal` | 1593 | Pane client: probe, session select loop, presentation, terminal modes |
-| `meowland-terminal-clipboard` | 973 | OSC 5522 (Kitty) and OSC 52 clipboard state machines |
-| `meowland-input` | 681 | VT parser wrapper, SGR pixel mouse, Kitty key tracking |
-| `meowland-kitty` | 331 | Kitty graphics encoder (zlib, base64, chunking, in-place frame edits) |
-| `meowland-core` | 628 | Error enum, `FrameSize`, `UiScale`, `RefreshRate`, latency stats, calloop async helpers |
+| `meowland` | 463 | CLI (`usage-rs`), TOML config loading, logging, `anyhow` error reporting |
+| `meowland-server` | 1130 | Owns the `calloop` loop: sockets, socket activation, child processes, shutdown |
+| `meowland-compositor` | 4340 | Smithay state (`Protocols`, `Input`, `Windows`), shell, seat, input injection, keymap, frame pacing |
+| `meowland-loop` | 216 | `CompositorHandle` projection: register calloop sources against a projected state |
+| `meowland-panes` | 1543 | Window catalog and pane attachments, generic over a `Presentation` trait (no Smithay) |
+| `meowland-selection` | 840 | Wayland ↔ terminal clipboard bridge behind a `Host` trait |
+| `meowland-readback` | 665 | DMA-BUF acquire fences, GPU submit and completion behind a `Host` trait |
+| `meowland-render` | 2601 | CPU composition, damage, shm snapshots, EGL/GLES DMA-BUF backend |
+| `meowland-protocol` | 2029 | Postcard wire types, sync and async framing, shared frames, clipboard limits |
+| `meowland-terminal` | 2128 | Pane client: probe, session loop, presentation, terminal modes |
+| `meowland-terminal-clipboard` | 1213 | OSC 5522 (Kitty) and OSC 52 clipboard state machines |
+| `meowland-input` | 1558 | VT parsing, SGR pixel mouse, Kitty key events, oversized-control recovery |
+| `meowland-kitty` | 355 | Kitty graphics encoder (zlib, base64, chunking, rectangle edits) |
+| `meowland-async` | 298 | calloop-local async I/O, timers, scheduling, and signals |
+| `meowland-core` | 463 | `FrameSize`, `UiScale`, `RefreshRate`, latency percentiles |
+| `meowland-bench` | 615 | Benchmark workload binary and the `cargo bench` shim |
 
-Also in the repo: `benchmarks/*.py` (process-level harness), `share/systemd/user`
-(socket and service units), `flake.nix` (crane build, Home Manager module, treefmt),
-`.github/workflows/ci.yaml`.
+Also in the repo: `benchmarks/` (Python harness, `smoke.py`, `GUIDE.md`),
+`share/systemd/user` (socket and service units), `flake.nix` (crane build, Home
+Manager module, treefmt), `.github/workflows/ci.yaml` (fmt, clippy, tests, docs,
+headless smoke test).
 
-Focused unit tests now cover the pure parsers, protocol framing, and shortcut
-configuration (see §5). CI and `nix flake check` run `cargo test`. Clippy is clean with
-the pedantic and nursery lint groups.
+## Open
 
----
+### In progress
 
-Out of scope by decision: protocol versioning (the project is pre-release), pinning
-nightly, and deduplicating the systemd units (Home Manager needs its own copy).
+- [ ] **Reusable shared-frame slots** (branch `todo/terminal-5`, not merged; needs a
+  design decision). Replaces the fresh POSIX shm object per frame (~0.45 ms of a
+  4.6 ms full-1080p frame is page faults) with a two-slot ring of `t=f` files freed
+  only by the terminal's `OK` reply for that exact transfer (`q=1`, image id +
+  placement id). Timeouts and errors retire the slot. `t=s` objects remain the
+  fallback, then inline RGB. Four review rounds fixed reply correlation, slot release
+  on fallback, stale repaints, and probe independence. The fourth round requested
+  changes again, with two blocking holes:
+  - **Image-id namespaces can collide across processes.** The per-process counter
+    with PID-derived high bits repeats for PIDs equal mod 32768, after PID reuse, and
+    across PID namespaces; the reviewer reproduced a premature release by forcing
+    equal PIDs. Kitty `a=q` does not look up stored images, and `a=d` cannot remove
+    replies already queued in the PTY, so neither is a barrier. Options: a locked,
+    persistent, monotonic allocator in the runtime directory shared by all pane
+    processes, which fails closed to objects or inline on any coordination failure
+    and is scoped to one host and user; a real terminal-input barrier (a unique
+    marker, then draining replies through it); or accepting probabilistic safety
+    explicitly and documenting it.
+  - **`Resync` resets the producer's transfer counter.** An ordinary keyframe request
+    on the last transfer restarts `p=1` under an unchanged image id. Simplest fix:
+    never reset; on exhaustion, retire the ring and disable slots for that
+    attachment.
 
-## 1. Correctness bugs
+  If the complexity is not worth ~10% of a full-frame update, close the branch and
+  keep the one-shot `t=s` objects. See `HANDOFF.md` for the decision options.
 
-- [x] **Non-US keyboard layouts send the wrong keys.** `meowland-input` translated
-  Kitty *logical* key codes to evdev codes with a hard-coded US table
-  (`char_code`), while the server resolved those codes against the *configured* XKB
-  keymap (`keyboard.layout`), so `layout = "de"` turned `y` into `z`. The pane now
-  forwards Kitty key identities and the compositor builds a reverse
-  keysym-to-keycode map from the active layout
-  (`meowland-compositor/src/keymap.rs`, levels 0 and 1), committing text for
-  printable keys the layout cannot type.
-- [x] **Extra mouse buttons are treated as motion.** In `meowland-input/src/input.rs`
-  `mouse()`, SGR codes 128–131 (buttons 8–11, back and forward) hit the
-  `code & (32 | 128) != 0` branch and become plain motion.
-- [x] **Horizontal scroll is dropped.** Wheel codes 66 and 67 return `None`, and
-  `Input::Pointer` can only express `scroll: i16` vertically. Add a horizontal axis to
-  the protocol and handle `Axis::Horizontal` in `meowland-compositor/src/input.rs`.
-- [x] **Configures are sent on every state touch.**
-  `meowland-compositor/src/commands.rs` `apply_window_state` always calls
-  `send_configure()`. It runs from `focus_window` (twice per focus change),
-  `bind_pane_window`, `resize_pane`, `remove_pane`, `title_changed` (through
-  `resolve_pending_panes`), and so on. Each redundant configure makes clients
-  re-layout and re-render. Use `send_pending_configure()`, which only sends when
-  pending state differs from the last configure.
-- [x] **Mixed sync and async writers to the TTY.** `TerminalGuard`
-  (`meowland-terminal/src/terminal.rs`) writes mode switches with blocking
-  `io::stdout()`. Frames go through a separate nonblocking descriptor
-  (`output::open`). A restore can interleave with a half-drained frame. Route mode
-  changes through the same `Output` queue, or drain it before `restore()`.
-- [x] **Probe query duplicates its ID constant.** `FRAME_EDIT_QUERY` in
-  `meowland-terminal/src/probe.rs` hard-codes `i=30` while `FRAME_EDIT_ID = 30` is a
-  separate constant. Build the query from the constant, as `query_shared` already does.
-- [x] **Pane-client logs disappear when journald is unavailable.** `init_logging`
-  (`meowland/src/main.rs`) silently installs nothing if `tracing_journald::layer()`
-  fails. Fall back to a file in `$XDG_STATE_HOME`. stderr cannot be used because the
-  terminal is in raw mode or the alternate screen.
+### Performance
 
-## 2. Architecture
+- [ ] **Restrict DMA-BUF readback to the damage.** The GPU blit and
+  `copy_framebuffer` still read the whole buffer. Smithay's renderer has no
+  per-rectangle mapping export, so this needs a separate target texture and copy per
+  damaged region.
 
-- [x] **Split `meowland-compositor`** (5.1k lines, 5.1× the AGENTS.md guideline).
-  Remaining seams:
-  - [x] `readback.rs` + `readback/fences.rs` (about 600 lines): DMA-BUF acquire, fence
-    export, and the GPU submit/complete state machine. Extracted to
-    `meowland-readback` behind a `Host` trait; the compositor supplies the GPU
-    backend, pane bounds, spare snapshots, client wakeups, and shutdown.
-  - [x] `clipboard.rs` (550 lines): the Wayland ↔ terminal selection bridge. It is an
-    independent state machine with its own sources and timers. Extracted to
-    `meowland-selection` behind a `Host` trait; the compositor owns the bridge state
-    and supplies the seat calls, pane routing, and paste action.
-  - [x] `catalog.rs` + `attachment.rs`: now the `meowland-panes` crate. `Attachments<P>`
-    is generic over a `Presentation` trait, so pane policy has no Smithay dependency.
-- [x] **Break up the `Compositor` god struct.** It has about 45 fields, and every
-  submodule reaches into all of them through `impl State`. Group them into
-  sub-structs (`Protocols`, `Seat`, `Windows`, `Panes`, `Selection`), so borrows split
-  cleanly and the `keyboard.take() … self.keyboard = Some(keyboard)` dance (repeated
-  about 12 times) goes away. Drop the `use Compositor as State` alias: two names for
-  one type makes grepping harder.
-  - Protocol, seat/input, and window state now live in `Protocols`, `Input`, and
-    `Windows`. The `pointer.take()` around motion stays on purpose: the take
-    suppresses `cursor_image` delivery while the pointer moves.
-- [x] **Replace the `CompositorHandle` projection machinery.**
-  `meowland-compositor/src/event_loop.rs` adds a custom `Source` trait object,
-  `Projected`, and `Rc<dyn Fn>` boxing (about 160 lines) so the compositor can register
-  sources on a loop whose data is `Server`. Simpler options: make `Compositor` the loop
-  data and keep server state inside it, or make registration generic over
-  `D: AsMut<Compositor>`.
-  Evaluated and kept: both alternatives either make `Compositor` generic throughout the
-  crate or still need an erased late-registration handle, so the current machinery is
-  the smallest viable design. It now lives in `meowland-loop`, generic over the
-  projected state, so other crates can register sources without owning the loop data.
-- [x] **The run loop does a full pass on every wakeup.** `actor::run` calls
-  `wayland.dispatch`, which ran `frame_callbacks` (all windows), `dispatch_frames`
-  (all panes), `expire_activation_tokens`, and `refresh_popup_grab`, after *any* event,
-  including a single control request. The duplicated display fd is registered with a
-  no-op callback just to force wakeups. Track dirty and due state, and only walk the
-  collections when something changed.
-- [x] **`meowland-core` is a grab bag.** Errors, pixel geometry, UI scale, refresh rate,
-  latency stats, calloop async helpers, and signals have nothing in common. Move
-  `asynchronous` and `signals` into a `meowland-async` crate (or into
-  protocol/terminal), and keep `core` for value types.
-- [x] **Replace the crate-wide `Error` enum** (`meowland-core/src/error.rs`). It mixes
-  terminal capabilities (`PixelMouseUnsupported`, `KeyboardUnsupported`), CLI response
-  handling (`UnexpectedWindowListResponse`), and server startup. Give each library
-  crate its own error type. The `meowland` binary should use `anyhow`-style context.
-- [x] **Stop using `io::Error` as the validation error.** `UiScale::from_str`,
-  `RefreshRate::try_from`, and `Config::into_settings` return
-  `io::ErrorKind::InvalidInput`. Use dedicated `thiserror` types such as
-  `InvalidScale` and `InvalidRefreshRate`.
-- [x] **Remove the duplicate config schema.** `meowland-server::Config`,
-  `OutputConfig`, and `KeyboardConfig` mirror `meowland-compositor::Settings` and
-  `KeyboardSettings` field by field, and repeat-rate validation exists in both
-  `configuration.rs` and `runtime.rs`. Make `Settings` deserialize directly (validated
-  newtypes with `TryFrom` and `#[serde(try_from)]`) and validate in one place.
-  - `self.output.scale.to_string().parse()` converts a float to a string and back to
-    build a `UiScale`. Add `UiScale::try_from(f64)`.
-- [x] **Separate connection IDs from pane IDs.** `Server::accepted` assigns
-  `PaneId(next_connection)` to *control* connections too. Introduce `ConnectionId` and
-  create a `PaneId` only after a successful `Hello`.
-- [x] **Listener capacity depends on array order.** `update_listeners` computes
-  capacity with `usize::from(index == 1)`, while `accepted` uses
-  `ConnectionKind::Pane`. Store the `ConnectionKind` in `Listener`.
-- [x] **Encode readback phases in types.** `readback.rs` `submit` and `complete`
-  `unreachable!()` on the wrong `Phase`. Keep acquiring and reading operations in
-  separate maps, or pass the phase payload to the callback directly.
-- [x] **Move benchmarks out of the shipping crate.** The `benchmarks` feature,
-  `[[bin]] meowland-workload`, `[[bench]] suite`, and the optional
-  `wayland-client`/`wayland-protocols`/`rustix` dependencies make
-  `crates/meowland/Cargo.toml` mostly about benchmarks. Create a
-  `crates/meowland-bench` crate (`publish = false`) for the workload, the shim, and
-  `benchmarks/*.py`.
+### Testing
 
-## 3. Performance
+AGENTS.md allows purposeful tests only: every test must guard a real invariant, edge
+case, regression, or contract.
 
-- [x] **shm commits copy the whole buffer.** `Snapshot::copy_shm` copies and swizzles
-  the full buffer on every commit, even when the damage is a few rows. At 4K that is
-  33 MB per commit. Copy only the buffer-damage rectangles into the retained snapshot.
-  The previous snapshot is already passed in for reuse.
-- [x] **DMA-BUF readback allocates and reads the whole buffer every frame.**
-  `DmabufBackend::complete` allocated `vec![0; needed]` and ran a full alpha pass
-  each time. Recycle the previous snapshot buffer instead.
-  - [ ] Restrict the GPU blit and `copy_framebuffer` to the damage. Smithay's
-    renderer has no per-rectangle mapping export, so this needs a separate target
-    texture and copy per damaged region.
-- [x] **Updates are sent as row bands, not rectangles.** `Renderer::update` computes a
-  column range but only reports changed *rows*. `FrameBand` and the Kitty `a=f` edit
-  then send full-width rows. A blinking cursor costs `width × 16 × 3` bytes before
-  zlib. Carry `x` and `width` in `FrameBand` and use Kitty's `x=`/`w=` edit keys.
-  - Rectangles inside the frame travel as `x`/`width`, and the edit uses Kitty's
-    `a=f,x=…,y=…` offset with `s`/`v` for the payload size (not `x=`/`w=`). Rectangles
-    at least 75% of the frame width are still sent as full rows.
-- [x] **Polling for shared-frame consumption.** `presentation/shared.rs` calls
-  `shm_open` every 1 ms for up to 250 ms to see whether the terminal unlinked the
-  object (`SharedFrame::exists`), and each poll allocates the name string
-  (`SharedFrame::name()`). Cache the name, and back off exponentially or ack
-  optimistically.
-- [x] **A shared-memory frame costs a full read on the next band.** After a shared
-  frame, the next inline band forces `SharedPresentation::into_band` to read the whole
-  frame back from shm. Read it lazily in the background, or keep the server on shared
-  transport for the following update.
-  - The pane copies a consumed frame back in bounded chunks from its own scheduling
-    turns, so the following band normally finds the pixels ready.
-- [ ] **A new shm object for every frame.** `SharedObject::create` costs a `shm_open`,
-  page faults for every page, and an unlink per frame, because the terminal unlinks
-  after reading. Measure against `t=f` with a reusable file, or a small ring of
-  objects.
-  - Measured on one 1080p frame: creating, writing and unlinking a fresh object costs
-    ~665 µs, of which `shm_open`/`ftruncate`/`unlink` are 2 µs; rewriting a populated
-    object costs ~205 µs. The whole available win is ~0.45 ms of a 4.6 ms frame.
-  - Reuse stays out for now because our `present_shared` sends `q=2`, so a shared
-    transfer gets no reply; that is a property of the current command, not of `t=f`.
-    Replies are suppressed by us: without `q=2` the terminal answers `OK` or an error
-    after loading, which would allow a reply-driven ring with correlation, error
-    handling, a timeout, and fallback. That round trip and its failure behaviour are
-    unevaluated. Without replies a pty can hold many frames of escapes, so a ring of
-    files cannot be proven free before it is overwritten. Prefaulting the next `t=s`
-    object pays the same 6 MB of writes to avoid the same page faults.
-- [x] **O(windows × panes) scans in hot paths.** `Attachments::visible`, `showing`,
-  `owner`, and `first_window` scan every pane. They are called per window in
-  `frame_callbacks`, per commit, and on every focus change. Keep a
-  `HashMap<WindowId, SmallVec<PaneId>>` index.
-- [x] **`window_for_surface` runs three times per commit.**
-  `CompositorHandler::commit` calls it three times, and each call walks up to 64
-  parents. Compute it once and cache the owner in the surface `data_map` instead of
-  `SurfaceCache::owners`.
-- [x] **Clipboard export reads every MIME type eagerly.**
-  `meowland-compositor/src/clipboard.rs` reads every representation (up to 64 types and
-  32 MiB) from the app on every selection change, so copying an image in a browser
-  pulls every format. Prioritise text and image types and cap the total. The OSC 5522
-  write does need the data up front, but not all of it.
-  - Exports follow a short allowlist in preference order, and a pane that reports the
-    OSC 52 transport is offered only the first plain-text representation it has, capped
-    at `MAX_TEXT` instead of `MAX_BYTES`.
-- [x] **Framing buffers never shrink.** `protocol::send`/`recv` use a thread-local
-  `SCRATCH`, and `asynchronous::Reader::body` keeps its high-water mark (up to
-  64 MiB). Shrink after oversized messages.
-- [x] **One `Outgoing` per message.** `pane_writer` allocates a fresh `Outgoing` for
-  every message (`transport.rs`). Reuse one.
-- [x] **`yield_now()` on every session iteration.** `TerminalSession::run` yields at the
-  end of every loop iteration, on top of the per-chunk yields in `Reader::read` and
-  `Outgoing::flush_to`. That is an extra executor round trip per event. Yield only
-  after an event budget is spent.
+- [ ] **End-to-end incremental rendering.** Blending, viewports, transforms, clipped
+  blits, and the opaque-cover decision helper are covered. Damage-limited
+  recomposition matching full recomposition still needs a `Renderer::update` fixture
+  with real `WlSurface` commits.
+- [ ] **Fuzz the parsers.** Add `cargo fuzz` targets for `meowland-input` (`Parser`,
+  `csi`, `mouse`), the probe parser, and `Packet::parse` once the Nix nightly
+  sanitizer flags are set up.
+- [ ] **CLI error output.** The Wayland bind and init error normalization is
+  tested at the conversion helpers. A process-level test that starts the CLI with a
+  runtime directory short enough for the control socket but too long for the Wayland
+  socket would also guard the wiring and assert the cause prints once.
 
-## 4. Type and API design
+### Owner
 
-These follow the `rust-best-practices` skill.
-
-- [x] **Invalid pointer states are representable.** `Input::Pointer { button:
-  Option<u8>, pressed: bool }`: `pressed` means nothing when `button` is `None`. Use
-  `button: Option<(Button, ButtonState)>` with a `Button` enum instead of raw
-  `0/1/2/_`.
-- [x] **Modifiers are a raw `u8`.** `protocol::modifiers` is a `u8` with loose consts.
-  Use a `bitflags` `Modifiers` type. The crate already decodes Kitty's bit layout by
-  hand in `input.rs` `csi()` (`(bits & !6) | …`), which needs a comment or a named
-  conversion.
-- [x] **Validate dimensions at deserialization.** `Hello { width, height }` and
-  `PaneAction::Resize` carry raw `u32`s that the server validates in three places
-  (`transport.rs`, `commands.rs` twice). Send `FrameSize` and validate during
-  deserialization, as `FrameBand` and `SharedFrame` already do.
-- [x] **Use ID newtypes on the wire.** `WindowInfo::id`, `Show::Id`, and the clipboard
-  `request` and `offer` IDs are bare `u64`. Use `WindowId`, `RequestId`, and `OfferId`.
-  `PaneId(pub u64)` and `WindowId(pub u64)` expose their fields.
-- [x] **Bool fields in the protocol.** `ClipboardOffer.paste`, `Input::Key.pressed`,
-  and `WindowInfo.active` should be enums.
-- [x] **Pair related probe fields.** `ProbeInfo` stores `pixel_width`/`pixel_height`
-  and `cell_width`/`cell_height` as independent `Option`s. Use
-  `Option<(u32, u32)>`, or reuse `FrameSize`.
-- [x] **Remove dead or over-public items.**
-  - [x] `Command::Shutdown` is never constructed.
-  - [x] `ControlRequest::Ping` is never sent by the CLI.
-  - [x] `terminal_clipboard::Clipboard::cancel_refresh` has no external callers.
-  - [x] `render::popup_origin` is private.
-  - [x] `Paths::in_runtime_dir` should be `pub(crate)` or private.
-- [x] **Duplicate completers.** `meowland/src/cli.rs` `attach_targets` and
-  `window_targets` are identical.
-- [x] **Logging setup sits in the wrong module.** `cli::start` calls back into
-  `crate::init_logging`, and `main.rs` owns a `LogDestination` enum only `cli` uses.
-  Move logging into its own module and call it from `main`.
-- [x] **The `config` crate is overkill for one TOML file.**
-  `meowland/src/configuration.rs` reads the file itself and then routes it through
-  `config::Config::builder()`. `toml::from_str` does the same with a much smaller
-  dependency tree.
-- [x] **Name the magic numbers.** Examples: 256 deferred inputs (`input_gate.rs`), 16
-  deliveries (`clipboard.rs`), 64 events per turn, 4096/4095 chunk sizes
-  (`terminal-clipboard/src/kitty.rs`), `SCROLL_FACTOR`, `15.0 / 120.0`, and button
-  codes `0x110…0x113` (use `BTN_LEFT` and friends). Give each a named constant with a
-  short reason.
-- [x] **Hard-coded Alt+Q / Alt+W shortcuts.** They are fixed in
-  `meowland-protocol/src/protocol.rs` and silently steal those keys from applications.
-  Make them configurable, and allow disabling them. The server config now has a
-  `[shortcuts]` table with `close_window` and `detach_pane` key strings, sent to
-  panes in `HelloOk`; empty strings disable either binding.
-
-## 5. Testing
-
-AGENTS.md says not to add tests unless asked. This section lists where tests would pay
-off most, for when that is requested.
-
-- [x] Pure parsers of untrusted input: `input.rs` `csi()` and `mouse()`, `Parser::push`
-  (split escape sequences, signed coordinates), `probe.rs` `ProbeParser`, and
-  `terminal-clipboard` `Packet::parse`.
-- [x] `keyboard::key_code` round-trips, `FrameBand` rectangle edge cases, and
-  `protocol` framing (oversize, trailing bytes, cancellation-safe `Reader`).
-- [ ] Add a `cargo fuzz` harness for the pure parsers once the Nix nightly sanitizer flags
-  are configured; this round only added deterministic unit tests.
-- [x] `catalog.rs` and `attachment.rs` selection and follow policy, which become
-  testable without Wayland once split out (see §2).
-- [ ] `render.rs` composition: blending, viewport, transforms, and damage-limited
-  recomposition matching full recomposition.
-  Blending, viewport, transforms, and direct clipped blits are covered. The
-  damage-limited claim still needs an end-to-end `Renderer::update` fixture with
-  surface commits; the opaque-cover shortcut is only tested through its decision
-  helper today.
-
-## 6. Tooling, CI, Nix
-
-- [x] **CI duplicates the flake checks.** The GitHub `check` job and `nix flake check`
-  both run clippy, fmt, docs, and tests with different toolchains. Keep one source of
-  truth, probably the flake.
-  Accepted: GitHub CI and `nix flake check` cover different environments and toolchains,
-  so both stay.
-- [x] **CI library setup is incomplete.** The CI `apt-get` installs only
-  `libxkbcommon-dev`, while Nix also needs `libglvnd` and `libgbm`. The job works only
-  because it never links the EGL paths at runtime.
-- [x] **No headless smoke test.** CI only runs `meowland --help`. A test that starts
-  `meowland server` in a temporary `XDG_RUNTIME_DIR`, runs the benchmark workload, and
-  checks `meowland list` would catch most integration breakage.
-- [ ] **Repo hygiene.** Needs the owner: these are untracked local files and a
-  history rewrite, not code changes.
+- [ ] **Repo hygiene.** These are local files and a history rewrite, not code changes:
   - `docs/` is an empty directory.
   - `result` is a stale symlink in the working tree.
-  - Recent history contains commits named `commit`, `comit`, and `cmt`. Squash them or
-    use descriptive messages.
+  - Early history contains commits named `commit`, `comit`, and `cmt`.
+
+## Done
+
+### Correctness
+
+- Non-US layouts: panes forward Kitty key identities; the compositor resolves them
+  through the active XKB layout (`keymap.rs`, levels 0 and 1), commits text for
+  printable keys the layout cannot type, and uses Kitty associated text.
+- Pointer input: typed buttons including back and forward, and horizontal scroll.
+  `Modifiers` is a bitflags type with a documented Kitty conversion.
+- Configures are sent only when pending state changed (`send_pending_configure`).
+- All TTY writes go through one ordered output queue. Closing drains it under a
+  deadline, then restores terminal modes.
+- Oversized escape sequences are discarded using the VT parser's own state
+  (including C1, CAN/SUB, ST split at any boundary, and the SGR mouse fast path).
+  Recovery fails closed with an input error after a byte cap or a 1 s deadline,
+  checked again after late reads; the deadline uses a test-controllable clock.
+- Pane logs fall back to `$XDG_STATE_HOME/meowland/pane.log` when journald is
+  unavailable.
+
+### Architecture
+
+- The compositor is split into `meowland-loop`, `meowland-panes`,
+  `meowland-selection`, and `meowland-readback`, and its state is grouped into
+  `Protocols`, `Input`, and `Windows`. `Attachments<P>` keeps its window index and
+  due count consistent through every public mutation; there is no `&mut` access to
+  indexed entries.
+- `CompositorHandle` was evaluated and kept: both alternatives made `Compositor`
+  generic throughout. It now lives in `meowland-loop`.
+- The selection bridge tracks a per-target generation, so host reentrancy
+  (detach, replacement, request errors) cannot reinstate stale exports.
+- Readback phases are typed (separate acquiring and reading maps). On surface
+  destruction, in-flight reads wait for their fence instead of being dropped.
+- Per-crate error types; the binary uses `anyhow` with structural cause
+  deduplication. Nested Wayland `BindError::Io` and `InitError::Io` are unwrapped at
+  the conversion boundary.
+- One validated config schema (`compositor::Settings`, serde with validated newtypes),
+  re-exported from `meowland-server`; TOML via `toml`, not `config`.
+- `ConnectionId` is separate from `PaneId`, and listeners carry their
+  `ConnectionKind`.
+- `meowland-core` holds only value types; the calloop helpers moved to
+  `meowland-async`. The benchmark workload and shim moved to `meowland-bench`; the
+  Python harness stays in `benchmarks/`.
+
+### Performance
+
+- shm commits copy only damaged rectangles, with an exact transparent-pixel count.
+  DMA-BUF readbacks recycle the previous snapshot's storage.
+- Pane updates are rectangles (`FrameBand { x, y, width }`, Kitty `a=f` with `x`/`y`
+  offsets and `s`/`v` sizes). Rectangles at least 75% of the frame width go as full
+  rows. Shared memory is chosen by changed-rectangle area.
+- Run-loop passes are skipped when nothing is due (frame-due counts, earliest
+  callback and activation deadlines, deferred popup cleanup).
+- Shared-frame consumption polling backs off; consumed frames are copied back in
+  bounded chunks between turns.
+- Attachments are indexed by window. Surface owners are cached in the surface data
+  map.
+- Clipboard exports follow a MIME allowlist (text first, then `text/html`,
+  `image/png`, `text/uri-list`). OSC 52 panes get one text type, capped at `MAX_TEXT`.
+- Framing buffers shrink back to 1 MiB after large messages. `Outgoing` buffers are
+  reused, and the session loop yields after a turn budget.
+
+### Types and API
+
+- `FrameSize` is validated during deserialization. The wire uses ID newtypes and
+  enums instead of bools. Probe sizes are paired. Dead items are removed.
+- Shortcuts are configurable: `[shortcuts] close_window`/`detach_pane` key strings,
+  sent to panes in `HelloOk`; an empty string disables a binding.
+- Magic numbers are named constants with documented sources.
+
+### Testing and CI
+
+- Unit and property tests for parsers, protocol framing, the async reader resuming
+  after cancellation, pane policy (with an independent proptest model), composition
+  (independent source-over oracle), shm snapshots, core value types, settings, and
+  the selection bridge's reentrancy.
+- CI installs the EGL and GBM libraries and runs `benchmarks/smoke.py`, which starts a
+  server, maps a workload window, kills it, and checks a clean shutdown.
+- GitHub CI and `nix flake check` both stay because they cover different
+  environments.
+- Benchmarks cover tall, wide, and off-origin rectangles. Each case asserts its
+  transport (shared or inline) and edit geometry, and `--compare` still matches
+  older saved results.

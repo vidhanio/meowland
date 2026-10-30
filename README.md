@@ -16,37 +16,59 @@ Meowland runs as two kinds of process:
 flowchart TD
     bin["meowland<br/>CLI, config loading, logging"]
     server["meowland-server<br/>event loop owner, sockets, processes"]
-    compositor["meowland-compositor<br/>Smithay state, panes, input, clipboard bridge"]
-    render["meowland-render<br/>CPU composition, damage, DMA-BUF readback"]
+    compositor["meowland-compositor<br/>Smithay state, shell, seat, input, keymap, frames"]
+    loop["meowland-loop<br/>calloop source projection"]
+    panes["meowland-panes<br/>window catalog, pane attachments"]
+    selection["meowland-selection<br/>clipboard bridge"]
+    readback["meowland-readback<br/>DMA-BUF fences and GPU readback"]
+    render["meowland-render<br/>CPU composition, damage, snapshots, EGL backend"]
     terminal["meowland-terminal<br/>pane client session, probing, presentation"]
     input["meowland-input<br/>VT and Kitty keyboard decoding"]
     tclip["meowland-terminal-clipboard<br/>OSC 5522 and OSC 52"]
     kitty["meowland-kitty<br/>Kitty graphics encoding"]
     protocol["meowland-protocol<br/>wire messages, framing, shared frames"]
-    core["meowland-core<br/>errors, FrameSize, async helpers, scale"]
+    async["meowland-async<br/>calloop-local async I/O, timers, signals"]
+    core["meowland-core<br/>FrameSize, scale, refresh rate, latency"]
 
     bin --> server
     bin --> terminal
     bin --> protocol
     server --> compositor
     server --> protocol
+    server --> async
+    compositor --> loop
+    compositor --> panes
+    compositor --> selection
+    compositor --> readback
     compositor --> render
     compositor --> protocol
+    selection --> loop
+    selection --> panes
+    selection --> protocol
+    readback --> loop
+    readback --> render
+    panes --> protocol
     terminal --> input
     terminal --> tclip
     terminal --> kitty
     terminal --> protocol
+    terminal --> async
     input --> protocol
+    input --> async
     kitty --> protocol
     tclip --> protocol
+    protocol --> async
     protocol --> core
     render --> core
-    server --> core
+    panes --> core
+    readback --> core
     compositor --> core
     terminal --> core
-    input --> core
     kitty --> core
 ```
+
+`meowland-bench` (benchmark workload and `cargo bench` shim) depends on none of the
+crates above; it drives the real binaries as separate processes.
 
 ### Runtime flow
 
@@ -76,10 +98,10 @@ flowchart LR
             cmds["commands.rs<br/>handle_command"]
             inp["input.rs<br/>pane_input to wl_seat"]
             buf["buffer.rs commit<br/>shm copy / readback"]
-            rb["readback.rs<br/>DMA-BUF fences + GPU"]
             frame["frame.rs<br/>PaneState + dispatch_frames"]
-            cb["clipboard.rs<br/>selection bridge"]
         end
+        rb["meowland-readback<br/>DMA-BUF fences + GPU"]
+        cb["meowland-selection<br/>selection bridge"]
         renderer["meowland-render<br/>Renderer::update"]
     end
 
@@ -119,22 +141,22 @@ sequenceDiagram
 
     App->>C: attach + damage + commit
     alt shm buffer
-        C->>C: Snapshot::copy_shm, BGRA to RGBA
+        C->>C: Snapshot::copy_shm, damaged rects only, BGRA to RGBA
     else DMA-BUF
-        C->>C: pre-commit blocker, export sync_file fences
+        C->>C: meowland-readback: pre-commit blocker, sync_file fences
         C->>C: GPU blit + PBO readback, native fence fd
     end
     C->>C: PaneState::damage marks pane Dirty
     Note over C: run loop calls Runtime::dispatch,<br/>then frame_callbacks and dispatch_frames
     C->>R: update scene, compose damaged strips
-    R-->>C: changed row range
-    alt shared transport and at least 1/4 of rows changed
-        C->>S: SharedFrame named POSIX shm object
+    R-->>C: changed rectangle (columns + rows)
+    alt shared transport and the rectangle covers at least 1/4 of the frame
+        C->>S: SharedFrame: one-shot POSIX shm object (t=s)
     else inline
-        C->>S: FrameBand of changed RGB rows
+        C->>S: FrameBand rectangle {x, y, width} of RGB
     end
     S->>P: length-prefixed postcard packet
-    P->>T: Kitty a=T whole image or a=f edit, zlib + base64
+    P->>T: Kitty a=T whole image or a=f edit at x,y, zlib + base64
     P->>S: PaneAction::Ack Retained or Resync
     S->>C: pane_ack, InFlight to Clean or Dirty
     C->>App: wl_callback.done, paced by refresh_rate

@@ -1,12 +1,11 @@
 //! Pane attachment, window rebinding, and presentation ownership.
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{Follow, FrameAck, FrameTransport, Target};
+use meowland_protocol::{Follow, FrameAck, FrameTransport, Selector, Target};
 use smithay::utils::{Logical, Size};
 
 use super::{
-    AttachedPane, Compositor, Matcher, PaneId, Selection, ServerToPane, WindowId, frame::PaneState,
-    input,
+    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, frame::PaneState, input,
 };
 
 impl Compositor {
@@ -89,16 +88,7 @@ impl Compositor {
                 return;
             }
             Target::Activation(token) => Selection::Activation(token),
-            Target::Selector(selector) => match Matcher::new(selector) {
-                Ok(matcher) => Selection::Matching(matcher),
-                Err(error) => {
-                    self.emit(
-                        pane,
-                        ServerToPane::Release(format!("invalid selector: {error}")),
-                    );
-                    return;
-                }
-            },
+            Target::Selector(selector) => Selection::Matching(selector),
         };
         let window = self.selected_window(&selection);
         if window.is_none() && follow == Follow::Current {
@@ -131,7 +121,7 @@ impl Compositor {
             if follow == Follow::Every {
                 let app_id = self.windows.catalog.app_id(window).to_owned();
                 self.attachments
-                    .reselect(pane, Selection::Matching(Matcher::ExactAppId(app_id)));
+                    .reselect(pane, Selection::Matching(Selector::AppId(app_id)));
             }
         }
         if previous != Some(window) {

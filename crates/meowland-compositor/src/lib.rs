@@ -60,7 +60,7 @@ mod toplevels;
 mod window;
 
 pub use meowland_panes::PaneId;
-use meowland_panes::{Matcher, Selection, WindowCatalog, WindowId};
+use meowland_panes::{Selection, WindowCatalog, WindowId};
 
 pub(crate) type AttachedPane = meowland_panes::AttachedPane<frame::PaneState>;
 pub(crate) type Attachments = meowland_panes::Attachments<frame::PaneState>;

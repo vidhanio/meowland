@@ -20,10 +20,12 @@ impl Server {
         }
         let response = match request {
             ControlRequest::List => ControlResponse::Windows(self.compositor.window_list()),
-            ControlRequest::Quit(selector) => self.compositor.close_window(selector).map_or_else(
-                |error| ControlResponse::Error(error.to_string()),
-                |()| ControlResponse::Ok,
-            ),
+            ControlRequest::Quit(selector) => {
+                self.compositor.close_window(selector.as_ref()).map_or_else(
+                    |error| ControlResponse::Error(error.to_string()),
+                    |()| ControlResponse::Ok,
+                )
+            }
             ControlRequest::Launch { args, env, cwd } => {
                 let token = self.compositor.create_activation_token();
                 match process::launch(&args, &env, &cwd, &self.display, &token) {

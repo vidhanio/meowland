@@ -6,9 +6,9 @@ use std::{
     hash::{BuildHasher, RandomState},
 };
 
-use meowland_protocol::{WindowInfo, WindowState};
+use meowland_protocol::{Selector, WindowInfo, WindowState};
 
-use crate::{Matcher, WindowId};
+use crate::WindowId;
 
 const ID_SUFFIX_LEN: usize = 4;
 const ID_SUFFIX_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -164,10 +164,13 @@ impl WindowCatalog {
             .map_or("", |window| window.app_id.as_str())
     }
 
-    /// Most recently mapped drawable window matching a selector.
-    pub fn select(&self, matcher: &Matcher) -> Option<WindowId> {
-        self.newest_matching(|window| {
-            matcher.matches(window.id.as_deref(), &window.app_id, &window.title)
+    /// Most recently mapped drawable window whose unique ID, app ID, or title
+    /// equals the selector's value.
+    pub fn select(&self, selector: &Selector) -> Option<WindowId> {
+        self.newest_matching(|window| match selector {
+            Selector::Id(id) => window.id.as_ref() == Some(id),
+            Selector::AppId(app_id) => window.app_id == *app_id,
+            Selector::Title(title) => window.title == *title,
         })
     }
 

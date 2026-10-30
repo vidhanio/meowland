@@ -5,20 +5,14 @@ use meowland_protocol::{Follow, Input, PaneAction, Selector, Shortcut, Target, T
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{
-    AttachedPane, Compositor, Matcher, PaneId, Selection, ServerToPane, WindowId, clipboard,
+    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, clipboard,
     input::pane_input,
 };
 
 /// The requested selector did not identify a mapped window to close.
-#[derive(Debug, thiserror::Error)]
-pub enum CloseWindowError {
-    /// The selector's regular expression is invalid.
-    #[error("invalid selector: {0}")]
-    InvalidSelector(#[from] regex::Error),
-    /// No mapped window matches the selector.
-    #[error("no such window")]
-    NoSuchWindow,
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no such window")]
+pub struct CloseWindowError;
 
 /// Owned operations applied exclusively on the Wayland event-loop thread.
 #[derive(Clone, Debug)]
@@ -141,23 +135,22 @@ impl Compositor {
     /// Ask the selected mapped window, or the focused window, to close.
     ///
     /// # Errors
-    /// Returns an error if the selector is invalid or does not identify a
-    /// mapped window.
-    pub fn close_window(&self, selector: Option<Selector>) -> Result<(), CloseWindowError> {
-        let window = match selector {
-            Some(selector) => self.windows.catalog.select(&Matcher::new(selector)?),
-            None => self.windows.catalog.focused(),
-        };
-        let window = window
+    /// Returns an error if the selector does not identify a mapped window.
+    pub fn close_window(&self, selector: Option<&Selector>) -> Result<(), CloseWindowError> {
+        let window = selector
+            .map_or_else(
+                || self.windows.catalog.focused(),
+                |selector| self.windows.catalog.select(selector),
+            )
             .and_then(|id| self.windows.by_id.get(&id))
-            .ok_or(CloseWindowError::NoSuchWindow)?;
+            .ok_or(CloseWindowError)?;
         window.surface.send_close();
         Ok(())
     }
 
     pub(crate) fn selected_window(&self, selection: &Selection) -> Option<WindowId> {
         match selection {
-            Selection::Matching(matcher) => self.windows.catalog.select(matcher),
+            Selection::Matching(selector) => self.windows.catalog.select(selector),
             Selection::Activation(token) => self
                 .protocols
                 .launches

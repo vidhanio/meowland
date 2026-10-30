@@ -230,9 +230,9 @@ impl From<u64> for ClipboardOfferId {
 pub enum Selector {
     /// Match the window with this server-assigned unique ID.
     Id(String),
-    /// Match windows whose application ID matches this regular expression.
+    /// Match windows whose application ID equals this string.
     AppId(String),
-    /// Match windows whose title matches this regular expression.
+    /// Match windows whose title equals this string.
     Title(String),
 }
 

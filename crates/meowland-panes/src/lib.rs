@@ -6,4 +6,4 @@ mod selection;
 
 pub use attachment::{AttachedPane, Attachments, PaneId, Presentation};
 pub use catalog::WindowCatalog;
-pub use selection::{Matcher, Selection, WindowId};
+pub use selection::{Selection, WindowId};

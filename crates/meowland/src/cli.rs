@@ -74,25 +74,15 @@ pub(crate) struct ServerArgs {
     config: Option<PathBuf>,
 }
 
-/// Regular-expression selectors; consumers limit them to one.
+/// App ID and title selectors; consumers limit them to one.
 #[derive(Args)]
 #[group(skip)]
 pub(crate) struct MatchArgs {
-    /// Match windows whose app ID matches this regular expression.
-    #[arg(
-        long,
-        value_name = "REGEX",
-        value_parser = regex_source,
-        add = ArgValueCandidates::new(app_id_candidates)
-    )]
+    /// Match windows with exactly this app ID.
+    #[arg(long, add = ArgValueCandidates::new(app_id_candidates))]
     app_id: Option<String>,
-    /// Match windows whose title matches this regular expression.
-    #[arg(
-        long,
-        value_name = "REGEX",
-        value_parser = regex_source,
-        add = ArgValueCandidates::new(title_candidates)
-    )]
+    /// Match windows with exactly this title.
+    #[arg(long, add = ArgValueCandidates::new(title_candidates))]
     title: Option<String>,
 }
 
@@ -104,8 +94,8 @@ impl MatchArgs {
     }
 }
 
-/// A regular-expression selector or a window's unique ID; consumers limit
-/// them to one.
+/// An app ID, title, or unique window ID selector; consumers limit them to
+/// one.
 #[derive(Args)]
 #[group(skip)]
 pub(crate) struct WindowArgs {
@@ -168,10 +158,6 @@ pub(crate) struct CompletionArgs {
     /// The shell to generate a completion script for.
     #[arg(value_parser = PossibleValuesParser::new(Shells::builtins().names()))]
     shell: String,
-}
-
-fn regex_source(source: &str) -> Result<String, regex::Error> {
-    regex::Regex::new(source).map(|_| source.to_owned())
 }
 
 /// Completes an executable on `PATH`, or a path once the value contains `/`

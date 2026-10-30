@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use meowland_core::pixels::FrameSize;
-use meowland_panes::{Attachments, Matcher, PaneId, Presentation, Selection, WindowId};
-use meowland_protocol::{Follow, FrameAck, FrameTransport, clipboard::Transport};
+use meowland_panes::{Attachments, PaneId, Presentation, Selection, WindowId};
+use meowland_protocol::{Follow, FrameAck, FrameTransport, Selector, clipboard::Transport};
 use proptest::prelude::*;
 
 fn frame_size(width: u32, height: u32) -> FrameSize {
@@ -20,7 +20,7 @@ fn window_id(value: u64) -> WindowId {
 }
 
 fn matching(app_id: &str) -> Selection {
-    Selection::Matching(Matcher::ExactAppId(app_id.into()))
+    Selection::Matching(Selector::AppId(app_id.into()))
 }
 
 fn activation(token: &str) -> Selection {
@@ -28,7 +28,7 @@ fn activation(token: &str) -> Selection {
 }
 
 fn waits_for_app(selection: Option<&Selection>, app_id: &str) -> bool {
-    matches!(selection, Some(Selection::Matching(matcher)) if matcher.matches(None, app_id, ""))
+    matches!(selection, Some(Selection::Matching(Selector::AppId(waiting))) if waiting == app_id)
 }
 
 fn waits_for_token(selection: Option<&Selection>, token: &str) -> bool {

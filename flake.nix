@@ -270,6 +270,7 @@
                 pkgs.cargo-audit
                 pkgs.cargo-deny
                 pkgs.cargo-edit
+                pkgs.cargo-fuzz
                 pkgs.cargo-machete
                 pkgs.python3
               ];

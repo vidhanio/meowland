@@ -16,6 +16,9 @@ use meowland_protocol::{Button, Input, Modifiers, Scroll, Transition, clipboard:
 use rustix::fs::{Mode, OFlags, open};
 use vtparse::{CsiParam, VTActor, VTParser};
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+
 const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
 const MAX_MUTED: usize = MAX_CONTROL * 4;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);

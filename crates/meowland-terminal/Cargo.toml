@@ -8,6 +8,9 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 meowland-input = { workspace = true }
 meowland-terminal-clipboard = { workspace = true }

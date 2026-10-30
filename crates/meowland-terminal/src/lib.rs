@@ -15,6 +15,8 @@ mod session;
 mod terminal;
 
 pub use error::{Error, Result};
+#[cfg(feature = "fuzzing")]
+pub use probe::fuzzing;
 
 /// Attach this terminal to a pane until release or disconnection.
 ///

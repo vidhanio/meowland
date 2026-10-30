@@ -19,6 +19,9 @@ use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
 use super::output;
 
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Quiet period after device attributes, allowing late probe replies.
 const PROBE_QUIET: Duration = Duration::from_millis(25);

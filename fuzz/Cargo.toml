@@ -1,0 +1,53 @@
+[package]
+name = "meowland-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+meowland-input = { path = "../crates/meowland-input", features = ["fuzzing"] }
+meowland-protocol = { path = "../crates/meowland-protocol" }
+meowland-terminal = { path = "../crates/meowland-terminal", features = ["fuzzing"] }
+meowland-terminal-clipboard = { path = "../crates/meowland-terminal-clipboard" }
+vtparse = "0.7.0"
+
+[[bin]]
+name = "input_parser"
+path = "fuzz_targets/input_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_csi"
+path = "fuzz_targets/input_csi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_mouse"
+path = "fuzz_targets/input_mouse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe_parser"
+path = "fuzz_targets/probe_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clipboard_packet"
+path = "fuzz_targets/clipboard_packet.rs"
+test = false
+doc = false
+bench = false

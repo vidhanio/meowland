@@ -52,6 +52,7 @@ pub(crate) fn launch(
         .env("XDG_ACTIVATION_TOKEN", token)
         .env("DESKTOP_STARTUP_ID", token)
         .env_remove("DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
         .env_remove("NOTIFY_SOCKET")
         .env_remove("LISTEN_PID")
         .env_remove("LISTEN_FDS")
@@ -86,5 +87,57 @@ impl Server {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, fs};
+
+    use super::launch;
+
+    #[test]
+    fn launched_clients_discover_the_compositor_by_display_name() {
+        let directory =
+            std::env::temp_dir().join(format!("meowland-launch-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("create test directory");
+        let output = directory.join("env");
+        let args = [
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("env > \"$1\""),
+            OsString::from("sh"),
+            output.clone().into_os_string(),
+        ];
+        let env = [
+            (OsString::from("WAYLAND_SOCKET"), OsString::from("3")),
+            (
+                OsString::from("WAYLAND_DISPLAY"),
+                OsString::from("wayland-0"),
+            ),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+        ];
+
+        let status = launch(&args, &env, &directory, "wayland-meowland-test", "token")
+            .expect("launch shell")
+            .wait()
+            .expect("wait for shell");
+        let environment = fs::read_to_string(&output).expect("read child environment");
+        let _ = fs::remove_dir_all(&directory);
+
+        assert!(status.success());
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("WAYLAND_SOCKET=")),
+            "{environment}"
+        );
+        assert!(
+            environment
+                .lines()
+                .any(|line| line == "WAYLAND_DISPLAY=wayland-meowland-test"),
+            "{environment}"
+        );
     }
 }

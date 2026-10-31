@@ -177,3 +177,92 @@ pub fn query_frame_edits(id: u32) -> Vec<u8> {
 fn begin_image(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[?2026h\x1b[2J\x1b[H");
 }
+
+#[cfg(test)]
+mod tests {
+    use meowland_protocol::SharedObject;
+
+    use super::*;
+    use crate::encoding::tests::decode_image;
+
+    fn band(size: FrameSize, x: u32, y: u32, width: u32, pixels: Vec<u8>) -> FrameBand {
+        FrameBand::new(size, x, y, width, pixels).expect("valid test band")
+    }
+
+    #[test]
+    fn partial_updates_merge_and_repaint_retained_pixels() {
+        let size = FrameSize::new(4, 3).expect("valid size");
+        let original: Vec<u8> = (0..36).collect();
+        let patch: Vec<u8> = (100..112).collect();
+        let mut expected = original.clone();
+        expected[15..21].copy_from_slice(&patch[..6]);
+        expected[27..33].copy_from_slice(&patch[6..]);
+        let mut presenter = Presenter::default();
+        let mut output = Vec::new();
+
+        assert_eq!(
+            presenter.present_into(band(size, 1, 1, 2, patch.clone()), &mut output),
+            PresentOutcome::NeedsKeyframe
+        );
+        assert_eq!(output, []);
+        assert_eq!(
+            presenter.present_into(band(size, 0, 0, 4, original.clone()), &mut output),
+            PresentOutcome::Encoded
+        );
+        let (header, decoded, _) = decode_image(&output);
+        assert!(header.contains("a=T"));
+        assert_eq!(decoded, original);
+
+        output.clear();
+        assert_eq!(
+            presenter.present_into(band(size, 1, 1, 2, patch.clone()), &mut output),
+            PresentOutcome::Encoded
+        );
+        let (header, decoded, _) = decode_image(&output);
+        assert!(header.contains("a=f") && header.contains("x=1,y=1"));
+        assert_eq!(decoded, patch);
+        assert_eq!(presenter.image, expected);
+
+        output.clear();
+        assert_eq!(
+            presenter.present_into(band(size, 1, 1, 2, patch), &mut output),
+            PresentOutcome::Unchanged
+        );
+        assert_eq!(output, []);
+        presenter.invalidate();
+        assert_eq!(presenter.repaint_into(&mut output), PresentOutcome::Encoded);
+        let (header, decoded, _) = decode_image(&output);
+        assert!(header.contains("a=T"));
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn invalidation_survives_shared_frame_adoption() {
+        let size = FrameSize::new(3, 2).expect("valid size");
+        let pixels: Vec<u8> = (0..18).collect();
+        let (shared, _file) = SharedObject::create(size).expect("create shared descriptor");
+        let mut presenter = Presenter::default();
+        let mut output = Vec::new();
+        presenter.present_shared(shared.frame(), &mut output);
+        presenter.invalidate();
+        assert!(presenter.retain_frame(band(size, 0, 0, 3, pixels.clone())));
+        output.clear();
+        assert_eq!(presenter.repaint_into(&mut output), PresentOutcome::Encoded);
+        assert_eq!(decode_image(&output).1, pixels);
+
+        presenter.present_shared(shared.frame(), &mut output);
+        presenter.invalidate();
+        assert!(presenter.retain_frame(band(size, 0, 0, 3, pixels.clone())));
+        output.clear();
+        let patch = vec![200, 201, 202];
+        assert_eq!(
+            presenter.present_into(band(size, 1, 1, 1, patch.clone()), &mut output),
+            PresentOutcome::Encoded
+        );
+        let (header, decoded, _) = decode_image(&output);
+        let mut expected = pixels;
+        expected[12..15].copy_from_slice(&patch);
+        assert!(header.contains("a=T"));
+        assert_eq!(decoded, expected);
+    }
+}

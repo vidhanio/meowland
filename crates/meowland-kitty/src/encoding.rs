@@ -150,3 +150,97 @@ pub(crate) fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, plac
     }
     .expect("writing to Vec cannot fail");
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::io::Read;
+
+    use flate2::read::ZlibDecoder;
+
+    use super::*;
+
+    pub(crate) fn decode_image(output: &[u8]) -> (String, Vec<u8>, usize) {
+        let text = std::str::from_utf8(output).expect("Kitty output is ASCII");
+        let mut rest = text;
+        let mut header = String::new();
+        let mut payload = Vec::new();
+        let mut count = 0;
+        let mut previous_more = false;
+        while let Some(start) = rest.find("\x1b_G") {
+            rest = &rest[start + 3..];
+            let (command, remaining) = rest.split_once("\x1b\\").expect("terminated Kitty chunk");
+            let (keys, encoded) = command.split_once(';').expect("chunk has payload");
+            if count == 0 {
+                header = keys.to_owned();
+            } else {
+                assert!(previous_more, "continuation without m=1");
+                assert!(keys == "m=1" || keys == "m=0" || keys == "a=f,m=1" || keys == "a=f,m=0");
+            }
+            assert!(encoded.len() <= 4096);
+            previous_more = keys.split(',').any(|key| key == "m=1");
+            if previous_more {
+                assert_eq!(encoded.len(), 4096);
+            }
+            payload.extend(STANDARD.decode(encoded).expect("valid base64 chunk"));
+            count += 1;
+            rest = remaining;
+        }
+        assert!(count > 0, "missing Kitty image");
+        assert!(!previous_more, "unterminated Kitty transfer");
+        if header.split(',').any(|key| key == "o=z") {
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(payload.as_slice())
+                .read_to_end(&mut decoded)
+                .expect("valid zlib payload");
+            payload = decoded;
+        }
+        (header, payload, count)
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678_u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raw_chunks_round_trip_at_payload_boundaries() {
+        for len in [3071, 3072, 3073, 6144, 6145] {
+            let pixels = noise(len);
+            for placement in [Placement::Whole, Placement::Edit { x: 2, y: 3 }] {
+                let mut output = Vec::new();
+                Encoder::default().image(&mut output, 7, (17, 13), &pixels, placement);
+                let (header, decoded, chunks) = decode_image(&output);
+                assert!(!header.contains("o=z"), "length {len}");
+                assert_eq!(decoded, pixels, "length {len}");
+                assert_eq!(chunks, len.div_ceil(CHUNK_PAYLOAD), "length {len}");
+                match placement {
+                    Placement::Whole => assert!(header.contains("a=T")),
+                    Placement::Edit { .. } => {
+                        assert!(header.contains("a=f") && header.contains("x=2,y=3"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_multichunk_payload_round_trips() {
+        let mut pixels = noise(9000);
+        pixels.extend(vec![0; 9000]);
+        for placement in [Placement::Whole, Placement::Edit { x: 2, y: 3 }] {
+            let mut output = Vec::new();
+            Encoder::default().image(&mut output, 7, (100, 60), &pixels, placement);
+            let (header, decoded, chunks) = decode_image(&output);
+            assert!(header.contains("o=z"));
+            assert!(chunks > 1);
+            assert_eq!(decoded, pixels);
+        }
+    }
+}

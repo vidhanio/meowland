@@ -57,7 +57,7 @@ impl SurfaceGeometry {
 
     /// Whether the snapshot can be copied without resampling or reorienting.
     #[must_use]
-    pub fn direct(&self) -> bool {
+    pub(crate) fn direct(&self) -> bool {
         self.scale == 1
             && self.transform == Transform::Normal
             && self.src == Rectangle::from_size(self.buffer)

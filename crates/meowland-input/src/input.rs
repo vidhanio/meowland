@@ -117,7 +117,7 @@ impl Reader {
     /// Deadline by which a muted control sequence must return to ground.
     #[must_use]
     pub const fn recovery_deadline(&self) -> Option<Instant> {
-        self.parser.muted_deadline
+        self.parser.decoder.muted_deadline
     }
 
     /// Fail if a muted control sequence has exceeded its recovery deadline.
@@ -215,7 +215,6 @@ struct Parser {
     mouse: Vec<u8>,
     control_bytes: usize,
     muted_bytes: usize,
-    muted_deadline: Option<Instant>,
     clock: Clock,
 }
 
@@ -249,31 +248,32 @@ impl Parser {
             mouse: Vec::new(),
             control_bytes: 0,
             muted_bytes: 0,
-            muted_deadline: None,
             clock: Clock::default(),
         }
     }
 
     fn begin_muted(&mut self) {
-        if self.decoder.muted {
+        if self.decoder.muted() {
             return;
         }
-        self.decoder.muted = true;
         self.muted_bytes = 0;
-        self.muted_deadline = Some(self.clock.now() + RECOVERY_TIMEOUT);
+        self.decoder.muted_deadline = Some(self.clock.now() + RECOVERY_TIMEOUT);
         tracing::warn!("Discarding oversized terminal control sequence");
     }
 
     fn end_muted(&mut self) -> Result<(), InputError> {
         self.check_recovery_now()?;
-        self.decoder.muted = false;
         self.muted_bytes = 0;
-        self.muted_deadline = None;
+        self.decoder.muted_deadline = None;
         Ok(())
     }
 
     fn check_recovery(&self, now: Instant) -> Result<(), InputError> {
-        if self.muted_deadline.is_some_and(|deadline| now >= deadline) {
+        if self
+            .decoder
+            .muted_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
             return Err(InputError);
         }
         Ok(())
@@ -294,7 +294,7 @@ impl Parser {
     }
 
     fn push(&mut self, byte: u8) -> Result<(), InputError> {
-        if self.decoder.muted {
+        if self.decoder.muted() {
             return self.terminal_byte(byte);
         }
         if self.decoder.paste.is_some() {
@@ -354,7 +354,8 @@ impl Parser {
     }
 
     fn terminal_byte(&mut self, byte: u8) -> Result<(), InputError> {
-        if !self.decoder.muted && !self.terminal.is_ground() && self.control_bytes >= MAX_CONTROL {
+        if !self.decoder.muted() && !self.terminal.is_ground() && self.control_bytes >= MAX_CONTROL
+        {
             self.begin_muted();
         }
         self.terminal.parse_byte(byte, &mut self.decoder);
@@ -363,7 +364,7 @@ impl Parser {
         } else {
             self.control_bytes.saturating_add(1)
         };
-        if self.decoder.muted {
+        if self.decoder.muted() {
             self.muted_bytes += 1;
             if self.terminal.is_ground() {
                 self.end_muted()?;
@@ -379,7 +380,9 @@ impl Parser {
 struct Decoder {
     events: VecDeque<Event>,
     paste: Option<Paste>,
-    muted: bool,
+    /// Deadline by which a muted oversized control sequence must return to
+    /// ground; set exactly while its bytes are being discarded.
+    muted_deadline: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -413,7 +416,7 @@ impl Paste {
 
 impl Decoder {
     fn paste_byte(&mut self, byte: u8) {
-        if self.muted {
+        if self.muted() {
             return;
         }
         if let Some(paste) = &mut self.paste
@@ -423,11 +426,15 @@ impl Decoder {
             self.events.push_back(Event::Paste(text));
         }
     }
+
+    const fn muted(&self) -> bool {
+        self.muted_deadline.is_some()
+    }
 }
 
 impl VTActor for Decoder {
     fn csi_dispatch(&mut self, params: &[CsiParam], truncated: bool, byte: u8) {
-        if self.muted || truncated {
+        if self.muted() || truncated {
             return;
         }
         if params == [CsiParam::Integer(200)] && byte == b'~' {
@@ -438,7 +445,7 @@ impl VTActor for Decoder {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]]) {
-        if self.muted {
+        if self.muted() {
             return;
         }
         if let [b"5522", metadata, rest @ ..] = params
@@ -457,7 +464,7 @@ impl VTActor for Decoder {
     }
 
     fn print(&mut self, character: char) {
-        if !self.muted && !character.is_control() {
+        if !self.muted() && !character.is_control() {
             self.events.push_back(Event::Text(character.to_string()));
         }
     }
@@ -703,7 +710,7 @@ mod tests {
         for &byte in &oversized_mouse(0) {
             parser.push(byte).expect("muted mouse report");
         }
-        assert!(parser.muted_deadline.is_some(), "parser must be muted");
+        assert!(parser.decoder.muted(), "parser must be muted");
         parser
     }
 
@@ -1377,7 +1384,10 @@ mod tests {
     #[test]
     fn parser_enforces_the_muted_recovery_deadline() {
         let parser = muted_parser();
-        let deadline = parser.muted_deadline.expect("muted after mouse overflow");
+        let deadline = parser
+            .decoder
+            .muted_deadline
+            .expect("muted after mouse overflow");
         let before = deadline
             .checked_sub(Duration::from_millis(1))
             .expect("deadline has margin");
@@ -1386,7 +1396,7 @@ mod tests {
 
         let mut recovered = muted_parser();
         recovered.push(b'M').expect("terminated mouse report");
-        assert!(recovered.muted_deadline.is_none());
+        assert!(!recovered.decoder.muted());
         for &byte in b"\x1b[I" {
             recovered.push(byte).expect("input after recovery");
         }
@@ -1400,10 +1410,10 @@ mod tests {
     #[test]
     fn parser_fails_closed_when_a_terminator_arrives_after_the_recovery_deadline() {
         let mut parser = muted_parser();
-        parser.muted_deadline = Some(parser.clock.now());
+        parser.decoder.muted_deadline = Some(parser.clock.now());
         assert_eq!(parser.push(b'M'), Err(InputError));
         assert!(
-            parser.muted_deadline.is_some(),
+            parser.decoder.muted(),
             "an expired deadline must not be cleared"
         );
         assert!(parser.decoder.events.is_empty());
@@ -1430,6 +1440,7 @@ mod tests {
         let clock = reader.parser.clock.clone();
         let deadline = reader
             .parser
+            .decoder
             .muted_deadline
             .expect("muted after mouse overflow");
 
@@ -1447,7 +1458,7 @@ mod tests {
         let error = result.expect_err("a read completing after the recovery deadline must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         drop(read_ready);
-        assert!(reader.parser.muted_deadline.is_some());
+        assert!(reader.parser.decoder.muted());
         assert!(!reader.pending());
     }
 

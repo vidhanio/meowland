@@ -1,6 +1,9 @@
 //! Surface commits, copied snapshots, and buffer protocol handling.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
@@ -28,12 +31,14 @@ use super::{Compositor, Snapshot, readback, render, runtime::ClientState};
 pub(crate) struct SurfaceCache {
     pub snapshots: HashMap<WlSurface, Snapshot>,
     pub spares: HashMap<WlSurface, Snapshot>,
+    missed: HashSet<WlSurface>,
 }
 
 impl SurfaceCache {
     pub(crate) fn forget(&mut self, surface: &WlSurface) {
         self.snapshots.remove(surface);
         self.spares.remove(surface);
+        self.missed.remove(surface);
     }
 }
 
@@ -184,12 +189,14 @@ impl CompositorHandler for Compositor {
             )
         });
         let new_buffer = matches!(assignment, Some(BufferAssignment::NewBuffer(_)));
+        let mut recovered = false;
         if callbacks && let Some(window) = window {
             self.request_callback(window);
         }
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = render::source_bound(self.pane_bound(surface), scale, transform);
+                let missed = self.windows.surface_cache.missed.contains(surface);
                 let mut previous = self.windows.surface_cache.snapshots.remove(surface);
                 let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
@@ -204,7 +211,11 @@ impl CompositorHandler for Compositor {
                                 *states.cached_state.get::<ViewportCachedState>().current()
                             });
                             let size = Size::from((data.width, data.height));
-                            let damage = buffer_damage(&damage, size, scale, transform, viewport);
+                            let damage = if missed {
+                                Vec::new()
+                            } else {
+                                buffer_damage(&damage, size, scale, transform, viewport)
+                            };
                             // SAFETY: Smithay keeps the mapped pool readable
                             // for this callback and supplies its pointer and
                             // length together.
@@ -217,17 +228,18 @@ impl CompositorHandler for Compositor {
                     }
                 });
                 buffer.release();
-                let snapshot = match snapshot {
-                    Some(snapshot) => {
-                        if dmabuf && let Some(previous) = previous.take() {
-                            self.windows
-                                .surface_cache
-                                .spares
-                                .insert(surface.clone(), previous);
-                        }
-                        Some(snapshot)
+                let snapshot = if let Some(snapshot) = snapshot {
+                    recovered = self.windows.surface_cache.missed.remove(surface);
+                    if dmabuf && let Some(previous) = previous.take() {
+                        self.windows
+                            .surface_cache
+                            .spares
+                            .insert(surface.clone(), previous);
                     }
-                    None => previous,
+                    Some(snapshot)
+                } else {
+                    self.windows.surface_cache.missed.insert(surface.clone());
+                    previous
                 };
                 if let Some(snapshot) = snapshot {
                     self.windows
@@ -251,7 +263,7 @@ impl CompositorHandler for Compositor {
                 .get(surface)
                 .map_or_default(|snapshot| {
                     let geometry = render::surface_geometry(surface, snapshot);
-                    if new_buffer && damage.is_empty() {
+                    if recovered || (new_buffer && damage.is_empty()) {
                         render::SurfaceDamage::full(&geometry)
                     } else {
                         render::SurfaceDamage::new(&damage, &geometry)
@@ -284,6 +296,48 @@ impl CompositorHandler for Compositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_snapshot_then_partial_damage_recopies_the_entire_buffer() {
+        use meowland_core::pixels::FrameSize;
+        use meowland_protocol::{Follow, Selector, Target};
+        use meowland_render::{Renderer, Scene};
+
+        let mut fixture = crate::fixture::Fixture::new();
+        let top = fixture.toplevel("app");
+        fixture.present(&top.surface, 4, 4, [0, 0, 0, 255]);
+        let window = fixture.window(&top);
+        fixture.state.focus_pane(
+            1.into(),
+            Target::Selector(Selector::AppId("app".into())),
+            Follow::First,
+            FrameSize::new(64, 64).expect("pane size"),
+        );
+        let failed = fixture.buffer(256, 256, [0, 0, 255, 255]);
+        top.surface.attach(Some(&failed), 0, 0);
+        top.surface.damage_buffer(0, 0, 1, 1);
+        top.surface.commit();
+        fixture.roundtrip();
+        let recovered = fixture.buffer(4, 4, [0, 0, 255, 255]);
+        top.surface.attach(Some(&recovered), 0, 0);
+        top.surface.damage_buffer(3, 3, 1, 1);
+        top.surface.commit();
+        fixture.roundtrip();
+
+        let root = fixture.state.windows.by_id[&window].surface.wl_surface();
+        let mut renderer = Renderer::default();
+        let mut scene = Scene::default();
+        renderer.update(
+            &mut scene,
+            Some(root),
+            &fixture.state.windows.surface_cache.snapshots,
+            FrameSize::new(4, 4).expect("frame size"),
+            1.0,
+            |_, _| {},
+        );
+        assert_eq!(&scene.pixels()[0..3], &[255, 0, 0]);
+        assert_eq!(&scene.pixels()[45..48], &[255, 0, 0]);
+    }
 
     const TRANSFORMS: [Transform; 8] = [
         Transform::Normal,

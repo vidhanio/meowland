@@ -32,8 +32,32 @@ const COMPLETE_VAR: &str = "COMPLETE";
 #[derive(Parser)]
 #[command(name = BIN, version)]
 struct Meowland {
+    /// Print results to stdout and errors to stderr as JSON.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+/// How command results and errors are written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// Human-readable text.
+    Text,
+    /// One JSON document per result or error.
+    Json,
+}
+
+impl Output {
+    /// Write a failed command's error chain to stderr.
+    pub(crate) fn report(self, error: &anyhow::Error) {
+        let message = format!("{error:#}");
+        let mut stderr = io::stderr().lock();
+        let _ = match self {
+            Self::Text => writeln!(stderr, "{BIN}: {message}"),
+            Self::Json => writeln!(stderr, "{}", serde_json::json!({ "error": message })),
+        };
+    }
 }
 
 #[derive(Subcommand)]
@@ -256,19 +280,20 @@ fn completions(
 }
 
 /// Answer shell completion requests, or parse the process command line into
-/// the selected meowland command.
-pub(crate) fn parse() -> Commands {
+/// the selected meowland command and its output format.
+pub(crate) fn parse() -> (Commands, Output) {
     CompleteEnv::with_factory(Meowland::command)
         .var(COMPLETE_VAR)
         .complete();
-    Meowland::parse().command
+    let Meowland { json, command } = Meowland::parse();
+    (command, if json { Output::Json } else { Output::Text })
 }
 
 /// Run the selected meowland command.
 ///
 /// # Errors
 /// Returns an error when the selected command cannot be completed.
-pub(crate) fn run(command: Commands) -> Result<()> {
+pub(crate) fn run(command: Commands, output: Output) -> Result<()> {
     match command {
         Commands::Server(args) => {
             let paths = Paths::discover()?;
@@ -278,8 +303,14 @@ pub(crate) fn run(command: Commands) -> Result<()> {
         }
         Commands::List => {
             let paths = Paths::discover()?;
+            let windows = list(&paths)?;
             let mut stdout = io::stdout().lock();
-            for window in list(&paths)? {
+            if output == Output::Json {
+                serde_json::to_writer(&mut stdout, &windows)?;
+                writeln!(stdout)?;
+                return Ok(());
+            }
+            for window in windows {
                 writeln!(
                     stdout,
                     "{}\t{}\t{}\t{}",

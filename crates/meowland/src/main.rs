@@ -4,13 +4,11 @@ mod cli;
 mod configuration;
 mod logging;
 
-use std::io::{self, Write};
-
 fn main() {
-    let command = cli::parse();
+    let (command, output) = cli::parse();
     logging::init(command.log_destination());
-    if let Err(error) = cli::run(command) {
-        let _ = writeln!(io::stderr().lock(), "meowland: {error:#}");
+    if let Err(error) = cli::run(command, output) {
+        output.report(&error);
         std::process::exit(1);
     }
 }

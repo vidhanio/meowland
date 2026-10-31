@@ -915,6 +915,8 @@ dependencies = [
  "meowland-protocol",
  "meowland-server",
  "meowland-terminal",
+ "serde_json",
+ "tempfile",
  "toml",
  "tracing-journald",
  "tracing-subscriber",

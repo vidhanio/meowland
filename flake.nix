@@ -160,6 +160,7 @@
               filter =
                 path: type:
                 craneLib.filterCargoSources path type
+                || pkgs.lib.hasPrefix (toString ./skills) path
                 || builtins.elem (pkgs.lib.baseNameOf (toString path)) [
                   "rustfmt.toml"
                   "clippy.toml"
@@ -198,6 +199,7 @@
                 meta.mainProgram = "meowland";
 
                 nativeBuildInputs = nativeBuildInputs ++ [
+                  pkgs.installAgentSkills
                   pkgs.installShellFiles
                   pkgs.makeWrapper
                 ];

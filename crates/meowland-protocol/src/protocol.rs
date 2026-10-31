@@ -359,6 +359,7 @@ pub struct WindowInfo {
 
 /// Compositor focus state of one window.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
 pub enum WindowState {
     /// The window currently has compositor focus.
     Active,

@@ -118,12 +118,15 @@ impl Server {
                 if self.shutdown.running() && self.connections.contains_key(&ConnectionId::from(id))
                 {
                     self.panes.insert(id, pane);
-                    self.send_to_pane(
+                    let greeted = self.send_to_pane(
                         id,
                         ServerToPane::HelloOk {
                             shortcuts: self.shortcuts,
                         },
                     );
+                    if !greeted {
+                        return;
+                    }
                     self.send_command(Command::Focus {
                         pane: id,
                         target: hello.target,
@@ -152,18 +155,22 @@ impl Server {
         }
     }
 
-    fn send_to_pane(&mut self, id: PaneId, message: ServerToPane) {
-        if self
-            .panes
-            .get(&id)
-            .is_some_and(|pane| pane.active() && !pane.send(message))
-        {
-            tracing::warn!(?id, "pane output exceeded its byte budget or disconnected");
-            if let Some(task) = self.connections.remove(&ConnectionId::from(id)) {
-                task.abort();
-            }
-            self.pane_gone(id);
+    /// Queue a message for an active pane, returning whether it was enqueued.
+    ///
+    /// A pane whose output cannot be enqueued is disconnected and detached.
+    fn send_to_pane(&mut self, id: PaneId, message: ServerToPane) -> bool {
+        let Some(pane) = self.panes.get(&id).filter(|pane| pane.active()) else {
+            return false;
+        };
+        if pane.send(message) {
+            return true;
         }
+        tracing::warn!(?id, "pane output exceeded its byte budget or disconnected");
+        if let Some(task) = self.connections.remove(&ConnectionId::from(id)) {
+            task.abort();
+        }
+        self.pane_gone(id);
+        false
     }
 
     fn send_command(&mut self, command: Command) {

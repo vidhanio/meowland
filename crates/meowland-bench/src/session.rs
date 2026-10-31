@@ -134,7 +134,6 @@ pub struct Session {
     frames: HashMap<u64, Duration>,
     deliveries: Vec<Frame>,
     app: Option<u32>,
-    ready: bool,
     throttled: bool,
     next_read: Duration,
 }
@@ -189,7 +188,6 @@ impl Session {
             frames: HashMap::new(),
             deliveries: Vec::new(),
             app: None,
-            ready: false,
             throttled: false,
             next_read: Duration::ZERO,
         };
@@ -231,7 +229,7 @@ impl Session {
         session.until(
             "initial frame and keyboard focus",
             START_TIMEOUT,
-            |session| session.ready && session.frames.contains_key(&0),
+            |session| session.ready() && session.frames.contains_key(&0),
         )?;
         Ok(session)
     }
@@ -507,10 +505,8 @@ impl Session {
         while let Some(end) = self.control_pending.iter().position(|&byte| byte == b'\n') {
             let event: Event = std::str::from_utf8(&self.control_pending[..end])?.parse()?;
             self.control_pending.drain(..=end);
-            match event.kind {
-                EventKind::Pid => self.app = Some(u32::try_from(event.id)?),
-                EventKind::Ready => self.ready = true,
-                _ => {}
+            if event.kind == EventKind::Pid {
+                self.app = Some(u32::try_from(event.id)?);
             }
             self.events
                 .entry((event.kind, event.id))
@@ -521,6 +517,11 @@ impl Session {
             "oversized workload event"
         );
         Ok(())
+    }
+
+    /// Whether the workload has reported that its surface is ready.
+    fn ready(&self) -> bool {
+        self.events.contains_key(&(EventKind::Ready, 0))
     }
 
     fn read_terminal(&mut self) -> anyhow::Result<()> {
@@ -604,7 +605,7 @@ impl Session {
     fn diagnostics(&self) -> String {
         let mut text = format!(
             "ready={} app={:?} commits={} frames={} counters={:?}",
-            self.ready,
+            self.ready(),
             self.app,
             self.events
                 .keys()

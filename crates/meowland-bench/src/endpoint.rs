@@ -383,11 +383,15 @@ impl Endpoint {
                     action.is_none() || (action == Some("f") && transfer.edit),
                     "interleaved Kitty transfers"
                 );
+                ensure!(
+                    fields.is(b't', "s") == transfer.shared,
+                    "Kitty transfer changed transport mid-transfer"
+                );
                 transfer
             }
         };
         let length = transfer.length();
-        if fields.is(b't', "s") {
+        if transfer.shared {
             let data = read_shared(payload, length)?;
             if transfer.data.is_empty() {
                 transfer.data = data;
@@ -430,9 +434,14 @@ impl Endpoint {
             fields.is(b'i', SCREEN_ID),
             "only the root image is supported"
         );
+        let shared = fields.is(b't', "s");
+        ensure!(
+            !shared || self.transport == Transport::Shared,
+            "shared-memory upload to an inline-only terminal"
+        );
         Ok(Transfer {
             edit,
-            shared: fields.is(b't', "s"),
+            shared,
             compressed: fields.is(b'o', "z"),
             x: fields.number(b'x')?,
             y: fields.number(b'y')?,
@@ -602,11 +611,13 @@ mod tests {
         assert_eq!(replies, b"");
     }
 
-    /// The inline-only terminal must refuse shared memory, or the inline
-    /// case would silently measure the shared path.
+    /// The inline-only terminal must refuse shared memory, both when queried
+    /// and when sent an actual upload, or the inline case would silently
+    /// measure the shared path. A refused upload must leave its object alone.
     #[test]
     fn inline_transport_refuses_shared_memory() {
-        let mut endpoint = Endpoint::new(320, 200, Pattern::Full, Transport::Inline);
+        let (width, height) = (320, 200);
+        let mut endpoint = Endpoint::new(width, height, Pattern::Full, Transport::Inline);
         let (mut replies, mut frames) = (Vec::new(), Vec::new());
         let query = format!(
             "\x1b_Ga=q,f=24,s=1,v=1,i=32,t=s;{}\x1b\\",
@@ -616,6 +627,20 @@ mod tests {
             .feed(query.as_bytes(), &mut replies, &mut frames)
             .unwrap();
         assert_eq!(replies, b"\x1b_Gi=32;ENOTSUP\x1b\\");
+
+        let name = format!("meowland-bench-inline-test-{}", std::process::id());
+        let path = Path::new("/dev/shm").join(&name);
+        fs::write(&path, image(Pattern::Full, width, height, 0)).unwrap();
+        let upload = format!(
+            "\x1b_Ga=T,f=24,s={width},v={height},i=1,t=s;{}\x1b\\",
+            STANDARD.encode(format!("/{name}"))
+        );
+        let result = endpoint.feed(upload.as_bytes(), &mut replies, &mut frames);
+        let survived = path.exists();
+        drop(fs::remove_file(&path));
+        assert!(result.is_err());
+        assert!(survived);
+        assert_eq!(endpoint.counters().shared_uploads, 0);
     }
 
     /// An image whose pixels disagree with its marker must fail, not count

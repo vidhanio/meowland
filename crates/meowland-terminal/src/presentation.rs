@@ -406,6 +406,15 @@ impl PanePresentation {
         tx.send(&PaneToServer::Action(PaneAction::Ack(ack)))?;
         Ok(())
     }
+
+    /// Acknowledge an unfinished frame as the presentation is dropped, so the
+    /// server is free to send the next one.
+    pub(crate) fn abandon(self, tx: &mut Outgoing) -> Result<()> {
+        if self.frame.is_some() {
+            tx.send(&PaneToServer::Action(PaneAction::Ack(FrameAck::Resync)))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

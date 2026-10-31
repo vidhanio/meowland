@@ -153,21 +153,32 @@ impl Compositor {
     }
 
     /// Return panes following every match of a window that went away to
-    /// waiting, then rebind them to other matching windows.
+    /// waiting, rebind them to other matching windows, and tell the rest to
+    /// wait.
     pub(crate) fn unbind_following_panes(&mut self, window: WindowId) {
-        for pane in self.attachments.showing(window) {
+        let following: Vec<_> = self
+            .attachments
+            .showing(window)
+            .into_iter()
+            .filter(|&pane| {
+                self.attachments
+                    .get(pane)
+                    .is_some_and(|entry| entry.follow == Follow::Every)
+            })
+            .collect();
+        for &pane in &following {
+            self.attachments.unbind(pane);
+        }
+        self.resolve_pending_panes();
+        for pane in following {
             if self
                 .attachments
                 .get(pane)
-                .is_none_or(|entry| entry.follow != Follow::Every)
+                .is_some_and(|entry| entry.window().is_none())
             {
-                continue;
+                self.emit(pane, ServerToPane::Waiting);
             }
-            self.attachments.unbind(pane);
-            self.emit(pane, ServerToPane::Title(String::new()));
-            self.send_pane_cursor(pane);
         }
-        self.resolve_pending_panes();
     }
 }
 
@@ -204,6 +215,69 @@ impl meowland_panes::Presentation for PaneState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture::Fixture;
+
+    fn messages(fixture: &mut Fixture, pane: PaneId) -> Vec<ServerToPane> {
+        fixture.state.dispatch_frames();
+        fixture
+            .state
+            .drain_events()
+            .filter(|event| event.pane == pane)
+            .map(|event| event.message)
+            .collect()
+    }
+
+    fn frames(messages: &[ServerToPane]) -> Vec<&meowland_protocol::FrameBand> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ServerToPane::Frame(band) => Some(band),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn following_pane_waits_without_frames_until_a_new_match_maps() {
+        let mut fixture = Fixture::new();
+        let first = fixture.toplevel("app");
+        fixture.present(&first.surface, 4, 4, [0, 0, 0, 255]);
+        let pane = PaneId::from(1);
+        fixture.state.focus_pane(
+            pane,
+            Target::Selector(Selector::AppId("app".into())),
+            Follow::Every,
+            FrameSize::new(64, 64).expect("test size"),
+        );
+        assert_eq!(frames(&messages(&mut fixture, pane)).len(), 1);
+        fixture.state.attachments.ack(pane, FrameAck::Retained);
+        fixture.present(&first.surface, 4, 4, [255, 0, 0, 255]);
+        assert_eq!(frames(&messages(&mut fixture, pane)).len(), 1);
+
+        first.surface.attach(None, 0, 0);
+        first.surface.commit();
+        fixture.roundtrip();
+        let unmapped = messages(&mut fixture, pane);
+        assert!(
+            unmapped
+                .iter()
+                .any(|message| matches!(message, ServerToPane::Waiting)),
+            "{unmapped:?}"
+        );
+        assert!(frames(&unmapped).is_empty(), "{unmapped:?}");
+        fixture.state.attachments.ack(pane, FrameAck::Resync);
+        assert!(frames(&messages(&mut fixture, pane)).is_empty());
+
+        let second = fixture.toplevel("app");
+        fixture.present(&second.surface, 4, 4, [0, 255, 0, 255]);
+        let shown = messages(&mut fixture, pane);
+        let shown = frames(&shown);
+        assert_eq!(shown.len(), 1);
+        assert!(
+            shown[0].is_whole(),
+            "the first frame after waiting is complete"
+        );
+    }
 
     #[test]
     fn release_skips_an_unmapped_attachment_before_a_drawable_one() {

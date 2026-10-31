@@ -272,6 +272,11 @@ impl Session {
         self.endpoint.counters()
     }
 
+    /// Whether the pane has the terminal on its alternate screen.
+    pub const fn alternate_screen(&self) -> bool {
+        self.endpoint.alternate_screen()
+    }
+
     /// When the workload committed `frame`, once it has reported it.
     pub fn committed(&self, frame: u64) -> Option<Duration> {
         self.event(EventKind::Commit, frame)

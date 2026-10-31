@@ -58,6 +58,9 @@ const TURNS_PER_YIELD: usize = 16;
 /// restore sequence shares the queue with the frames still ahead of it.
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Status line shown while the pane waits for a window to present.
+const WAITING: &str = "waiting for a window (Ctrl+C to cancel)";
+
 enum Lifecycle {
     Handshaking { deadline: Instant },
     Waiting,
@@ -279,14 +282,16 @@ impl TerminalSession {
                 if matches!(self.lifecycle, Lifecycle::Handshaking { .. }) {
                     self.shortcuts = shortcuts;
                     self.lifecycle = Lifecycle::Waiting;
-                    writeln!(
-                        io::stderr(),
-                        "meowland: waiting for a window (Ctrl+C to cancel)"
-                    )?;
+                    writeln!(io::stderr(), "meowland: {WAITING}")?;
                 }
             }
             ServerToPane::Reject(reason) | ServerToPane::Release(reason) => {
                 return self.close(Some(&reason)).await;
+            }
+            ServerToPane::Waiting => {
+                if matches!(self.lifecycle, Lifecycle::Active(_)) {
+                    self.suspend().await?;
+                }
             }
             ServerToPane::Bell => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
@@ -459,19 +464,51 @@ impl TerminalSession {
         Ok(())
     }
 
-    /// Restore terminal modes after a bounded drain, then report a reason.
-    ///
-    /// The restore sequence is appended to the same ordered queue as frames, so
-    /// a half-written frame can never interleave with it. If the terminal stops
-    /// accepting output, queued frames are discarded and the restore sequence
-    /// is written directly, best effort, so shutdown always finishes.
+    /// Restore terminal modes and report a reason, ending the session.
     #[expect(
         clippy::future_not_send,
         reason = "the terminal session runs on calloop's local executor"
     )]
     async fn close(&mut self, reason: Option<&str>) -> Result<()> {
+        self.restore_terminal(Lifecycle::Closed, reason).await
+    }
+
+    /// Restore the terminal while no window is shown, keeping the connection
+    /// for the next matching window, whose first frame starts presentation
+    /// again.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn suspend(&mut self) -> Result<()> {
+        self.restore_terminal(Lifecycle::Waiting, Some(WAITING))
+            .await?;
+        std::mem::replace(
+            &mut self.presentation,
+            PanePresentation::new(FrameTransport::Inline),
+        )
+        .abandon(&mut self.tx)?;
+        self.keyboard = Keyboard::default();
+        self.input_gate = InputGate::default();
+        self.clipboard = Clipboard::new(Transport::Osc52)?;
+        self.window = PendingWindow::default();
+        Ok(())
+    }
+
+    /// Restore terminal modes after a bounded drain, print `message`, and
+    /// move to `next`.
+    ///
+    /// The restore sequence is appended to the same ordered queue as frames, so
+    /// a half-written frame can never interleave with it. If the terminal stops
+    /// accepting output, queued frames are discarded and the restore sequence
+    /// is written directly, best effort, so restoration always finishes.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn restore_terminal(&mut self, next: Lifecycle, message: Option<&str>) -> Result<()> {
         let mut restore = Vec::new();
-        let mut mode = match std::mem::replace(&mut self.lifecycle, Lifecycle::Closed) {
+        let mut mode = match std::mem::replace(&mut self.lifecycle, next) {
             Lifecycle::Active(mode) => Some(mode),
             _ => None,
         };
@@ -484,13 +521,16 @@ impl TerminalSession {
         } else {
             None
         };
+        let line = message.map(|message| {
+            let clean = protocol::sanitize_with_limit(message, terminal::MAX_TEXT_CHARS);
+            format!("meowland: {clean}\n")
+        });
         let mut queued_restore = restore.clone();
         if mode.is_some() {
             queued_restore.extend_from_slice(b"\x1b[23;0t");
         }
-        if let Some(reason) = reason {
-            let clean = protocol::sanitize_with_limit(reason, terminal::MAX_TEXT_CHARS);
-            queued_restore.extend_from_slice(format!("meowland: {clean}\n").as_bytes());
+        if let Some(line) = &line {
+            queued_restore.extend_from_slice(line.as_bytes());
         }
         self.presentation.append(&queued_restore);
         let drained = self.drain_until(Instant::now() + CLOSE_DRAIN_TIMEOUT).await;
@@ -502,7 +542,7 @@ impl TerminalSession {
             }
         };
         if !complete {
-            tracing::warn!("queued terminal output did not drain before shutdown");
+            tracing::warn!("queued terminal output did not drain before restoring the terminal");
             if retry_title_pop(
                 mode.as_ref().filter(|mode| mode.title_pushed()).map(|_| ()),
                 self.presentation
@@ -512,9 +552,8 @@ impl TerminalSession {
             ) {
                 restore.extend_from_slice(b"\x1b[23;0t");
             }
-            if let Some(reason) = reason {
-                let clean = protocol::sanitize_with_limit(reason, terminal::MAX_TEXT_CHARS);
-                restore.extend_from_slice(format!("meowland: {clean}\n").as_bytes());
+            if let Some(line) = &line {
+                restore.extend_from_slice(line.as_bytes());
             }
             self.presentation.discard();
             output::write_best_effort(&restore);

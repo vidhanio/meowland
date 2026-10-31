@@ -570,6 +570,9 @@ pub enum PanePacket<F> {
     Bell,
     /// A complete immutable RGB object, requiring shared-memory negotiation.
     SharedFrame(crate::SharedFrame),
+    /// The shown window went away and the pane waits for the next matching
+    /// window: restore the terminal until another frame arrives.
+    Waiting,
 }
 
 /// Server packet carrying owned, validated RGB frame bands.

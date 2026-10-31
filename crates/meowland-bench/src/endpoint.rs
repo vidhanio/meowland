@@ -165,6 +165,7 @@ pub struct Endpoint {
     transfer: Option<Transfer>,
     last: Option<u64>,
     probing: bool,
+    alternate: bool,
     counters: Counters,
 }
 
@@ -182,6 +183,7 @@ impl Endpoint {
             transfer: None,
             last: None,
             probing: false,
+            alternate: false,
             counters: Counters::default(),
         }
     }
@@ -189,6 +191,11 @@ impl Endpoint {
     /// Totals so far.
     pub const fn counters(&self) -> Counters {
         self.counters
+    }
+
+    /// Whether the pane has the terminal on its alternate screen.
+    pub const fn alternate_screen(&self) -> bool {
+        self.alternate
     }
 
     /// Consume pane output, appending replies for the pane to `replies` and
@@ -304,6 +311,8 @@ impl Endpoint {
             (b"?1016", b'p') => replies.extend_from_slice(b"\x1b[?1016;2$y"),
             (b"?5522", b'p') => replies.extend_from_slice(b"\x1b[?5522;2$y"),
             (b"?2026", b'l') => self.present(frames)?,
+            (b"?1049", b'h') => self.alternate = true,
+            (b"?1049", b'l') => self.alternate = false,
             _ => {}
         }
         Ok(())

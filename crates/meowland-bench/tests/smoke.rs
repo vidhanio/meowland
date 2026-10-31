@@ -1,6 +1,7 @@
 //! Headless end-to-end smoke test: an isolated server, a detached
 //! `meowland launch`, `meowland focus` in a pane on a pseudo-terminal,
-//! verified frames and input, `meowland quit`, and a clean shutdown.
+//! verified frames and input, `meowland quit`, the following pane returning
+//! the terminal while it waits, and a clean shutdown.
 //!
 //! Cargo exposes only this package's binaries to its tests, so the workload
 //! comes from `CARGO_BIN_EXE_meowland-workload` and [`Binaries::build`]
@@ -50,6 +51,7 @@ fn launch_focus_present_and_quit() {
         .input(2)
         .expect("a key press reaches the workload and its response the pane");
 
+    assert!(session.alternate_screen());
     session.quit(&id).unwrap();
     session
         .until("the window to close", STEP_TIMEOUT, |session| {
@@ -57,6 +59,13 @@ fn launch_focus_present_and_quit() {
                 .windows()
                 .is_ok_and(|windows| windows.iter().all(|window| window.id != id))
         })
+        .unwrap();
+    session
+        .until(
+            "the waiting pane to leave the alternate screen",
+            STEP_TIMEOUT,
+            |session| !session.alternate_screen(),
+        )
         .unwrap();
 
     let status = session.stop_server(Duration::from_secs(10)).unwrap();

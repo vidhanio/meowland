@@ -131,6 +131,19 @@ impl PaneState {
         self.schedule(Instant::now());
     }
 
+    /// Drop pending work while the pane shows no window. An in-flight frame
+    /// still waits for its acknowledgement; the pane renegotiates its
+    /// transport when presentation restarts, and the next frame is complete.
+    pub(crate) fn unbind(&mut self) {
+        self.scene.invalidate();
+        self.changed = None;
+        self.sent_size = None;
+        self.transport = FrameTransport::Inline;
+        if matches!(self.presentation, Presentation::Dirty) {
+            self.presentation = Presentation::Clean;
+        }
+    }
+
     pub(crate) fn damage(&mut self, surface: &WlSurface, damage: SurfaceDamage, changed: Instant) {
         self.scene.damage(surface, damage);
         self.schedule(changed);
@@ -341,7 +354,11 @@ impl Compositor {
                 if !presentation.due() {
                     return;
                 }
-                let root = window
+                let Some(window) = window else {
+                    presentation.unbind();
+                    return;
+                };
+                let root = Some(window)
                     .filter(|&id| windows.catalog.drawable(id))
                     .and_then(|id| windows.by_id.get(&id))
                     .map(|window| window.surface.wl_surface());

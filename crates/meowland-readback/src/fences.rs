@@ -105,12 +105,7 @@ const EXPORT_SYNC_FILE: Opcode = opcode::read_write::<ExportSyncFile>(b'b', 2);
 /// wait.
 ///
 /// An unsupported ioctl or polling failure leaves the caller free to use the
-/// DMA-BUF readiness fallback. Successful ioctl results transfer ownership of
-/// a new descriptor to this function; the request matches `linux/dma-buf.h`.
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "the ioctl ABI and returned descriptor ownership are documented above"
-)]
+/// DMA-BUF readiness fallback.
 fn snapshot(dmabuf: &Dmabuf) -> Option<Vec<OwnedFd>> {
     let mut fences = Vec::new();
     for handle in dmabuf.handles() {
@@ -118,7 +113,13 @@ fn snapshot(dmabuf: &Dmabuf) -> Option<Vec<OwnedFd>> {
             flags: DMA_BUF_SYNC_READ,
             fd: -1,
         };
+        // SAFETY: `EXPORT_SYNC_FILE` is the read-write `linux/dma-buf.h` opcode
+        // for `ExportSyncFile`, whose `repr(C)` layout matches the kernel's
+        // `struct dma_buf_export_sync_file`, and `request` outlives the
+        // updater.
         let updater = unsafe { Updater::<EXPORT_SYNC_FILE, _>::new(&mut request) };
+        // SAFETY: `handle` is a live DMA-BUF descriptor borrowed from `dmabuf`
+        // and `updater` describes the request the kernel reads and writes.
         if let Err(error) = unsafe { ioctl::ioctl(handle, updater) } {
             tracing::debug!(%error, "cannot snapshot DMA-BUF write fences; polling DMA-BUF readiness");
             return None;
@@ -126,6 +127,8 @@ fn snapshot(dmabuf: &Dmabuf) -> Option<Vec<OwnedFd>> {
         if request.fd < 0 {
             return None;
         }
+        // SAFETY: A successful export stores a new nonnegative descriptor that
+        // this function now exclusively owns.
         let fence = unsafe { OwnedFd::from_raw_fd(request.fd) };
         let mut pollfds = [PollFd::new(&fence, PollFlags::IN)];
         if poll(&mut pollfds, Some(&Timespec::default())).is_err()

@@ -624,7 +624,7 @@ pub(crate) fn message_size(header: [u8; HEADER]) -> io::Result<usize> {
 ///
 /// # Errors
 /// Returns an error for oversized, malformed, or trailing message bytes.
-pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
+pub(crate) fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> io::Result<T> {
     if bytes.len() > MAX_MESSAGE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

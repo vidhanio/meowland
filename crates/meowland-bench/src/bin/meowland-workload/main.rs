@@ -36,7 +36,6 @@ struct Buffer {
     proxy: wl_buffer::WlBuffer,
     small: wl_buffer::WlBuffer,
     file: File,
-    released: bool,
     /// Whether every pixel has been painted, so later frames of a pattern
     /// with bounded damage only need to repaint that damage.
     painted: bool,
@@ -73,7 +72,6 @@ impl Buffer {
             proxy,
             small,
             file,
-            released: true,
             painted: false,
             frame: None,
         })
@@ -126,7 +124,6 @@ impl State {
 
     fn release(&mut self, index: usize) {
         let buffer = &mut self.buffers[index];
-        buffer.released = true;
         if let Some(frame) = buffer.frame.take() {
             self.event(EventKind::Release, frame);
         }
@@ -149,7 +146,11 @@ impl State {
         if self.phase == Phase::WaitingConfigure {
             return Ok(());
         }
-        let Some(index) = self.buffers.iter().position(|buffer| buffer.released) else {
+        let Some(index) = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.frame.is_none())
+        else {
             return Ok(());
         };
         let initial = self.phase == Phase::Initial;
@@ -188,7 +189,6 @@ impl State {
                 .write_all_at(&self.pixels[..width * height * 4], 0)?;
             buffer.painted = true;
         }
-        buffer.released = false;
         buffer.frame = Some(id);
         let proxy = if (width, height) == (self.width, self.height) {
             &buffer.proxy

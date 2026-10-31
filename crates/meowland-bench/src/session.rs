@@ -339,7 +339,7 @@ impl Session {
             |session| session.event(EventKind::Armed, frame).is_some(),
         )?;
         let start = control::now();
-        self.write_terminal(KEY_PRESS)?;
+        write_terminal(&self.master, KEY_PRESS)?;
         self.until(
             format_args!("input response {frame}"),
             STEP_TIMEOUT,
@@ -349,7 +349,7 @@ impl Session {
                     && session.consumed(frame).is_some()
             },
         )?;
-        self.write_terminal(KEY_RELEASE)?;
+        write_terminal(&self.master, KEY_RELEASE)?;
         let delivery = elapsed(Some(start), self.event(EventKind::Input, frame))?;
         let response = elapsed(Some(start), self.consumed(frame))?;
         ensure!(
@@ -550,39 +550,11 @@ impl Session {
                 self.frames.entry(frame.id).or_insert(frame.at);
                 self.deliveries.push(frame);
             }
-            let replies = std::mem::take(&mut self.replies);
-            self.write_terminal(&replies)?;
-            self.replies = replies;
+            write_terminal(&self.master, &self.replies)?;
             self.replies.clear();
             if self.throttled {
                 self.next_read = control::now() + THROTTLE_INTERVAL;
                 break;
-            }
-        }
-        Ok(())
-    }
-
-    fn write_terminal(&self, mut bytes: &[u8]) -> anyhow::Result<()> {
-        let deadline = control::now() + Duration::from_secs(1);
-        while !bytes.is_empty() {
-            match rustix::io::write(&self.master, bytes) {
-                Ok(count) => bytes = &bytes[count..],
-                Err(Errno::AGAIN) => {
-                    ensure!(
-                        control::now() < deadline,
-                        "pane stopped reading its terminal"
-                    );
-                    let mut descriptors = [PollFd::new(&self.master, PollFlags::OUT)];
-                    match poll(
-                        &mut descriptors,
-                        Some(&Timespec::try_from(Duration::from_millis(10))?),
-                    ) {
-                        Ok(_) | Err(Errno::INTR) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-                Err(Errno::INTR) => {}
-                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
@@ -921,4 +893,31 @@ fn signal(handles: &[OwnedFd], signal: Signal) {
     for handle in handles {
         let _ = rustix::process::pidfd_send_signal(handle, signal);
     }
+}
+
+/// Write all of `bytes` to the pane's terminal through `master`.
+fn write_terminal(master: &OwnedFd, mut bytes: &[u8]) -> anyhow::Result<()> {
+    let deadline = control::now() + Duration::from_secs(1);
+    while !bytes.is_empty() {
+        match rustix::io::write(master, bytes) {
+            Ok(count) => bytes = &bytes[count..],
+            Err(Errno::AGAIN) => {
+                ensure!(
+                    control::now() < deadline,
+                    "pane stopped reading its terminal"
+                );
+                let mut descriptors = [PollFd::new(master, PollFlags::OUT)];
+                match poll(
+                    &mut descriptors,
+                    Some(&Timespec::try_from(Duration::from_millis(10))?),
+                ) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }

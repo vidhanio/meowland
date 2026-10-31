@@ -59,6 +59,9 @@ pub(super) struct Parser {
     decoder: Decoder,
     mouse: Vec<u8>,
     control_bytes: usize,
+    /// OSC reply whose string ended at an ESC, complete only if the next byte
+    /// finishes the `ESC \` string terminator.
+    osc_escape: Option<Event>,
     clock: Clock,
 }
 
@@ -136,6 +139,7 @@ impl Parser {
             decoder: Decoder::default(),
             mouse: Vec::new(),
             control_bytes: 0,
+            osc_escape: None,
             clock: Clock::default(),
         }
     }
@@ -295,7 +299,20 @@ impl Parser {
         {
             self.begin_muted();
         }
+        let escaped = self.osc_escape.take();
         self.terminal.parse_byte(byte, &mut self.decoder);
+        if let Some(event) = escaped
+            && byte == b'\\'
+        {
+            self.decoder.events.push_back(event);
+        }
+        if let Some(event) = self.decoder.osc.take() {
+            match byte {
+                b'\x07' | b'\x9c' => self.decoder.events.push_back(event),
+                b'\x1b' => self.osc_escape = Some(event),
+                _ => {}
+            }
+        }
         self.control_bytes = if self.terminal.is_ground() {
             0
         } else {
@@ -320,6 +337,10 @@ struct Decoder {
     /// Recovery from an oversized control sequence, set exactly while its
     /// bytes are being discarded.
     muted: Option<Recovery>,
+    /// Recognized OSC reply whose string just ended; the parser publishes it
+    /// only if the byte that ended it was a string terminator rather than a
+    /// cancellation.
+    osc: Option<Event>,
 }
 
 /// Bracketed paste between its start and end markers.
@@ -362,19 +383,7 @@ impl VTActor for Decoder {
         if self.is_muted() {
             return;
         }
-        if let [b"5522", metadata, rest @ ..] = params
-            && rest.len() <= 1
-        {
-            let mut packet = metadata.to_vec();
-            if let Some(payload) = rest.first() {
-                packet.push(b';');
-                packet.extend_from_slice(payload);
-            }
-            self.events.push_back(Event::Clipboard(packet));
-        } else if let [b"52", b"c" | b"", payload] = params {
-            self.events
-                .push_back(Event::ClipboardText(payload.to_vec()));
-        }
+        self.osc = osc(params);
     }
 
     fn print(&mut self, character: char) {
@@ -401,6 +410,24 @@ impl VTActor for Decoder {
     }
 
     fn apc_dispatch(&mut self, _data: Vec<u8>) {}
+}
+
+/// Decode a Kitty OSC 5522 clipboard packet or an OSC 52 text reply.
+fn osc(params: &[&[u8]]) -> Option<Event> {
+    if let [b"5522", metadata, rest @ ..] = params
+        && rest.len() <= 1
+    {
+        let mut packet = metadata.to_vec();
+        if let Some(payload) = rest.first() {
+            packet.push(b';');
+            packet.extend_from_slice(payload);
+        }
+        Some(Event::Clipboard(packet))
+    } else if let [b"52", b"c" | b"", payload] = params {
+        Some(Event::ClipboardText(payload.to_vec()))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -781,5 +808,36 @@ pub(super) mod tests {
         bytes.extend_from_slice(b"\x1b[I");
         assert_eq!(push_all(&mut parser, &bytes), Err(InputError::Paste));
         assert!(!parser.pending());
+    }
+
+    #[test]
+    fn parser_publishes_osc_replies_only_after_a_string_terminator() {
+        let cases: [(&str, &[u8], bool); 7] = [
+            ("BEL", b"\x07", true),
+            ("C1 ST", b"\x9c", true),
+            ("UTF-8 C1 ST", b"\xc2\x9c", true),
+            ("ESC ST", b"\x1b\\", true),
+            ("CAN", b"\x18", false),
+            ("SUB", b"\x1a", false),
+            ("ESC without ST", b"\x1b", false),
+        ];
+        for (name, terminator, complete) in cases {
+            let mut bytes = b"\x1b]52;c;aGk=".to_vec();
+            bytes.extend_from_slice(terminator);
+            bytes.extend_from_slice(b"\x1b[I");
+            let mut expected = Vec::new();
+            if complete {
+                expected.push(Event::ClipboardText(b"aGk=".to_vec()));
+            }
+            expected.push(Event::Focus(true));
+            for cut in 0..=bytes.len() {
+                let chunks: [&[u8]; 2] = bytes.split_at(cut).into();
+                let events: Vec<Event> = parse_chunks_after_drain(&chunks)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert_eq!(events, expected, "{name} cut at {cut}");
+            }
+        }
     }
 }

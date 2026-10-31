@@ -120,14 +120,13 @@ impl Snapshot {
             format: data.format,
             stride,
         };
-        let reusable = !damage.is_empty()
-            && previous.as_ref().is_some_and(|previous| {
-                previous.source == Some(source)
-                    && previous.width == size.width()
-                    && previous.height == size.height()
-            });
         let source_ptr = ptr.wrapping_add(offset);
-        let Some(mut snapshot) = reusable.then(|| previous.take()).flatten() else {
+        let Some(mut snapshot) = previous.take_if(|old| {
+            !damage.is_empty()
+                && old.source == Some(source)
+                && old.width == size.width()
+                && old.height == size.height()
+        }) else {
             let mut pixels = Self::reclaim(previous.take(), size);
             let transparent = if data.format == wl_shm::Format::Xrgb8888 {
                 // SAFETY: Every source row lies within the checked mapping and
@@ -185,7 +184,6 @@ impl Snapshot {
                 }
             }
         }
-        snapshot.source = Some(source);
         Some(snapshot)
     }
 

@@ -716,6 +716,9 @@ impl Session {
         }
         signal(&handles, Signal::KILL);
         for process in &mut self.processes {
+            if matches!(process.child.try_wait(), Ok(None)) {
+                drop(process.child.kill());
+            }
             drop(process.child.wait());
         }
         for path in shared {

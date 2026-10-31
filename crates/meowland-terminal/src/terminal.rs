@@ -113,6 +113,9 @@ pub(crate) struct TerminalGuard {
 impl TerminalGuard {
     /// Enter raw mode and append the sequences that switch pane modes on.
     ///
+    /// Input typed while the terminal showed the waiting status is discarded,
+    /// so it never reaches the window about to be shown.
+    ///
     /// Escape sequences are appended to `out`, the session's ordered output
     /// queue, so they can never interleave with a partially written frame. Raw
     /// mode itself is a termios change and takes effect immediately.
@@ -187,6 +190,7 @@ impl TerminalGuard {
             });
         }
         out.extend_from_slice(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\");
+        out.extend_from_slice(&cursor_bytes(None));
         queue!(
             out,
             event::DisableFocusChange,

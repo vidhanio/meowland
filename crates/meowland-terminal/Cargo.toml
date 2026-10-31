@@ -21,7 +21,7 @@ calloop = { workspace = true }
 futures = { workspace = true }
 meowland-kitty = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "events"] }
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "termios"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 vtparse = { workspace = true }

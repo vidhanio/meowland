@@ -282,10 +282,9 @@ impl PanePresentation {
 
     /// Copy one bounded chunk of a consumed shared frame off the critical path.
     fn retain_shared(&mut self) -> Option<std::io::Error> {
-        match self.shared_frame.as_mut() {
-            Some(shared) if !shared.retained() => shared.retain_step().err(),
-            _ => None,
-        }
+        self.shared_frame
+            .as_mut()
+            .and_then(|shared| shared.retain_step().err())
     }
 
     pub(crate) async fn drain(&mut self, stdout: &mut (impl AsyncWrite + Unpin)) -> Result<()> {

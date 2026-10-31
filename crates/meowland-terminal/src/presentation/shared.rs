@@ -90,20 +90,18 @@ impl SharedPresentation {
         matches!(self.readback, Readback::Ready(_))
     }
 
-    /// Copy one bounded chunk of a consumed frame, reporting completion.
+    /// Copy one bounded chunk of a consumed frame into memory.
     ///
     /// Called once per scheduling turn after the terminal confirms consumption,
     /// so the next inline band finds the retained pixels ready instead of
-    /// reading the whole object on its own critical path.
+    /// reading the whole object on its own critical path. Does nothing before
+    /// consumption or once the frame is retained.
     ///
     /// # Errors
     /// Returns an error if the shared object cannot be read.
-    pub(super) fn retain_step(&mut self) -> io::Result<bool> {
-        if self.retained() {
-            return Ok(true);
-        }
-        if !self.consumed {
-            return Ok(false);
+    pub(super) fn retain_step(&mut self) -> io::Result<()> {
+        if self.retained() || !self.consumed {
+            return Ok(());
         }
         if matches!(self.readback, Readback::Idle) {
             self.readback = Readback::Reading {
@@ -118,7 +116,7 @@ impl SharedPresentation {
         self.file.read_exact(&mut pixels[*offset..end])?;
         *offset = end;
         if *offset < pixels.len() {
-            return Ok(false);
+            return Ok(());
         }
         let Readback::Reading { pixels, .. } =
             std::mem::replace(&mut self.readback, Readback::Idle)
@@ -126,7 +124,7 @@ impl SharedPresentation {
             unreachable!("the readback was just filled");
         };
         self.readback = Readback::Ready(whole_band(&self.frame, pixels)?);
-        Ok(true)
+        Ok(())
     }
 
     /// Finish the frame, reading any remainder synchronously.

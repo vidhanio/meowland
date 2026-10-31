@@ -63,7 +63,7 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
     handle
         .insert_source(signals, |event, (), server| match event.signal() {
             Signal::SIGCHLD => server.reap_children(),
-            Signal::SIGINT | Signal::SIGTERM => server.begin_shutdown(),
+            Signal::SIGINT | Signal::SIGTERM | Signal::SIGHUP => server.begin_shutdown(),
             _ => {}
         })
         .map_err(|error| Error::io("registering signal handling", io::Error::from(error.error)))?;

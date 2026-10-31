@@ -1,11 +1,11 @@
 ---
 name: meowland
-description: "Drive Meowland, a Wayland compositor that shows graphical apps in Kitty or Ghostty terminal panes. Use when the user asks to launch, list, show, or close GUI windows through Meowland, or to run or diagnose the `meowland` server."
+description: "Drive Meowland, a Wayland compositor that shows graphical apps in Kitty or Ghostty terminal panes. Use when the user asks to launch, list, or close GUI windows through Meowland, or to run or diagnose the `meowland` server."
 ---
 
 # Meowland
 
-Meowland is a headless Wayland compositor. `meowland server` hosts Wayland clients; `meowland launch` and `meowland focus` attach a terminal pane that draws one window with the Kitty graphics protocol and forwards keyboard and mouse input to it. Every other command is a one-shot request to the server's control socket in `$XDG_RUNTIME_DIR`.
+Meowland is a headless Wayland compositor. `meowland server` hosts Wayland clients, and the other commands you run are one-shot requests to the server's control socket in `$XDG_RUNTIME_DIR`.
 
 ## Learn the installed CLI
 
@@ -24,7 +24,7 @@ Pass `--json` before the subcommand on every call you parse:
 meowland --json list
 ```
 
-- Results go to stdout as one JSON document. Commands without a result (`launch`, `quit`, `focus`) print nothing on success.
+- Results go to stdout as one JSON document. `launch` and `quit` print nothing on success.
 - Runtime failures exit 1 and write `{"error": "<message>"}` to stderr.
 - Usage errors exit 2 with clap's plain-text message, not JSON.
 
@@ -40,7 +40,7 @@ An error starting with `cannot reach the server` means no server is listening. D
 
 ## Core workflow
 
-1. Launch the app from a non-interactive shell so the command returns immediately instead of taking over a terminal:
+1. Launch the app. From a non-interactive shell the command returns as soon as the server has spawned it:
 
    ```bash
    meowland --json launch -- <program> [args...]
@@ -64,9 +64,18 @@ An error starting with `cannot reach the server` means no server is listening. D
 
    `quit` asks the client to close; the client may refuse or prompt. Re-run `list` to confirm the window is gone.
 
+## Showing a window to the user
+
+You cannot display a window yourself: a pane needs an interactive Kitty or Ghostty 1.4+ terminal. Give the user the command to run there:
+
+```bash
+meowland focus <id>
+```
+
+or `meowland focus --app-id <app id> --follow` to keep showing the newest window of that app across restarts. Never run `focus` yourself.
+
 ## Safety rules
 
 - Never run `meowland quit` without a selector: it closes the window that currently has compositor focus, which is usually the user's.
 - Never close windows you did not launch unless the user explicitly asked.
-- Never run `launch` or `focus` inside a pseudo-terminal you cannot hand to the user. With a terminal on both stdin and stdout they take over that terminal until the window closes and require Kitty or Ghostty graphics support. See [references/panes.md](references/panes.md) to show a window to the user.
 - Do not stop, restart, or reconfigure the server unless asked; every Meowland window dies with it.

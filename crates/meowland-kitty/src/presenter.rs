@@ -68,12 +68,12 @@ impl Presenter {
         true
     }
 
-    /// Retain a validated RGB rectangle and encode its terminal update.
+    /// Retain a validated RGB rectangle and append its terminal update to
+    /// `out`.
     ///
     /// # Panics
     /// Panics if a validated rectangle does not fit in `usize` offsets.
     pub fn present_into(&mut self, band: FrameBand, out: &mut Vec<u8>) -> PresentOutcome {
-        out.clear();
         let whole = band.is_whole();
         let size = band.size();
         let (x, y, width) = (band.x(), band.y(), band.width());
@@ -126,9 +126,9 @@ impl Presenter {
         }
     }
 
-    /// Replace the displayed image using retained pixels after a grid change.
+    /// Append a replacement of the displayed image from retained pixels, if the
+    /// placement was invalidated.
     pub fn repaint_into(&mut self, out: &mut Vec<u8>) -> PresentOutcome {
-        out.clear();
         let Some(size) = self.size.filter(|_| !self.displayed) else {
             return PresentOutcome::Unchanged;
         };
@@ -146,12 +146,12 @@ impl Presenter {
     }
 }
 
-/// Encode a complete immutable object without reading or copying its pixels.
+/// Append commands displaying a complete immutable object without reading or
+/// copying its pixels.
 ///
 /// The caller must retain the object's producer guard until the terminal opens
 /// it, and restore retained RGB pixels before incremental edits or repainting.
 pub fn present_shared(frame: &SharedFrame, out: &mut Vec<u8>) {
-    out.clear();
     begin_image(out);
     out.extend_from_slice(b"\x1b_G");
     transmit(

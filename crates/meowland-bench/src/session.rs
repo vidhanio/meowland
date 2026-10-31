@@ -872,11 +872,11 @@ fn descendants(pid: u32, found: &mut HashSet<u32>) {
 }
 
 /// Meowland shared-memory objects `pid` holds open.
-fn shared_objects(pid: u32) -> Vec<PathBuf> {
-    let Ok(descriptors) = fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return Vec::new();
-    };
-    descriptors
+fn shared_objects(pid: u32) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()
+        .into_iter()
+        .flatten()
         .flatten()
         .filter_map(|descriptor| {
             let target = fs::read_link(descriptor.path()).ok()?;
@@ -886,7 +886,6 @@ fn shared_objects(pid: u32) -> Vec<PathBuf> {
                 .starts_with("/dev/shm/meowland-")
                 .then(|| PathBuf::from(target))
         })
-        .collect()
 }
 
 fn signal(handles: &[OwnedFd], signal: Signal) {

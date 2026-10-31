@@ -328,10 +328,6 @@ impl Compositor {
         }
     }
 
-    pub(crate) fn pane_ack(&mut self, pane: super::PaneId, ack: FrameAck) {
-        self.attachments.ack(pane, ack);
-    }
-
     pub(crate) fn dispatch_frames(&mut self) {
         if self.attachments.due_frames() == 0 {
             return;

@@ -17,10 +17,6 @@ impl Compositor {
         })
     }
 
-    pub(crate) fn panes_showing(&self, window: WindowId) -> Vec<PaneId> {
-        self.attachments.showing(window)
-    }
-
     /// Remove every pane-keyed entry and restore the remaining window size
     /// owner.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
@@ -156,7 +152,7 @@ impl Compositor {
     /// Return panes following every match of a window that went away to
     /// waiting, then rebind them to other matching windows.
     pub(crate) fn unbind_following_panes(&mut self, window: WindowId) {
-        for pane in self.panes_showing(window) {
+        for pane in self.attachments.showing(window) {
             if self
                 .attachments
                 .get(pane)

@@ -111,7 +111,7 @@ impl Compositor {
             PaneAction::ClipboardTransport(transport) => {
                 self.attachments.set_clipboard_transport(pane, transport);
             }
-            PaneAction::Ack(ack) => self.pane_ack(pane, ack),
+            PaneAction::Ack(ack) => self.attachments.ack(pane, ack),
             PaneAction::FrameTransport(transport) => {
                 self.attachments.set_transport(pane, transport);
             }

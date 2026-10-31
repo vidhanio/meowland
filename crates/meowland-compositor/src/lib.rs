@@ -400,10 +400,6 @@ impl Compositor {
         None
     }
 
-    fn window_info(&self, window: WindowId) -> WindowInfo {
-        self.windows.catalog.info(window)
-    }
-
     fn touch(&mut self, window: WindowId) {
         self.attachments
             .for_each_showing_mut(window, |_, presentation| presentation.mark_dirty());
@@ -444,7 +440,10 @@ impl Compositor {
             .filter(|&id| self.windows.catalog.drawable(id))
             .collect();
         windows.sort_unstable();
-        windows.into_iter().map(|id| self.window_info(id)).collect()
+        windows
+            .into_iter()
+            .map(|id| self.windows.catalog.info(id))
+            .collect()
     }
 
     /// Whether the host should stop dispatching this compositor.

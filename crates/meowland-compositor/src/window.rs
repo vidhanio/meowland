@@ -100,7 +100,7 @@ impl Compositor {
     pub(crate) fn remove_window(&mut self, id: WindowId) {
         self.unmap_window(id);
         self.cancel_window_activations(id);
-        for pane in self.panes_showing(id) {
+        for pane in self.attachments.showing(id) {
             self.remove_pane(pane);
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }

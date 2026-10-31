@@ -30,7 +30,6 @@ pub struct WindowCatalog {
     windows: HashMap<WindowId, Metadata>,
     next: u64,
     mapping_order: u64,
-    newest: Option<WindowId>,
     focused: Option<WindowId>,
     suffixes: RandomState,
     salt: u64,
@@ -85,7 +84,6 @@ impl WindowCatalog {
             window.id = unique;
         }
         window.mapped_at = Some(self.mapping_order);
-        self.newest = Some(id);
         true
     }
 
@@ -96,9 +94,6 @@ impl WindowCatalog {
             .get_mut(&id)
             .and_then(|window| window.mapped_at.take())
             .is_some();
-        if self.newest == Some(id) {
-            self.newest = self.newest_matching(|_| true);
-        }
         if self.focused == Some(id) {
             self.focused = None;
         }
@@ -113,8 +108,8 @@ impl WindowCatalog {
     }
 
     /// Most recently mapped drawable window.
-    pub const fn newest(&self) -> Option<WindowId> {
-        self.newest
+    pub fn newest(&self) -> Option<WindowId> {
+        self.newest_matching(|_| true)
     }
 
     /// Window that currently has focus.

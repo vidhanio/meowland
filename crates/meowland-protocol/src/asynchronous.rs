@@ -346,4 +346,155 @@ mod tests {
         assert_eq!(reader.header_read, 0);
         assert_eq!(reader.body_read, 0);
     }
+
+    #[derive(Default)]
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        pending: bool,
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pending {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.pending = true;
+            let count = bytes.len().min(7);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn run<T>(future: impl Future<Output = T>) -> T {
+        let mut future = Box::pin(future);
+        loop {
+            if let Poll::Ready(result) = poll_once(&mut future) {
+                return result;
+            }
+        }
+    }
+
+    fn drain(outgoing: &mut Outgoing) -> Vec<u8> {
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        run(outgoing.flush_to(&mut writer)).expect("write packet");
+        writer.into_inner()
+    }
+
+    #[test]
+    fn split_frames_match_normal_framing_and_decode() {
+        use meowland_core::pixels::FrameSize;
+
+        for length in [126_usize, 129, 16_383, 16_386] {
+            let width = u32::try_from(length / 3).expect("width fits u32");
+            let pixels: Vec<u8> = (0..length)
+                .map(|index| index.to_le_bytes()[0].wrapping_mul(37))
+                .collect();
+            for partial in [false, true] {
+                let size = if partial {
+                    FrameSize::new(width + 1, 2)
+                } else {
+                    FrameSize::new(width, 1)
+                }
+                .expect("valid frame size");
+                let (x, y) = if partial { (1, 1) } else { (0, 0) };
+                let frame = crate::FrameBand::new(size, x, y, width, pixels.clone())
+                    .expect("valid frame band");
+                let mut ordinary = Outgoing::default();
+                ordinary
+                    .send(&ServerToPane::Frame(frame.clone()))
+                    .expect("encode normal");
+                let mut split = Outgoing::default();
+                split
+                    .send_pane(ServerToPane::Frame(frame))
+                    .expect("encode split");
+                let bytes = drain(&mut split);
+                assert_eq!(
+                    bytes,
+                    drain(&mut ordinary),
+                    "length {length}, partial {partial}"
+                );
+                let stream = futures::io::Cursor::new(bytes);
+                let decoded =
+                    run(Reader::new(stream).read::<ServerToPane>()).expect("decode frame");
+                let ServerToPane::Frame(decoded) = decoded else {
+                    panic!("expected frame");
+                };
+                assert_eq!(decoded.size(), size);
+                assert_eq!((decoded.x(), decoded.y(), decoded.width()), (x, y, width));
+                assert_eq!(decoded.rgb(), pixels);
+            }
+        }
+    }
+
+    #[test]
+    fn short_writes_resume_after_cancellation_and_preserve_accounting() {
+        use meowland_core::pixels::FrameSize;
+
+        let size = FrameSize::new(20, 2).expect("valid size");
+        let frame = crate::FrameBand::new(size, 0, 0, 20, (0..120).collect()).expect("valid frame");
+        let mut expected = Outgoing::default();
+        expected
+            .send(&ServerToPane::Frame(frame.clone()))
+            .expect("encode frame");
+        expected
+            .send(&ServerToPane::Title("after frame".into()))
+            .expect("encode title");
+        let expected = drain(&mut expected);
+        let mut outgoing = Outgoing::default();
+        outgoing
+            .send_pane(ServerToPane::Frame(frame))
+            .expect("encode split frame");
+        outgoing
+            .send_pane(ServerToPane::Title("after frame".into()))
+            .expect("encode title");
+        let mut writer = ShortWriter::default();
+
+        while outgoing.pending() {
+            let mut future = Box::pin(outgoing.write_ready(&mut writer));
+            let result = poll_once(&mut future);
+            drop(future);
+            if result.is_pending() {
+                let before = outgoing.queued;
+                let mut future = Box::pin(outgoing.write_ready(&mut writer));
+                assert!(matches!(poll_once(&mut future), Poll::Ready(Ok(()))));
+                drop(future);
+                assert!(outgoing.queued < before);
+            } else {
+                assert!(matches!(result, Poll::Ready(Ok(()))));
+            }
+            assert_eq!(outgoing.queued, expected.len() - writer.bytes.len());
+            assert_eq!(writer.bytes, expected[..writer.bytes.len()]);
+        }
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn rejected_packet_preserves_previously_queued_non_frame_packet() {
+        let mut outgoing = Outgoing::default();
+        outgoing.send_pane(ServerToPane::Bell).expect("queue bell");
+        let queued = outgoing.queued;
+        let error = outgoing
+            .send_pane(ServerToPane::Title("x".repeat(MAX_MESSAGE - 5)))
+            .expect_err("packet exceeding the remaining queue limit must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(outgoing.queued, queued);
+        let bytes = drain(&mut outgoing);
+        let decoded = run(Reader::new(futures::io::Cursor::new(bytes)).read::<ServerToPane>())
+            .expect("decode queued bell");
+        assert!(matches!(decoded, ServerToPane::Bell));
+    }
 }

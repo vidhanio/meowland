@@ -3,10 +3,11 @@
 
 use std::{
     collections::VecDeque,
+    io::Write as _,
     time::{Duration, Instant},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{Engine, display::Base64Display, engine::general_purpose::STANDARD};
 use meowland_protocol::{
     ClipboardOfferId, ClipboardRequestId,
     clipboard::{ClipboardData, Deadline, MAX_TEXT, Selection, TEXT_MIMES},
@@ -84,8 +85,12 @@ impl Clipboard {
             return;
         }
         if let Some(text) = data.utf8_text() {
-            output
-                .extend_from_slice(format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(text)).as_bytes());
+            write!(
+                output,
+                "\x1b]52;c;{}\x1b\\",
+                Base64Display::new(text, &STANDARD)
+            )
+            .expect("writing to a Vec cannot fail");
         } else if data.items.is_empty() {
             output.extend_from_slice(b"\x1b]52;c;\x1b\\");
         }

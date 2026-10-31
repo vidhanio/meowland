@@ -2,11 +2,12 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    io,
+    fmt,
+    io::{self, Write as _},
     time::{Duration, Instant},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{Engine, display::Base64Display, engine::general_purpose::STANDARD};
 use meowland_protocol::{
     ClipboardOfferId, ClipboardRequestId,
     clipboard::{
@@ -361,7 +362,7 @@ impl Clipboard {
                     if *selection == Selection::Primary {
                         metadata.push_str(":loc=primary");
                     }
-                    packet(output, &format!("type=read:{metadata}"), b".");
+                    packet(output, format_args!("type=read:{metadata}"), b".");
                 }
                 Request::Read {
                     request: number,
@@ -391,13 +392,17 @@ impl Clipboard {
                             }
                         );
                     }
-                    packet(output, &format!("type=read:{metadata}"), mime.as_bytes());
+                    packet(
+                        output,
+                        format_args!("type=read:{metadata}"),
+                        mime.as_bytes(),
+                    );
                 }
                 Request::Write { selection, data } => {
                     if *selection == Selection::Primary {
                         metadata.push_str(":loc=primary");
                     }
-                    packet(output, &format!("type=write:{metadata}"), b"");
+                    packet(output, format_args!("type=write:{metadata}"), b"");
                     for item in &data.items {
                         let metadata = format!("type=wdata:mime={}", STANDARD.encode(&item.mime));
                         if item.data.is_empty() {
@@ -565,10 +570,13 @@ const fn request_selection(request: &Request) -> Selection {
     }
 }
 
-fn packet(output: &mut Vec<u8>, metadata: &str, payload: &[u8]) {
-    output.extend_from_slice(
-        format!("\x1b]5522;{metadata};{}\x1b\\", STANDARD.encode(payload)).as_bytes(),
-    );
+fn packet(output: &mut Vec<u8>, metadata: impl fmt::Display, payload: &[u8]) {
+    write!(
+        output,
+        "\x1b]5522;{metadata};{}\x1b\\",
+        Base64Display::new(payload, &STANDARD)
+    )
+    .expect("writing to a Vec cannot fail");
 }
 
 struct Packet<'a> {
@@ -621,7 +629,80 @@ impl<'a> Packet<'a> {
 
 #[cfg(test)]
 mod tests {
+    use meowland_protocol::clipboard::Item;
+
     use super::*;
+
+    /// Split OSC 5522 escapes into metadata and decoded payload.
+    fn decode_packets(output: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let text = std::str::from_utf8(output).expect("packets are ASCII");
+        text.split_terminator("\x1b\\")
+            .map(|packet| {
+                let body = packet
+                    .strip_prefix("\x1b]5522;")
+                    .expect("every packet starts with the OSC 5522 introducer");
+                let (metadata, payload) = body.split_once(';').expect("payload separator");
+                let payload = STANDARD.decode(payload).expect("base64 payload");
+                (metadata.to_owned(), payload)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn write_packets_reassemble_items_across_chunk_boundaries() {
+        let items = vec![
+            Item {
+                mime: "text/plain".to_owned(),
+                data: (0..=u8::MAX)
+                    .cycle()
+                    .take(WRITE_CHUNK_BYTES * 2 + 1)
+                    .collect(),
+            },
+            Item {
+                mime: "image/png".to_owned(),
+                data: Vec::new(),
+            },
+            Item {
+                mime: "text/html".to_owned(),
+                data: vec![7; WRITE_CHUNK_BYTES],
+            },
+        ];
+        let mut clipboard = Clipboard::new().expect("clipboard credentials");
+        clipboard.copy(
+            Selection::Clipboard,
+            ClipboardData {
+                items: items.clone(),
+            },
+        );
+        let mut output = Vec::new();
+        clipboard.advance(&mut output);
+
+        let packets = decode_packets(&output);
+        let (header, rest) = packets.split_first().expect("write header");
+        assert!(header.0.starts_with("type=write:id="), "{header:?}");
+        assert_eq!(header.1, b"");
+        let (terminator, chunks) = rest.split_last().expect("write terminator");
+        assert_eq!(*terminator, ("type=wdata".to_owned(), Vec::new()));
+        assert_eq!(chunks.len(), 3 + 1 + 1);
+        let mut decoded: Vec<(String, Vec<u8>)> = Vec::new();
+        for (metadata, payload) in chunks {
+            assert!(payload.len() <= WRITE_CHUNK_BYTES);
+            let mime = metadata
+                .strip_prefix("type=wdata:mime=")
+                .expect("data chunks carry their MIME type");
+            let mime =
+                String::from_utf8(STANDARD.decode(mime).expect("base64 MIME")).expect("UTF-8 MIME");
+            match decoded.last_mut() {
+                Some((current, data)) if *current == mime => data.extend_from_slice(payload),
+                _ => decoded.push((mime, payload.clone())),
+            }
+        }
+        let expected: Vec<_> = items
+            .into_iter()
+            .map(|item| (item.mime, item.data))
+            .collect();
+        assert_eq!(decoded, expected);
+    }
 
     #[test]
     fn packet_parses_metadata_and_payload() {

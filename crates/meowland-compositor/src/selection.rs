@@ -16,7 +16,7 @@ use smithay::wayland::selection::{
     },
 };
 
-use super::{Compositor, input};
+use super::{AttachedPane, Compositor, input};
 
 impl meowland_selection::Host for Compositor {
     fn handle(&self) -> &meowland_loop::Handle<Self> {
@@ -54,7 +54,8 @@ impl meowland_selection::Host for Compositor {
     fn pane_has_window(&self, pane: PaneId) -> bool {
         self.attachments
             .get(pane)
-            .is_some_and(|pane| pane.window().is_some())
+            .and_then(AttachedPane::window)
+            .is_some_and(|window| self.windows.catalog.drawable(window))
     }
 
     fn request_selection(

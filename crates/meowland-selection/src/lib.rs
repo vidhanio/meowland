@@ -241,7 +241,8 @@ pub trait Host: Sized + 'static {
     fn pane_transport(&self, pane: PaneId) -> Option<Transport>;
     /// Whether a pane is attached.
     fn contains_pane(&self, pane: PaneId) -> bool;
-    /// Whether a pane currently shows a window.
+    /// Whether a pane currently shows a mapped window, which a paste can
+    /// focus and type into.
     fn pane_has_window(&self, pane: PaneId) -> bool;
     /// Ask the client that owns the selection for one representation.
     ///
@@ -259,7 +260,7 @@ pub trait Host: Sized + 'static {
     fn selection_owner(&self, target: SelectionTarget) -> Option<PaneId>;
     /// Withdraw the seat selection.
     fn clear_selection(&mut self, target: SelectionTarget);
-    /// Run the terminal paste shortcut in a pane.
+    /// Run the terminal paste shortcut in a pane showing a mapped window.
     fn paste(&mut self, pane: PaneId);
 }
 
@@ -687,7 +688,10 @@ pub fn offer<H: Host>(host: &mut H, pane: PaneId, offer: TerminalOffer) {
     let mimes = mime_types(mimes);
     host.bridge().set_export(target, None);
     host.set_selection(target, mimes, Source::Terminal { pane, offer });
-    if intent == OfferIntent::Paste && target == SelectionTarget::Clipboard {
+    if intent == OfferIntent::Paste
+        && target == SelectionTarget::Clipboard
+        && host.pane_has_window(pane)
+    {
         host.paste(pane);
     }
 }
@@ -740,6 +744,8 @@ mod tests {
         emitted: Vec<(PaneId, ServerToPane)>,
         /// Seat selections by [`target_index`].
         seat: [Option<Source>; 2],
+        mapped: bool,
+        pasted: Vec<PaneId>,
     }
 
     impl FakeHost {
@@ -756,6 +762,8 @@ mod tests {
                 requests: Vec::new(),
                 emitted: Vec::new(),
                 seat: [None, None],
+                mapped: true,
+                pasted: Vec::new(),
             };
             (event_loop, host)
         }
@@ -840,7 +848,7 @@ mod tests {
         }
 
         fn pane_has_window(&self, _pane: PaneId) -> bool {
-            true
+            self.mapped
         }
 
         fn request_selection(
@@ -878,7 +886,9 @@ mod tests {
             self.seat[target_index(target)] = None;
         }
 
-        fn paste(&mut self, _pane: PaneId) {}
+        fn paste(&mut self, pane: PaneId) {
+            self.pasted.push(pane);
+        }
     }
 
     fn offer_both(host: &mut FakeHost, pane: PaneId) {
@@ -894,6 +904,29 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn pastes_skip_panes_without_a_mapped_window() {
+        let pane = PaneId::from(7);
+        let paste_offer = || TerminalOffer {
+            selection: ClipboardSelection::Clipboard,
+            id: ClipboardOfferId::from(1),
+            mimes: vec!["text/plain".to_owned()],
+            intent: OfferIntent::Paste,
+        };
+        let (_event_loop, mut host) = FakeHost::new();
+
+        host.mapped = false;
+        offer(&mut host, pane, paste_offer());
+        assert_eq!(host.selection_owner(SelectionTarget::Clipboard), Some(pane));
+        paste(&mut host, pane, "text");
+        assert_eq!(host.pasted, []);
+
+        host.mapped = true;
+        offer(&mut host, pane, paste_offer());
+        paste(&mut host, pane, "text");
+        assert_eq!(host.pasted, [pane, pane]);
     }
 
     #[test]

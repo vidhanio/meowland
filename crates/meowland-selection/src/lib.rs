@@ -263,6 +263,10 @@ pub trait Host: Sized + 'static {
 ///
 /// Smithay invokes this before it updates the seat selection, so exports are
 /// requested from an immediate timer rather than synchronously.
+///
+/// Only a cleared selection clears the pane's clipboard. An export that
+/// yields no representation, because none is supported or every transfer
+/// fails, leaves the pane's clipboard untouched.
 pub fn selection<H: Host>(host: &mut H, target: SelectionTarget, source: Option<SelectionSource>) {
     host.bridge().set_export(target, None);
     let Some(pane) = host.selection_pane() else {
@@ -364,7 +368,10 @@ fn export_attempt<H: Host>(
             Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
         }
     }
-    if host.bridge().generation(target) != generation || !host.contains_pane(export.pane) {
+    if export.data.items.is_empty()
+        || host.bridge().generation(target) != generation
+        || !host.contains_pane(export.pane)
+    {
         return;
     }
     host.emit(
@@ -699,6 +706,8 @@ pub fn paste<H: Host>(host: &mut H, pane: PaneId, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs::File, io::Write as _, time::Duration};
+
     use calloop::EventLoop;
 
     use super::*;
@@ -710,26 +719,32 @@ mod tests {
         bridge: Bridge<Self>,
         contains: bool,
         on_request: Option<RequestAction>,
+        /// Bytes the selection owner writes per representation; `None` fails
+        /// the request. Requests for representations not listed stay open.
+        served: HashMap<String, Option<Vec<u8>>>,
+        open: Vec<OwnedFd>,
         requests: Vec<String>,
         emitted: Vec<(PaneId, ServerToPane)>,
     }
 
     impl FakeHost {
-        fn new() -> Self {
-            let event_loop: &'static EventLoop<'static, Self> =
-                Box::leak(Box::new(EventLoop::try_new().expect("event loop")));
+        fn new() -> (EventLoop<'static, Self>, Self) {
+            let event_loop = EventLoop::try_new().expect("event loop");
             let handle = Handle::new(event_loop.handle(), |host| host);
-            Self {
+            let host = Self {
                 handle,
                 bridge: Bridge::default(),
                 contains: true,
                 on_request: None,
+                served: HashMap::new(),
+                open: Vec::new(),
                 requests: Vec::new(),
                 emitted: Vec::new(),
-            }
+            };
+            (event_loop, host)
         }
 
-        fn attach_export(&mut self, pane: PaneId, mimes: &[&str]) {
+        fn attach_export(&mut self, pane: PaneId, mimes: &[&str], limit: usize) {
             let target = SelectionTarget::Clipboard;
             let id = self.bridge.id();
             self.bridge.set_export(
@@ -742,10 +757,44 @@ mod tests {
                     active: None,
                     data: ClipboardData::default(),
                     bytes: 0,
-                    limit: MAX_BYTES,
+                    limit,
                     deadline: Deadline::new(TRANSFER_TIMEOUT),
                 }),
             );
+        }
+
+        fn serve(&mut self, mime: &str, data: Option<&[u8]>) {
+            self.served
+                .insert(mime.to_owned(), data.map(<[u8]>::to_vec));
+        }
+
+        /// Run transfers until the clipboard export finishes.
+        fn settle(&mut self, event_loop: &mut EventLoop<'static, Self>) {
+            for _ in 0..16 {
+                if self.bridge.export(SelectionTarget::Clipboard).is_none() {
+                    return;
+                }
+                event_loop
+                    .dispatch(Some(Duration::ZERO), self)
+                    .expect("dispatch");
+            }
+            panic!("clipboard export did not finish");
+        }
+
+        /// Representations of every clipboard write sent to a pane.
+        fn written(&self) -> Vec<Vec<(&str, &[u8])>> {
+            self.emitted
+                .iter()
+                .filter_map(|(_, message)| match message {
+                    ServerToPane::ClipboardWrite { data, .. } => Some(
+                        data.items
+                            .iter()
+                            .map(|item| (item.mime.as_str(), item.data.as_slice()))
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
         }
     }
 
@@ -782,10 +831,20 @@ mod tests {
             &mut self,
             _target: SelectionTarget,
             mime: String,
-            _fd: OwnedFd,
+            fd: OwnedFd,
         ) -> io::Result<()> {
-            self.requests.push(mime);
-            self.on_request.take().map_or(Ok(()), |action| action(self))
+            self.requests.push(mime.clone());
+            if let Some(action) = self.on_request.take() {
+                return action(self);
+            }
+            match self.served.remove(&mime) {
+                Some(Some(data)) => File::from(fd).write_all(&data),
+                Some(None) => Err(io::Error::other("request failed")),
+                None => {
+                    self.open.push(fd);
+                    Ok(())
+                }
+            }
         }
 
         fn set_selection(
@@ -803,9 +862,9 @@ mod tests {
     fn reentrant_requests_discard_in_flight_export() {
         let pane = PaneId::from(7);
         let target = SelectionTarget::Clipboard;
-        let mut host = FakeHost::new();
+        let (_event_loop, mut host) = FakeHost::new();
 
-        host.attach_export(pane, &["text/plain", "text/html"]);
+        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.on_request = Some(Box::new(move |host| {
             host.bridge.detach(pane);
             Ok(())
@@ -816,7 +875,7 @@ mod tests {
         assert!(host.emitted.is_empty());
 
         host.requests.clear();
-        host.attach_export(pane, &["text/plain", "text/html"]);
+        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.on_request = Some(Box::new(move |host| {
             host.bridge.set_export(target, None);
             Err(io::Error::other("request failed"))
@@ -826,7 +885,7 @@ mod tests {
         assert!(host.bridge.export(target).is_none());
 
         host.requests.clear();
-        host.attach_export(pane, &["text/plain", "text/html"]);
+        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.on_request = Some(Box::new(|_| Err(io::Error::other("request failed"))));
         export_next(&mut host, target);
         assert_eq!(
@@ -835,5 +894,42 @@ mod tests {
         );
         assert!(host.bridge.export(target).is_some());
         assert!(host.emitted.is_empty());
+    }
+
+    #[test]
+    fn unusable_exports_leave_the_terminal_clipboard_untouched() {
+        let pane = PaneId::from(7);
+        let target = SelectionTarget::Clipboard;
+        let (mut event_loop, mut host) = FakeHost::new();
+
+        host.attach_export(pane, &[], MAX_BYTES);
+        export_next(&mut host, target);
+        host.settle(&mut event_loop);
+        assert!(host.emitted.is_empty());
+
+        host.serve("text/plain", None);
+        host.serve("text/html", None);
+        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
+        export_next(&mut host, target);
+        host.settle(&mut event_loop);
+        assert_eq!(host.requests, ["text/plain", "text/html"]);
+        assert!(host.emitted.is_empty());
+    }
+
+    #[test]
+    fn cleared_selections_and_empty_representations_reach_the_terminal() {
+        let pane = PaneId::from(7);
+        let target = SelectionTarget::Clipboard;
+        let (mut event_loop, mut host) = FakeHost::new();
+
+        selection(&mut host, target, None);
+        assert_eq!(host.written(), [Vec::new()]);
+
+        host.emitted.clear();
+        host.serve("text/plain", Some(b""));
+        host.attach_export(pane, &["text/plain"], MAX_BYTES);
+        export_next(&mut host, target);
+        host.settle(&mut event_loop);
+        assert_eq!(host.written(), [[("text/plain", &b""[..])]]);
     }
 }

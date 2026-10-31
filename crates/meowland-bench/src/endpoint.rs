@@ -309,14 +309,15 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Synchronized output ended: consume the image if it shows a new frame.
+    /// Synchronized output ended: validate the image and consume it if it
+    /// shows a new frame.
     fn present(&mut self, frames: &mut Vec<Frame>) -> anyhow::Result<()> {
         let Some(image) = &self.image else {
             return Ok(());
         };
         let id = pattern::identify(&image[..MARKER_PIXELS * 3]).context("corrupt frame marker")?;
+        pattern::verify(image, self.width, self.height, self.pattern, id)?;
         if self.last != Some(id) {
-            pattern::verify(image, self.width, self.height, self.pattern, id)?;
             self.last = Some(id);
             frames.push(Frame {
                 id,
@@ -631,5 +632,30 @@ mod tests {
         let (mut replies, mut frames) = (Vec::new(), Vec::new());
         assert!(endpoint.feed(&output, &mut replies, &mut frames).is_err());
         assert_eq!(frames, []);
+    }
+
+    /// Pixels corrupted by an edit that keeps the marker must fail when
+    /// presented, even though the marker shows an already-delivered frame.
+    #[test]
+    fn rejects_corrupted_repeat_of_delivered_marker() {
+        let (width, height) = (320, 200);
+        let mut endpoint = Endpoint::new(width, height, Pattern::Full, Transport::Inline);
+        let mut output = chunked(
+            &format!("a=T,f=24,s={width},v={height},i=1"),
+            &image(Pattern::Full, width, height, 0),
+        );
+        output.extend_from_slice(b"\x1b[?2026l");
+        let (mut replies, mut frames) = (Vec::new(), Vec::new());
+        endpoint.feed(&output, &mut replies, &mut frames).unwrap();
+        assert_eq!(frames.len(), 1);
+
+        let other = image(Pattern::Full, width, height, 1);
+        let mut output = chunked(
+            &format!("a=f,f=24,s={width},v={},x=0,y=1,i=1,r=1,X=1", height - 1),
+            &other[width * 3..],
+        );
+        output.extend_from_slice(b"\x1b[?2026l");
+        assert!(endpoint.feed(&output, &mut replies, &mut frames).is_err());
+        assert_eq!(frames.len(), 1);
     }
 }

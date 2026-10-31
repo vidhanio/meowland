@@ -8,7 +8,7 @@ use smithay::{
         Client,
         protocol::{wl_buffer, wl_surface::WlSurface},
     },
-    utils::{Buffer, Rectangle, Size, Transform},
+    utils::{Buffer, Logical, Rectangle, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -42,18 +42,17 @@ impl SurfaceCache {
 ///
 /// Empty damage means the whole buffer may have changed. A viewport maps
 /// surface damage through a source region, so patching falls back to a full
-/// copy for those surfaces.
+/// copy for those surfaces, as it does for a scale the protocol forbids.
 fn buffer_damage(
     damage: &[Damage],
-    data: &smithay::wayland::shm::BufferData,
+    size: Size<i32, Buffer>,
     scale: i32,
     transform: Transform,
     viewport: ViewportCachedState,
 ) -> Vec<Rectangle<i32, Buffer>> {
-    if damage.is_empty() {
+    if damage.is_empty() || scale < 1 {
         return Vec::new();
     }
-    let size = Size::<i32, Buffer>::from((data.width, data.height));
     let surface = size.to_logical(scale, transform);
     let mut rects = Vec::with_capacity(damage.len());
     for damage in damage {
@@ -63,12 +62,39 @@ fn buffer_damage(
                 if viewport.src.is_some() || viewport.dst.is_some() {
                     return Vec::new();
                 }
+                let Some(rect) = clip_surface_damage(*rect, surface) else {
+                    continue;
+                };
                 rect.to_buffer(scale, transform, &surface)
             }
         };
         rects.push(rect);
     }
     rects
+}
+
+/// Clip client-controlled surface damage to the surface in wide arithmetic.
+///
+/// Smithay transforms and scales rectangles in `i32`, so unclipped extreme
+/// coordinates would overflow before the snapshot copy clips them.
+fn clip_surface_damage(
+    rect: Rectangle<i32, Logical>,
+    surface: Size<i32, Logical>,
+) -> Option<Rectangle<i32, Logical>> {
+    let clip = |start: i32, length: i32, extent: i32| {
+        let start = i64::from(start);
+        let low = start.max(0);
+        let high = (start + i64::from(length)).min(i64::from(extent));
+        (low < high).then(|| {
+            (
+                i32::try_from(low).expect("clipped start lies within the surface"),
+                i32::try_from(high - low).expect("clipped length fits the surface"),
+            )
+        })
+    };
+    let (x, width) = clip(rect.loc.x, rect.size.w, surface.w)?;
+    let (y, height) = clip(rect.loc.y, rect.size.h, surface.h)?;
+    Some(Rectangle::new((x, y).into(), (width, height).into()))
 }
 
 impl BufferHandler for Compositor {
@@ -177,7 +203,8 @@ impl CompositorHandler for Compositor {
                             let viewport = with_states(surface, |states| {
                                 *states.cached_state.get::<ViewportCachedState>().current()
                             });
-                            let damage = buffer_damage(&damage, &data, scale, transform, viewport);
+                            let size = Size::from((data.width, data.height));
+                            let damage = buffer_damage(&damage, size, scale, transform, viewport);
                             // SAFETY: Smithay keeps the mapped pool readable
                             // for this callback and supplies its pointer and
                             // length together.
@@ -251,5 +278,79 @@ impl CompositorHandler for Compositor {
                 self.touch(window);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRANSFORMS: [Transform; 8] = [
+        Transform::Normal,
+        Transform::_90,
+        Transform::_180,
+        Transform::_270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ];
+
+    fn surface_damage(x: i32, y: i32, width: i32, height: i32) -> Damage {
+        Damage::Surface(Rectangle::new((x, y).into(), (width, height).into()))
+    }
+
+    #[test]
+    fn extreme_surface_damage_is_clipped_inside_the_buffer() {
+        let size = Size::<i32, Buffer>::from((12, 6));
+        let damage = [
+            surface_damage(i32::MIN, i32::MIN, i32::MAX, i32::MAX),
+            surface_damage(i32::MIN, 0, i32::MAX, 1),
+            surface_damage(-1, -1, i32::MAX, i32::MAX),
+            surface_damage(i32::MAX, i32::MAX, i32::MAX, i32::MAX),
+            surface_damage(1, 1, 1, 1),
+        ];
+        let bounds = Rectangle::from_size(size);
+        for scale in [1, 2, 3] {
+            for transform in TRANSFORMS {
+                let rects = buffer_damage(
+                    &damage,
+                    size,
+                    scale,
+                    transform,
+                    ViewportCachedState::default(),
+                );
+                assert!(!rects.is_empty(), "{scale} {transform:?}");
+                for rect in rects {
+                    assert!(
+                        rect.size.w > 0 && rect.size.h > 0 && bounds.contains_rect(rect),
+                        "{rect:?} escapes {bounds:?} at scale {scale} {transform:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn surface_damage_overlapping_an_edge_keeps_its_visible_part() {
+        let rects = buffer_damage(
+            &[surface_damage(-5, 1, 7, i32::MAX)],
+            Size::from((8, 6)),
+            2,
+            Transform::Normal,
+            ViewportCachedState::default(),
+        );
+        assert_eq!(rects, [Rectangle::new((0, 2).into(), (4, 4).into())]);
+    }
+
+    #[test]
+    fn damage_entirely_outside_the_surface_patches_nothing() {
+        assert_eq!(
+            clip_surface_damage(
+                Rectangle::new((i32::MIN, 0).into(), (i32::MAX, 4).into()),
+                Size::from((4, 4)),
+            ),
+            None
+        );
     }
 }

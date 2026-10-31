@@ -1,6 +1,6 @@
 //! Terminal mode ownership, pane geometry, and terminal control output.
 
-use std::io::{self, Write};
+use std::io;
 
 use crossterm::{
     event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
@@ -9,7 +9,7 @@ use crossterm::{
 use meowland_core::pixels::FrameSize;
 use meowland_protocol as protocol;
 
-use crate::{Error, Result};
+use crate::{Error, Result, output};
 
 /// Longest sanitized title or status line forwarded to the terminal.
 ///
@@ -122,6 +122,11 @@ impl TerminalGuard {
             mouse: false,
             clipboard: None,
         };
+        Self::append_enter(out);
+        Ok(guard)
+    }
+
+    fn append_enter(out: &mut Vec<u8>) {
         queue!(
             out,
             terminal::EnterAlternateScreen,
@@ -131,7 +136,6 @@ impl TerminalGuard {
         )
         .expect("writing terminal commands to a byte buffer cannot fail");
         out.extend_from_slice(b"\x1b[?7l\x1b[?25l\x1b[?2004h");
-        Ok(guard)
     }
 
     pub(crate) fn enable_mouse(&mut self, out: &mut Vec<u8>) {
@@ -155,6 +159,11 @@ impl TerminalGuard {
         }
         self.active = false;
         let raw = terminal::disable_raw_mode();
+        self.append_restore(out);
+        raw
+    }
+
+    fn append_restore(&mut self, out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x18\x1b\\");
         queue!(out, terminal::EndSynchronizedUpdate)
             .expect("writing terminal commands to a byte buffer cannot fail");
@@ -178,20 +187,68 @@ impl TerminalGuard {
             terminal::LeaveAlternateScreen
         )
         .expect("writing terminal commands to a byte buffer cannot fail");
-        raw
     }
 
-    /// Best-effort synchronous restore for unwinding or error paths.
-    fn restore_blocking(&mut self) {
-        let mut bytes = Vec::new();
-        let _ = self.restore_into(&mut bytes);
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(&bytes).and_then(|()| stdout.flush());
+    fn restore_best_effort(&mut self) {
+        if self.active {
+            let mut bytes = Vec::new();
+            let _ = self.restore_into(&mut bytes);
+            output::write_best_effort(&bytes);
+        }
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        self.restore_blocking();
+        self.restore_best_effort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClipboardMode, TerminalGuard};
+
+    #[test]
+    fn restoration_restores_enabled_modes() {
+        let mut guard = TerminalGuard {
+            active: false,
+            mouse: true,
+            clipboard: Some(ClipboardMode::Disabled),
+        };
+        let mut bytes = Vec::new();
+        guard.append_restore(&mut bytes);
+        assert!(
+            bytes
+                .windows(b"\x1b[?1016l".len())
+                .any(|part| part == b"\x1b[?1016l")
+        );
+        assert!(
+            bytes
+                .windows(b"\x1b[?5522l".len())
+                .any(|part| part == b"\x1b[?5522l")
+        );
+        assert!(!guard.mouse);
+        assert_eq!(guard.clipboard, None);
+    }
+
+    #[test]
+    fn restoration_preserves_enabled_clipboard_and_is_idempotent_when_inactive() {
+        let mut guard = TerminalGuard {
+            active: false,
+            mouse: false,
+            clipboard: Some(ClipboardMode::Enabled),
+        };
+        let mut bytes = Vec::new();
+        guard.append_restore(&mut bytes);
+        assert!(
+            bytes
+                .windows(b"\x1b[?5522h".len())
+                .any(|part| part == b"\x1b[?5522h")
+        );
+        let len = bytes.len();
+        guard
+            .restore_into(&mut bytes)
+            .expect("inactive guard restores successfully");
+        assert_eq!(bytes.len(), len);
     }
 }

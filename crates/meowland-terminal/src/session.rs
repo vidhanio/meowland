@@ -153,11 +153,26 @@ impl TerminalSession {
         reason = "the terminal session runs on calloop's local executor"
     )]
     pub(crate) async fn run(mut self) -> Result<()> {
+        let result = self.run_inner().await;
+        if result.is_err()
+            && !matches!(self.lifecycle, Lifecycle::Closed)
+            && let Err(error) = self.close(None).await
+        {
+            tracing::warn!(%error, "failed to restore terminal after session error");
+        }
+        result
+    }
+
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn run_inner(&mut self) -> Result<()> {
         let mut turns = TURNS_PER_YIELD;
         while !matches!(self.lifecycle, Lifecycle::Closed) {
             self.prepare_pending_work()?;
             if let Err(error) = self.input.check_recovery() {
-                return self.finish_after_input_error(error).await;
+                return Err(error.into());
             }
             let active = matches!(self.lifecycle, Lifecycle::Active(_));
             let pending_output = active && self.presentation.pending();
@@ -179,7 +194,7 @@ impl TerminalSession {
             .await;
             match ready {
                 Ready::Input(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
-                    return self.finish_after_input_error(error).await;
+                    return Err(error.into());
                 }
                 Ready::Terminate | Ready::Input(Err(_)) => return self.close(None).await,
                 Ready::Resize => self.send_event(input::Event::Resize)?,
@@ -206,15 +221,6 @@ impl TerminalSession {
             }
         }
         Ok(())
-    }
-
-    #[expect(
-        clippy::future_not_send,
-        reason = "the terminal session runs on calloop's local executor"
-    )]
-    async fn finish_after_input_error(&mut self, error: io::Error) -> Result<()> {
-        self.close(None).await?;
-        Err(error.into())
     }
 
     #[expect(
@@ -365,7 +371,8 @@ impl TerminalSession {
         reason = "the terminal session runs on calloop's local executor"
     )]
     async fn start_presentation(&mut self) -> Result<()> {
-        let mut mode = TerminalGuard::enter(self.presentation.buffer())?;
+        let mode = TerminalGuard::enter(self.presentation.buffer())?;
+        self.lifecycle = Lifecycle::Active(mode);
         self.flush_output().await?;
         let Some(probe) = terminal_probe(
             &mut self.input,
@@ -375,10 +382,7 @@ impl TerminalSession {
         )
         .await?
         else {
-            let raw = mode.restore_into(self.presentation.buffer());
-            self.close(None).await?;
-            raw?;
-            return Ok(());
+            return self.close(None).await;
         };
         if !probe.frame_edits {
             return Err(Error::GraphicsUnsupported);
@@ -406,9 +410,11 @@ impl TerminalSession {
             FrameTransport::Inline
         };
         self.presentation = PanePresentation::new(transport);
-        mode.enable_mouse(self.presentation.buffer());
-        if let Some(previous) = probe.clipboard {
-            mode.enable_clipboard(previous, self.presentation.buffer());
+        if let Lifecycle::Active(mode) = &mut self.lifecycle {
+            mode.enable_mouse(self.presentation.buffer());
+            if let Some(previous) = probe.clipboard {
+                mode.enable_clipboard(previous, self.presentation.buffer());
+            }
         }
         self.flush_output().await?;
         self.tx
@@ -432,7 +438,6 @@ impl TerminalSession {
         self.tx
             .send(&PaneToServer::Action(PaneAction::Resize { size }))?;
         probe.log_capabilities(width, height);
-        self.lifecycle = Lifecycle::Active(mode);
         Ok(())
     }
 

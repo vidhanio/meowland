@@ -5,8 +5,6 @@ use std::io::Write;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, write::ZlibEncoder};
 
-use crate::presenter::{Placement, transmit};
-
 const CHUNK: usize = 4096;
 /// Base64 payload bytes per 4096-character chunk.
 const CHUNK_PAYLOAD: usize = CHUNK / 4 * 3;
@@ -121,4 +119,33 @@ impl Encoder {
 fn encoded_capacity(payload_len: usize) -> usize {
     let chunks = payload_len.div_ceil(CHUNK_PAYLOAD).max(1);
     payload_len.div_ceil(3) * 4 + chunks * 16 + 96
+}
+
+/// Whether a transfer replaces the whole placement or edits the root frame in
+/// place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Placement {
+    Whole,
+    Edit { x: u32, y: u32 },
+}
+
+impl Placement {
+    const fn continuation(self) -> &'static [u8] {
+        match self {
+            Self::Whole => b"\x1b_G",
+            Self::Edit { .. } => b"\x1b_Ga=f,",
+        }
+    }
+}
+
+/// Common Kitty transmission keys; callers append transport and chunk keys.
+pub(crate) fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, placement: Placement) {
+    match placement {
+        Placement::Whole => write!(out, "a=T,f=24,s={width},v={height},i={id},p=1,z=1,C=1,q=2"),
+        Placement::Edit { x, y } => write!(
+            out,
+            "a=f,f=24,s={width},v={height},i={id},r=1,x={x},y={y},X=1,q=2"
+        ),
+    }
+    .expect("writing to Vec cannot fail");
 }

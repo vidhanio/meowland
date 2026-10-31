@@ -1,12 +1,10 @@
 //! Retained RGB frames with in-place Kitty root-frame updates.
 
-use std::io::Write;
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameBand, SharedFrame};
 
-use crate::encoding::Encoder;
+use crate::encoding::{Encoder, Placement, transmit};
 
 const SCREEN_ID: u32 = 1;
 
@@ -194,31 +192,4 @@ pub fn query_frame_edits(id: u32) -> Vec<u8> {
 
 fn begin_image(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[?2026h\x1b[2J\x1b[H");
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Placement {
-    Whole,
-    Edit { x: u32, y: u32 },
-}
-
-impl Placement {
-    pub(crate) const fn continuation(self) -> &'static [u8] {
-        match self {
-            Self::Whole => b"\x1b_G",
-            Self::Edit { .. } => b"\x1b_Ga=f,",
-        }
-    }
-}
-
-/// Common Kitty transmission keys; callers append transport and chunk keys.
-pub(crate) fn transmit(out: &mut Vec<u8>, id: u32, width: u32, height: u32, placement: Placement) {
-    match placement {
-        Placement::Whole => write!(out, "a=T,f=24,s={width},v={height},i={id},p=1,z=1,C=1,q=2"),
-        Placement::Edit { x, y } => write!(
-            out,
-            "a=f,f=24,s={width},v={height},i={id},r=1,x={x},y={y},X=1,q=2"
-        ),
-    }
-    .expect("writing to Vec cannot fail");
 }

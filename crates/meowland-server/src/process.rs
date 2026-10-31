@@ -13,13 +13,6 @@ use super::Server;
 use crate::{Error, Result};
 
 /// Launch with the server's signalfd subscriptions unblocked in the child.
-/// The pre-exec closure only invokes the async-signal-safe signal-mask
-/// operation on a set built before fork, without allocating or accessing shared
-/// state.
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "the pre-exec safety contract is documented above"
-)]
 pub(crate) fn launch(
     args: &[OsString],
     env: &[(OsString, OsString)],
@@ -40,6 +33,10 @@ pub(crate) fn launch(
         unblocked.add(signal);
     }
     let mut command = Command::new(executable);
+    // SAFETY: between fork and exec the closure only calls `pthread_sigmask`,
+    // which is async-signal-safe, on a signal set built before fork; it neither
+    // allocates nor touches shared state, and an `Errno` converts to an
+    // `io::Error` without allocating.
     unsafe {
         command.pre_exec(move || unblocked.thread_unblock().map_err(std::io::Error::from));
     }

@@ -47,8 +47,8 @@ fuzz_target!(|report: Report| {
     );
     if bytes.len() <= BUFFERED {
         assert_eq!(
-            format!("{reports:?}"),
-            format!("{:?}", expected.as_slice()),
+            reports,
+            expected.as_slice(),
             "streaming and standalone mouse decoding disagree"
         );
     } else {

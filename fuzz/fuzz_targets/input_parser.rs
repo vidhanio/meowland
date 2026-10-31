@@ -37,7 +37,7 @@ fn check(event: &Event) {
 }
 
 /// Decode `chunks`, draining events after each one as the reader does.
-fn decode<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (bool, Vec<String>) {
+fn decode<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (bool, Vec<Event>) {
     let mut parser = Parser::default();
     let mut events = Vec::new();
     for chunk in chunks {
@@ -48,7 +48,7 @@ fn decode<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (bool, Vec<String>)
         }
         while let Some(event) = parser.next_event() {
             check(&event);
-            events.push(format!("{event:?}"));
+            events.push(event);
         }
     }
     (true, events)

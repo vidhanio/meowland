@@ -15,7 +15,7 @@ pub enum Kind {
 
 /// Logical key identity, modifier state, and associated text reported by the
 /// Kitty protocol.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Key {
     /// Unicode code point or Kitty functional-key number.
     pub code: u32,
@@ -28,7 +28,7 @@ pub struct Key {
 }
 
 /// Decoded terminal event, with bounded text and control-sequence payloads.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Event {
     /// Kitty keyboard transition for the compositor to resolve.
     Key(Key),

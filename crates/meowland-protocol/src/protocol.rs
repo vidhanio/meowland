@@ -330,7 +330,7 @@ pub struct Scroll {
 
 /// Terminal-originated input; key identities follow the Kitty keyboard
 /// protocol rather than Linux evdev codes.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub enum Input {
     /// One key transition with the terminal's authoritative modifier snapshot.
     Key {

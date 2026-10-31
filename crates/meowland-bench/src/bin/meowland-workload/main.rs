@@ -2,20 +2,25 @@
 //! Unix socket.
 
 mod dispatch;
-mod fixture;
 
 use std::{
     fs::File,
-    io::{Read, Seek, Write},
-    os::{fd::AsFd, unix::net::UnixStream},
+    io::{Read, Write},
+    os::{
+        fd::AsFd,
+        unix::{fs::FileExt as _, net::UnixStream},
+    },
     time::Duration,
 };
 
-use fixture::Pattern;
+use anyhow::{Context as _, bail, ensure};
+use meowland_bench::{
+    control::{self, Command, Event, EventKind},
+    pattern::{APP_ID, Pattern, Rect},
+};
 use rustix::{
     event::{PollFd, PollFlags, poll},
     fs::{MemfdFlags, memfd_create},
-    time::{ClockId, clock_gettime},
 };
 use wayland_client::{
     Connection, EventQueue, QueueHandle,
@@ -24,13 +29,19 @@ use wayland_client::{
 };
 use wayland_protocols::xdg::shell::client::xdg_wm_base;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+/// Evdev code of the `a` key.
+const KEY_A: u32 = 30;
 
 struct Buffer {
     proxy: wl_buffer::WlBuffer,
     small: wl_buffer::WlBuffer,
     file: File,
     released: bool,
+    /// Whether every pixel has been painted, so later frames of a pattern
+    /// with bounded damage only need to repaint that damage.
+    painted: bool,
+    /// Frame the compositor holds this buffer for.
+    frame: Option<u64>,
 }
 
 impl Buffer {
@@ -39,12 +50,12 @@ impl Buffer {
         qh: &QueueHandle<State>,
         (width, height): (usize, usize),
         index: usize,
-    ) -> Result<Self> {
+    ) -> anyhow::Result<Self> {
         let file = File::from(memfd_create("meowland-workload", MemfdFlags::CLOEXEC)?);
         let length = width * height * 4;
         file.set_len(u64::try_from(length)?)?;
         let pool = shm.create_pool(file.as_fd(), i32::try_from(length)?, qh, ());
-        let create = |width, height| -> Result<_> {
+        let create = |width, height| -> anyhow::Result<_> {
             Ok(pool.create_buffer(
                 0,
                 i32::try_from(width)?,
@@ -63,6 +74,8 @@ impl Buffer {
             small,
             file,
             released: true,
+            painted: false,
+            frame: None,
         })
     }
 }
@@ -90,50 +103,49 @@ struct State {
     error: Option<String>,
 }
 
-fn now() -> i64 {
-    let time = clock_gettime(ClockId::Monotonic);
-    time.tv_sec * 1_000_000_000 + time.tv_nsec
-}
-
 impl State {
-    fn event(&mut self, kind: &str, id: u64) {
-        if let Err(error) = writeln!(self.control, "{kind} {id} {}", now()) {
+    fn event(&mut self, kind: EventKind, id: u64) {
+        let event = Event {
+            kind,
+            id,
+            at: control::now(),
+        };
+        if let Err(error) = writeln!(self.control, "{event}") {
             self.error = Some(error.to_string());
         }
     }
 
     fn input(&mut self, key: u32) {
-        if key == 30
+        if key == KEY_A
             && let Some(id) = self.expectation.take()
         {
-            self.event("input", id);
+            self.event(EventKind::Input, id);
             self.pending = Some((id, id));
         }
     }
 
-    fn command(&mut self, line: &str) -> Result<bool> {
-        let mut words = line.split_whitespace();
-        let kind = words.next().ok_or("empty command")?;
-        if kind == "stop" {
-            return Ok(false);
+    fn release(&mut self, index: usize) {
+        let buffer = &mut self.buffers[index];
+        buffer.released = true;
+        if let Some(frame) = buffer.frame.take() {
+            self.event(EventKind::Release, frame);
         }
-        let id: u64 = words.next().ok_or("missing command ID")?.parse()?;
-        match kind {
-            "commit" => self.pending = Some((id, id)),
-            "repeat" => {
-                let content = words.next().ok_or("missing repeat content ID")?.parse()?;
-                self.pending = Some((id, content));
-            }
-            "arm" => {
-                self.expectation = Some(id);
-                self.event("armed", id);
-            }
-            _ => return Err("unknown command".into()),
-        }
-        Ok(true)
     }
 
-    fn draw(&mut self) -> Result<()> {
+    fn command(&mut self, command: Command) -> bool {
+        match command {
+            Command::Commit(id) => self.pending = Some((id, id)),
+            Command::Repeat { frame, content } => self.pending = Some((frame, content)),
+            Command::Arm(id) => {
+                self.expectation = Some(id);
+                self.event(EventKind::Armed, id);
+            }
+            Command::Stop => return false,
+        }
+        true
+    }
+
+    fn draw(&mut self) -> anyhow::Result<()> {
         if self.phase == Phase::WaitingConfigure {
             return Ok(());
         }
@@ -149,66 +161,96 @@ impl State {
         } else {
             return Ok(());
         };
-        let small = matches!(self.pattern, Pattern::Resize) && id & 1 != 0;
-        let (width, height) = if small {
-            (self.width / 2, self.height / 2)
-        } else {
-            (self.width, self.height)
-        };
-        let pixels = &mut self.pixels[..width * height * 4];
-        fixture::paint(pixels, width, height, self.pattern, content);
+        let (width, height) = self.pattern.surface(self.width, self.height, content);
         let buffer = &mut self.buffers[index];
-        buffer.file.rewind()?;
-        buffer.file.write_all(pixels)?;
-        buffer.released = false;
-        let proxy = if small { &buffer.small } else { &buffer.proxy };
-        self.surface.attach(Some(proxy), 0, 0);
-        if initial {
-            self.surface
-                .damage_buffer(0, 0, i32::try_from(width)?, i32::try_from(height)?);
-        } else if let Some((x, y, w, h)) = self.pattern.damage(width, height) {
-            self.surface.damage_buffer(
-                i32::try_from(x)?,
-                i32::try_from(y)?,
-                i32::try_from(w)?,
-                i32::try_from(h)?,
-            );
-        } else if matches!(self.pattern, Pattern::Sparse) {
-            self.surface.damage_buffer(0, 0, 16, 1);
-            self.surface.damage_buffer(80, 100, 40, 20);
+        if let Some(rectangles) = self.pattern.damage().filter(|_| buffer.painted) {
+            for rectangle in rectangles {
+                paint(&mut self.pixels, width, self.pattern, content, rectangle);
+                let (x, y, w, h) = rectangle;
+                for row in y..y + h {
+                    let start = (row * width + x) * 4;
+                    let end = start + w * 4;
+                    buffer
+                        .file
+                        .write_all_at(&self.pixels[start..end], u64::try_from(start)?)?;
+                }
+            }
         } else {
-            self.surface
-                .damage_buffer(0, 0, i32::try_from(width)?, i32::try_from(height)?);
+            paint(
+                &mut self.pixels,
+                width,
+                self.pattern,
+                content,
+                (0, 0, width, height),
+            );
+            buffer
+                .file
+                .write_all_at(&self.pixels[..width * height * 4], 0)?;
+            buffer.painted = true;
         }
-        let at = now();
+        buffer.released = false;
+        buffer.frame = Some(id);
+        let proxy = if (width, height) == (self.width, self.height) {
+            &buffer.proxy
+        } else {
+            &buffer.small
+        };
+        self.surface.attach(Some(proxy), 0, 0);
+        match self.pattern.damage().filter(|_| !initial) {
+            Some(rectangles) => {
+                for (x, y, w, h) in rectangles {
+                    self.surface.damage_buffer(
+                        i32::try_from(x)?,
+                        i32::try_from(y)?,
+                        i32::try_from(w)?,
+                        i32::try_from(h)?,
+                    );
+                }
+            }
+            None => {
+                self.surface
+                    .damage_buffer(0, 0, i32::try_from(width)?, i32::try_from(height)?);
+            }
+        }
+        let at = control::now();
         self.surface.commit();
-        writeln!(self.control, "commit {id} {at}")?;
+        let event = Event {
+            kind: EventKind::Commit,
+            id,
+            at,
+        };
+        writeln!(self.control, "{event}")?;
         Ok(())
     }
 }
 
-fn run() -> Result<()> {
+/// Paint `rectangle` of `frame` into XRGB8888 `pixels` holding a surface
+/// `width` pixels wide.
+fn paint(pixels: &mut [u8], width: usize, pattern: Pattern, frame: u64, rectangle: Rect) {
+    let (x, y, w, h) = rectangle;
+    for row in y..y + h {
+        let start = (row * width + x) * 4;
+        let line = &mut pixels[start..start + w * 4];
+        for (column, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let [red, green, blue] = pattern.surface_pixel(x + column, row, width, frame);
+            *pixel = [blue, green, red, 255];
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [control, width, height, pattern] = args.as_slice() else {
-        return Err(
-            "usage: meowland-workload CONTROL_SOCKET WIDTH HEIGHT full|sparse|resize|tall|wide"
-                .into(),
-        );
+        bail!("usage: meowland-workload CONTROL_SOCKET WIDTH HEIGHT full|sparse|resize");
     };
     let width: usize = width.parse()?;
     let height: usize = height.parse()?;
-    if !(160..=7680).contains(&width) || !(120..=4320).contains(&height) {
-        return Err("workload dimensions must be 160x120 through 7680x4320".into());
-    }
-    let pattern = match pattern.as_str() {
-        "full" => Pattern::Full,
-        "sparse" => Pattern::Sparse,
-        "resize" => Pattern::Resize,
-        "tall" => Pattern::Tall,
-        "wide" => Pattern::Wide,
-        _ => return Err("pattern must be full, sparse, resize, tall, or wide".into()),
-    };
-    let control = UnixStream::connect(control)?;
+    ensure!(
+        (160..=7680).contains(&width) && (120..=4320).contains(&height),
+        "workload dimensions must be 160x120 through 7680x4320"
+    );
+    let pattern: Pattern = pattern.parse()?;
+    let control = UnixStream::connect(control).context("connecting to the harness")?;
     control.set_read_timeout(Some(Duration::from_secs(5)))?;
     control.set_write_timeout(Some(Duration::from_secs(5)))?;
     let connection = Connection::connect_to_env()?;
@@ -221,12 +263,12 @@ fn run() -> Result<()> {
     let surface = compositor.create_surface(&qh, ());
     let xdg = wm.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg.get_toplevel(&qh, ());
-    toplevel.set_app_id(fixture::APP_ID.into());
+    toplevel.set_app_id(APP_ID.into());
     toplevel.set_title("Meowland benchmark workload".into());
     surface.commit();
     let buffers = (0..3)
         .map(|index| Buffer::new(&shm, &qh, (width, height), index))
-        .collect::<Result<_>>()?;
+        .collect::<anyhow::Result<_>>()?;
     let mut state = State {
         width,
         height,
@@ -242,7 +284,7 @@ fn run() -> Result<()> {
         control,
         error: None,
     };
-    state.event("pid", u64::from(std::process::id()));
+    state.event(EventKind::Pid, u64::from(std::process::id()));
     event_loop(&connection, queue, state)
 }
 
@@ -250,14 +292,14 @@ fn event_loop(
     connection: &Connection,
     mut queue: EventQueue<State>,
     mut state: State,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     let mut pending = String::new();
     let mut bytes = [0; 4096];
     let timeout = Duration::from_millis(100).try_into()?;
     loop {
         queue.dispatch_pending(&mut state)?;
         if let Some(error) = state.error.take() {
-            return Err(error.into());
+            bail!(error);
         }
         state.draw()?;
         queue.flush()?;
@@ -273,7 +315,7 @@ fn event_loop(
             (descriptors[0].revents(), descriptors[1].revents())
         };
         if wayland.intersects(PollFlags::ERR | PollFlags::HUP) {
-            return Err("Wayland disconnected".into());
+            bail!("Wayland disconnected");
         }
         if wayland.contains(PollFlags::IN) {
             read.read()?;
@@ -288,17 +330,15 @@ fn event_loop(
             pending.push_str(std::str::from_utf8(&bytes[..count])?);
             while let Some(end) = pending.find('\n') {
                 let line: String = pending.drain(..=end).collect();
-                if !state.command(&line)? {
+                if !state.command(line.parse()?) {
                     return Ok(());
                 }
             }
-            if pending.len() > 4096 {
-                return Err("oversized control command".into());
-            }
+            ensure!(pending.len() <= 4096, "oversized control command");
         }
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     run()
 }

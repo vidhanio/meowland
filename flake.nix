@@ -272,7 +272,6 @@
                 pkgs.cargo-edit
                 pkgs.cargo-fuzz
                 pkgs.cargo-machete
-                pkgs.python3
               ];
 
               inherit buildInputs nativeBuildInputs;
@@ -288,7 +287,6 @@
                   package = rustToolchain pkgs;
                 };
                 taplo.enable = true;
-                ruff-format.enable = true;
               };
             };
           };

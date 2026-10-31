@@ -30,6 +30,9 @@ meowland-server = { path = "crates/meowland-server" }
 anyhow = "1"
 base64 = "0.23.1"
 bitflags = "2.13.2"
+criterion = { version = "0.8.2", default-features = false, features = [
+  "cargo_bench_support",
+] }
 calloop = { version = "0.14.5", features = [
   "executor",
   "futures-io",
@@ -56,6 +59,7 @@ tracing = "0.1.44"
 tracing-journald = "0.3.2"
 tracing-subscriber = "0.3.23"
 toml = "1.1"
+tempfile = "3.27.0"
 rustix = "1.1.5"
 smithay = { git = "https://github.com/Smithay/smithay.git", rev = "76118ad7796e3edc46875f44c437485996a8e39d", default-features = false }
 clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }

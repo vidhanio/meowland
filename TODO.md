@@ -39,12 +39,14 @@ units), `flake.nix` (crane build, Home Manager module, treefmt),
 
 ## Open
 
-Items from the 2026-10-30 code review carry two independent severity scores out of 10,
-written **[R n · M n]**: R is the reviewer agent that found the issue, M is the
-consolidating agent, scored without seeing R. Items are sorted by combined score
-within each section. The [state machine](#state-machines) section groups the items
-that an explicit lifecycle model would rule out; the other sections hold the full
-list.
+Items from the code reviews carry two independent severity scores out of 10, written
+**[R n · M n]**: R is the reviewer agent that found the issue, M is the consolidating
+agent, scored without seeing R. Items are sorted by combined score within each
+section. The [state machine](#state-machines) section groups the items that an
+explicit lifecycle model would rule out, and [Architecture](#architecture) proposes
+larger changes that remove whole bug classes. Findings from comparing against other
+projects are under [Niri comparison](#niri-comparison) and
+[wlclipsync comparison](#wlclipsync-comparison).
 
 ### State machines
 
@@ -115,6 +117,20 @@ but a deadline, budget, or validation is still needed.
     bounded set of held keys.
     - Helps: *Forward repeats for keys sent as text*; *Validate and limit held key
       identities*.
+12. **XDG toplevel configure lifecycle** (`meowland-compositor`):
+    `AwaitingInitialCommit → Configured → Mapped → Unmapped → AwaitingInitialCommit`,
+    with request handlers returning a `ConfigureAction` (see
+    [Architecture](#architecture) A5).
+    - Prevents: *Restart the configure sequence after unmapping*.
+    - Helps: *Reply to explicit state requests even when state is unchanged*;
+      *Separate protocol mapping from snapshot availability*.
+
+Niri-comparison items that the existing machines also cover: *Reconcile keyboard
+focus when reattaching a window* and *Restrict popup grabs to the focused window*
+(machine 7, seat focus); *Do not clear the terminal clipboard when an export has no
+usable data* and *Synchronize an existing selection on pane attachment* (machine 5);
+*Resume callbacks when a retained pane's window remaps* (machine 8). *Handle SIGHUP
+as a shutdown request* is a missing transition in the server's own shutdown lifecycle.
 
 Ownership tracking also helps with *Keep signal masks correct across overlapping
 subscriptions* and *Clean up shared objects after a producer crash*. Neither is a
@@ -124,6 +140,124 @@ ownership records that survive a crash.
 Not state-machine problems: arithmetic and geometry (damage clipping, viewports,
 popup geometry, value120, SGR pixels), resource bounds (decoded sizes, output
 budget, MIME lists), environment handling, layout mapping, and docs.
+
+### Architecture
+
+Larger-scope changes proposed by the reviewers to remove whole bug classes rather than
+individual bugs, ranked by consolidated value against cost. **R** is the reviewer's
+value/cost rating (several reviewers proposed overlapping ideas; their ratings are
+listed together), **M** is the consolidator's. These are proposals to evaluate, not
+agreed plans.
+
+1. **[R 8 · M 8] One committed scene model per transaction.** Build a `SurfaceView`
+   tree once per transaction: effective window geometry, root origin, buffer
+   transform, scale, validated viewport, mapped state, and clipping in wide integers.
+   Composition, damage, hit testing, popup placement, and source bounds all read the
+   same tree instead of re-deriving geometry. Eliminates the geometry-drift class:
+   *Clip surface damage before transforming it*, *Account for viewports when bounding
+   source buffers*, *Use the effective window geometry for popup placement*, *Place
+   the root at the window-geometry origin*, *Skip descendants of unmapped surfaces*,
+   *Validate committed viewport bounds*. Cost: a substantial cutover across
+   `meowland-render` and `meowland-compositor`; Smithay's `RenderElement`/
+   `OutputDamageTracker` path is GPU-oriented and not a drop-in for the shm CPU
+   fallback, so reuse only Smithay's surface-view helpers where buffer ownership fits.
+2. **[R 9, 7 · M 8] Resource admission as owned reservations.** A per-client budget
+   under a global one; framing readers, bounded deserializers, clipboard deliveries,
+   and readback submissions must acquire an RAII reservation *before* allocating or
+   submitting, and the reservation travels with the buffer or operation until every
+   completion or cancellation path releases it. Unbounded allocation becomes
+   impossible to write without a token. Eliminates: *Bound decoded collection sizes*,
+   *Bound total memory held by partial frames*, *Give each client its own DMA-BUF
+   readback budget*, *Prevent one client from occupying every clipboard delivery
+   slot*. Cost: invasive API changes plus a fairness policy; submitted GPU work must
+   stay retained until complete, so deadlines cannot simply free its buffer.
+3. **[R 8, 8 · M 8] Real-client conformance harness.** A reusable test crate modelled on
+   niri's `src/tests/fixture.rs`: in-process Wayland clients over socket pairs, a
+   scripted terminal peer on the pane protocol, controlled commits, input, pipe
+   progress, permission replies, and disconnects, recording protocol traces and
+   asserting invariants. Optionally run the same XDG scenarios against headless niri
+   as a differential reference. Covers most open Testing items and every lifecycle
+   finding from the niri comparison. Detects rather than prevents; niri pins a
+   different Smithay revision and legitimate policy differences must not count as
+   failures.
+4. **[R 9 · M 8] Clipboard effects as distinct semantic types.** Replace the overloaded
+   empty `ClipboardData` with `SelectionUpdate::Clear | Publish(NonEmptyClipboardData)`
+   and a separate export-failure result; a zero-byte payload is an item, not a clear.
+   Only an explicit selection-clear event can construct `Clear`. Eliminates *Do not
+   clear the terminal clipboard when an export has no usable data* and structures
+   *Keep finished representations when a later one fails*. Cost: a wire change across
+   `meowland-protocol`, `meowland-selection`, and `meowland-terminal-clipboard` (fine
+   pre-release); partial exports still need a policy.
+5. **[R 9 · M 7] Protocol obligations returned, not remembered.** Route Smithay XDG
+   callbacks through a `ShellPolicy` whose request methods return an exhaustive
+   `ConfigureAction` (defer until initial commit, send even if unchanged, send if
+   changed, dismiss); only the adapter sends configures and it tracks obligations
+   across map and unmap. Eliminates *Restart the configure sequence after unmapping*
+   and *Reply to explicit state requests even when state is unchanged*. Risk: Rust
+   cannot force Smithay callbacks to go through the adapter, so make direct configure
+   calls private to it.
+6. **[R 8 · M 7] One-shot obligation objects for clipboard requests.** A `PastePermit`
+   owns the deferred input and can only be released through
+   `publish_offer_then_release` or an explicit failure; a `ReadReply` owns each request
+   ID and is consumed by success, denial, or cancellation. This is the typed form of
+   [state machine 3](#state-machines). Eliminates *Hold Ctrl-V until its own paste
+   refresh completes*, *Queue the paste offer before `Unblock`*, *Keep explicit pastes
+   across focus loss*. Risk: `Drop` cannot deliver after a disconnect, so shutdown must
+   resolve outstanding obligations explicitly.
+7. **[R 7, 7 · M 7] Pure lifecycle cores with effects at the edges.** Extract reducers for
+   the pane handshake, clipboard, readback, and frame presentation that consume
+   timestamped events and return typed effects; calloop, Smithay, and GPU adapters
+   execute effects and feed completions back. Tests replay traces and generate
+   interleavings (proptest or stateright) against the real transition logic. Targets
+   ordering and forgotten-transition bugs: *Skip `Focus` when sending `HelloOk`
+   fails*, *Queue the paste offer before `Unblock`*, *Force full damage after a failed
+   snapshot*, *Test readback lifetimes*, *Test frame acknowledgement*. Start with the
+   pane handshake, not a compositor-wide rewrite; it makes failures testable but does
+   not prove correctness by itself.
+8. **[R 7, 8 · M 7] Seat authority with scoped interaction grants.** One coordinator
+   derives a drawable focus target and generation, then applies keyboard, selection,
+   and grab effects together. Sensitive entry points (popup grab, paste, activation)
+   take short-lived `MappedWindow`/`InteractionGrant` values minted after checking
+   window, seat, originating surface tree, serial, and mapping generation; unmap,
+   focus change, and destruction invalidate them. Eliminates *Clear selection focus
+   when keyboard focus is removed*, *Don't send synthetic key presses to popup grabs*,
+   *Ignore paste into an unmapped pane window*, *Restore focus to a drawable window*,
+   *Restrict popup grabs to the focused window*, *Reconcile keyboard focus when
+   reattaching a window*. Grants must still be revalidated at use time.
+9. **[R 6, 8 · M 7] Snapshot generations with derived damage.** Each successful surface
+   update produces an immutable `SnapshotGeneration` with complete pixels and its
+   mapping basis; pane damage is derived by comparing tiles against the last
+   published generation (hash, then confirm bytes), and skipped generations force a
+   full refresh. Eliminates *Force full damage after a failed snapshot* and *Rebuild
+   shm snapshots when buffer mapping changes*. Cost: full shm copies raise memory
+   bandwidth; benchmark before replacing damage-limited copies.
+10. **[R 8 · M 7] Credit-based backpressure in the pane protocol.** Replace the boolean
+    enqueue result with byte and frame credits plus acknowledgements; coalesce frame
+    work when out of credit and keep control and shutdown traffic serviceable on a
+    bounded path. Eliminates *Stop disconnecting panes for valid concurrent output*,
+    *Put a deadline on the release drain*, *Keep reading from the server while output
+    is stalled*. Both endpoints and the benchmark assertions migrate together; a single
+    blocked byte stream still cannot be preempted, so deadlines remain.
+11. **[R 7 · M 6] Separate text, key, and paste intent end to end.** Distinct protocol
+    events for committed text, key transitions, and paste; the terminal classifies
+    once, the compositor routes text through text-input or an explicit fallback rather
+    than reverse-mapping it to a layout key, and paste is an operation instead of a
+    synthetic Ctrl+V. Eliminates *Use associated text even when the key maps to the
+    layout*, *Forward repeats for keys sent as text*, *Paste on layouts without a
+    Latin V*. Kitty gives logical identities, not scan codes, so physical shortcuts and
+    XKB group switching remain separate problems.
+12. **[R 7 · M 4] Declared protocol manifest.** Derive globals and XDG capabilities from
+    one table with explicit `Supported` or `Rejected` per optional operation instead of
+    inherited trait defaults. Eliminates *Advertise only implemented window
+    capabilities* and *Install the drag-and-drop grab*. A generic framework for a small
+    protocol set may cost more than it saves; contract tests from A3 catch the same
+    bugs.
+13. **[R 5 · M 4] Durable compositor-owned clipboard snapshot.** Optionally capture
+    bounded representations into immutable storage and publish that as the seat
+    selection, so reads no longer depend on the pane or source staying alive. Helps
+    *Revoke terminal-owned selections when their pane detaches* and *Keep finished
+    representations when a later one fails*. A behavior change: eager capture can
+    trigger terminal permission prompts and freeze dynamic data.
 
 ### Security
 
@@ -442,6 +576,177 @@ Tooling:
 - [ ] **[R 1 · M 1] README frame diagram:** inline compression is optional, and shared
   frames use `t=s` (`README.md:159`; needs your OK under AGENTS.md).
 
+### Niri comparison
+
+Found by comparing against [niri](https://github.com/YaLTeR/niri/tree/8e7b574) at
+commit `8e7b574`; niri paths are relative to its repository. **SM** marks whether an
+explicit state machine would prevent the bug (yes, partial, or no).
+
+Correctness:
+
+- [ ] **[R 5 · M 7] Place the root at the window-geometry origin.** SM: no.
+  `meowland-render/src/render.rs:231` renders the root surface at `(0, 0)` while the
+  pane is sized to the xdg window geometry, so client-side decoration and shadow
+  margins (GTK, libadwaita) shift content and clip the bottom and right edges. Niri
+  subtracts the geometry origin when rendering and compensates input
+  (`src/window/mapped.rs:637,661`).
+- [ ] **[R 7 · M 6] Restart the configure sequence after unmapping.** SM: yes.
+  `meowland-compositor/src/buffer.rs:145` sends the initial configure only at toplevel
+  creation; after a null-buffer unmap, `send_pending_configure` sees no change and
+  sends nothing, so a remapping client can wait forever. Niri returns the toplevel to
+  an initial-configure state (`src/handlers/compositor.rs:251-257`).
+- [ ] **[R 6 · M 6] Do not clear the terminal clipboard when an export has no usable
+  data.** SM: partial. `meowland-selection/src/lib.rs:360`: a source offering only
+  non-allowlisted types, or whose reads all fail, produces an empty `ClipboardData`,
+  which the terminal treats as a clear.
+- [ ] **[R 6 · M 5] Skip descendants of unmapped surfaces.** SM: partial.
+  `meowland-render/src/render.rs:296` always descends; a buffer-less intermediate
+  subsurface leaves its children visible and hit-testable. Niri stops at the unmapped
+  ancestor (`src/render_helpers/surface.rs:103`).
+- [ ] **[R 5 · M 5] Install the drag-and-drop grab.** SM: partial.
+  `meowland-compositor/src/seat.rs:250` uses Smithay's default, which cancels the
+  source, so drags fail even within one window. Niri installs `DnDGrab`
+  (`src/handlers/mod.rs:319`).
+- [ ] **[R 5 · M 5] Reconcile keyboard focus when reattaching a window.** SM: yes.
+  `meowland-compositor/src/seat.rs:49`: detaching the keyboard-owning pane clears
+  Smithay focus while the catalog still names the window, so reattaching returns early
+  without a keyboard enter. Niri derives focus centrally (`src/niri.rs:1314`).
+- [ ] **[R 5 · M 5] Separate protocol mapping from snapshot availability.** SM: partial.
+  `meowland-compositor/src/window.rs:44` treats "has a snapshot" as "mapped", so a
+  window whose first readback fails is never announced. Track mapping from committed
+  state and represent missing pixels explicitly.
+- [ ] **[R 5 · M 5] Allow visible portions of oversized surfaces.** SM: no.
+  `meowland-compositor/src/buffer.rs:166` rejects any buffer larger than twice the
+  pane, so a window whose minimum size exceeds a small pane never appears. Keep a
+  global limit but crop instead.
+- [ ] **[R 6 · M 4] Rebuild shm snapshots when the buffer mapping changes.** SM: partial.
+  `meowland-render/src/snapshot.rs:123` reuses snapshots on matching size, format, and
+  stride but ignores transform, scale, and viewport, so a damage-only patch after a
+  transform change leaves stale pixels.
+- [ ] **[R 6 · M 4] Move application spawning off the compositor loop.** SM: no.
+  `meowland-server/src/control.rs:29` calls `Command::spawn` while dispatching, so a
+  slow executable or working directory stalls everything. Niri spawns on a thread
+  (`src/utils/spawning.rs:65`).
+- [ ] **[R 5 · M 4] Avoid following an unknown app ID.** SM: partial.
+  `meowland-compositor/src/panes.rs:119` turns an empty app ID into
+  `Selector::AppId("")`, so the pane can follow any unrelated window without an app ID.
+  Keep the target unresolved until an identity exists, as niri uses `Option`.
+- [ ] **[R 5 · M 4] Synchronize an existing selection on pane attachment.** SM: partial.
+  `meowland-selection/src/lib.rs:266`: a selection made while no pane was eligible is
+  never exported, and a later terminal background offer can replace it with older
+  data. Define attach-time reconciliation before accepting background refreshes.
+- [ ] **[R 5 · M 4] Reply to explicit state requests even when state is unchanged.**
+  SM: partial. `meowland-compositor/src/shell.rs:158`: refused maximize and repeated
+  fullscreen requests get no configure. Niri forces one
+  (`src/handlers/xdg_shell.rs:469`).
+- [ ] **[R 5 · M 3] Restrict popup grabs to the focused window.** SM: partial.
+  `meowland-compositor/src/input.rs:368` accepts any surface of the same client; check
+  the popup's root against the focused window as niri does
+  (`src/handlers/xdg_shell.rs:404`).
+- [ ] **[R 5 · M 3] Prevent one client from occupying every clipboard delivery slot.**
+  SM: partial. `meowland-selection/src/lib.rs:499`: 16 stalled reads from one client
+  make everyone else's reads return EOF for up to 60 s. Add per-requester limits.
+- [ ] **[R 5 · M 3] Handle descriptor exhaustion without stopping the compositor.**
+  SM: partial. `meowland-server/src/actor.rs:194` shuts down on `EMFILE`/`ENFILE`. Niri
+  raises the soft `RLIMIT_NOFILE` (`src/utils/spawning.rs:25`); also treat exhaustion as
+  a temporary admission failure.
+- [ ] **[R 5 · M 3] Handle SIGHUP as a shutdown request.** SM: yes.
+  `meowland-server/src/actor.rs:31,64` subscribes to SIGHUP and then ignores it. Niri
+  handles it with SIGINT and SIGTERM (`src/utils/signals.rs:45`).
+- [ ] **[R 4 · M 3] Reconfigure reactive popups when their constraints change.** SM: no.
+  `meowland-compositor/src/panes.rs:72` places popups only on creation or reposition,
+  so resizing a pane leaves reactive popups constrained to the old size
+  (`src/handlers/xdg_shell.rs:1413`).
+- [ ] **[R 4 · M 3] Filter for supported types before applying the MIME count limit.**
+  SM: no. `meowland-selection/src/lib.rs:127` keeps the first 64 types before checking
+  the allowlist, so `text/plain` after 64 unrelated types is lost.
+- [ ] **[R 3 · M 3] Advertise only implemented window capabilities.** SM: no.
+  `meowland-compositor/src/lib.rs:319` uses `XdgShellState::new`, which advertises
+  maximize, minimize, fullscreen, and window menu. Use `new_with_capabilities` like
+  niri (`src/niri.rs:2530`).
+- [ ] **[R 4 · M 2] Reply after a control client half-closes its write side.** SM:
+  partial. `meowland-server/src/transport.rs:58` races the EOF against the reply.
+  Niri supports `shutdown(SHUT_WR)` clients (`niri-ipc/src/lib.rs:25`).
+- [ ] **[R 3 · M 2] Validate committed viewport bounds.** SM: no.
+  `meowland-render/src/geometry.rs:101` never calls Smithay's `ensure_viewport_valid`,
+  so out-of-buffer sources sample clamped edges instead of raising the protocol error.
+- [ ] **[R 3 · M 2] Resume callbacks when a retained pane's window remaps.** SM: partial.
+  `meowland-compositor/src/window.rs:55` keeps the hidden one-second callback deadline
+  after remap, delaying the next callback by up to a second.
+- [ ] **[R 3 · M 2] Reject overlapping shortcut bindings.** SM: no.
+  `meowland-compositor/src/settings.rs:88`: the same key for close and detach makes
+  detach unreachable. Niri reports conflicting binds (`niri-config/src/binds.rs:924`).
+
+Simplification:
+
+- [ ] **[R 2 · M 1] Share local paste bytes across MIME aliases and deliveries.**
+  `meowland-selection/src/lib.rs:507`, `meowland-protocol/src/clipboard.rs:59`: two
+  identical vectors per paste, copied again per read. Store one `Arc<[u8]>`.
+
+Testing (all feed [Architecture](#architecture) A3):
+
+- [ ] **[R 5 · M 5] Test the XDG lifecycle through a real client fixture:** initial
+  configure, unmap and remap, unchanged-state requests, reactive popup resize, grabs
+  across two toplevels (niri `src/tests/window_opening.rs:39`).
+- [ ] **[R 4 · M 4] Test attachment and activation through a compositor fixture:**
+  detach and reattach keyboard enter, following a missing or late app ID.
+- [ ] **[R 4 · M 4] Test selection lifecycle through real Wayland clients:** offer
+  dispatch, focus changes, source destruction, data-control clients, unsupported offers.
+- [ ] **[R 3 · M 2] Test control-socket half-close and SIGHUP shutdown.**
+
+### wlclipsync comparison
+
+[wlclipsync](https://codeberg.org/gms/wlclipsync) (commit `6e51b0e`, one 664-line C
+file) syncs selections between two Wayland compositors as an ext-data-control client.
+It forwards each offer's MIME list to a new source on the other side without copying
+payload, passes the requester's fd straight to `offer.receive` on paste, and breaks
+echo loops with a marker MIME type (`strange/loop`). The selection reviewer checked
+each lesson against meowland and the [OSC 5522 spec](https://sw.kovidgoyal.net/kitty/clipboard/);
+R is that reviewer's score, M the consolidator's.
+
+- [ ] **[R 8 · M 7] Prototype a direct local bridge to the host compositor.** SM:
+  partial. When the pane runs in a terminal on a local Wayland session, it inherits the
+  host `WAYLAND_DISPLAY` and could bridge selections wlclipsync-style between the host
+  and meowland, which already exposes ext- and wlr-data-control
+  (`meowland-compositor/src/lib.rs:228-235`). That path is lossless (every MIME type),
+  lazy, passes fds through with no bridge-side copies, needs no size caps, and avoids
+  terminal permission prompts; OSC 5522 and OSC 52 stay as the remote (SSH) fallback.
+  The pane should own it, because the server may run in a different session. It needs
+  arbitration between multiple panes, must not echo through the OSC path at the same
+  time, and must tear down cleanly. Zero-code experiment today, if the host supports
+  ext-data-control: `wlclipsync -d <meowland socket> -b <host socket>`.
+- [ ] **[R 6 · M 5] Restrict data-control to trusted clients.** SM: no. Both
+  data-control globals use the filter `|_| true` (`meowland-compositor/src/lib.rs:228-235`),
+  so any client in meowland can read every clipboard and primary selection without
+  focus. Restrict the globals to an allowlist (clipboard managers, the bridge above), or
+  document the trust model.
+- [ ] **[R 5 · M 5] Tag Kitty exports with a per-export marker MIME type.** SM: partial.
+  OSC 5522 accepts arbitrary MIME types on write and lists them back, so writing a
+  unique type such as `application/x-meowland-export-<generation>` lets a later
+  background refresh or paste notification recognise that the terminal still holds
+  meowland's own export, instead of replacing the seat selection with a terminal-backed
+  copy of the same data. This is only a best-effort hint: the marker can be stripped,
+  copied, or spoofed, and OSC 52 has no channel for it. It does not replace
+  attach-time reconciliation (*Synchronize an existing selection on pane attachment*)
+  or detach revocation (*Revoke terminal-owned selections when their pane detaches*).
+- [ ] **[R 5 · M 3] Send identical representations once with Kitty `type=walias`.**
+  SM: no. The text MIME aliases are currently written as separate copies; OSC 5522
+  can alias a type to one already sent, when the bytes are known to be identical.
+
+Not adopted:
+
+- **Lazy export to the terminal.** OSC 5522 makes the application send bytes during
+  `type=write`/`wdata`; the terminal cannot pull them on paste, so Wayland-to-terminal
+  exports must stay eager and bounded (R 1). Terminal-to-Wayland reads are already
+  on demand.
+- **fd passthrough for terminal paths.** Smithay already pipes Wayland-to-Wayland
+  transfers directly; terminal replies arrive as framed bytes, so only the local bridge
+  above can pass fds. Chunked streaming is the alternative for terminal transports.
+- **wlclipsync's error handling.** It calls `exit(1)` on failures, has no bounds, does
+  not propagate a selection clear, and despite its comment drops MIME types that arrive
+  after the selection event (KWin sends them late). A meowland bridge needs tests for
+  late offers and clears, and bounded failure handling.
+
 ### Performance
 
 - [ ] **Restrict DMA-BUF readback to the damage.** The GPU blit and
@@ -489,6 +794,12 @@ Tooling:
   generic throughout. It now lives in `meowland-loop`.
 - The selection bridge tracks a per-target generation, so host reentrancy
   (detach, replacement, request errors) cannot reinstate stale exports.
+- The niri comparison (2026-10-31) found no case for merging crates or replacing
+  structure: the calloop helpers and postcard framing are needed for cancellation-safe
+  partial frames, binary payloads, and bounded writes; `meowland-panes`,
+  `CompositorHandle`, and the selection bridge's `Host` trait and generations stay.
+  Niri's GPU `RenderElement` pipeline is not a safe replacement, because meowland needs
+  the shm CPU fallback and early buffer release.
 - Readback phases are typed (separate acquiring and reading maps). On surface
   destruction, in-flight reads wait for their fence instead of being dropped.
 - Per-crate error types; the binary uses `anyhow` with structural cause

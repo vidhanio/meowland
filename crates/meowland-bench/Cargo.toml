@@ -8,16 +8,33 @@ publish = false
 [lints]
 workspace = true
 
+[lib]
+bench = false
+
 [[bin]]
 name = "meowland-workload"
-path = "src/main.rs"
+path = "src/bin/meowland-workload/main.rs"
+bench = false
 
 [[bench]]
 name = "suite"
-path = "benches/suite.rs"
 harness = false
 
 [dependencies]
-rustix = { workspace = true, features = ["event", "fs", "time"] }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+rustix = { workspace = true, features = [
+  "event",
+  "fs",
+  "process",
+  "pty",
+  "termios",
+  "time",
+] }
+tempfile = { workspace = true }
 wayland-client = { workspace = true }
 wayland-protocols = { workspace = true, features = ["client"] }
+
+[dev-dependencies]
+criterion = { workspace = true }

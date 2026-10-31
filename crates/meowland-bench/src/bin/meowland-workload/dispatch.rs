@@ -1,3 +1,4 @@
+use meowland_bench::control::EventKind;
 use wayland_client::{
     Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     globals::GlobalListContents,
@@ -37,7 +38,7 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for State {
         _: &QueueHandle<Self>,
     ) {
         if matches!(event, wl_buffer::Event::Release) {
-            state.buffers[*index].released = true;
+            state.release(*index);
         }
     }
 }
@@ -127,7 +128,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             } => state.input(key),
             wl_keyboard::Event::Enter { .. } if !state.ready => {
                 state.ready = true;
-                state.event("ready", 0);
+                state.event(EventKind::Ready, 0);
             }
             _ => {}
         }

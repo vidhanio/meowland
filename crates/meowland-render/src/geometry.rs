@@ -127,18 +127,11 @@ pub fn source_bound(
         .ok()
         .filter(|scale| *scale > 0)
         .unwrap_or(1);
-    let width = width.saturating_mul(scale);
-    let height = height.saturating_mul(scale);
-    Some(
-        if matches!(
-            transform,
-            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
-        ) {
-            (height, width)
-        } else {
-            (width, height)
-        },
-    )
+    let size = transform.transform_size(Size::<u32, Logical>::from((
+        width.saturating_mul(scale),
+        height.saturating_mul(scale),
+    )));
+    Some((size.w, size.h))
 }
 
 #[expect(

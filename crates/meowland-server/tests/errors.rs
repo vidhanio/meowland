@@ -5,15 +5,15 @@ use std::io;
 use meowland_server::Error;
 
 #[test]
-fn io_context_display_includes_the_action_and_source() {
+fn io_context_leaves_its_cause_to_the_source_chain() {
     let error = Error::IoContext {
         action: "binding the control socket".into(),
         source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
     };
 
+    assert!(!error.to_string().contains("permission denied"));
     assert_eq!(
-        error.to_string(),
-        "binding the control socket: permission denied"
+        std::error::Error::source(&error).map(ToString::to_string),
+        Some("permission denied".into())
     );
-    assert!(std::error::Error::source(&error).is_some());
 }

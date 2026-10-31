@@ -12,7 +12,7 @@ pub enum Error {
     Io(#[from] io::Error),
     /// The pane socket could not be reached.
     #[error(
-        "could not reach the pane socket {} (is the server running?): {source}",
+        "could not reach the pane socket {} (is the server running?)",
         .path.display()
     )]
     Connect {
@@ -46,15 +46,6 @@ pub enum Error {
         /// Height in physical pixels.
         height: u32,
     },
-}
-
-impl Error {
-    /// Whether [`Display`](std::fmt::Display) already includes this error's
-    /// immediate [`source`](std::error::Error::source).
-    #[must_use]
-    pub const fn source_is_in_display(&self) -> bool {
-        matches!(self, Self::Connect { .. })
-    }
 }
 
 /// Result of a pane client operation.

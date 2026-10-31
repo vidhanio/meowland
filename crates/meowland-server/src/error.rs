@@ -12,7 +12,7 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
     /// An I/O failure annotated with the operation that failed.
-    #[error("{action}: {source}")]
+    #[error("{action}")]
     IoContext {
         /// Description of the attempted operation.
         action: String,
@@ -45,22 +45,13 @@ impl Error {
         }
     }
 
-    /// Whether [`Display`](std::fmt::Display) already includes this error's
-    /// immediate [`source`](std::error::Error::source).
-    #[must_use]
-    pub const fn source_is_in_display(&self) -> bool {
-        matches!(self, Self::IoContext { .. })
-    }
-
+    /// Render this error and each of its sources, separated by `": "`.
     pub(crate) fn report(&self) -> String {
         let mut report = self.to_string();
         let mut source = std::error::Error::source(self);
-        if self.source_is_in_display() {
-            source = source.and_then(std::error::Error::source);
-        }
         while let Some(error) = source {
             let _ = write!(report, ": {error}");
-            source = std::error::Error::source(error);
+            source = error.source();
         }
         report
     }
@@ -74,30 +65,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_renders_each_source_once() {
-        let error = Error::IoContext {
-            action: "binding the control socket".into(),
-            source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
-        };
-
-        assert_eq!(
-            error.to_string(),
-            "binding the control socket: permission denied"
+    fn report_renders_the_context_and_each_source_once() {
+        let error = Error::io(
+            "starting /bin/missing",
+            io::Error::new(io::ErrorKind::NotFound, "no such file"),
         );
-        assert_eq!(
-            error.report(),
-            "binding the control socket: permission denied"
-        );
-    }
 
-    #[test]
-    fn report_keeps_a_source_that_repeats_the_end_of_the_action() {
-        let message = io::Error::from_raw_os_error(2).to_string();
-        let error = Error::IoContext {
-            action: format!("binding /tmp/{message}"),
-            source: io::Error::from_raw_os_error(2),
-        };
-
-        assert_eq!(error.report(), format!("binding /tmp/{message}: {message}"));
+        assert_eq!(error.report(), "starting /bin/missing: no such file");
     }
 }

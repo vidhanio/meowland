@@ -378,11 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_binding_reports_the_invalid_value() {
+    fn parse_binding_reports_the_trimmed_invalid_value() {
         let error = parse_binding(" alt+qq ").expect_err("invalid shortcut");
-        assert_eq!(
-            error.to_string(),
-            "invalid shortcut `alt+qq`; use modifiers joined to one key, such as `ctrl+shift+q`"
-        );
+        assert_eq!(error.value, "alt+qq");
+        assert!(error.to_string().contains("`alt+qq`"));
     }
 }

@@ -5,8 +5,7 @@ use meowland_protocol::{Follow, FrameAck, FrameTransport, Selector, Target};
 use smithay::utils::{Logical, Size};
 
 use super::{
-    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, clipboard,
-    frame::PaneState, input,
+    AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, frame::PaneState, input,
 };
 
 impl Compositor {
@@ -31,8 +30,7 @@ impl Compositor {
         let removed = self.attachments.remove(pane);
         let window = removed.as_ref().and_then(AttachedPane::window);
         clipboard::detach(self, pane);
-        if let Some(Selection::Activation(token)) = removed.as_ref().and_then(AttachedPane::waiting)
-        {
+        if let Some(Target::Activation(token)) = removed.as_ref().and_then(AttachedPane::waiting) {
             self.forget_activation(token);
         }
         if self.input.last_input_pane == Some(pane) {
@@ -83,20 +81,18 @@ impl Compositor {
         follow: Follow,
         size: FrameSize,
     ) {
-        let selection = match target {
-            Target::Activation(token) if !self.protocols.launches.contains_key(&token) => {
-                self.emit(pane, ServerToPane::Release("no such activation".into()));
-                return;
-            }
-            Target::Activation(token) => Selection::Activation(token),
-            Target::Selector(selector) => Selection::Matching(selector),
-        };
-        let window = self.selected_window(&selection);
+        if let Target::Activation(token) = &target
+            && !self.protocols.launches.contains_key(token)
+        {
+            self.emit(pane, ServerToPane::Release("no such activation".into()));
+            return;
+        }
+        let window = self.selected_window(&target);
         if window.is_none() && follow == Follow::Current {
             self.emit(pane, ServerToPane::Release("no such window".into()));
             return;
         }
-        self.attachments.insert(pane, selection, follow, size);
+        self.attachments.insert(pane, target, follow, size);
         if let Some(window) = window {
             self.show_pane_window(pane, window);
         }
@@ -122,7 +118,7 @@ impl Compositor {
             if follow == Follow::Every {
                 let app_id = self.windows.catalog.app_id(window).to_owned();
                 self.attachments
-                    .reselect(pane, Selection::Matching(Selector::AppId(app_id)));
+                    .reselect(pane, Target::Selector(Selector::AppId(app_id)));
             }
         }
         if previous != Some(window) {

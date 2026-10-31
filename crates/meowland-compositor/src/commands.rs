@@ -5,8 +5,7 @@ use meowland_protocol::{Follow, Input, PaneAction, Selector, Shortcut, Target, T
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{
-    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, clipboard,
-    input::pane_input,
+    AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, input::pane_input,
 };
 
 /// The requested selector did not identify a mapped window to close.
@@ -148,10 +147,10 @@ impl Compositor {
         Ok(())
     }
 
-    pub(crate) fn selected_window(&self, selection: &Selection) -> Option<WindowId> {
-        match selection {
-            Selection::Matching(selector) => self.windows.catalog.select(selector),
-            Selection::Activation(token) => self
+    pub(crate) fn selected_window(&self, target: &Target) -> Option<WindowId> {
+        match target {
+            Target::Selector(selector) => self.windows.catalog.select(selector),
+            Target::Activation(token) => self
                 .protocols
                 .launches
                 .get(token)

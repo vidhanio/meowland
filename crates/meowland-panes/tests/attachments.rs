@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use meowland_core::pixels::FrameSize;
-use meowland_panes::{Attachments, PaneId, Presentation, Selection, WindowId};
-use meowland_protocol::{Follow, FrameAck, FrameTransport, Selector, clipboard::Transport};
+use meowland_panes::{Attachments, PaneId, Presentation, WindowId};
+use meowland_protocol::{Follow, FrameAck, FrameTransport, Selector, Target, clipboard::Transport};
 use proptest::prelude::*;
 
 fn frame_size(width: u32, height: u32) -> FrameSize {
@@ -19,26 +19,26 @@ fn window_id(value: u64) -> WindowId {
     WindowId::from(value)
 }
 
-fn matching(app_id: &str) -> Selection {
-    Selection::Matching(Selector::AppId(app_id.into()))
+fn matching(app_id: &str) -> Target {
+    Target::Selector(Selector::AppId(app_id.into()))
 }
 
-fn activation(token: &str) -> Selection {
-    Selection::Activation(token.into())
+fn activation(token: &str) -> Target {
+    Target::Activation(token.into())
 }
 
-fn waits_for_app(selection: Option<&Selection>, app_id: &str) -> bool {
-    matches!(selection, Some(Selection::Matching(Selector::AppId(waiting))) if waiting == app_id)
+fn waits_for_app(target: Option<&Target>, app_id: &str) -> bool {
+    matches!(target, Some(Target::Selector(Selector::AppId(waiting))) if waiting == app_id)
 }
 
-fn waits_for_token(selection: Option<&Selection>, token: &str) -> bool {
-    matches!(selection, Some(Selection::Activation(waiting)) if waiting == token)
+fn waits_for_token(target: Option<&Target>, token: &str) -> bool {
+    matches!(target, Some(Target::Activation(waiting)) if waiting == token)
 }
 
 fn shown<P: Presentation>(
     attachments: &mut Attachments<P>,
     pane: PaneId,
-    selection: Selection,
+    selection: Target,
     window: WindowId,
     size: FrameSize,
 ) {
@@ -148,7 +148,7 @@ fn panes_wait_on_their_selection_until_shown() {
     assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
     assert!(matches!(
         attachments.get(pane_id(1)).unwrap().selection(),
-        Selection::Activation(token) if token == "other"
+        Target::Activation(token) if token == "other"
     ));
     attachments.unbind(pane_id(1));
     assert!(waits_for_token(
@@ -520,7 +520,7 @@ enum VisitAction {
 enum Operation {
     Insert {
         pane: PaneId,
-        selection: Selection,
+        selection: Target,
         size: FrameSize,
     },
     Show {
@@ -532,7 +532,7 @@ enum Operation {
     },
     Reselect {
         pane: PaneId,
-        selection: Selection,
+        selection: Target,
     },
     Remove {
         pane: PaneId,
@@ -581,17 +581,17 @@ fn token_strategy() -> impl Strategy<Value = String> {
     prop_oneof![Just("first".to_owned()), Just("second".to_owned())]
 }
 
-fn selection_strategy() -> impl Strategy<Value = Selection> {
+fn selection_strategy() -> impl Strategy<Value = Target> {
     prop_oneof![
         app_id_strategy().prop_map(|app_id| matching(&app_id)),
-        token_strategy().prop_map(Selection::Activation),
+        token_strategy().prop_map(Target::Activation),
     ]
 }
 
-fn token_of(selection: &Selection) -> Option<String> {
+fn token_of(selection: &Target) -> Option<String> {
     match selection {
-        Selection::Activation(token) => Some(token.clone()),
-        Selection::Matching(_) => None,
+        Target::Activation(token) => Some(token.clone()),
+        Target::Selector(_) => None,
     }
 }
 

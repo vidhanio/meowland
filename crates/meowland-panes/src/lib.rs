@@ -2,8 +2,8 @@
 
 mod attachment;
 mod catalog;
-mod selection;
+mod window;
 
 pub use attachment::{AttachedPane, Attachments, PaneId, Presentation};
 pub use catalog::WindowCatalog;
-pub use selection::{Selection, WindowId};
+pub use window::WindowId;

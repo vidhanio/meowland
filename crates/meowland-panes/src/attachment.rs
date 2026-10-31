@@ -6,9 +6,9 @@ use std::{
 };
 
 use meowland_core::pixels::FrameSize;
-use meowland_protocol::{Follow, FrameAck, FrameTransport, clipboard::Transport};
+use meowland_protocol::{Follow, FrameAck, FrameTransport, Target, clipboard::Transport};
 
-use crate::{Selection, WindowId};
+use crate::WindowId;
 
 /// Host-assigned identity of a terminal pane, distinct from a Wayland window
 /// ID.
@@ -58,7 +58,7 @@ pub trait Presentation {
 
 /// A pane attached to a window selector.
 pub struct AttachedPane<P> {
-    selection: Selection,
+    target: Target,
     window: Option<WindowId>,
     /// How long the pane keeps matching its selection.
     pub follow: Follow,
@@ -77,15 +77,15 @@ impl<P> AttachedPane<P> {
         self.window
     }
 
-    /// Selection identifying the windows this pane may show.
-    pub const fn selection(&self) -> &Selection {
-        &self.selection
+    /// Target identifying the windows this pane may show.
+    pub const fn selection(&self) -> &Target {
+        &self.target
     }
 
-    /// Selection this pane is waiting to resolve while showing no window.
-    pub const fn waiting(&self) -> Option<&Selection> {
+    /// Target this pane is waiting to resolve while showing no window.
+    pub const fn waiting(&self) -> Option<&Target> {
         match self.window {
-            None => Some(&self.selection),
+            None => Some(&self.target),
             Some(_) => None,
         }
     }
@@ -95,7 +95,7 @@ impl<P> fmt::Debug for AttachedPane<P> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AttachedPane")
-            .field("selection", &self.selection)
+            .field("target", &self.target)
             .field("window", &self.window)
             .field("follow", &self.follow)
             .field("clipboard", &self.clipboard)
@@ -104,9 +104,9 @@ impl<P> fmt::Debug for AttachedPane<P> {
 }
 
 impl<P: Presentation> AttachedPane<P> {
-    fn new(selection: Selection, follow: Follow, size: FrameSize) -> Self {
+    fn new(target: Target, follow: Follow, size: FrameSize) -> Self {
         Self {
-            selection,
+            target,
             window: None,
             follow,
             presentation: P::new(size),
@@ -117,8 +117,8 @@ impl<P: Presentation> AttachedPane<P> {
     fn show(&mut self, window: WindowId) -> Option<String> {
         let previous = self.window.replace(window);
         self.presentation.mark_dirty();
-        match (&self.selection, previous) {
-            (Selection::Activation(token), None) => Some(token.clone()),
+        match (&self.target, previous) {
+            (Target::Activation(token), None) => Some(token.clone()),
             _ => None,
         }
     }
@@ -192,10 +192,10 @@ impl<P: Presentation> Attachments<P> {
         self.panes.iter()
     }
 
-    /// Attach a pane waiting for its selection, replacing any previous
+    /// Attach a pane waiting for its target, replacing any previous
     /// attachment with the same ID.
-    pub fn insert(&mut self, pane: PaneId, selection: Selection, follow: Follow, size: FrameSize) {
-        let entry = AttachedPane::<P>::new(selection, follow, size);
+    pub fn insert(&mut self, pane: PaneId, target: Target, follow: Follow, size: FrameSize) {
+        let entry = AttachedPane::<P>::new(target, follow, size);
         let new_due = entry.presentation.due();
         if let Some(previous) = self.panes.insert(pane, entry) {
             track_due(&mut self.due, previous.presentation.due(), new_due);
@@ -207,10 +207,10 @@ impl<P: Presentation> Attachments<P> {
         }
     }
 
-    /// Replace the selection a pane matches against once it next waits.
-    pub fn reselect(&mut self, pane: PaneId, selection: Selection) {
+    /// Replace the target a pane matches against once it next waits.
+    pub fn reselect(&mut self, pane: PaneId, target: Target) {
         if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.selection = selection;
+            entry.target = target;
         }
     }
 

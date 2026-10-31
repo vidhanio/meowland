@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use meowland_protocol::Target;
 use smithay::{
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     wayland::xdg_activation::{
@@ -10,7 +11,7 @@ use smithay::{
     },
 };
 
-use super::{Compositor, Selection, ServerToPane, WindowId};
+use super::{Compositor, ServerToPane, WindowId};
 
 const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -51,7 +52,7 @@ impl Compositor {
             .attachments
             .iter()
             .filter_map(|(&pane, entry)| {
-                matches!(entry.waiting(), Some(Selection::Activation(pending)) if pending == token)
+                matches!(entry.waiting(), Some(Target::Activation(pending)) if pending == token)
                     .then_some(pane)
             })
             .collect();

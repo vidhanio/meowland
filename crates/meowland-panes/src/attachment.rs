@@ -77,11 +77,6 @@ impl<P> AttachedPane<P> {
         self.window
     }
 
-    /// Target identifying the windows this pane may show.
-    pub const fn selection(&self) -> &Target {
-        &self.target
-    }
-
     /// Target this pane is waiting to resolve while showing no window.
     pub const fn waiting(&self) -> Option<&Target> {
         match self.window {

@@ -146,10 +146,6 @@ fn panes_wait_on_their_selection_until_shown() {
 
     attachments.reselect(pane_id(1), activation("other"));
     assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
-    assert!(matches!(
-        attachments.get(pane_id(1)).unwrap().selection(),
-        Target::Activation(token) if token == "other"
-    ));
     attachments.unbind(pane_id(1));
     assert!(waits_for_token(
         attachments.get(pane_id(1)).unwrap().waiting(),

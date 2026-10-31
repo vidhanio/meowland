@@ -16,12 +16,23 @@ use meowland_protocol::{
 };
 use serde::Serialize;
 
-use super::{ConnectionId, Incoming, IncomingSender, Server};
+use super::{ConnectionId, Incoming, IncomingSender, MAX_CONNECTIONS, Server};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ConnectionKind {
     Control,
     Pane,
+}
+
+impl ConnectionKind {
+    /// Open connections allowed when accepting this kind; panes leave the last
+    /// slot for control traffic.
+    pub(crate) const fn capacity(self) -> usize {
+        match self {
+            Self::Control => MAX_CONNECTIONS,
+            Self::Pane => MAX_CONNECTIONS - 1,
+        }
+    }
 }
 
 #[expect(

@@ -171,9 +171,8 @@ impl Server {
 
     fn update_listeners(&mut self) -> io::Result<()> {
         for listener in &mut self.listeners {
-            let capacity =
-                MAX_CONNECTIONS - usize::from(matches!(listener.kind, ConnectionKind::Pane));
-            let enabled = self.shutdown.running() && self.connections.len() < capacity;
+            let enabled =
+                self.shutdown.running() && self.connections.len() < listener.kind.capacity();
             if enabled != listener.enabled {
                 if enabled {
                     self.handle.enable(&listener.token)?;
@@ -187,8 +186,7 @@ impl Server {
     }
 
     fn accepted(&mut self, kind: ConnectionKind, result: io::Result<UnixStream>) {
-        let capacity = MAX_CONNECTIONS - usize::from(matches!(kind, ConnectionKind::Pane));
-        if !self.shutdown.running() || self.connections.len() >= capacity {
+        if !self.shutdown.running() || self.connections.len() >= kind.capacity() {
             return;
         }
         let socket = match result {

@@ -202,16 +202,26 @@ fn id_candidates() -> Vec<CompletionCandidate> {
 }
 
 fn app_id_candidates() -> Vec<CompletionCandidate> {
-    candidates(|window| (!window.app_id.is_empty()).then_some((window.app_id, window.title)))
+    candidates(by_app_id)
 }
 
 fn title_candidates() -> Vec<CompletionCandidate> {
-    candidates(|window| (!window.title.is_empty()).then_some((window.title, window.app_id)))
+    candidates(by_title)
 }
 
-/// Complete from the running server's windows, newest first per value.
+/// A window's app ID, described by its title.
+fn by_app_id(window: WindowInfo) -> Option<(String, String)> {
+    (!window.app_id.is_empty()).then_some((window.app_id, window.title))
+}
+
+/// A window's title, described by its app ID.
+fn by_title(window: WindowInfo) -> Option<(String, String)> {
+    (!window.title.is_empty()).then_some((window.title, window.app_id))
+}
+
+/// Complete from the running server's windows.
 fn candidates(
-    describe: impl Fn(WindowInfo) -> Option<(String, String)>,
+    describe: impl FnMut(WindowInfo) -> Option<(String, String)>,
 ) -> Vec<CompletionCandidate> {
     let Ok(paths) = Paths::discover() else {
         return Vec::new();
@@ -219,16 +229,24 @@ fn candidates(
     let Ok(windows) = list_with_timeout(&paths, Duration::from_millis(100)) else {
         return Vec::new();
     };
+    completions(windows, describe)
+}
+
+/// Exact selector values with sanitized help, taking the help of the newest
+/// window per value.
+///
+/// Values containing control characters cannot be carried by the shell
+/// completion protocols and are omitted rather than altered.
+fn completions(
+    windows: Vec<WindowInfo>,
+    describe: impl FnMut(WindowInfo) -> Option<(String, String)>,
+) -> Vec<CompletionCandidate> {
     let mut values = BTreeMap::new();
-    for window in windows.into_iter().rev() {
-        let window = WindowInfo {
-            id: protocol::sanitize(&window.id),
-            app_id: protocol::sanitize(&window.app_id),
-            title: protocol::sanitize(&window.title),
-            ..window
-        };
-        if let Some((value, help)) = describe(window) {
-            values.entry(value).or_insert(help);
+    for (value, help) in windows.into_iter().rev().filter_map(describe) {
+        if !value.chars().any(char::is_control) {
+            values
+                .entry(value)
+                .or_insert_with(|| protocol::sanitize(&help));
         }
     }
     values
@@ -370,5 +388,52 @@ fn request_with_timeout(
     match reply {
         ControlResponse::Error(error) => bail!("server rejected the request: {error}"),
         reply => Ok(reply),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(id: &str, app_id: &str, title: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.into(),
+            app_id: app_id.into(),
+            title: title.into(),
+            state: WindowState::Inactive,
+        }
+    }
+
+    fn values(candidates: &[CompletionCandidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn long_values_are_completed_exactly_and_kept_distinct() {
+        let shared = "t".repeat(300);
+        let first = format!("{shared}a");
+        let second = format!("{shared}b");
+        let windows = vec![window("a_1", "a", &first), window("b_1", "b", &second)];
+
+        assert_eq!(values(&completions(windows, by_title)), [first, second]);
+    }
+
+    #[test]
+    fn values_with_control_characters_are_omitted_and_help_is_sanitized() {
+        let windows = vec![
+            window("bad_1", "bad\napp", "plain"),
+            window("good_1", "good", "ti\x1b]tle"),
+        ];
+
+        let candidates = completions(windows, by_app_id);
+
+        assert_eq!(values(&candidates), ["good"]);
+        assert_eq!(
+            candidates[0].get_help().map(ToString::to_string),
+            Some("ti]tle".into())
+        );
     }
 }

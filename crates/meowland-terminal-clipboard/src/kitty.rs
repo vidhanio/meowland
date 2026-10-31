@@ -113,6 +113,37 @@ struct Operation {
     cancelled: bool,
 }
 
+struct Writing {
+    data: ClipboardData,
+    item: usize,
+    offset: usize,
+}
+
+impl Writing {
+    fn advance(&mut self, output: &mut Vec<u8>) -> bool {
+        let Some(item) = self.data.items.get(self.item) else {
+            packet(output, "type=wdata", b"");
+            return true;
+        };
+        let end = (self.offset + WRITE_CHUNK_BYTES).min(item.data.len());
+        packet(
+            output,
+            format_args!(
+                "type=wdata:mime={}",
+                Base64Display::new(item.mime.as_bytes(), &STANDARD)
+            ),
+            &item.data[self.offset..end],
+        );
+        if end == item.data.len() {
+            self.item += 1;
+            self.offset = 0;
+        } else {
+            self.offset = end;
+        }
+        false
+    }
+}
+
 /// Bounded OSC 5522 selections with serialized requests and session
 /// credentials.
 pub(crate) struct Clipboard {
@@ -123,6 +154,7 @@ pub(crate) struct Clipboard {
     next: u64,
     requests: VecDeque<Queued>,
     active: Option<Operation>,
+    writing: Option<Writing>,
     notification: Option<Reading>,
     offers: HashMap<ClipboardOfferId, Credentials>,
     actions: VecDeque<Action>,
@@ -153,6 +185,7 @@ impl Clipboard {
             next: 0,
             requests: VecDeque::new(),
             active: None,
+            writing: None,
             notification: None,
             offers: HashMap::new(),
             actions: VecDeque::new(),
@@ -346,10 +379,23 @@ impl Clipboard {
     /// Expire requests and append the next transfer when output is idle.
     pub(crate) fn advance(&mut self, output: &mut Vec<u8>) {
         self.expire();
-        if self.active.is_some() || !output.is_empty() {
+        if !output.is_empty() {
             return;
         }
-        while let Some(Queued { request, deadline }) = self.requests.pop_front() {
+        if let Some(writing) = &mut self.writing {
+            if writing.advance(output) {
+                self.writing = None;
+            }
+            return;
+        }
+        if self.active.is_some() {
+            return;
+        }
+        while let Some(Queued {
+            mut request,
+            deadline,
+        }) = self.requests.pop_front()
+        {
             self.next += 1;
             let id = format!("meowland-{}", self.next);
             let mut metadata = format!(
@@ -357,7 +403,7 @@ impl Clipboard {
                 STANDARD.encode("meowland"),
                 STANDARD.encode(&self.password)
             );
-            match &request {
+            match &mut request {
                 Request::List { selection, .. } => {
                     if *selection == Selection::Primary {
                         metadata.push_str(":loc=primary");
@@ -403,16 +449,11 @@ impl Clipboard {
                         metadata.push_str(":loc=primary");
                     }
                     packet(output, format_args!("type=write:{metadata}"), b"");
-                    for item in &data.items {
-                        let metadata = format!("type=wdata:mime={}", STANDARD.encode(&item.mime));
-                        if item.data.is_empty() {
-                            packet(output, &metadata, b"");
-                        }
-                        for chunk in item.data.chunks(WRITE_CHUNK_BYTES) {
-                            packet(output, &metadata, chunk);
-                        }
-                    }
-                    packet(output, "type=wdata", b"");
+                    self.writing = Some(Writing {
+                        data: std::mem::take(data),
+                        item: 0,
+                        offset: 0,
+                    });
                 }
             }
             self.active = Some(Operation {
@@ -675,9 +716,54 @@ mod tests {
             },
         );
         let mut output = Vec::new();
-        clipboard.advance(&mut output);
+        let mut wire = Vec::new();
+        loop {
+            clipboard.advance(&mut output);
+            assert!(
+                !output.is_empty(),
+                "each drain must be followed by write progress"
+            );
+            assert!(output.len() < 8192, "write output must remain bounded");
+            let queued_len = output.len();
+            clipboard.advance(&mut output);
+            assert_eq!(output.len(), queued_len, "undrained output must not grow");
+            wire.extend_from_slice(&output);
+            output.clear();
+            if clipboard.writing.is_none() {
+                break;
+            }
+        }
 
-        let packets = decode_packets(&output);
+        let mut expected_wire = format!(
+            "\x1b]5522;type=write:id=meowland-1:name={}:pw={};\x1b\\",
+            STANDARD.encode("meowland"),
+            STANDARD.encode(&clipboard.password),
+        )
+        .into_bytes();
+        for item in &items {
+            let mime = STANDARD.encode(&item.mime);
+            if item.data.is_empty() {
+                expected_wire.extend_from_slice(
+                    format!("\x1b]5522;type=wdata:mime={mime};\x1b\\").as_bytes(),
+                );
+            }
+            for chunk in item.data.chunks(WRITE_CHUNK_BYTES) {
+                expected_wire.extend_from_slice(
+                    format!(
+                        "\x1b]5522;type=wdata:mime={mime};{}\x1b\\",
+                        STANDARD.encode(chunk)
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        expected_wire.extend_from_slice(b"\x1b]5522;type=wdata;\x1b\\");
+        assert_eq!(
+            wire, expected_wire,
+            "streaming must preserve the wire bytes"
+        );
+
+        let packets = decode_packets(&wire);
         let (header, rest) = packets.split_first().expect("write header");
         assert!(header.0.starts_with("type=write:id="), "{header:?}");
         assert_eq!(header.1, b"");
@@ -702,6 +788,57 @@ mod tests {
             .map(|item| (item.mime, item.data))
             .collect();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn timed_out_write_finishes_before_next_request_and_ignores_late_reply() {
+        let mut clipboard = Clipboard::new().expect("clipboard credentials");
+        clipboard.copy(
+            Selection::Clipboard,
+            ClipboardData {
+                items: vec![Item {
+                    mime: "text/plain".to_owned(),
+                    data: vec![1; WRITE_CHUNK_BYTES + 1],
+                }],
+            },
+        );
+        let mut output = Vec::new();
+        clipboard.advance(&mut output);
+        output.clear();
+        clipboard.copy(Selection::Primary, ClipboardData::default());
+        clipboard
+            .active
+            .as_mut()
+            .expect("first write is active")
+            .deadline = Instant::now();
+
+        let mut wire = Vec::new();
+        while clipboard.writing.is_some() {
+            clipboard.advance(&mut output);
+            assert!(!output.is_empty(), "timed-out write must still finish");
+            wire.extend_from_slice(&output);
+            output.clear();
+        }
+        assert!(
+            clipboard.active.is_none(),
+            "expired request must be removed"
+        );
+        let packets = decode_packets(&wire);
+        assert_eq!(packets.len(), 3, "two data chunks and one terminator");
+        assert_eq!(packets.last().expect("terminator").0, "type=wdata");
+
+        clipboard.advance(&mut output);
+        let header = decode_packets(&output);
+        assert!(header[0].0.starts_with("type=write:id=meowland-2:"));
+        clipboard.packet(b"type=write:status=DONE:id=meowland-1;");
+        assert_eq!(
+            clipboard
+                .active
+                .as_ref()
+                .map(|operation| operation.id.as_str()),
+            Some("meowland-2"),
+            "a late reply must not finish the next request"
+        );
     }
 
     #[test]

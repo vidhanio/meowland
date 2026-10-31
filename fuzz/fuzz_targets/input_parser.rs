@@ -3,24 +3,18 @@
 //! Terminal input decoding must not depend on how reads split the byte
 //! stream, and every decoded event must respect its documented size bound.
 
+mod support;
+
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use meowland_input::{Event, fuzzing::Parser};
-use meowland_protocol::{MAX_INPUT_TEXT, clipboard::MAX_TEXT};
+use meowland_protocol::clipboard::MAX_TEXT;
+use support::assert_committed;
 
 #[derive(Debug, Arbitrary)]
 struct Stream {
     bytes: Vec<u8>,
     cuts: Vec<u16>,
-}
-
-fn assert_committed(text: &str) {
-    assert!(!text.is_empty(), "empty committed text");
-    assert!(text.len() <= MAX_INPUT_TEXT, "oversized committed text");
-    assert!(
-        !text.chars().any(char::is_control),
-        "control character in committed text: {text:?}"
-    );
 }
 
 fn check(event: &Event) {

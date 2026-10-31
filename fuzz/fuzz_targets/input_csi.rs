@@ -2,10 +2,12 @@
 
 //! CSI key decoding must only yield well-formed key, text, or focus events.
 
+mod support;
+
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use meowland_input::{Event, fuzzing::csi};
-use meowland_protocol::MAX_INPUT_TEXT;
+use support::assert_committed;
 use vtparse::CsiParam;
 
 #[derive(Debug, Arbitrary)]
@@ -20,15 +22,6 @@ enum Param {
 struct Sequence {
     params: Vec<Param>,
     final_byte: u8,
-}
-
-fn assert_committed(text: &str) {
-    assert!(!text.is_empty(), "empty committed text");
-    assert!(text.len() <= MAX_INPUT_TEXT, "oversized committed text");
-    assert!(
-        !text.chars().any(char::is_control),
-        "control character in committed text: {text:?}"
-    );
 }
 
 fuzz_target!(|sequence: Sequence| {

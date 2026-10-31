@@ -234,11 +234,13 @@ impl Runner {
     /// Offer frames every [`OFFER_PERIOD`] until `count` of them are
     /// consumed, returning the time from the first offer to the last
     /// consumption, then let the newest offer drain outside the sample.
+    /// Slots missed while the harness was busy are skipped rather than
+    /// replayed as a burst.
     fn stream(&mut self, count: u64) -> anyhow::Result<Duration> {
         let first = self.next;
         let mut seen = self.session.deliveries().len();
         let start = control::now();
-        let (mut offered, mut consumed, mut progress) = (0_u32, 0, start);
+        let (mut offered, mut slot, mut consumed, mut progress) = (0_u32, 0_u32, 0, start);
         let end = loop {
             let mut end = None;
             for frame in &self.session.deliveries()[seen..] {
@@ -260,11 +262,14 @@ impl Runner {
                 now.saturating_sub(progress) < STEP_TIMEOUT,
                 "no stream frame consumed for {STEP_TIMEOUT:?}"
             );
-            let due = start + OFFER_PERIOD * offered;
+            let due = start + OFFER_PERIOD * slot;
             if now >= due {
                 self.session
                     .command(Command::Commit(first + u64::from(offered)))?;
                 offered += 1;
+                slot =
+                    u32::try_from(now.saturating_sub(start).as_nanos() / OFFER_PERIOD.as_nanos())?
+                        + 1;
             }
             self.session
                 .pump(due.saturating_sub(now).min(Duration::from_millis(1)))?;

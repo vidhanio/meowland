@@ -8,7 +8,7 @@ use smithay::{
         utils::{send_frames_surface_tree, with_surfaces_surface_tree},
     },
     output::Output,
-    wayland::compositor::SurfaceData,
+    wayland::compositor::{BufferAssignment, SurfaceData},
 };
 
 use super::{Compositor, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
@@ -41,6 +41,27 @@ impl Window {
 }
 
 impl Compositor {
+    pub(crate) fn update_remap_phase(
+        &mut self,
+        surface: &WlSurface,
+        window: Option<WindowId>,
+        assignment: Option<&BufferAssignment>,
+    ) {
+        if let Some(entry) = window.and_then(|id| self.windows.by_id.get_mut(&id))
+            && entry.surface.wl_surface() == surface
+        {
+            match assignment {
+                Some(BufferAssignment::NewBuffer(_)) => entry.awaiting_remap_commit = false,
+                None | Some(BufferAssignment::Removed) if entry.awaiting_remap_commit => {
+                    entry.awaiting_remap_commit = false;
+                    entry.surface.send_configure();
+                }
+                Some(BufferAssignment::Removed) => entry.awaiting_remap_commit = true,
+                None => {}
+            }
+        }
+    }
+
     pub(crate) fn refresh_window_mapping(&mut self, surface: &WlSurface) {
         let Some(id) = self.windows.id_by_surface.get(surface).copied() else {
             return;
@@ -149,5 +170,38 @@ mod tests {
         assert!(fixture.state.windows.catalog.drawable(window));
         assert_eq!(fixture.state.windows.catalog.focused(), Some(window));
         assert_eq!(fixture.app.keyboard_focus, Some(toplevel.surface.id()));
+    }
+
+    #[test]
+    fn remapping_and_unchanged_state_requests_receive_configures() {
+        let mut fixture = Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        toplevel.surface.attach(None, 0, 0);
+        toplevel.surface.commit();
+        fixture.roundtrip();
+        let before = fixture.app.configures.len();
+        toplevel.surface.attach(None, 0, 0);
+        toplevel.surface.commit();
+        fixture.roundtrip();
+        assert!(fixture.app.configures.len() > before);
+        fixture.ack_configure(&toplevel);
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        let before = fixture.app.configures.len();
+        toplevel.role.unset_fullscreen();
+        fixture.roundtrip();
+        assert!(fixture.app.configures.len() > before);
+        toplevel.role.set_maximized();
+        fixture.roundtrip();
+        let before = fixture.app.configures.len();
+        toplevel.role.set_maximized();
+        fixture.roundtrip();
+        assert!(fixture.app.configures.len() > before);
+        toplevel.role.set_fullscreen(None);
+        fixture.roundtrip();
+        let before = fixture.app.configures.len();
+        toplevel.role.set_fullscreen(None);
+        fixture.roundtrip();
+        assert!(fixture.app.configures.len() > before);
     }
 }

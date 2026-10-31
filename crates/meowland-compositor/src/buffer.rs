@@ -190,6 +190,7 @@ impl CompositorHandler for Compositor {
         });
         let new_buffer = matches!(assignment, Some(BufferAssignment::NewBuffer(_)));
         let mut recovered = false;
+        self.update_remap_phase(surface, window, assignment.as_ref());
         if callbacks && let Some(window) = window {
             self.request_callback(window);
         }

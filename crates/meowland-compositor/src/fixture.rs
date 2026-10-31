@@ -138,7 +138,7 @@ delegate_noop!(App: ignore XdgToplevel);
 pub(crate) struct Toplevel {
     pub surface: WlSurface,
     pub xdg: XdgSurface,
-    _role: XdgToplevel,
+    pub role: XdgToplevel,
 }
 
 /// A compositor and one connected client, pumped on the test thread.
@@ -230,7 +230,7 @@ impl Fixture {
         let toplevel = Toplevel {
             surface,
             xdg,
-            _role: toplevel,
+            role: toplevel,
         };
         self.ack_configure(&toplevel);
         toplevel

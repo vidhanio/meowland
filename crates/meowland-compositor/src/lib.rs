@@ -92,6 +92,7 @@ pub struct Event {
 struct Window {
     surface: ToplevelSurface,
     fullscreen: bool,
+    awaiting_remap_commit: bool,
     callback_due: Instant,
     callback_pending: bool,
 }

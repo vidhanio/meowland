@@ -37,6 +37,7 @@ impl XdgShellHandler for Compositor {
             Window {
                 surface,
                 fullscreen: false,
+                awaiting_remap_commit: false,
                 callback_due: Instant::now(),
                 callback_pending: false,
             },
@@ -145,7 +146,7 @@ impl XdgShellHandler for Compositor {
         window.fullscreen = true;
         self.enter_output(id);
         self.focus_window(id);
-        self.apply_window_state(id);
+        self.apply_window_state_for_request(id);
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
@@ -160,7 +161,7 @@ impl XdgShellHandler for Compositor {
         if let Some(window) = self.windows.by_id.get_mut(&id) {
             window.fullscreen = false;
         }
-        self.apply_window_state(id);
+        self.apply_window_state_for_request(id);
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
@@ -170,7 +171,7 @@ impl XdgShellHandler for Compositor {
             .get(surface.wl_surface())
             .copied()
         {
-            self.apply_window_state(id);
+            self.apply_window_state_for_request(id);
         }
     }
 

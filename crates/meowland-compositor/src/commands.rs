@@ -46,6 +46,12 @@ pub enum Command {
     CloseAll,
 }
 
+#[derive(Clone, Copy)]
+enum Configure {
+    Changed,
+    Requested,
+}
+
 impl Compositor {
     /// Apply one pane or lifecycle command on the event-loop thread.
     pub fn handle_command(&mut self, command: Command) {
@@ -162,6 +168,14 @@ impl Compositor {
     /// Publish the tiling, activation, and size state the compositor wants
     /// for a window, configuring the client only when it actually changed.
     pub(crate) fn apply_window_state(&self, window: WindowId) {
+        self.configure_window(window, Configure::Changed);
+    }
+
+    pub(crate) fn apply_window_state_for_request(&self, window: WindowId) {
+        self.configure_window(window, Configure::Requested);
+    }
+
+    fn configure_window(&self, window: WindowId, configure: Configure) {
         let Some(entry) = self.windows.by_id.get(&window) else {
             return;
         };
@@ -185,6 +199,10 @@ impl Compositor {
                 pending.states.unset(xdg_toplevel::State::Fullscreen);
             }
         });
-        let _ = entry.surface.send_pending_configure();
+        if matches!(configure, Configure::Requested) {
+            entry.surface.send_configure();
+        } else {
+            let _ = entry.surface.send_pending_configure();
+        }
     }
 }

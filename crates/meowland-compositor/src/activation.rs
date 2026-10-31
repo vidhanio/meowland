@@ -128,12 +128,22 @@ impl XdgActivationHandler for Compositor {
 
     /// Only the focused Wayland client may delegate activation to another app.
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        self.windows
+        let accepted = self
+            .windows
             .catalog
             .focused()
             .and_then(|window| self.windows.by_id.get(&window))
             .and_then(|window| window.surface.wl_surface().client())
-            .is_some_and(|client| data.client_id == Some(client.id()))
+            .is_some_and(|client| data.client_id == Some(client.id()));
+        if accepted {
+            let expires = data.timestamp + TOKEN_LIFETIME;
+            self.protocols.activation_deadline = Some(
+                self.protocols
+                    .activation_deadline
+                    .map_or(expires, |deadline| deadline.min(expires)),
+            );
+        }
+        accepted
     }
 
     fn request_activation(

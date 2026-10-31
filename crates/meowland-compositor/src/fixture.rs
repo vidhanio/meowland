@@ -25,10 +25,13 @@ use wayland_client::{
         wl_surface::WlSurface,
     },
 };
-use wayland_protocols::xdg::shell::client::{
-    xdg_surface::{self, XdgSurface},
-    xdg_toplevel::XdgToplevel,
-    xdg_wm_base::{self, XdgWmBase},
+use wayland_protocols::{
+    wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+    xdg::shell::client::{
+        xdg_surface::{self, XdgSurface},
+        xdg_toplevel::XdgToplevel,
+        xdg_wm_base::{self, XdgWmBase},
+    },
 };
 
 use super::{Compositor, CompositorHandle, Runtime, Settings, WindowId};
@@ -133,6 +136,8 @@ delegate_noop!(App: ignore WlShm);
 delegate_noop!(App: ignore WlSurface);
 delegate_noop!(App: ignore WlBuffer);
 delegate_noop!(App: ignore XdgToplevel);
+delegate_noop!(App: WpViewporter);
+delegate_noop!(App: WpViewport);
 
 /// One client toplevel.
 pub(crate) struct Toplevel {
@@ -153,6 +158,7 @@ pub(crate) struct Fixture {
     compositor: WlCompositor,
     shm: WlShm,
     wm_base: XdgWmBase,
+    viewporter: WpViewporter,
     _keyboard: WlKeyboard,
 }
 
@@ -180,6 +186,7 @@ impl Fixture {
         let compositor: WlCompositor = partial.bind(&registry, 6);
         let shm: WlShm = partial.bind(&registry, 1);
         let wm_base: XdgWmBase = partial.bind(&registry, 6);
+        let viewporter: WpViewporter = partial.bind(&registry, 1);
         let seat: WlSeat = partial.bind(&registry, 9);
         let keyboard = seat.get_keyboard(&partial.qh, ());
         partial.roundtrip();
@@ -202,6 +209,7 @@ impl Fixture {
             compositor,
             shm,
             wm_base,
+            viewporter,
             _keyboard: keyboard,
         }
     }
@@ -216,6 +224,23 @@ impl Fixture {
             &self.qh,
             &mut self.app,
         );
+    }
+
+    pub(crate) fn viewport(&self, surface: &WlSurface) -> WpViewport {
+        self.viewporter.get_viewport(surface, &self.qh, ())
+    }
+
+    pub(crate) fn protocol_error(&mut self) -> wayland_client::backend::protocol::ProtocolError {
+        self.connection.flush().expect("flush invalid request");
+        self.runtime
+            .dispatch(&mut self.state)
+            .expect("dispatch invalid request");
+        if let Some(guard) = self.queue.prepare_read() {
+            let _ = guard.read();
+        }
+        self.connection
+            .protocol_error()
+            .expect("server sent protocol error")
     }
 
     /// Create a toplevel with an app ID and acknowledge its initial

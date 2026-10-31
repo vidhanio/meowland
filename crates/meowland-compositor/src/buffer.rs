@@ -6,7 +6,7 @@ use std::{
 };
 
 use smithay::{
-    backend::allocator::dmabuf::Dmabuf,
+    backend::{allocator::dmabuf::Dmabuf, renderer::buffer_dimensions},
     reexports::wayland_server::{
         Client,
         protocol::{wl_buffer, wl_surface::WlSurface},
@@ -21,7 +21,7 @@ use smithay::{
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         shm::{ShmHandler, ShmState, with_buffer_contents},
         single_pixel_buffer::get_single_pixel_buffer,
-        viewporter::ViewportCachedState,
+        viewporter::{ViewportCachedState, ensure_viewport_valid},
     },
 };
 
@@ -32,6 +32,7 @@ pub(crate) struct SurfaceCache {
     pub snapshots: HashMap<WlSurface, Snapshot>,
     pub spares: HashMap<WlSurface, Snapshot>,
     missed: HashSet<WlSurface>,
+    buffer_sizes: HashMap<WlSurface, Size<i32, Buffer>>,
 }
 
 impl SurfaceCache {
@@ -39,6 +40,35 @@ impl SurfaceCache {
         self.snapshots.remove(surface);
         self.spares.remove(surface);
         self.missed.remove(surface);
+        self.buffer_sizes.remove(surface);
+    }
+
+    fn valid_viewport(
+        &mut self,
+        surface: &WlSurface,
+        assignment: Option<&BufferAssignment>,
+        scale: i32,
+        transform: Transform,
+    ) -> bool {
+        match assignment {
+            Some(BufferAssignment::NewBuffer(buffer)) => {
+                if let Some(size) = buffer_dimensions(buffer) {
+                    self.buffer_sizes.insert(surface.clone(), size);
+                } else {
+                    self.buffer_sizes.remove(surface);
+                }
+            }
+            Some(BufferAssignment::Removed) => {
+                self.buffer_sizes.remove(surface);
+            }
+            None => {}
+        }
+        self.buffer_sizes.get(surface).is_none_or(|size| {
+            scale > 0
+                && with_states(surface, |states| {
+                    ensure_viewport_valid(states, size.to_logical(scale, transform))
+                })
+        })
     }
 }
 
@@ -169,25 +199,19 @@ impl CompositorHandler for Compositor {
         });
     }
 
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "`cached` borrows from the guard and must outlive `current`"
-    )]
     fn commit(&mut self, surface: &WlSurface) {
         self.windows.popups.commit(surface);
         let window = self.window_for_surface(surface);
         let changed = readback::prepared_at(surface).unwrap_or_else(Instant::now);
-        let (assignment, damage, scale, transform, callbacks) = with_states(surface, |states| {
-            let mut cached = states.cached_state.get::<SurfaceAttributes>();
-            let current = cached.current();
-            (
-                current.buffer.take(),
-                std::mem::take(&mut current.damage),
-                current.buffer_scale,
-                Transform::from(current.buffer_transform),
-                !current.frame_callbacks.is_empty(),
-            )
-        });
+        let (assignment, damage, scale, transform, callbacks) = committed_attributes(surface);
+        if !self.windows.surface_cache.valid_viewport(
+            surface,
+            assignment.as_ref(),
+            scale,
+            transform,
+        ) {
+            return;
+        }
         let new_buffer = matches!(assignment, Some(BufferAssignment::NewBuffer(_)));
         let mut recovered = false;
         self.update_remap_phase(surface, window, assignment.as_ref());
@@ -294,9 +318,47 @@ impl CompositorHandler for Compositor {
     }
 }
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "`cached` borrows from the guard and must outlive `current`"
+)]
+fn committed_attributes(
+    surface: &WlSurface,
+) -> (Option<BufferAssignment>, Vec<Damage>, i32, Transform, bool) {
+    with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<SurfaceAttributes>();
+        let current = cached.current();
+        (
+            current.buffer.take(),
+            std::mem::take(&mut current.damage),
+            current.buffer_scale,
+            Transform::from(current.buffer_transform),
+            !current.frame_callbacks.is_empty(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_only_commit_validates_against_the_retained_buffer() {
+        use wayland_protocols::wp::viewporter::client::wp_viewport;
+
+        let mut fixture = crate::fixture::Fixture::new();
+        let top = fixture.toplevel("app");
+        fixture.present(&top.surface, 4, 4, [0, 0, 0, 255]);
+        let viewport = fixture.viewport(&top.surface);
+        viewport.set_source(0.0, 0.0, 4.0, 4.0);
+        top.surface.commit();
+        fixture.roundtrip();
+        viewport.set_source(0.0, 0.0, 5.0, 4.0);
+        top.surface.commit();
+        let error = fixture.protocol_error();
+        assert_eq!(error.object_interface, "wp_viewport");
+        assert_eq!(error.code, u32::from(wp_viewport::Error::OutOfBuffer));
+    }
 
     #[test]
     fn failed_snapshot_then_partial_damage_recopies_the_entire_buffer() {

@@ -438,12 +438,8 @@ fn export_source<H: Host>(
                             });
                             export_next(host, target);
                         }
-                        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
-                            tracing::warn!(%error, "Clipboard export exceeds size limit");
-                            host.bridge().set_export(target, None);
-                        }
                         Err(error) => {
-                            tracing::warn!(%error, "Client clipboard transfer failed");
+                            tracing::warn!(%error, %mime, "Cannot transfer client clipboard");
                             export_next(host, target);
                         }
                         Ok(false) => unreachable!(),
@@ -914,6 +910,28 @@ mod tests {
         host.settle(&mut event_loop);
         assert_eq!(host.requests, ["text/plain", "text/html"]);
         assert!(host.emitted.is_empty());
+    }
+
+    #[test]
+    fn oversized_representations_keep_the_others() {
+        let pane = PaneId::from(7);
+        let target = SelectionTarget::Clipboard;
+        let (mut event_loop, mut host) = FakeHost::new();
+
+        host.serve("text/plain", Some(b"hello"));
+        host.serve("text/html", Some(b"<b>hello</b>"));
+        host.attach_export(pane, &["text/plain", "text/html"], 8);
+        export_next(&mut host, target);
+        host.settle(&mut event_loop);
+        assert_eq!(host.written(), [[("text/plain", &b"hello"[..])]]);
+
+        host.emitted.clear();
+        host.serve("text/html", Some(b"<b>hello</b>"));
+        host.serve("text/plain", Some(b"hello"));
+        host.attach_export(pane, &["text/html", "text/plain"], 8);
+        export_next(&mut host, target);
+        host.settle(&mut event_loop);
+        assert_eq!(host.written(), [[("text/plain", &b"hello"[..])]]);
     }
 
     #[test]

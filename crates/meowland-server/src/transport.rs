@@ -61,25 +61,35 @@ pub(crate) async fn connection(
     }
 }
 
+/// Answer one control request.
+///
+/// A peer that shuts down its write half after the request still gets the
+/// response; any further request bytes abort the conversation.
 async fn control(
     mut reader: impl futures::io::AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
     mut incoming: IncomingSender,
 ) -> io::Result<()> {
     let request: ControlRequest = Reader::new(&mut reader).read().await?;
-    let (reply, answer) = oneshot::channel();
+    let (reply, mut answer) = oneshot::channel();
     incoming
         .send(Incoming::Control(request, reply))
         .await
         .map_err(io::Error::other)?;
-    let mut eof = [0];
-    let response = futures::select! {
-        result = answer.fuse() => result.map_err(io::Error::other)?,
-        result = reader.read(&mut eof).fuse() => {
-            result?;
-            return Err(io::ErrorKind::ConnectionAborted.into());
+    let mut extra = [0];
+    let response = futures::select_biased! {
+        result = reader.read(&mut extra).fuse() => {
+            if result? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected bytes after the control request",
+                ));
+            }
+            answer.await
         }
-    };
+        result = answer => result,
+    }
+    .map_err(io::Error::other)?;
     send(&mut writer, &response).await
 }
 
@@ -269,6 +279,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use calloop::EventLoop;
+    use meowland_protocol::ControlResponse;
 
     use super::*;
 
@@ -364,5 +375,125 @@ mod tests {
         let (packet, notice) = reading.join().expect("peer thread");
         assert!(matches!(packet, ServerToPane::Title(value) if value == title));
         assert!(matches!(notice, ServerToPane::Release(reason) if reason == "closed"));
+    }
+
+    #[test]
+    fn extra_control_bytes_take_priority_over_a_ready_reply() {
+        use std::io::Write;
+
+        let (socket, mut peer) = UnixStream::pair().expect("socket pair");
+        protocol::send(&mut peer, &ControlRequest::List).expect("send request");
+        let (incoming, mut requests) = mpsc::channel(1);
+        let mut event_loop = EventLoop::<Option<io::Result<()>>>::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let reader = handle
+            .adapt_io(socket.try_clone().expect("clone socket"))
+            .expect("adapt reader");
+        let writer = handle.adapt_io(socket).expect("adapt writer");
+        let (executor, scheduler) = calloop::futures::executor().expect("executor");
+        handle
+            .insert_source(executor, |result, (), finished| *finished = Some(result))
+            .expect("register executor");
+        scheduler
+            .schedule(control(reader, writer, incoming))
+            .expect("schedule control");
+        let mut finished = None;
+        let started = Instant::now();
+        let reply = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "request was not received"
+            );
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut finished)
+                .expect("dispatch");
+            assert!(finished.is_none(), "control stopped before its reply");
+            if let Ok(Incoming::Control(ControlRequest::List, reply)) = requests.try_recv() {
+                break reply;
+            }
+        };
+        peer.write_all(&[42]).expect("send extra byte");
+        reply.send(ControlResponse::Ok).expect("send reply");
+        while finished.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "control did not finish"
+            );
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut finished)
+                .expect("dispatch");
+        }
+        assert_eq!(
+            finished
+                .expect("control finished")
+                .expect_err("extra bytes rejected")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn a_half_closed_control_request_is_answered() {
+        use std::net::Shutdown;
+
+        let (socket, mut peer) = UnixStream::pair().expect("socket pair");
+        protocol::send(&mut peer, &ControlRequest::List).expect("send request");
+        peer.shutdown(Shutdown::Write).expect("half-close request");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let (incoming, mut requests) = mpsc::channel(1);
+        let mut event_loop = EventLoop::<Option<io::Result<()>>>::try_new().expect("loop");
+        let handle = event_loop.handle();
+        let reader = handle
+            .adapt_io(socket.try_clone().expect("clone socket"))
+            .expect("adapt reader");
+        let writer = handle.adapt_io(socket).expect("adapt writer");
+        let (executor, scheduler) = calloop::futures::executor().expect("executor");
+        handle
+            .insert_source(executor, |result, (), finished| *finished = Some(result))
+            .expect("register executor");
+        scheduler
+            .schedule(control(reader, writer, incoming))
+            .expect("schedule control");
+        let mut finished = None;
+        let started = Instant::now();
+        let reply = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "request was not received"
+            );
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut finished)
+                .expect("dispatch");
+            assert!(finished.is_none(), "control stopped before its reply");
+            if let Ok(request) = requests.try_recv() {
+                let Incoming::Control(ControlRequest::List, reply) = request else {
+                    panic!("expected a list request");
+                };
+                break reply;
+            }
+        };
+        event_loop
+            .dispatch(Some(Duration::from_millis(20)), &mut finished)
+            .expect("dispatch EOF");
+        assert!(
+            finished.is_none(),
+            "half-close must not abort the pending reply"
+        );
+        reply.send(ControlResponse::Ok).expect("send reply");
+        while finished.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "control did not finish"
+            );
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut finished)
+                .expect("dispatch");
+        }
+        finished
+            .expect("control finished")
+            .expect("a half-closed request is answered");
+        let response: ControlResponse = protocol::recv(&mut peer).expect("decode response");
+        assert!(matches!(response, ControlResponse::Ok), "{response:?}");
     }
 }

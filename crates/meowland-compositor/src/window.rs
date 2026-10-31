@@ -56,10 +56,10 @@ impl Compositor {
         if !self.windows.catalog.map(id) {
             return;
         }
-        let info = self.window_info(id);
+        let catalog = &self.windows.catalog;
         self.protocols
             .toplevels
-            .announce(id, &info.title, &info.app_id);
+            .announce(id, catalog.title(id), catalog.app_id(id));
         self.touch(id);
         self.resolve_pending_panes();
         self.apply_window_state(id);

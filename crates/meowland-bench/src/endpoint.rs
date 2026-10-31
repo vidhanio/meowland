@@ -490,8 +490,7 @@ impl Endpoint {
 /// Kitty terminal does.
 fn read_shared(payload: &[u8], length: usize) -> anyhow::Result<Vec<u8>> {
     let name = String::from_utf8(STANDARD.decode(payload)?)?;
-    let suffix = name
-        .strip_prefix("/meowland-")
+    name.strip_prefix("/meowland-")
         .filter(|suffix| {
             !suffix.is_empty()
                 && suffix
@@ -499,7 +498,7 @@ fn read_shared(payload: &[u8], length: usize) -> anyhow::Result<Vec<u8>> {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
         .with_context(|| format!("invalid SHM name {name:?}"))?;
-    let path = Path::new("/dev/shm").join(format!("meowland-{suffix}"));
+    let path = Path::new("/dev/shm").join(&name[1..]);
     let mut file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     match fs::remove_file(&path) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),

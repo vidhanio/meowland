@@ -137,7 +137,7 @@ impl TerminalSession {
             shortcuts: Shortcuts::default(),
             input_gate: InputGate::default(),
             clipboard: Clipboard::new(Transport::Osc52)?,
-            presentation: PanePresentation::new(cell, FrameTransport::Inline),
+            presentation: PanePresentation::new(FrameTransport::Inline),
             cell,
             lifecycle: Lifecycle::Handshaking {
                 deadline: Instant::now() + protocol::REQUEST_TIMEOUT,
@@ -405,7 +405,7 @@ impl TerminalSession {
         } else {
             FrameTransport::Inline
         };
-        self.presentation = PanePresentation::new(self.cell, transport);
+        self.presentation = PanePresentation::new(transport);
         mode.enable_mouse(self.presentation.buffer());
         if let Some(previous) = probe.clipboard {
             mode.enable_clipboard(previous, self.presentation.buffer());

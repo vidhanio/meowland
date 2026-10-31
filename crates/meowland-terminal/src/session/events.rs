@@ -65,8 +65,11 @@ impl TerminalSession {
             Event::Resize => {
                 let cells = terminal::cells();
                 let pixels = terminal::window_pixels();
-                self.cell = terminal::derived_cell(pixels, cells).or(self.cell);
-                self.presentation.set_cell_size(self.cell);
+                let cell = terminal::derived_cell(pixels, cells).or(self.cell);
+                if cell != self.cell {
+                    self.cell = cell;
+                    self.presentation.cell_size_changed();
+                }
                 let (width, height) =
                     terminal::pane_pixels(None, pixels, cells, self.cell.unwrap_or(FALLBACK_CELL));
                 let size = terminal::frame_size(width, height)?;

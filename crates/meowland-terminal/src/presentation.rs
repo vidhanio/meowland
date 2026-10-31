@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures::io::AsyncWrite;
 use meowland_core::latency::Latency;
-use meowland_kitty::{PresentOutcome, Presenter, present_shared};
+use meowland_kitty::{PresentOutcome, Presenter};
 use meowland_protocol::{
     FrameAck, FrameBand, FrameTransport, PaneAction, PaneToServer, SharedFrame,
     asynchronous::Outgoing,
@@ -100,6 +100,9 @@ pub(crate) struct PanePresentation {
     pending: output::Output,
     frame: Option<PendingFrame>,
     retry: Option<Instant>,
+    /// A grid change invalidated the placement; repaint it from retained
+    /// pixels once they are in memory.
+    repaint: bool,
     shared_frame: Option<SharedPresentation>,
     transport: FrameTransport,
 }
@@ -114,13 +117,14 @@ struct PendingFrame {
 }
 
 impl PanePresentation {
-    pub(crate) fn new(cell: Option<(u16, u16)>, transport: FrameTransport) -> Self {
+    pub(crate) fn new(transport: FrameTransport) -> Self {
         Self {
-            presenter: Presenter::new(cell),
+            presenter: Presenter::default(),
             stats: PaneStats::new(),
             pending: output::Output::default(),
             frame: None,
             retry: None,
+            repaint: false,
             shared_frame: None,
             transport,
         }
@@ -144,13 +148,17 @@ impl PanePresentation {
         self.pending.buffer()
     }
 
-    pub(crate) fn set_cell_size(&mut self, cell: Option<(u16, u16)>) {
-        if self.presenter.set_cell_size(cell) && self.shared_frame.is_none() {
-            self.retry = Some(Instant::now());
-        }
+    /// Replace the image placement after the terminal's cell geometry changed.
+    ///
+    /// A displayed shared frame is repainted as soon as its pixels are
+    /// retained, so its placement never keeps the old grid either.
+    pub(crate) const fn cell_size_changed(&mut self) {
+        self.presenter.invalidate();
+        self.repaint = true;
     }
 
-    /// Next deadline: a pending repaint, or the next background readback turn.
+    /// Next deadline: shared-frame consumption, a pending repaint, or the next
+    /// background readback turn.
     pub(crate) fn deadline(&self) -> Option<Instant> {
         if self.pending() {
             return None;
@@ -158,7 +166,7 @@ impl PanePresentation {
         if let Some(deadline) = self.retry {
             return Some(deadline);
         }
-        self.readback_pending().then(Instant::now)
+        (self.repaint_ready() || self.readback_pending()).then(Instant::now)
     }
 
     /// Whether a consumed shared frame still needs to be copied into memory.
@@ -166,6 +174,15 @@ impl PanePresentation {
         self.shared_frame
             .as_ref()
             .is_some_and(|shared| shared.consumed && !shared.retained())
+    }
+
+    /// Whether a requested repaint has every retained pixel it needs.
+    fn repaint_ready(&self) -> bool {
+        self.repaint
+            && self
+                .shared_frame
+                .as_ref()
+                .is_none_or(SharedPresentation::retained)
     }
 
     pub(crate) fn draw(&mut self, band: FrameBand, tx: &mut Outgoing) -> Result<()> {
@@ -189,6 +206,7 @@ impl PanePresentation {
             }
         }
         let outcome = self.presenter.present_into(band, self.pending.buffer());
+        self.repaint = false;
         self.frame = Some(PendingFrame {
             encoded: started.elapsed(),
             written: Duration::ZERO,
@@ -217,8 +235,9 @@ impl PanePresentation {
                 return self.reject_shared(tx);
             }
         };
-        self.presenter.invalidate();
-        present_shared(&shared.frame, self.pending.buffer());
+        self.presenter
+            .present_shared(&shared.frame, self.pending.buffer());
+        self.repaint = false;
         self.shared_frame = Some(shared);
         self.frame = Some(PendingFrame {
             started,
@@ -244,6 +263,7 @@ impl PanePresentation {
         self.presenter.invalidate();
         self.shared_frame = None;
         self.retry = None;
+        self.repaint = false;
         self.disable_shared(tx)?;
         tx.send(&PaneToServer::Action(PaneAction::Ack(FrameAck::Resync)))?;
         Ok(())
@@ -263,21 +283,32 @@ impl PanePresentation {
         if let Some(error) = self.retain_shared() {
             tracing::warn!(%error, "retained upstream frame could not be read");
             self.shared_frame = None;
+            self.presenter.invalidate();
+            self.repaint = false;
         }
-        if let Some(deadline) = self.retry
-            && !self.pending()
-            && Instant::now() >= deadline
-        {
-            let started = Instant::now();
-            self.presenter.repaint_into(self.pending.buffer());
-            if let Some(frame) = &mut self.frame {
-                frame.encoded += started.elapsed();
-                frame.bytes += self.pending.len();
-            }
-            self.retry = None;
-            self.finish(tx)?;
+        if self.repaint_ready() && !self.pending() {
+            self.repaint(tx)?;
         }
         Ok(())
+    }
+
+    /// Replace the placement from retained pixels, first adopting a retained
+    /// shared frame.
+    fn repaint(&mut self, tx: &mut Outgoing) -> Result<()> {
+        let started = Instant::now();
+        if let Some(shared) = self.shared_frame.take() {
+            let band = shared
+                .into_band()
+                .expect("a retained shared frame needs no further reads");
+            self.presenter.retain_frame(band);
+        }
+        self.presenter.repaint_into(self.pending.buffer());
+        if let Some(frame) = &mut self.frame {
+            frame.encoded += started.elapsed();
+            frame.bytes += self.pending.len();
+        }
+        self.repaint = false;
+        self.finish(tx)
     }
 
     /// Copy one bounded chunk of a consumed shared frame off the critical path.
@@ -318,6 +349,7 @@ impl PanePresentation {
                 match shared.into_band() {
                     Ok(band) => {
                         let started = Instant::now();
+                        self.presenter.invalidate();
                         let outcome = self.presenter.present_into(band, self.pending.buffer());
                         if outcome == PresentOutcome::NeedsKeyframe
                             && let Some(frame) = &mut self.frame
@@ -329,10 +361,13 @@ impl PanePresentation {
                             frame.encoded += started.elapsed();
                         }
                         self.retry = None;
+                        self.repaint = false;
                     }
                     Err(error) => {
                         tracing::warn!(%error, "unread shared frame could not be recovered");
                         self.retry = None;
+                        self.repaint = false;
+                        self.presenter.invalidate();
                         if let Some(frame) = &mut self.frame {
                             frame.accepted = false;
                         }
@@ -348,7 +383,7 @@ impl PanePresentation {
             return Ok(());
         }
         self.poll_shared(tx)?;
-        if self.pending() || self.retry.is_some() {
+        if self.pending() || self.retry.is_some() || self.repaint_ready() {
             return Ok(());
         }
         let Some(frame) = self.frame.take() else {
@@ -362,5 +397,65 @@ impl PanePresentation {
         self.stats.frame(&frame, ack);
         tx.send(&PaneToServer::Action(PaneAction::Ack(ack)))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use meowland_core::pixels::FrameSize;
+    use meowland_protocol::SharedObject;
+
+    use super::*;
+
+    fn consumed_shared() -> PanePresentation {
+        let size = FrameSize::new(2, 2).expect("valid dimensions");
+        let (object, mut file) = SharedObject::create(size).expect("create shared frame");
+        file.write_all(&[1; 12]).expect("write shared pixels");
+        let mut presentation = PanePresentation::new(FrameTransport::Shared);
+        let mut shared = SharedPresentation::new(*object.frame()).expect("open shared frame");
+        presentation
+            .presenter
+            .present_shared(&shared.frame, presentation.pending.buffer());
+        presentation.pending.discard();
+        shared.frame.unlink().expect("consume shared frame");
+        shared.consumed = true;
+        shared.retain_step().expect("retain shared pixels");
+        presentation.shared_frame = Some(shared);
+        presentation
+    }
+
+    #[test]
+    fn cell_change_repaints_consumed_shared_frame_without_new_band() {
+        let mut presentation = consumed_shared();
+        let mut tx = Outgoing::default();
+        presentation.cell_size_changed();
+        assert!(presentation.deadline().is_some());
+        presentation.advance(&mut tx).expect("repaint");
+        assert!(
+            presentation
+                .pending
+                .buffer()
+                .windows(3)
+                .any(|part| part == b"a=T")
+        );
+    }
+
+    #[test]
+    fn cell_change_replaces_shared_placement_when_partial_band_arrives() {
+        let mut presentation = consumed_shared();
+        let mut tx = Outgoing::default();
+        presentation.cell_size_changed();
+        let size = FrameSize::new(2, 2).expect("valid dimensions");
+        let band = FrameBand::new(size, 1, 0, 1, vec![2; 3]).expect("valid band");
+        presentation.draw(band, &mut tx).expect("draw band");
+        assert!(
+            presentation
+                .pending
+                .buffer()
+                .windows(3)
+                .any(|part| part == b"a=T")
+        );
     }
 }

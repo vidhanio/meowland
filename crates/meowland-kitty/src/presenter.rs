@@ -11,7 +11,6 @@ const SCREEN_ID: u32 = 1;
 /// Retains pixels for full-image repaint and edits changed bands in place.
 #[derive(Debug, Default)]
 pub struct Presenter {
-    cell_size: Option<(u16, u16)>,
     image: Vec<u8>,
     size: Option<FrameSize>,
     displayed: bool,
@@ -30,33 +29,17 @@ pub enum PresentOutcome {
 }
 
 impl Presenter {
-    /// Create a presenter for terminals supporting in-place Kitty frame edits.
-    #[must_use]
-    pub fn new(cell_size: Option<(u16, u16)>) -> Self {
-        Self {
-            cell_size,
-            ..Self::default()
-        }
-    }
-
-    /// Changing the grid requires replacing the image placement.
-    pub fn set_cell_size(&mut self, cell_size: Option<(u16, u16)>) -> bool {
-        if self.cell_size == cell_size {
-            return false;
-        }
-        self.cell_size = cell_size;
-        self.invalidate();
-        true
-    }
-
     /// Forget the displayed placement without discarding retained pixels.
     pub const fn invalidate(&mut self) {
         self.displayed = false;
     }
 
-    /// Adopt a complete frame already displayed through an upstream transfer.
+    /// Adopt the pixels of a complete frame shown by [`Self::present_shared`].
     ///
-    /// Returns false for partial rectangles, leaving the presenter unchanged.
+    /// The placement keeps its state: it stays valid unless something
+    /// invalidated it after the shared frame was presented, in which case the
+    /// next update replaces it. Returns false for partial rectangles, leaving
+    /// the presenter unchanged.
     pub fn retain_frame(&mut self, band: FrameBand) -> bool {
         if !band.is_whole() {
             return false;
@@ -64,7 +47,6 @@ impl Presenter {
         let size = band.size();
         self.image = band.into_rgb();
         self.size = Some(size);
-        self.displayed = true;
         true
     }
 
@@ -144,26 +126,28 @@ impl Presenter {
         self.displayed = true;
         PresentOutcome::Encoded
     }
-}
 
-/// Append commands displaying a complete immutable object without reading or
-/// copying its pixels.
-///
-/// The caller must retain the object's producer guard until the terminal opens
-/// it, and restore retained RGB pixels before incremental edits or repainting.
-pub fn present_shared(frame: &SharedFrame, out: &mut Vec<u8>) {
-    begin_image(out);
-    out.extend_from_slice(b"\x1b_G");
-    transmit(
-        out,
-        SCREEN_ID,
-        frame.size().width(),
-        frame.size().height(),
-        Placement::Whole,
-    );
-    out.extend_from_slice(b",t=s;");
-    out.extend_from_slice(STANDARD.encode(frame.name()).as_bytes());
-    out.extend_from_slice(b"\x1b\\\x1b[?2026l");
+    /// Append commands displaying a complete immutable object without reading
+    /// or copying its pixels, replacing the placement.
+    ///
+    /// The caller must retain the object's producer guard until the terminal
+    /// opens it, and pass its pixels to [`Self::retain_frame`] before
+    /// incremental edits or repainting.
+    pub fn present_shared(&mut self, frame: &SharedFrame, out: &mut Vec<u8>) {
+        begin_image(out);
+        out.extend_from_slice(b"\x1b_G");
+        transmit(
+            out,
+            SCREEN_ID,
+            frame.size().width(),
+            frame.size().height(),
+            Placement::Whole,
+        );
+        out.extend_from_slice(b",t=s;");
+        out.extend_from_slice(STANDARD.encode(frame.name()).as_bytes());
+        out.extend_from_slice(b"\x1b\\\x1b[?2026l");
+        self.displayed = true;
+    }
 }
 
 /// Query shared-memory support using a published RGB object and request ID.

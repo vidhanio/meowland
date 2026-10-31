@@ -44,12 +44,11 @@ const BTN_TRIGGER_HAPPY1: u32 = 0x2c0;
 const EXTRA_BUTTON_CODES: u8 = 40;
 /// First X11 button number without a named protocol [`Button`] variant.
 const FIRST_EXTRA_BUTTON: u8 = 10;
-/// Wheel units the terminal reports for one detent.
+/// Wheel units the terminal reports for one detent, which matches Wayland's
+/// value120 scale, so terminal units are forwarded as value120 unchanged.
 const SCROLL_UNITS_PER_DETENT: i32 = 120;
 /// Wayland axis distance emitted for one wheel detent.
 const AXIS_UNITS_PER_DETENT: f64 = 7.5;
-/// High-resolution Wayland units emitted for one wheel detent.
-const V120_PER_DETENT: i32 = 60;
 
 pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
     if !valid_input(event) {
@@ -239,24 +238,7 @@ fn pointer_input(
                 },
             );
         }
-        let vertical = -i32::from(scroll.vertical);
-        let horizontal = i32::from(scroll.horizontal);
-        if vertical != 0 || horizontal != 0 {
-            let frame = AxisFrame::new(time).source(AxisSource::Wheel);
-            let frame = if vertical == 0 {
-                frame
-            } else {
-                frame
-                    .value(Axis::Vertical, axis_units(vertical))
-                    .v120(Axis::Vertical, v120_units(vertical))
-            };
-            let frame = if horizontal == 0 {
-                frame
-            } else {
-                frame
-                    .value(Axis::Horizontal, axis_units(horizontal))
-                    .v120(Axis::Horizontal, v120_units(horizontal))
-            };
+        if let Some(frame) = wheel_frame(scroll, time) {
             pointer.frame(state);
             pointer.axis(state, frame);
         }
@@ -285,14 +267,25 @@ fn button_code(button: Button) -> u32 {
     }
 }
 
+/// Wayland axis frame for a terminal wheel movement, if it moved at all.
+fn wheel_frame(scroll: Scroll, time: InputTime) -> Option<AxisFrame> {
+    let vertical = -i32::from(scroll.vertical);
+    let horizontal = i32::from(scroll.horizontal);
+    if vertical == 0 && horizontal == 0 {
+        return None;
+    }
+    let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+    for (axis, units) in [(Axis::Vertical, vertical), (Axis::Horizontal, horizontal)] {
+        if units != 0 {
+            frame = frame.value(axis, axis_units(units)).v120(axis, units);
+        }
+    }
+    Some(frame)
+}
+
 /// Convert a wheel delta in terminal units to Wayland axis distance.
 fn axis_units(units: i32) -> f64 {
     f64::from(units) * AXIS_UNITS_PER_DETENT / f64::from(SCROLL_UNITS_PER_DETENT)
-}
-
-/// Convert a wheel delta in terminal units to Wayland high-resolution units.
-const fn v120_units(units: i32) -> i32 {
-    units * V120_PER_DETENT / SCROLL_UNITS_PER_DETENT
 }
 
 fn enter_keyboard(
@@ -487,5 +480,44 @@ pub(crate) fn paste_action(state: &mut Compositor, pane: PaneId) {
         forward(&keyboard, state, code, KeyState::Pressed);
         forward(&keyboard, state, code, KeyState::Released);
         set_modifiers(&keyboard, state, previous);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(vertical: i16, horizontal: i16) -> Option<AxisFrame> {
+        wheel_frame(
+            Scroll {
+                vertical,
+                horizontal,
+            },
+            InputTime::now(),
+        )
+    }
+
+    #[test]
+    fn wheel_frames_carry_one_value120_unit_per_terminal_unit() {
+        for (vertical, horizontal, v120) in [
+            (120, 0, (0, -120)),
+            (-120, 0, (0, 120)),
+            (1, 0, (0, -1)),
+            (-1, 0, (0, 1)),
+            (0, 120, (120, 0)),
+            (0, -120, (-120, 0)),
+            (0, 1, (1, 0)),
+            (0, -1, (-1, 0)),
+            (240, -1, (-1, -240)),
+        ] {
+            let frame = frame(vertical, horizontal).expect("wheel moved");
+            assert_eq!(frame.v120, Some(v120), "{vertical} {horizontal}");
+            assert_eq!(frame.source, Some(AxisSource::Wheel));
+        }
+    }
+
+    #[test]
+    fn still_wheel_sends_no_axis_frame() {
+        assert!(frame(0, 0).is_none());
     }
 }

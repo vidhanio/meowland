@@ -18,7 +18,6 @@ enum Encoding {
 #[derive(Debug, Default)]
 pub(crate) struct Encoder {
     compressed: Vec<u8>,
-    sample: Vec<u8>,
 }
 
 impl Encoder {
@@ -92,27 +91,29 @@ impl Encoder {
     fn compress(&mut self, pixels: &[u8]) -> bool {
         const SAMPLE_BYTES: usize = 16 * 1024;
         const SAMPLES: usize = 4;
-        if pixels.len() > SAMPLE_BYTES * SAMPLES {
-            self.sample.clear();
-            self.sample.reserve(SAMPLE_BYTES * SAMPLES);
-            for index in 0..SAMPLES {
+        const SAMPLED_BYTES: usize = SAMPLE_BYTES * SAMPLES;
+        if pixels.len() > SAMPLED_BYTES {
+            let samples = (0..SAMPLES).map(|index| {
                 let start = (pixels.len() - SAMPLE_BYTES) * index / (SAMPLES - 1);
-                self.sample
-                    .extend_from_slice(&pixels[start..start + SAMPLE_BYTES]);
-            }
-            if !Self::zlib(&mut self.compressed, &self.sample)
-                || self.compressed.len() * 4 > self.sample.len() * 3
+                &pixels[start..start + SAMPLE_BYTES]
+            });
+            if !Self::zlib(&mut self.compressed, samples)
+                || self.compressed.len() * 4 > SAMPLED_BYTES * 3
             {
                 return false;
             }
         }
-        Self::zlib(&mut self.compressed, pixels)
+        Self::zlib(&mut self.compressed, [pixels])
     }
 
-    fn zlib(out: &mut Vec<u8>, pixels: &[u8]) -> bool {
+    /// Compress the concatenation of `parts` into `out`.
+    fn zlib<'a>(out: &mut Vec<u8>, parts: impl IntoIterator<Item = &'a [u8]>) -> bool {
         out.clear();
         let mut encoder = ZlibEncoder::new(out, Compression::fast());
-        encoder.write_all(pixels).is_ok() && encoder.finish().is_ok()
+        parts
+            .into_iter()
+            .all(|part| encoder.write_all(part).is_ok())
+            && encoder.finish().is_ok()
     }
 }
 

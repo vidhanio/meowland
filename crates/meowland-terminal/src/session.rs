@@ -371,7 +371,9 @@ impl TerminalSession {
         reason = "the terminal session runs on calloop's local executor"
     )]
     async fn start_presentation(&mut self) -> Result<()> {
-        let mode = TerminalGuard::enter(self.presentation.buffer())?;
+        let progress = self.presentation.output_progress();
+        let end = self.presentation.output_end_position();
+        let mode = TerminalGuard::enter(self.presentation.buffer(), progress, end)?;
         self.lifecycle = Lifecycle::Active(mode);
         self.flush_output().await?;
         let Some(probe) = terminal_probe(
@@ -469,18 +471,28 @@ impl TerminalSession {
     )]
     async fn close(&mut self, reason: Option<&str>) -> Result<()> {
         let mut restore = Vec::new();
-        let mut failure = if let Lifecycle::Active(mut mode) =
-            std::mem::replace(&mut self.lifecycle, Lifecycle::Closed)
-        {
-            mode.restore_into(&mut restore).err().map(Error::from)
+        let mut mode = match std::mem::replace(&mut self.lifecycle, Lifecycle::Closed) {
+            Lifecycle::Active(mode) => Some(mode),
+            _ => None,
+        };
+        let mut failure = mode
+            .as_mut()
+            .and_then(|mode| mode.restore_into(&mut restore).err())
+            .map(Error::from);
+        let pop_end = if mode.is_some() {
+            Some(self.presentation.output_end_position() + restore.len() + b"\x1b[23;0t".len())
         } else {
             None
         };
+        let mut queued_restore = restore.clone();
+        if mode.is_some() {
+            queued_restore.extend_from_slice(b"\x1b[23;0t");
+        }
         if let Some(reason) = reason {
             let clean = protocol::sanitize_with_limit(reason, terminal::MAX_TEXT_CHARS);
-            restore.extend_from_slice(format!("meowland: {clean}\n").as_bytes());
+            queued_restore.extend_from_slice(format!("meowland: {clean}\n").as_bytes());
         }
-        self.presentation.append(&restore);
+        self.presentation.append(&queued_restore);
         let drained = self.drain_until(Instant::now() + CLOSE_DRAIN_TIMEOUT).await;
         let complete = match drained {
             Ok(complete) => complete,
@@ -491,6 +503,19 @@ impl TerminalSession {
         };
         if !complete {
             tracing::warn!("queued terminal output did not drain before shutdown");
+            if retry_title_pop(
+                mode.as_ref().filter(|mode| mode.title_pushed()).map(|_| ()),
+                self.presentation
+                    .output_progress()
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                pop_end,
+            ) {
+                restore.extend_from_slice(b"\x1b[23;0t");
+            }
+            if let Some(reason) = reason {
+                let clean = protocol::sanitize_with_limit(reason, terminal::MAX_TEXT_CHARS);
+                restore.extend_from_slice(format!("meowland: {clean}\n").as_bytes());
+            }
             self.presentation.discard();
             output::write_best_effort(&restore);
         }
@@ -530,6 +555,10 @@ impl TerminalSession {
     }
 }
 
+fn retry_title_pop(pushed: Option<()>, written: usize, pop_end: Option<usize>) -> bool {
+    pushed.is_some() && pop_end.is_some_and(|end| written < end)
+}
+
 /// Await one scheduling turn, reporting whether it had to wait for readiness.
 ///
 /// A turn that never returned `Pending` kept the executor to itself, so the
@@ -545,4 +574,72 @@ async fn scheduled<F: Future>(future: F) -> (F::Output, bool) {
     })
     .await;
     (output, waited)
+}
+#[cfg(test)]
+mod title_tests {
+    use std::{
+        io::{self, Write},
+        sync::atomic::Ordering,
+    };
+
+    use futures::FutureExt;
+
+    use super::retry_title_pop;
+    use crate::output::Output;
+
+    struct ShortWriter(usize);
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len().min(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn partial_output_tracks_push_and_pop_boundaries() {
+        let mut output = Output::default();
+        let progress = output.progress();
+        output.append(b"\x1b[22;0t");
+        let push_end = output.end_position();
+        output.append(b"restore\x1b[23;0t");
+        let pop_end = output.end_position();
+        output.append(b"reason");
+        let mut writer = futures::io::AllowStdIo::new(ShortWriter(push_end - 1));
+        output
+            .drain(&mut writer)
+            .now_or_never()
+            .expect("ready")
+            .expect("partial push");
+        assert!(progress.load(Ordering::Relaxed) < push_end);
+        assert!(!retry_title_pop(
+            None,
+            progress.load(Ordering::Relaxed),
+            Some(pop_end)
+        ));
+        writer.get_mut().0 = pop_end - progress.load(Ordering::Relaxed);
+        output
+            .drain(&mut writer)
+            .now_or_never()
+            .expect("ready")
+            .expect("complete pop");
+        assert_eq!(progress.load(Ordering::Relaxed), pop_end);
+        assert!(!retry_title_pop(
+            Some(()),
+            progress.load(Ordering::Relaxed),
+            Some(pop_end)
+        ));
+        assert!(output.pending());
+    }
+
+    #[test]
+    fn fallback_only_pops_a_pushed_title_that_has_not_been_popped() {
+        assert!(!retry_title_pop(None, 7, Some(30)));
+        assert!(retry_title_pop(Some(()), 29, Some(30)));
+        assert!(!retry_title_pop(Some(()), 30, Some(30)));
+        assert!(!retry_title_pop(Some(()), 31, Some(30)));
+    }
 }

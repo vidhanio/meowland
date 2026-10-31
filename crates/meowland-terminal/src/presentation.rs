@@ -148,6 +148,14 @@ impl PanePresentation {
         self.pending.buffer()
     }
 
+    pub(crate) fn output_progress(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.pending.progress()
+    }
+
+    pub(crate) fn output_end_position(&self) -> usize {
+        self.pending.end_position()
+    }
+
     /// Replace the image placement after the terminal's cell geometry changed.
     ///
     /// A displayed shared frame is repainted as soon as its pixels are

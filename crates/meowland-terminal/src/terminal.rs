@@ -107,6 +107,7 @@ pub(crate) struct TerminalGuard {
     active: bool,
     mouse: bool,
     clipboard: Option<ClipboardMode>,
+    title: Option<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
 }
 
 impl TerminalGuard {
@@ -115,18 +116,24 @@ impl TerminalGuard {
     /// Escape sequences are appended to `out`, the session's ordered output
     /// queue, so they can never interleave with a partially written frame. Raw
     /// mode itself is a termios change and takes effect immediately.
-    pub(crate) fn enter(out: &mut Vec<u8>) -> io::Result<Self> {
+    pub(crate) fn enter(
+        out: &mut Vec<u8>,
+        progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        end: usize,
+    ) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self {
             active: true,
             mouse: false,
             clipboard: None,
+            title: Some((progress, end + b"\x1b[22;0t".len())),
         };
         Self::append_enter(out);
         Ok(guard)
     }
 
     fn append_enter(out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[22;0t");
         queue!(
             out,
             terminal::EnterAlternateScreen,
@@ -189,10 +196,19 @@ impl TerminalGuard {
         .expect("writing terminal commands to a byte buffer cannot fail");
     }
 
+    pub(crate) fn title_pushed(&self) -> bool {
+        self.title.as_ref().is_some_and(|(written, end)| {
+            written.load(std::sync::atomic::Ordering::Relaxed) >= *end
+        })
+    }
+
     fn restore_best_effort(&mut self) {
         if self.active {
             let mut bytes = Vec::new();
             let _ = self.restore_into(&mut bytes);
+            if self.title_pushed() {
+                bytes.extend_from_slice(b"\x1b[23;0t");
+            }
             output::write_best_effort(&bytes);
         }
     }
@@ -207,6 +223,23 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::{ClipboardMode, TerminalGuard};
+    #[test]
+    fn presentation_pushes_and_restoration_pops_title() {
+        let mut entered = Vec::new();
+        TerminalGuard::append_enter(&mut entered);
+        assert!(entered.starts_with(b"\x1b[22;0t"));
+
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(7));
+        let guard = TerminalGuard {
+            active: false,
+            mouse: false,
+            clipboard: None,
+            title: Some((std::sync::Arc::clone(&progress), 8)),
+        };
+        assert!(!guard.title_pushed());
+        progress.store(8, std::sync::atomic::Ordering::Relaxed);
+        assert!(guard.title_pushed());
+    }
 
     #[test]
     fn restoration_restores_enabled_modes() {
@@ -214,6 +247,7 @@ mod tests {
             active: false,
             mouse: true,
             clipboard: Some(ClipboardMode::Disabled),
+            title: None,
         };
         let mut bytes = Vec::new();
         guard.append_restore(&mut bytes);
@@ -237,6 +271,7 @@ mod tests {
             active: false,
             mouse: false,
             clipboard: Some(ClipboardMode::Enabled),
+            title: None,
         };
         let mut bytes = Vec::new();
         guard.append_restore(&mut bytes);

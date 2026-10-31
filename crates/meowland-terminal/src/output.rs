@@ -1,5 +1,12 @@
 //! Ordered, resumable terminal writes with a bounded per-turn budget.
-use std::{fs::File, io};
+use std::{
+    fs::File,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use futures::io::{AsyncWrite, AsyncWriteExt};
 use meowland_protocol::release_oversized;
@@ -42,6 +49,7 @@ pub(crate) fn write_best_effort(bytes: &[u8]) {
 pub(crate) struct Output {
     bytes: Vec<u8>,
     offset: usize,
+    written: Arc<AtomicUsize>,
 }
 impl Output {
     pub(crate) const fn pending(&self) -> bool {
@@ -60,6 +68,14 @@ impl Output {
         self.bytes.len()
     }
 
+    pub(crate) fn progress(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.written)
+    }
+
+    pub(crate) fn end_position(&self) -> usize {
+        self.written.load(Ordering::Relaxed) + self.bytes.len() - self.offset
+    }
+
     /// Drop every queued byte instead of writing it.
     pub(crate) fn discard(&mut self) {
         self.bytes.clear();
@@ -76,6 +92,7 @@ impl Output {
                 return Err(io::ErrorKind::WriteZero.into());
             }
             self.offset += written;
+            self.written.fetch_add(written, Ordering::Relaxed);
         }
         if !self.pending() {
             self.bytes.clear();

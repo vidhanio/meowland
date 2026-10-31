@@ -3,13 +3,18 @@
 use std::{
     cell::RefCell,
     ffi::OsString,
+    fmt,
     io::{self, Read, Write},
+    marker::PhantomData,
     path::PathBuf,
     time::Duration,
 };
 
 use meowland_core::pixels::FrameSize;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeSeed, SeqAccess, Visitor},
+};
 
 /// Maximum encoded packet body; bounds allocations made for untrusted length
 /// prefixes.
@@ -25,6 +30,77 @@ pub const MAX_HELD_KEYS: usize = 256;
 #[must_use]
 pub const fn valid_key_identity(key: u32) -> bool {
     key > 0 && key <= 0x10_ffff
+}
+
+fn bounded_sequence<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Reject;
+    impl<'de> DeserializeSeed<'de> for Reject {
+        type Value = ();
+
+        fn deserialize<D: Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
+            Err(de::Error::custom("too many items"))
+        }
+    }
+    struct Sequence<T, const MAX: usize>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de>, const MAX: usize> Visitor<'de> for Sequence<T, MAX> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a sequence of at most {MAX} items")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            if seq.size_hint().is_some_and(|size| size > MAX) {
+                return Err(de::Error::custom("too many items"));
+            }
+            let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX));
+            while items.len() < MAX {
+                match seq.next_element()? {
+                    Some(item) => items.push(item),
+                    None => return Ok(items),
+                }
+            }
+            seq.next_element_seed(Reject)?;
+            Ok(items)
+        }
+    }
+    deserializer.deserialize_seq(Sequence::<T, MAX>(PhantomData))
+}
+
+fn held_keys<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u32>, D::Error> {
+    bounded_sequence::<D, u32, MAX_HELD_KEYS>(deserializer)
+}
+
+struct BoundedMime(String);
+
+impl<'de> Deserialize<'de> for BoundedMime {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Mime;
+        impl Visitor<'_> for Mime {
+            type Value = BoundedMime;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a MIME type of at most 256 bytes")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.len() > 256 {
+                    return Err(E::custom("MIME type too long"));
+                }
+                Ok(BoundedMime(value.to_owned()))
+            }
+        }
+        deserializer.deserialize_str(Mime)
+    }
+}
+
+fn offer_mimes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    bounded_sequence::<D, BoundedMime, { crate::clipboard::MAX_TYPES }>(deserializer)
+        .map(|mimes| mimes.into_iter().map(|mime| mime.0).collect())
 }
 
 pub(crate) const HEADER: usize = 4;
@@ -355,6 +431,7 @@ pub enum Input {
         /// characters.
         text: Option<String>,
         /// Client-known held keys immediately before this transition.
+        #[serde(deserialize_with = "held_keys")]
         held: Vec<u32>,
     },
     /// Pointer motion, an optional button transition, and vertical wheel
@@ -376,6 +453,7 @@ pub enum Input {
     /// Client-known held keys and modifiers on focus entry.
     KeyboardEnter {
         /// Kitty key identities held when focus was gained.
+        #[serde(deserialize_with = "held_keys")]
         keys: Vec<u32>,
         /// [`Modifiers`] snapshot, including lock state.
         modifiers: Modifiers,
@@ -423,6 +501,7 @@ pub enum PaneAction {
         /// Terminal-assigned offer identity for subsequent reads.
         offer: ClipboardOfferId,
         /// Available MIME types, validated and bounded by the receiver.
+        #[serde(deserialize_with = "offer_mimes")]
         mimes: Vec<String>,
         /// What accepting the offer should do.
         intent: OfferIntent,
@@ -675,6 +754,83 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn wire_collections_reject_excess_and_accept_the_limit() {
+        fn offer(mimes: Vec<String>) -> PaneAction {
+            PaneAction::ClipboardOffer {
+                selection: crate::clipboard::Selection::Clipboard,
+                offer: 1.into(),
+                mimes,
+                intent: OfferIntent::Refresh,
+            }
+        }
+        let cases = [
+            offer(vec![String::new(); crate::clipboard::MAX_TYPES + 1]),
+            offer(vec!["a".repeat(257)]),
+            PaneAction::Input(Input::KeyboardEnter {
+                keys: vec![1; MAX_HELD_KEYS + 1],
+                modifiers: Modifiers::empty(),
+            }),
+            PaneAction::Input(Input::Key {
+                key: 1,
+                state: Transition::Pressed,
+                modifiers: Modifiers::empty(),
+                text: None,
+                held: vec![1; MAX_HELD_KEYS + 1],
+            }),
+        ];
+        for value in cases {
+            let mut framed = Vec::new();
+            send(&mut framed, &value).expect("encode oversized collection");
+            assert!(recv::<PaneAction>(&mut Cursor::new(&framed)).is_err());
+            #[cfg(feature = "async")]
+            {
+                let mut reader = crate::asynchronous::Reader::new(futures::io::Cursor::new(framed));
+                let mut future = std::pin::pin!(reader.read::<PaneAction>());
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                loop {
+                    if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut context) {
+                        assert!(result.is_err());
+                        break;
+                    }
+                }
+            }
+        }
+        for value in [
+            offer(vec!["a".repeat(256); crate::clipboard::MAX_TYPES]),
+            PaneAction::Input(Input::KeyboardEnter {
+                keys: vec![1; MAX_HELD_KEYS],
+                modifiers: Modifiers::empty(),
+            }),
+        ] {
+            let mut framed = Vec::new();
+            send(&mut framed, &value).expect("encode valid collection");
+            recv::<PaneAction>(&mut Cursor::new(framed)).expect("decode valid collection");
+        }
+    }
+
+    #[test]
+    fn compact_declared_lengths_are_rejected() {
+        let mut body = postcard::to_allocvec(&PaneAction::ClipboardOffer {
+            selection: crate::clipboard::Selection::Clipboard,
+            offer: 1.into(),
+            mimes: Vec::new(),
+            intent: OfferIntent::Refresh,
+        })
+        .expect("encode offer");
+        body.truncate(body.len() - 2);
+        body.extend(postcard::to_allocvec(&1_000_000_usize).expect("encode count"));
+        assert!(decode::<PaneAction>(&body).is_err());
+        let mut body = postcard::to_allocvec(&Input::KeyboardEnter {
+            keys: Vec::new(),
+            modifiers: Modifiers::empty(),
+        })
+        .expect("encode enter");
+        body.truncate(body.len() - 2);
+        body.extend(postcard::to_allocvec(&1_000_000_usize).expect("encode count"));
+        assert!(decode::<Input>(&body).is_err());
+    }
 
     #[test]
     fn send_and_recv_round_trip() {

@@ -30,19 +30,20 @@ fn check(event: &Event) {
     }
 }
 
-/// Decode `chunks`, draining events after each one as the reader does.
+/// Decode `chunks`, draining events after each one as the reader does,
+/// including the events a failing chunk queued before its error, so the
+/// result does not depend on where the stream was cut.
 fn decode<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (bool, Vec<Event>) {
     let mut parser = Parser::default();
     let mut events = Vec::new();
     for chunk in chunks {
-        for &byte in chunk {
-            if parser.push(byte).is_err() {
-                return (false, events);
-            }
-        }
+        let decoded = chunk.iter().all(|&byte| parser.push(byte).is_ok());
         while let Some(event) = parser.next_event() {
             check(&event);
             events.push(event);
+        }
+        if !decoded {
+            return (false, events);
         }
     }
     (true, events)

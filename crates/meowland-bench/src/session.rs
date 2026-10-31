@@ -122,7 +122,6 @@ pub struct Session {
     environment: Vec<(OsString, OsString)>,
     processes: Vec<Process>,
     master: OwnedFd,
-    terminal: Option<OwnedFd>,
     listener: UnixListener,
     control: Option<UnixStream>,
     control_pending: Vec<u8>,
@@ -173,7 +172,6 @@ impl Session {
             environment,
             processes: vec![server],
             master,
-            terminal: Some(terminal),
             listener,
             control: None,
             control_pending: Vec::new(),
@@ -221,10 +219,6 @@ impl Session {
                     .to_vec()
             }
         };
-        let terminal = session
-            .terminal
-            .take()
-            .context("terminal already attached")?;
         let pane = spawn(
             &session.binaries.meowland,
             pane,

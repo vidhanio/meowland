@@ -500,7 +500,7 @@ pub fn send<H: Host>(host: &mut H, fd: OwnedFd, mime: &str, source: &Source) {
     match source {
         Source::Local(data) => {
             if let Some(item) = data.items.iter().find(|item| item.mime == mime) {
-                write(host, fd, Arc::from(item.data.as_slice()), deadline);
+                write(host, fd, item.data.clone(), deadline);
             }
         }
         Source::Terminal { pane, offer } => {
@@ -562,7 +562,7 @@ fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn write<H: Host>(host: &mut H, fd: OwnedFd, data: Arc<[u8]>, deadline: Deadline) {
+fn write<H: Host>(host: &mut H, fd: OwnedFd, data: Vec<u8>, deadline: Deadline) {
     if data.is_empty() || data.len() > MAX_BYTES || deadline.expired() {
         return;
     }
@@ -648,7 +648,7 @@ pub fn reply<H: Host>(
         };
         drop(delivery.sources);
         if let Some(data) = data.filter(|data| data.len() <= MAX_BYTES) {
-            write(host, fd, data.into(), delivery.deadline);
+            write(host, fd, data, delivery.deadline);
         }
     }
 }

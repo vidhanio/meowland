@@ -13,9 +13,10 @@ pub use frame::FrameBand;
 pub use paths::{Paths, PathsError};
 pub use protocol::{
     Button, ClipboardOfferId, ClipboardRequestId, ControlRequest, ControlResponse, Follow,
-    FrameAck, Hello, Input, KEY_INSERT, KEY_V, KeyBinding, MAX_INPUT_TEXT, MAX_MESSAGE, Modifiers,
-    OfferIntent, PaneAction, PanePacket, PaneToServer, REQUEST_TIMEOUT, RETAINED_BUFFER, Scroll,
-    Selector, ServerToPane, Shortcut, Shortcuts, Target, Transition, WindowInfo, WindowState, recv,
-    release_oversized, sanitize, sanitize_with_limit, send,
+    FrameAck, Hello, Input, KEY_INSERT, KEY_V, KeyBinding, MAX_HELD_KEYS, MAX_INPUT_TEXT,
+    MAX_MESSAGE, Modifiers, OfferIntent, PaneAction, PanePacket, PaneToServer, REQUEST_TIMEOUT,
+    RETAINED_BUFFER, Scroll, Selector, ServerToPane, Shortcut, Shortcuts, Target, Transition,
+    WindowInfo, WindowState, recv, release_oversized, sanitize, sanitize_with_limit, send,
+    valid_key_identity,
 };
 pub use shared::{FrameTransport, SharedFrame, SharedObject};

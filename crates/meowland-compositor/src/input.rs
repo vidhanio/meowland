@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use meowland_protocol::{Button, Input, KEY_V, Modifiers, Scroll, Transition};
+use meowland_protocol::{
+    Button, Input, KEY_V, MAX_HELD_KEYS, Modifiers, Scroll, Transition, valid_key_identity,
+};
 use smithay::{
     backend::input::{
         Axis, AxisSource, ButtonState as WaylandButtonState, InputTime, KeyState, Keycode,
@@ -48,8 +50,6 @@ const SCROLL_UNITS_PER_DETENT: i32 = 120;
 const AXIS_UNITS_PER_DETENT: f64 = 7.5;
 /// High-resolution Wayland units emitted for one wheel detent.
 const V120_PER_DETENT: i32 = 60;
-/// Largest Unicode scalar value accepted as a Kitty key identity.
-const MAX_UNICODE: u32 = 0x0010_ffff;
 
 pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
     if !valid_input(event) {
@@ -142,19 +142,15 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
 
 fn valid_input(event: &Input) -> bool {
     match event {
-        Input::Key { key, held, .. } => valid_key(*key) && valid_keys(held),
+        Input::Key { key, held, .. } => valid_key_identity(*key) && valid_keys(held),
         Input::KeyboardEnter { keys, .. } => valid_keys(keys),
         Input::Pointer { x, y, .. } => x.is_finite() && y.is_finite(),
         Input::Text(_) | Input::ResetKeyboard => true,
     }
 }
 
-const fn valid_key(key: u32) -> bool {
-    key > 0 && key <= MAX_UNICODE
-}
-
 fn valid_keys(keys: &[u32]) -> bool {
-    keys.len() <= 256 && keys.iter().all(|key| valid_key(*key))
+    keys.len() <= MAX_HELD_KEYS && keys.iter().all(|key| valid_key_identity(*key))
 }
 
 /// Route one key transition through the active layout or the text fallback.

@@ -18,6 +18,14 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum UTF-8 bytes in a single committed keyboard-text event.
 pub const MAX_INPUT_TEXT: usize = 4096;
+/// Maximum number of key identities tracked by a pane.
+pub const MAX_HELD_KEYS: usize = 256;
+
+/// Whether a Kitty key identity can be forwarded to the compositor.
+#[must_use]
+pub const fn valid_key_identity(key: u32) -> bool {
+    key > 0 && key <= 0x10_ffff
+}
 
 pub(crate) const HEADER: usize = 4;
 

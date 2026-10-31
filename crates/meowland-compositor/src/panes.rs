@@ -5,7 +5,8 @@ use meowland_protocol::{Follow, FrameAck, FrameTransport, Selector, Target};
 use smithay::utils::{Logical, Size};
 
 use super::{
-    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, frame::PaneState, input,
+    AttachedPane, Compositor, PaneId, Selection, ServerToPane, WindowId, clipboard,
+    frame::PaneState, input,
 };
 
 impl Compositor {
@@ -29,7 +30,7 @@ impl Compositor {
         }
         let removed = self.attachments.remove(pane);
         let window = removed.as_ref().and_then(AttachedPane::window);
-        self.clipboard.detach(pane);
+        clipboard::detach(self, pane);
         if let Some(Selection::Activation(token)) = removed.as_ref().and_then(AttachedPane::waiting)
         {
             self.forget_activation(token);

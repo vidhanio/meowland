@@ -6,8 +6,14 @@ use meowland_panes::PaneId;
 use meowland_protocol::{ServerToPane, clipboard::Transport};
 use smithay::wayland::selection::{
     SelectionTarget,
-    data_device::{request_data_device_client_selection, set_data_device_selection},
-    primary_selection::{request_primary_client_selection, set_primary_selection},
+    data_device::{
+        clear_data_device_selection, current_data_device_selection_userdata,
+        request_data_device_client_selection, set_data_device_selection,
+    },
+    primary_selection::{
+        clear_primary_selection, current_primary_selection_userdata,
+        request_primary_client_selection, set_primary_selection,
+    },
 };
 
 use super::{Compositor, input};
@@ -81,6 +87,28 @@ impl meowland_selection::Host for Compositor {
             }
             SelectionTarget::Primary => {
                 set_primary_selection(&self.display, &self.input.seat, mimes, source);
+            }
+        }
+    }
+
+    fn selection_owner(&self, target: SelectionTarget) -> Option<PaneId> {
+        let source = match target {
+            SelectionTarget::Clipboard => current_data_device_selection_userdata(&self.input.seat),
+            SelectionTarget::Primary => current_primary_selection_userdata(&self.input.seat),
+        }?;
+        match *source {
+            meowland_selection::Source::Terminal { pane, .. } => Some(pane),
+            meowland_selection::Source::Local(_) => None,
+        }
+    }
+
+    fn clear_selection(&mut self, target: SelectionTarget) {
+        match target {
+            SelectionTarget::Clipboard => {
+                clear_data_device_selection(&self.display, &self.input.seat);
+            }
+            SelectionTarget::Primary => {
+                clear_primary_selection(&self.display, &self.input.seat);
             }
         }
     }

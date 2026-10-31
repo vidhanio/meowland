@@ -201,7 +201,7 @@ impl<H> Bridge<H> {
     }
 
     /// Forget every delivery and export owned by a detached pane.
-    pub fn detach(&mut self, pane: PaneId) {
+    fn detach(&mut self, pane: PaneId) {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
@@ -255,6 +255,10 @@ pub trait Host: Sized + 'static {
     ) -> io::Result<()>;
     /// Offer representations to the seat selection.
     fn set_selection(&mut self, target: SelectionTarget, mimes: Vec<String>, source: Source);
+    /// Pane whose offer currently backs the seat selection.
+    fn selection_owner(&self, target: SelectionTarget) -> Option<PaneId>;
+    /// Withdraw the seat selection.
+    fn clear_selection(&mut self, target: SelectionTarget);
     /// Run the terminal paste shortcut in a pane.
     fn paste(&mut self, pane: PaneId);
 }
@@ -700,6 +704,19 @@ pub fn paste<H: Host>(host: &mut H, pane: PaneId, text: &str) {
     host.paste(pane);
 }
 
+/// Forget a detached pane's exports and deliveries, and withdraw every seat
+/// selection its offers still back.
+///
+/// A newer selection that replaced the pane's offer is left in place.
+pub fn detach<H: Host>(host: &mut H, pane: PaneId) {
+    host.bridge().detach(pane);
+    for target in [SelectionTarget::Clipboard, SelectionTarget::Primary] {
+        if host.selection_owner(target) == Some(pane) {
+            host.clear_selection(target);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs::File, io::Write as _, time::Duration};
@@ -721,6 +738,8 @@ mod tests {
         open: Vec<OwnedFd>,
         requests: Vec<String>,
         emitted: Vec<(PaneId, ServerToPane)>,
+        /// Seat selections by [`target_index`].
+        seat: [Option<Source>; 2],
     }
 
     impl FakeHost {
@@ -736,6 +755,7 @@ mod tests {
                 open: Vec::new(),
                 requests: Vec::new(),
                 emitted: Vec::new(),
+                seat: [None, None],
             };
             (event_loop, host)
         }
@@ -843,15 +863,71 @@ mod tests {
             }
         }
 
-        fn set_selection(
-            &mut self,
-            _target: SelectionTarget,
-            _mimes: Vec<String>,
-            _source: Source,
-        ) {
+        fn set_selection(&mut self, target: SelectionTarget, _mimes: Vec<String>, source: Source) {
+            self.seat[target_index(target)] = Some(source);
+        }
+
+        fn selection_owner(&self, target: SelectionTarget) -> Option<PaneId> {
+            match self.seat[target_index(target)] {
+                Some(Source::Terminal { pane, .. }) => Some(pane),
+                Some(Source::Local(_)) | None => None,
+            }
+        }
+
+        fn clear_selection(&mut self, target: SelectionTarget) {
+            self.seat[target_index(target)] = None;
         }
 
         fn paste(&mut self, _pane: PaneId) {}
+    }
+
+    fn offer_both(host: &mut FakeHost, pane: PaneId) {
+        for selection in [ClipboardSelection::Clipboard, ClipboardSelection::Primary] {
+            offer(
+                host,
+                pane,
+                TerminalOffer {
+                    selection,
+                    id: ClipboardOfferId::from(1),
+                    mimes: vec!["text/plain".to_owned()],
+                    intent: OfferIntent::Refresh,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn detaching_a_pane_withdraws_only_the_offers_it_still_backs() {
+        let (old, new) = (PaneId::from(7), PaneId::from(8));
+        let (_event_loop, mut host) = FakeHost::new();
+
+        offer_both(&mut host, old);
+        detach(&mut host, old);
+        assert!(host.seat.iter().all(Option::is_none));
+
+        offer_both(&mut host, old);
+        offer(
+            &mut host,
+            new,
+            TerminalOffer {
+                selection: ClipboardSelection::Primary,
+                id: ClipboardOfferId::from(2),
+                mimes: vec!["text/plain".to_owned()],
+                intent: OfferIntent::Refresh,
+            },
+        );
+        detach(&mut host, old);
+        assert!(host.seat[target_index(SelectionTarget::Clipboard)].is_none());
+        assert_eq!(host.selection_owner(SelectionTarget::Primary), Some(new));
+
+        offer_both(&mut host, old);
+        paste(&mut host, new, "local");
+        detach(&mut host, old);
+        assert!(matches!(
+            host.seat[target_index(SelectionTarget::Clipboard)],
+            Some(Source::Local(_))
+        ));
+        assert!(host.seat[target_index(SelectionTarget::Primary)].is_none());
     }
 
     #[test]

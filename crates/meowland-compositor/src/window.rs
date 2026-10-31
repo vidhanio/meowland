@@ -173,6 +173,24 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_catalog_focus_restores_keyboard_after_reset() {
+        let mut fixture = Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        let window = fixture.window(&toplevel);
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        crate::input::reset_keyboard(&mut fixture.state);
+        fixture.roundtrip();
+        assert_eq!(fixture.app.keyboard_focus, None);
+        fixture.state.focus_window(window);
+        fixture.roundtrip();
+        assert_eq!(fixture.app.keyboard_focus, Some(toplevel.surface.id()));
+        toplevel.surface.attach(None, 0, 0);
+        toplevel.surface.commit();
+        fixture.roundtrip();
+        assert_eq!(fixture.app.keyboard_focus, None);
+    }
+
+    #[test]
     fn remapping_and_unchanged_state_requests_receive_configures() {
         let mut fixture = Fixture::new();
         let toplevel = fixture.toplevel("app");

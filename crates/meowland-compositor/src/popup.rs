@@ -21,7 +21,7 @@ impl Compositor {
         {
             keyboard.unset_grab(self);
             let focus = grab.current_grab().filter(Resource::is_alive);
-            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
+            self.set_keyboard_focus(focus, SERIAL_COUNTER.next_serial());
         }
         if let Some(pointer) = self.input.pointer.take() {
             if pointer.has_grab(grab.serial()) {

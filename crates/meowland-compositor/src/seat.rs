@@ -9,7 +9,7 @@ use smithay::{
         tablet::TabletSeatHandler,
     },
     reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
-    utils::SERIAL_COUNTER,
+    utils::{SERIAL_COUNTER, Serial},
     wayland::{
         output::OutputHandler,
         pointer_constraints::PointerConstraintsHandler,
@@ -42,12 +42,29 @@ pub(crate) struct CursorState {
 }
 
 impl Compositor {
+    pub(crate) fn set_keyboard_focus(&mut self, focus: Option<WlSurface>, serial: Serial) {
+        if let Some(keyboard) = self.input.keyboard.clone() {
+            keyboard.set_focus(self, focus, serial);
+            if keyboard.current_focus().is_none() {
+                let seat = self.input.seat.clone();
+                set_data_device_focus(&self.display, &seat, None);
+                set_primary_focus(&self.display, &seat, None);
+            }
+        }
+    }
+
     pub(crate) fn focus_window(&mut self, window: WindowId) {
         if !self.windows.catalog.drawable(window) {
             return;
         }
         self.refresh_popup_grab();
         if self.windows.catalog.focused() == Some(window) {
+            let surface = self.windows.by_id[&window].surface.wl_surface().clone();
+            if self.input.keyboard.as_ref().is_some_and(|keyboard| {
+                !keyboard.is_grabbed() && keyboard.current_focus().as_ref() != Some(&surface)
+            }) {
+                self.set_keyboard_focus(Some(surface), SERIAL_COUNTER.next_serial());
+            }
             return;
         }
         if let Some(grab) = &mut self.input.popup_grab {
@@ -62,9 +79,7 @@ impl Compositor {
             .by_id
             .get(&window)
             .map(|entry| entry.surface.wl_surface().clone());
-        if let Some(keyboard) = self.input.keyboard.clone() {
-            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
-        }
+        self.set_keyboard_focus(surface, SERIAL_COUNTER.next_serial());
         if let Some(previous) = previous {
             self.apply_window_state(previous);
         }

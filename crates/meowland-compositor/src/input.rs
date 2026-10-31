@@ -300,7 +300,7 @@ fn enter_keyboard(
         state.focus_window(window);
     }
     if let Some(keyboard) = state.input.keyboard.clone() {
-        keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        state.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
         set_modifiers(&keyboard, state, snapshot(bits));
         for key in keys {
             if let Some(code) = state.input.keymap.lookup(*key)
@@ -310,7 +310,7 @@ fn enter_keyboard(
             }
         }
         let surface = state.windows.by_id[&window].surface.wl_surface().clone();
-        keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+        state.set_keyboard_focus(Some(surface), SERIAL_COUNTER.next_serial());
     }
     state.input.keyboard_state.owner = Some(pane);
     state.input.keyboard_state.known = true;
@@ -323,9 +323,9 @@ fn activate_keyboard(state: &mut Compositor, pane: PaneId, window: WindowId) {
     }
     if !keyboard_grabbed(state) {
         state.focus_window(window);
-        if changed && let Some(keyboard) = state.input.keyboard.clone() {
+        if changed && state.input.keyboard.is_some() {
             let surface = state.windows.by_id[&window].surface.wl_surface().clone();
-            keyboard.set_focus(state, Some(surface), SERIAL_COUNTER.next_serial());
+            state.set_keyboard_focus(Some(surface), SERIAL_COUNTER.next_serial());
         }
     }
     state.input.keyboard_state.owner = Some(pane);
@@ -392,7 +392,7 @@ pub(crate) fn reset_keyboard(state: &mut Compositor) {
         for code in keys.into_values() {
             forward(&keyboard, state, code, KeyState::Released);
         }
-        keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
+        state.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
     }
 }
 

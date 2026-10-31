@@ -4,7 +4,7 @@
 //! pane routing, and event-loop projection through [`Host`].
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     fmt, io,
     os::fd::OwnedFd,
     sync::Arc,
@@ -632,24 +632,23 @@ pub fn reply<H: Host>(
     request: ClipboardRequestId,
     data: Option<Vec<u8>>,
 ) {
-    if host
-        .bridge()
-        .deliveries
-        .get(&request)
-        .is_none_or(|delivery| {
-            !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
-        })
+    let Entry::Occupied(entry) = host.bridge().deliveries.entry(request) else {
+        return;
+    };
+    if !matches!(entry.get().phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
     {
         return;
     }
-    if let Some(delivery) = host.bridge().deliveries.remove(&request) {
-        let DeliveryPhase::AwaitingTerminal { fd, .. } = delivery.phase else {
-            unreachable!();
-        };
-        drop(delivery.sources);
-        if let Some(data) = data.filter(|data| data.len() <= MAX_BYTES) {
-            write(host, fd, data, delivery.deadline);
-        }
+    let Delivery {
+        phase,
+        deadline,
+        sources,
+    } = entry.remove();
+    drop(sources);
+    if let DeliveryPhase::AwaitingTerminal { fd, .. } = phase
+        && let Some(data) = data.filter(|data| data.len() <= MAX_BYTES)
+    {
+        write(host, fd, data, deadline);
     }
 }
 

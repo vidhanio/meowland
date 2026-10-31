@@ -5,4 +5,4 @@ mod clipboard;
 mod kitty;
 mod osc52;
 
-pub use clipboard::{Action, Clipboard, Focus, Protocol, Refresh};
+pub use clipboard::{Action, Clipboard, Focus, Refresh};

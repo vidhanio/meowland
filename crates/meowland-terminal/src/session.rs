@@ -24,7 +24,7 @@ use meowland_protocol::{
     asynchronous::{Outgoing, Reader},
     clipboard::{Selection, Transport},
 };
-use meowland_terminal_clipboard::{Clipboard, Protocol as ClipboardProtocol, Refresh};
+use meowland_terminal_clipboard::{Clipboard, Refresh};
 type Socket = Async<'static, UnixStream>;
 
 use super::{
@@ -136,7 +136,7 @@ impl TerminalSession {
             keyboard: Keyboard::default(),
             shortcuts: Shortcuts::default(),
             input_gate: InputGate::default(),
-            clipboard: Clipboard::new(ClipboardProtocol::Osc52)?,
+            clipboard: Clipboard::new(Transport::Osc52)?,
             presentation: PanePresentation::new(cell, FrameTransport::Inline),
             cell,
             lifecycle: Lifecycle::Handshaking {
@@ -413,16 +413,16 @@ impl TerminalSession {
         self.flush_output().await?;
         self.tx
             .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
-        let protocol = if probe.clipboard.is_some() {
-            ClipboardProtocol::Kitty
+        let clipboard = if probe.clipboard.is_some() {
+            Transport::Kitty
         } else {
-            ClipboardProtocol::Osc52
+            Transport::Osc52
         };
         self.tx
             .send(&PaneToServer::Action(PaneAction::ClipboardTransport(
-                clipboard_transport(protocol),
+                clipboard,
             )))?;
-        self.clipboard = Clipboard::new(protocol)?;
+        self.clipboard = Clipboard::new(clipboard)?;
         let _ = self
             .clipboard
             .refresh(Selection::Clipboard, Refresh::Background);
@@ -522,14 +522,6 @@ impl TerminalSession {
         }
         self.stdout.flush().await?;
         Ok(())
-    }
-}
-
-/// Report the probed clipboard protocol as the transport hint for the server.
-const fn clipboard_transport(protocol: ClipboardProtocol) -> Transport {
-    match protocol {
-        ClipboardProtocol::Kitty => Transport::Kitty,
-        ClipboardProtocol::Osc52 => Transport::Osc52,
     }
 }
 

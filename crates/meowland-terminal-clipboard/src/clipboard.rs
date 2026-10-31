@@ -5,7 +5,7 @@ use std::{io, time::Instant};
 
 use meowland_protocol::{
     ClipboardOfferId, ClipboardRequestId,
-    clipboard::{ClipboardData, Deadline, Selection},
+    clipboard::{ClipboardData, Deadline, Selection, Transport},
 };
 
 use crate::{kitty, osc52};
@@ -55,16 +55,7 @@ pub enum Focus {
     Lost,
 }
 
-/// Clipboard protocol advertised by the terminal during capability probing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Protocol {
-    /// MIME-aware, permission-aware OSC 5522 transfers.
-    Kitty,
-    /// Legacy OSC 52 plain-text transfers.
-    Osc52,
-}
-
-enum Transport {
+enum Backend {
     Kitty(Box<kitty::Clipboard>),
     Text(osc52::Clipboard),
 }
@@ -72,61 +63,61 @@ enum Transport {
 /// Bounded terminal selection state with serialized requests and deferred
 /// server actions.
 pub struct Clipboard {
-    transport: Transport,
+    backend: Backend,
 }
 
 impl std::fmt::Debug for Clipboard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let protocol = match &self.transport {
-            Transport::Kitty(_) => Protocol::Kitty,
-            Transport::Text(_) => Protocol::Osc52,
+        let transport = match &self.backend {
+            Backend::Kitty(_) => Transport::Kitty,
+            Backend::Text(_) => Transport::Osc52,
         };
         f.debug_struct("Clipboard")
-            .field("protocol", &protocol)
+            .field("transport", &transport)
             .finish_non_exhaustive()
     }
 }
 
 impl Clipboard {
-    /// Select the clipboard protocol advertised by the terminal.
+    /// Select the clipboard transport advertised by the terminal.
     ///
     /// # Errors
     /// Returns an error if secure request credentials cannot be generated.
-    pub fn new(protocol: Protocol) -> io::Result<Self> {
-        let transport = match protocol {
-            Protocol::Kitty => Transport::Kitty(Box::new(kitty::Clipboard::new()?)),
-            Protocol::Osc52 => Transport::Text(osc52::Clipboard::default()),
+    pub fn new(transport: Transport) -> io::Result<Self> {
+        let backend = match transport {
+            Transport::Kitty => Backend::Kitty(Box::new(kitty::Clipboard::new()?)),
+            Transport::Osc52 => Backend::Text(osc52::Clipboard::default()),
         };
-        Ok(Self { transport })
+        Ok(Self { backend })
     }
 
     /// Apply focus and report whether deferred input must survive an active
     /// permission dialog.
     pub fn focus(&mut self, focus: Focus) -> bool {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => {
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => {
                 clipboard.focus(focus);
                 false
             }
-            Transport::Text(clipboard) => clipboard.pending(),
+            Backend::Text(clipboard) => clipboard.pending(),
         }
     }
 
     /// Request metadata, returning an input-deferral deadline when a paste
     /// needs it.
     pub fn refresh(&mut self, selection: Selection, refresh: Refresh) -> Option<Instant> {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.refresh(selection, refresh),
-            Transport::Text(clipboard) => clipboard.refresh(selection, refresh),
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.refresh(selection, refresh),
+            Backend::Text(clipboard) => clipboard.refresh(selection, refresh),
         }
     }
 
     /// Supersede queued refreshes for one selection after an explicit paste or
     /// copy.
     pub fn cancel_refresh_selection(&mut self, selection: Selection) {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.cancel_refresh_selection(selection),
-            Transport::Text(clipboard) => {
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.cancel_refresh_selection(selection),
+            Backend::Text(clipboard) => {
                 if selection == Selection::Clipboard {
                     clipboard.cancel_refresh();
                 }
@@ -143,35 +134,35 @@ impl Clipboard {
         mime: String,
         deadline: Deadline,
     ) {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.read(request, offer, mime, deadline),
-            Transport::Text(clipboard) => clipboard.read(request, offer, &mime, deadline),
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.read(request, offer, mime, deadline),
+            Backend::Text(clipboard) => clipboard.read(request, offer, &mime, deadline),
         }
     }
 
     /// Suppress a pending read and any queued reply with the given request
     /// identity.
     pub fn cancel(&mut self, request: ClipboardRequestId) {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.cancel(request),
-            Transport::Text(clipboard) => clipboard.cancel(request),
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.cancel(request),
+            Backend::Text(clipboard) => clipboard.cancel(request),
         }
     }
 
     /// Copy bounded data, appending immediate OSC 52 commands or queuing a
     /// Kitty transfer.
     pub fn copy(&mut self, selection: Selection, data: ClipboardData, output: &mut Vec<u8>) {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.copy(selection, data),
-            Transport::Text(_) => osc52::Clipboard::copy(selection, &data, output),
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.copy(selection, data),
+            Backend::Text(_) => osc52::Clipboard::copy(selection, &data, output),
         }
     }
 
     /// Pop the next server or input action in transport order.
     pub fn next_action(&mut self) -> Option<Action> {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.next_action(),
-            Transport::Text(clipboard) => clipboard.next_action(),
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.next_action(),
+            Backend::Text(clipboard) => clipboard.next_action(),
         }
     }
 
@@ -179,32 +170,32 @@ impl Clipboard {
     /// session.
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
-        match &self.transport {
-            Transport::Kitty(clipboard) => clipboard.deadline(),
-            Transport::Text(clipboard) => clipboard.deadline(),
+        match &self.backend {
+            Backend::Kitty(clipboard) => clipboard.deadline(),
+            Backend::Text(clipboard) => clipboard.deadline(),
         }
     }
 
     /// Expire requests and append the next transfer when terminal output is
     /// available.
     pub fn advance(&mut self, output: &mut Vec<u8>) {
-        match &mut self.transport {
-            Transport::Kitty(clipboard) => clipboard.advance(output),
-            Transport::Text(clipboard) => clipboard.poll(output),
+        match &mut self.backend {
+            Backend::Kitty(clipboard) => clipboard.advance(output),
+            Backend::Text(clipboard) => clipboard.poll(output),
         }
     }
 
     /// Accept an OSC 5522 reply or notification; ignored for the legacy
     /// transport.
     pub fn packet(&mut self, bytes: &[u8]) {
-        if let Transport::Kitty(clipboard) = &mut self.transport {
+        if let Backend::Kitty(clipboard) = &mut self.backend {
             clipboard.packet(bytes);
         }
     }
 
     /// Accept a base64 OSC 52 reply; ignored for the Kitty transport.
     pub fn text(&mut self, bytes: &[u8]) {
-        if let Transport::Text(clipboard) = &mut self.transport {
+        if let Backend::Text(clipboard) = &mut self.backend {
             clipboard.text(bytes);
         }
     }

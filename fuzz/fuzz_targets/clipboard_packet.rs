@@ -5,8 +5,8 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use meowland_protocol::clipboard::Selection;
-use meowland_terminal_clipboard::{Clipboard, Focus, Protocol, Refresh};
+use meowland_protocol::clipboard::{Selection, Transport};
+use meowland_terminal_clipboard::{Clipboard, Focus, Refresh};
 
 #[derive(Debug, Arbitrary)]
 enum Op {
@@ -24,12 +24,12 @@ struct Session {
 }
 
 fuzz_target!(|session: Session| {
-    let protocol = if session.kitty {
-        Protocol::Kitty
+    let transport = if session.kitty {
+        Transport::Kitty
     } else {
-        Protocol::Osc52
+        Transport::Osc52
     };
-    let mut clipboard = Clipboard::new(protocol).expect("clipboard credentials");
+    let mut clipboard = Clipboard::new(transport).expect("clipboard credentials");
     let mut output = Vec::new();
     for op in session.ops {
         match op {

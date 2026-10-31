@@ -41,13 +41,15 @@ impl Reader {
         self.parser.pending()
     }
 
-    /// Deadline by which a muted control sequence must return to ground.
+    /// Deadline by which an oversized control sequence or bracketed paste
+    /// must terminate.
     #[must_use]
-    pub const fn recovery_deadline(&self) -> Option<Instant> {
+    pub fn recovery_deadline(&self) -> Option<Instant> {
         self.parser.recovery_deadline()
     }
 
-    /// Fail if a muted control sequence has exceeded its recovery deadline.
+    /// Fail if an oversized control sequence or bracketed paste has exceeded
+    /// its recovery deadline.
     ///
     /// # Errors
     /// Returns an input error when the recovery deadline has elapsed.
@@ -65,8 +67,8 @@ impl Reader {
     ///
     /// # Errors
     /// Returns an error on EOF, input failure, or an unterminated control
-    /// sequence that exceeds the recovery limit, including one whose deadline
-    /// elapsed while this read was waiting.
+    /// sequence or bracketed paste that exceeds the recovery limit, including
+    /// one whose deadline elapsed while this read was waiting.
     #[expect(
         clippy::future_not_send,
         reason = "terminal input belongs to the calloop owner thread"

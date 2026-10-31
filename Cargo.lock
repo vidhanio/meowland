@@ -961,6 +961,8 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

@@ -43,6 +43,8 @@ mod bell;
 mod buffer;
 mod commands;
 mod decoration;
+#[cfg(test)]
+mod fixture;
 mod frame;
 mod input;
 mod keymap;

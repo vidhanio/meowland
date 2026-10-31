@@ -130,3 +130,24 @@ impl Compositor {
         self.windows.popups_dirty = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use wayland_client::Proxy;
+
+    use crate::fixture::Fixture;
+
+    #[test]
+    fn mapping_a_toplevel_gives_it_keyboard_focus() {
+        let mut fixture = Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        let window = fixture.window(&toplevel);
+        assert!(!fixture.state.windows.catalog.drawable(window));
+
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+
+        assert!(fixture.state.windows.catalog.drawable(window));
+        assert_eq!(fixture.state.windows.catalog.focused(), Some(window));
+        assert_eq!(fixture.app.keyboard_focus, Some(toplevel.surface.id()));
+    }
+}

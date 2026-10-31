@@ -46,6 +46,29 @@ impl Runtime {
         settings: &Settings,
         handle: &CompositorHandle,
     ) -> io::Result<(Self, Compositor)> {
+        let (runtime, state) = Self::new(settings, handle)?;
+        let listener = ListeningSocket::bind(name).map_err(bind_error)?;
+        handle.insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            |_, listener, state| {
+                if let Some(stream) = listener.accept()?
+                    && let Err(error) = state
+                        .display
+                        .insert_client(stream, Arc::new(ClientState::default()))
+                {
+                    tracing::debug!(%error, "Cannot register Wayland client");
+                }
+                Ok(PostAction::Continue)
+            },
+        )?;
+        Ok((runtime, state))
+    }
+
+    /// Build the display and compositor without accepting clients.
+    pub(crate) fn new(
+        settings: &Settings,
+        handle: &CompositorHandle,
+    ) -> io::Result<(Self, Compositor)> {
         let display = Display::<Compositor>::new().map_err(init_error)?;
         let mut state = Compositor::new(display.handle(), handle.clone(), settings);
         let keyboard = &settings.keyboard;
@@ -67,25 +90,20 @@ impl Runtime {
         let keymap = super::keymap::Keymap::new(&keyboard_handle, &mut state);
         state.input.keymap = keymap;
         state.input.keyboard = Some(keyboard_handle);
-        let listener = ListeningSocket::bind(name).map_err(bind_error)?;
-        handle.insert_source(
-            Generic::new(listener, Interest::READ, Mode::Level),
-            |_, listener, state| {
-                if let Some(stream) = listener.accept()?
-                    && let Err(error) = state
-                        .display
-                        .insert_client(stream, Arc::new(ClientState::default()))
-                {
-                    tracing::debug!(%error, "Cannot register Wayland client");
-                }
-                Ok(PostAction::Continue)
-            },
-        )?;
         handle.insert_source(
             Generic::new(rustix::io::dup(&display)?, Interest::READ, Mode::Level),
             |_, _, _| Ok(PostAction::Continue),
         )?;
         Ok((Self { display }, state))
+    }
+
+    /// Connect an in-process client over an already connected socket.
+    #[cfg(test)]
+    pub(crate) fn insert_client(&self, stream: std::os::unix::net::UnixStream) {
+        self.display
+            .handle()
+            .insert_client(stream, Arc::new(ClientState::default()))
+            .expect("in-process client registers");
     }
 
     /// Dispatch and flush Wayland clients, callbacks, and ready frames.

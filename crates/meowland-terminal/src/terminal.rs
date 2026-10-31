@@ -122,6 +122,7 @@ impl TerminalGuard {
         end: usize,
     ) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
+        rustix::termios::tcflush(io::stdin(), rustix::termios::QueueSelector::IFlush)?;
         let guard = Self {
             active: true,
             mouse: false,

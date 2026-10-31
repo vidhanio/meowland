@@ -329,8 +329,9 @@ fn event_loop(
             }
             pending.push_str(std::str::from_utf8(&bytes[..count])?);
             while let Some(end) = pending.find('\n') {
-                let line: String = pending.drain(..=end).collect();
-                if !state.command(line.parse()?) {
+                let command: Command = pending[..=end].parse()?;
+                pending.drain(..=end);
+                if !state.command(command) {
                     return Ok(());
                 }
             }

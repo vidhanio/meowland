@@ -120,7 +120,7 @@ fn panes_wait_on_their_selection_until_shown() {
         "token"
     ));
     assert_eq!(attachments.due_frames(), 0);
-    assert_eq!(attachments.first_window(), None);
+    assert_eq!(attachments.windows().next(), None);
 
     assert_eq!(attachments.show(pane_id(1), window_id(1)), None);
     assert!(attachments.get(pane_id(1)).unwrap().waiting().is_none());
@@ -300,7 +300,7 @@ fn ordering_and_owner_are_deterministic() {
         vec![pane_id(2), pane_id(3)]
     );
     assert_eq!(attachments.first_showing(window_id(1)), Some(pane_id(2)));
-    assert_eq!(attachments.first_window(), Some(window_id(2)));
+    assert_eq!(attachments.windows().next(), Some(window_id(2)));
     assert_eq!(attachments.owner(window_id(1)), Some(pane_id(2)));
     assert_eq!(attachments.size(window_id(1)), Some(size));
 
@@ -320,7 +320,7 @@ fn ordering_and_owner_are_deterministic() {
 
     attachments.forget_window(window_id(1));
     assert_eq!(attachments.owner(window_id(1)), Some(pane_id(2)));
-    assert_eq!(attachments.first_window(), Some(window_id(2)));
+    assert_eq!(attachments.windows().next(), Some(window_id(2)));
 }
 
 #[test]

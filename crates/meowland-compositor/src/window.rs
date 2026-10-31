@@ -109,8 +109,8 @@ impl Compositor {
         if focused {
             let next = self
                 .attachments
-                .first_window()
-                .filter(|&id| self.windows.catalog.drawable(id))
+                .windows()
+                .find(|&id| self.windows.catalog.drawable(id))
                 .or_else(|| self.windows.catalog.newest());
             if let Some(next) = next {
                 self.focus_window(next);

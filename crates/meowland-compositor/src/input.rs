@@ -1,6 +1,6 @@
 //! Terminal-pane keyboard and pointer events mapped into Wayland input.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use meowland_protocol::{
     Button, Input, KEY_V, MAX_HELD_KEYS, Modifiers, Scroll, Transition, valid_key_identity,
@@ -23,6 +23,7 @@ use super::{AttachedPane, Compositor, PaneId, WindowId, WlSurface, keymap, text}
 pub(crate) struct KeyboardState {
     pub owner: Option<PaneId>,
     pub held: HashMap<u32, u16>,
+    suppressed: HashSet<u32>,
     pub known: bool,
     pub serials: VecDeque<(Serial, ClientId)>,
 }
@@ -306,7 +307,11 @@ fn enter_keyboard(
             if let Some(code) = state.input.keymap.lookup(*key)
                 && state.input.keyboard_state.held.insert(*key, code).is_none()
             {
-                forward(&keyboard, state, code, KeyState::Pressed);
+                if keyboard_grabbed(state) {
+                    state.input.keyboard_state.suppressed.insert(*key);
+                } else {
+                    forward(&keyboard, state, code, KeyState::Pressed);
+                }
             }
         }
         let surface = state.windows.by_id[&window].surface.wl_surface().clone();
@@ -366,11 +371,12 @@ pub(crate) fn valid_serial(state: &Compositor, serial: Serial, surface: &WlSurfa
             .pointer
             .as_ref()
             .and_then(PointerHandle::current_focus);
-        let focused = keyboard.into_iter().chain(pointer).any(|focus| {
-            focus
-                .client()
-                .is_some_and(|focused| focused.id() == client.id())
-        });
+        let root = state.window_for_surface(surface);
+        let focused = root.is_some()
+            && keyboard
+                .into_iter()
+                .chain(pointer)
+                .any(|focus| state.window_for_surface(&focus) == root);
         focused
             && state
                 .input
@@ -387,10 +393,13 @@ pub(crate) fn reset_keyboard(state: &mut Compositor) {
     state.input.keyboard_state.owner = None;
     state.input.keyboard_state.known = false;
     let keys = std::mem::take(&mut state.input.keyboard_state.held);
+    let suppressed = std::mem::take(&mut state.input.keyboard_state.suppressed);
     if let Some(keyboard) = state.input.keyboard.clone() {
         set_modifiers(&keyboard, state, ModifiersState::default());
-        for code in keys.into_values() {
-            forward(&keyboard, state, code, KeyState::Released);
+        for (key, code) in keys {
+            if !suppressed.contains(&key) {
+                forward(&keyboard, state, code, KeyState::Released);
+            }
         }
         state.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
     }
@@ -435,7 +444,7 @@ fn inject_key(
             code,
         )
     } else if let Some(code) = state.input.keyboard_state.held.remove(&key) {
-        (true, code)
+        (!state.input.keyboard_state.suppressed.remove(&key), code)
     } else {
         (false, code)
     };
@@ -485,7 +494,102 @@ pub(crate) fn paste_action(state: &mut Compositor, pane: PaneId) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::input::keyboard::{GrabStartData, KeyboardGrab, KeyboardInnerHandle};
+
     use super::*;
+
+    struct RecordingGrab {
+        start: GrabStartData<Compositor>,
+        events: Arc<Mutex<Vec<KeyState>>>,
+    }
+
+    impl KeyboardGrab<Compositor> for RecordingGrab {
+        fn input(
+            &mut self,
+            _: &mut Compositor,
+            _: &mut KeyboardInnerHandle<'_, Compositor>,
+            _: Keycode,
+            state: KeyState,
+            _: Option<ModifiersState>,
+            _: Serial,
+            _: InputTime,
+        ) {
+            self.events.lock().expect("grab events lock").push(state);
+        }
+
+        fn set_focus(
+            &mut self,
+            _: &mut Compositor,
+            _: &mut KeyboardInnerHandle<'_, Compositor>,
+            _: Option<WlSurface>,
+            _: Serial,
+        ) {
+        }
+
+        fn start_data(&self) -> &GrabStartData<Compositor> {
+            &self.start
+        }
+
+        fn unset(&mut self, _: &mut Compositor) {}
+    }
+
+    #[test]
+    fn grabbed_snapshot_keys_do_not_emit_unmatched_releases() {
+        let mut fixture = crate::fixture::Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        let window = fixture.window(&toplevel);
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        let keyboard = fixture.state.input.keyboard.clone().expect("keyboard");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        keyboard.set_grab(
+            &mut fixture.state,
+            RecordingGrab {
+                start: GrabStartData { focus: None },
+                events: Arc::clone(&events),
+            },
+            SERIAL_COUNTER.next_serial(),
+        );
+        enter_keyboard(
+            &mut fixture.state,
+            PaneId::from(1),
+            window,
+            &[u32::from('a'), u32::from('b')],
+            Modifiers::empty(),
+        );
+        key_transition(
+            &mut fixture.state,
+            u32::from('a'),
+            KeyState::Released,
+            Modifiers::empty(),
+            None,
+        );
+        reset_keyboard(&mut fixture.state);
+        assert!(events.lock().expect("grab events lock").is_empty());
+    }
+
+    #[test]
+    fn serial_from_another_window_of_the_same_client_cannot_grab() {
+        let mut fixture = crate::fixture::Fixture::new();
+        let first = fixture.toplevel("first");
+        fixture.present(&first.surface, 4, 4, [0, 0, 0, 255]);
+        let first_id = fixture.window(&first);
+        let first_surface = fixture.state.windows.by_id[&first_id]
+            .surface
+            .wl_surface()
+            .clone();
+        let second = fixture.toplevel("second");
+        fixture.present(&second.surface, 4, 4, [0, 0, 0, 255]);
+        let second_id = fixture.window(&second);
+        let second_surface = fixture.state.windows.by_id[&second_id]
+            .surface
+            .wl_surface()
+            .clone();
+        let serial = event_serial(&mut fixture.state, Some(second_surface.clone()));
+        assert!(valid_serial(&fixture.state, serial, &second_surface));
+        assert!(!valid_serial(&fixture.state, serial, &first_surface));
+    }
 
     fn frame(vertical: i16, horizontal: i16) -> Option<AxisFrame> {
         wheel_frame(

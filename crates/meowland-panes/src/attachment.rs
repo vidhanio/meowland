@@ -263,9 +263,9 @@ impl<P: Presentation> Attachments<P> {
             .collect()
     }
 
-    /// First window shown by an attached pane, in pane-identity order.
-    pub fn first_window(&self) -> Option<WindowId> {
-        self.panes.values().find_map(AttachedPane::window)
+    /// Windows shown by attached panes, in pane-identity order.
+    pub fn windows(&self) -> impl Iterator<Item = WindowId> + '_ {
+        self.panes.values().filter_map(AttachedPane::window)
     }
 
     /// Record the pane that most recently routed input to a window.

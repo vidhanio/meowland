@@ -56,11 +56,14 @@ impl Compositor {
         let Some(window) = self.remove_pane(pane) else {
             return;
         };
-        if self.windows.catalog.focused() == Some(window)
-            && !self.attachments.visible(window)
-            && let Some(next) = self.attachments.first_window()
-        {
-            self.focus_window(next);
+        if self.windows.catalog.focused() == Some(window) && !self.attachments.visible(window) {
+            let next = self
+                .attachments
+                .windows()
+                .find(|&id| self.windows.catalog.drawable(id));
+            if let Some(next) = next {
+                self.focus_window(next);
+            }
         }
     }
 
@@ -195,5 +198,42 @@ impl meowland_panes::Presentation for PaneState {
 
     fn ack(&mut self, pane: PaneId, ack: FrameAck) {
         Self::ack(self, pane, ack);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_skips_an_unmapped_attachment_before_a_drawable_one() {
+        let mut fixture = crate::fixture::Fixture::new();
+        let first = fixture.toplevel("first");
+        fixture.present(&first.surface, 4, 4, [0, 0, 0, 255]);
+        let second = fixture.toplevel("second");
+        fixture.present(&second.surface, 4, 4, [0, 0, 0, 255]);
+        let third = fixture.toplevel("third");
+        fixture.present(&third.surface, 4, 4, [0, 0, 0, 255]);
+        let windows = [
+            fixture.window(&first),
+            fixture.window(&second),
+            fixture.window(&third),
+        ];
+        for (number, window) in (1..=3).zip(windows) {
+            let pane = PaneId::from(number);
+            fixture.state.attachments.insert(
+                pane,
+                Target::Selector(Selector::AppId(String::new())),
+                Follow::Current,
+                FrameSize::new(64, 64).expect("test size"),
+            );
+            fixture.state.attachments.show(pane, window);
+        }
+        first.surface.attach(None, 0, 0);
+        first.surface.commit();
+        fixture.roundtrip();
+        fixture.state.focus_window(windows[2]);
+        fixture.state.release_pane_window(PaneId::from(3));
+        assert_eq!(fixture.state.windows.catalog.focused(), Some(windows[1]));
     }
 }

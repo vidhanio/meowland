@@ -353,3 +353,131 @@ impl Compositor {
             });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use meowland_protocol::{Follow, Selector, Target};
+
+    use super::*;
+    use crate::{Attachments, WindowId};
+
+    fn pane() -> PaneId {
+        PaneId::from(1)
+    }
+
+    fn shown_pane() -> Attachments {
+        let mut attachments = Attachments::default();
+        attachments.insert(
+            pane(),
+            Target::Selector(Selector::AppId("app".into())),
+            Follow::First,
+            FrameSize::new(4, 2).expect("test size is valid"),
+        );
+        attachments.show(pane(), WindowId::from(1));
+        attachments
+    }
+
+    fn send_due_frames(attachments: &mut Attachments, renderer: &mut Renderer) -> usize {
+        let mut sent = 0;
+        attachments.for_each_presentation_mut(|_, _, presentation| {
+            if presentation.due()
+                && presentation
+                    .frame(renderer, None, &HashMap::new(), 1.0)
+                    .is_some()
+            {
+                sent += 1;
+            }
+        });
+        sent
+    }
+
+    fn presentation(attachments: &Attachments) -> Presentation {
+        attachments
+            .get(pane())
+            .expect("test pane is attached")
+            .presentation
+            .presentation
+    }
+
+    fn change(attachments: &mut Attachments) {
+        attachments.for_each_showing_mut(WindowId::from(1), |_, presentation| {
+            presentation.mark_dirty();
+        });
+    }
+
+    #[test]
+    fn retained_ack_without_changes_leaves_the_pane_clean() {
+        let mut renderer = Renderer::default();
+        let mut attachments = shown_pane();
+        assert_eq!(send_due_frames(&mut attachments, &mut renderer), 1);
+        assert!(matches!(
+            presentation(&attachments),
+            Presentation::InFlight { .. }
+        ));
+
+        attachments.ack(pane(), FrameAck::Retained);
+
+        assert!(matches!(presentation(&attachments), Presentation::Clean));
+        assert_eq!(attachments.due_frames(), 0);
+    }
+
+    #[test]
+    fn changes_during_flight_wait_for_the_retained_ack() {
+        let mut renderer = Renderer::default();
+        let mut attachments = shown_pane();
+        send_due_frames(&mut attachments, &mut renderer);
+
+        change(&mut attachments);
+        assert!(matches!(
+            presentation(&attachments),
+            Presentation::InFlight { .. }
+        ));
+        assert_eq!(attachments.due_frames(), 0);
+
+        attachments.ack(pane(), FrameAck::Retained);
+
+        assert!(matches!(presentation(&attachments), Presentation::Dirty));
+        assert_eq!(attachments.due_frames(), 1);
+    }
+
+    #[test]
+    fn resync_ack_schedules_a_full_frame() {
+        let mut renderer = Renderer::default();
+        let mut attachments = shown_pane();
+        send_due_frames(&mut attachments, &mut renderer);
+
+        attachments.ack(pane(), FrameAck::Resync);
+
+        assert!(matches!(presentation(&attachments), Presentation::Dirty));
+        assert_eq!(attachments.due_frames(), 1);
+        assert_eq!(
+            attachments
+                .get(pane())
+                .expect("test pane is attached")
+                .presentation
+                .sent_size,
+            None
+        );
+    }
+
+    #[test]
+    fn acks_without_a_frame_in_flight_are_ignored() {
+        let mut renderer = Renderer::default();
+        let mut attachments = shown_pane();
+        for ack in [FrameAck::Retained, FrameAck::Resync] {
+            attachments.ack(pane(), ack);
+            assert!(matches!(presentation(&attachments), Presentation::Dirty));
+            assert_eq!(attachments.due_frames(), 1);
+        }
+
+        send_due_frames(&mut attachments, &mut renderer);
+        attachments.ack(pane(), FrameAck::Retained);
+        for ack in [FrameAck::Retained, FrameAck::Resync] {
+            attachments.ack(pane(), ack);
+            assert!(matches!(presentation(&attachments), Presentation::Clean));
+            assert_eq!(attachments.due_frames(), 0);
+        }
+    }
+}

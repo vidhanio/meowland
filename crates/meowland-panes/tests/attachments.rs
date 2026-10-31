@@ -392,7 +392,7 @@ fn transport_and_clipboard_updates_track_dirty_state() {
 }
 
 #[test]
-fn acknowledgements_clear_the_due_state() {
+fn acks_reach_only_attached_presentations_and_update_the_due_count() {
     let size = frame_size(80, 24);
     let mut attachments = Attachments::<Fake>::default();
     shown(

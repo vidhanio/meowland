@@ -182,28 +182,23 @@ impl std::fmt::Debug for Reader {
 }
 
 /// Time source for recovery deadlines that tests can freeze.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Clock {
-    source: fn() -> Instant,
     #[cfg(test)]
     frozen: Rc<Cell<Option<Instant>>>,
 }
 
 impl Clock {
-    fn new() -> Self {
-        Self {
-            source: Instant::now,
-            #[cfg(test)]
-            frozen: Rc::new(Cell::new(None)),
-        }
-    }
-
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "only tests store a frozen time")
+    )]
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = self.frozen.get() {
             return now;
         }
-        (self.source)()
+        Instant::now()
     }
 
     #[cfg(test)]
@@ -255,7 +250,7 @@ impl Parser {
             control_bytes: 0,
             muted_bytes: 0,
             muted_deadline: None,
-            clock: Clock::new(),
+            clock: Clock::default(),
         }
     }
 

@@ -123,11 +123,21 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// How a transmission carries its pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Payload {
+    /// Base64 RGB, possibly split over chunks.
+    Raw,
+    /// Base64 zlib-compressed RGB, possibly split over chunks.
+    Zlib,
+    /// One chunk naming a shared-memory object.
+    Shared,
+}
+
 /// A transmission whose chunks are still arriving.
 struct Transfer {
     edit: bool,
-    shared: bool,
-    compressed: bool,
+    payload: Payload,
     x: usize,
     y: usize,
     width: usize,
@@ -146,7 +156,7 @@ impl std::fmt::Debug for Transfer {
         formatter
             .debug_struct("Transfer")
             .field("edit", &self.edit)
-            .field("shared", &self.shared)
+            .field("payload", &self.payload)
             .field("size", &(self.width, self.height))
             .field("received", &self.data.len())
             .finish_non_exhaustive()
@@ -385,6 +395,7 @@ impl Endpoint {
             }
             return Ok(());
         }
+        let more = fields.get(b'm').is_some_and(|more| more != "0");
         let mut transfer = match self.transfer.take() {
             None => self.begin(&fields, action)?,
             Some(transfer) => {
@@ -393,20 +404,16 @@ impl Endpoint {
                     "interleaved Kitty transfers"
                 );
                 ensure!(
-                    fields.is(b't', "s") == transfer.shared,
+                    !fields.is(b't', "s"),
                     "Kitty transfer changed transport mid-transfer"
                 );
                 transfer
             }
         };
         let length = transfer.length();
-        if transfer.shared {
-            let data = read_shared(payload, length)?;
-            if transfer.data.is_empty() {
-                transfer.data = data;
-            } else {
-                transfer.data.extend_from_slice(&data);
-            }
+        if transfer.payload == Payload::Shared {
+            ensure!(!more, "shared-memory transfers are a single chunk");
+            transfer.data = read_shared(payload, length)?;
         } else {
             STANDARD
                 .decode_vec(payload, &mut transfer.data)
@@ -416,7 +423,7 @@ impl Endpoint {
             transfer.data.len() <= length * 2 + 65536,
             "oversized Kitty transfer"
         );
-        if fields.get(b'm').is_some_and(|more| more != "0") {
+        if more {
             self.transfer = Some(transfer);
             return Ok(());
         }
@@ -443,15 +450,19 @@ impl Endpoint {
             fields.is(b'i', SCREEN_ID),
             "only the root image is supported"
         );
-        let shared = fields.is(b't', "s");
+        let payload = match (fields.is(b't', "s"), fields.is(b'o', "z")) {
+            (false, false) => Payload::Raw,
+            (false, true) => Payload::Zlib,
+            (true, false) => Payload::Shared,
+            (true, true) => bail!("compressed shared-memory uploads are unsupported"),
+        };
         ensure!(
-            !shared || self.transport == Transport::Shared,
+            payload != Payload::Shared || self.transport == Transport::Shared,
             "shared-memory upload to an inline-only terminal"
         );
         Ok(Transfer {
             edit,
-            shared,
-            compressed: fields.is(b'o', "z"),
+            payload,
             x: fields.number(b'x')?,
             y: fields.number(b'y')?,
             width,
@@ -462,7 +473,7 @@ impl Endpoint {
 
     fn finish(&mut self, transfer: Transfer) -> anyhow::Result<()> {
         let length = transfer.length();
-        let data = if transfer.compressed {
+        let data = if transfer.payload == Payload::Zlib {
             inflate(&transfer.data, length)?
         } else {
             transfer.data
@@ -495,7 +506,7 @@ impl Endpoint {
             self.image = Some(data);
             self.counters.whole_uploads += 1;
         }
-        if transfer.shared {
+        if transfer.payload == Payload::Shared {
             self.counters.shared_uploads += 1;
         } else {
             self.counters.inline_uploads += 1;

@@ -4,21 +4,24 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     io::{self, Write as _},
+    mem,
     time::{Duration, Instant},
 };
 
 use base64::{Engine, display::Base64Display, engine::general_purpose::STANDARD};
 use meowland_protocol::{
-    ClipboardOfferId, ClipboardRequestId,
+    ClipboardOfferId, ClipboardRequestId, OfferIntent,
     clipboard::{
         ClipboardData, Deadline, MAX_BYTES, MAX_TYPES, Selection, TRANSFER_TIMEOUT, mime_types,
     },
 };
 
-use super::{Action, Focus, Refresh};
+use crate::clipboard::{Action, Focus, Refresh};
 
 const MAX_REQUESTS: usize = 16;
 const MAX_OFFERS: usize = 16;
+/// How long the terminal may take to list a selection's MIME types.
+const LIST_TIMEOUT: Duration = Duration::from_secs(1);
 /// Kitty's OSC 5522 payload limit per escape, applied before base64 encoding.
 ///
 /// The protocol asks senders to split a representation into chunks of no more
@@ -30,61 +33,106 @@ const MAX_CHUNK_BYTES: usize = 4096;
 const WRITE_CHUNK_BYTES: usize = MAX_CHUNK_BYTES - 1;
 /// Room for every accepted MIME type at its maximum length plus a separator.
 const MAX_TYPE_LIST: usize = MAX_TYPES * 257;
+/// Human-readable requester name sent with the session password.
+const SESSION_NAME: &str = "meowland";
+/// Requester name the protocol prescribes when using a paste event's one-time
+/// password.
+const PASTE_EVENT_NAME: &str = "Paste event";
+/// Payload asking the terminal to list a selection's MIME types.
+const LIST_PAYLOAD: &str = ".";
 
-#[derive(Default)]
+/// Wire identity of one request, echoed by the terminal in every reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OperationId(u64);
+
+impl OperationId {
+    const PREFIX: &str = "meowland-";
+
+    fn parse(id: &str) -> Option<Self> {
+        id.strip_prefix(Self::PREFIX)?.parse().ok().map(Self)
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", Self::PREFIX, self.0)
+    }
+}
+
+/// The selection an offer came from and the terminal's one-time paste
+/// password, which the protocol allows to be used once.
 struct Credentials {
-    primary: bool,
+    selection: Selection,
     password: Option<String>,
 }
 
-struct Reading {
-    started: bool,
+/// A read reply that has delivered its `OK` header and all `DATA` packets.
+struct Received {
     bytes: Vec<u8>,
     credentials: Credentials,
 }
 
-impl Reading {
-    fn new() -> Self {
-        Self {
-            started: false,
-            bytes: Vec::new(),
-            credentials: Credentials::default(),
-        }
-    }
+/// Progress of an OSC 5522 read reply.
+enum Reading {
+    AwaitingOk,
+    Receiving {
+        bytes: Vec<u8>,
+        credentials: Credentials,
+    },
+}
 
-    fn accept(&mut self, packet: &Packet<'_>, expected: &str, limit: usize) -> Option<bool> {
-        if self.started
-            && packet
-                .password
-                .as_ref()
-                .is_some_and(|password| self.credentials.password.as_ref() != Some(password))
-        {
-            return None;
-        }
-        match packet.status {
-            "OK" if !self.started => {
-                self.started = true;
-                self.credentials.primary = packet.primary;
-                self.credentials.password.clone_from(&packet.password);
+enum Progress {
+    Pending(Reading),
+    Complete(Received),
+    Failed,
+}
+
+impl Reading {
+    fn accept(self, packet: &Packet<'_>, expected: &str, limit: usize) -> Progress {
+        match (self, packet.status) {
+            (Self::AwaitingOk, Status::Ok) => Progress::Pending(Self::Receiving {
+                bytes: Vec::new(),
+                credentials: Credentials {
+                    selection: packet.selection,
+                    password: packet.password.clone(),
+                },
+            }),
+            (Self::Receiving { credentials, .. }, _)
+                if packet
+                    .password
+                    .as_ref()
+                    .is_some_and(|password| credentials.password.as_ref() != Some(password)) =>
+            {
+                Progress::Failed
             }
-            "DATA" if self.started && packet.mime.as_deref() == Some(expected) => {
-                let data = STANDARD.decode(packet.payload).ok()?;
-                if data.len() > MAX_CHUNK_BYTES || self.bytes.len() + data.len() > limit {
-                    return None;
+            (
+                Self::Receiving {
+                    mut bytes,
+                    credentials,
+                },
+                Status::Data,
+            ) if packet.mime.as_deref() == Some(expected) => {
+                let Ok(data) = STANDARD.decode(packet.payload) else {
+                    return Progress::Failed;
+                };
+                if data.len() > MAX_CHUNK_BYTES || bytes.len() + data.len() > limit {
+                    return Progress::Failed;
                 }
-                self.bytes.extend_from_slice(&data);
+                bytes.extend_from_slice(&data);
+                Progress::Pending(Self::Receiving { bytes, credentials })
             }
-            "DONE" if self.started => return Some(true),
-            _ => return None,
+            (Self::Receiving { bytes, credentials }, Status::Done) => {
+                Progress::Complete(Received { bytes, credentials })
+            }
+            _ => Progress::Failed,
         }
-        Some(false)
     }
 }
 
 enum Request {
     List {
         selection: Selection,
-        shortcut: bool,
+        refresh: Refresh,
         epoch: u64,
     },
     Read {
@@ -100,27 +148,76 @@ enum Request {
     },
 }
 
+impl Request {
+    const fn selection(&self) -> Selection {
+        match self {
+            Self::List { selection, .. }
+            | Self::Read { selection, .. }
+            | Self::Write { selection, .. } => *selection,
+        }
+    }
+}
+
 struct Queued {
     request: Request,
     deadline: Instant,
 }
 
-struct Operation {
-    id: String,
-    request: Request,
-    reading: Reading,
-    deadline: Instant,
-    cancelled: bool,
+/// Who receives the result of a representation read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    To(ClipboardRequestId),
+    /// The server withdrew the request; the terminal's reply is consumed
+    /// silently to keep later replies correlated.
+    Cancelled,
 }
 
-struct Writing {
+/// What an in-flight request is waiting for.
+enum Purpose {
+    List {
+        refresh: Refresh,
+        epoch: u64,
+        reading: Reading,
+    },
+    Read {
+        reply: Reply,
+        mime: String,
+        reading: Reading,
+    },
+    Write,
+}
+
+/// A request whose header was sent and whose reply is awaited.
+struct Operation {
+    id: OperationId,
+    selection: Selection,
+    deadline: Instant,
+    purpose: Purpose,
+}
+
+/// Whether a streaming write's `DONE` reply is still awaited.
+enum WriteReply {
+    Awaiting {
+        id: OperationId,
+        deadline: Instant,
+    },
+    /// The write timed out or the terminal reported an error; the payload
+    /// still streams to its terminator so the terminal sees a complete
+    /// transfer before the next request.
+    Abandoned,
+}
+
+/// Remaining `wdata` packets of a write.
+struct Stream {
     data: ClipboardData,
     item: usize,
     offset: usize,
 }
 
-impl Writing {
-    fn advance(&mut self, output: &mut Vec<u8>) -> bool {
+impl Stream {
+    /// Append the next `wdata` packet, returning true once the terminator was
+    /// written.
+    fn write_chunk(&mut self, output: &mut Vec<u8>) -> bool {
         let Some(item) = self.data.items.get(self.item) else {
             packet(output, "type=wdata", b"");
             return true;
@@ -144,26 +241,64 @@ impl Writing {
     }
 }
 
+/// The single request the terminal is serving.
+#[derive(Default)]
+enum Channel {
+    #[default]
+    Idle,
+    Awaiting(Operation),
+    Streaming {
+        selection: Selection,
+        stream: Stream,
+        reply: WriteReply,
+    },
+}
+
+impl Channel {
+    const fn selection(&self) -> Option<Selection> {
+        match self {
+            Self::Idle => None,
+            Self::Awaiting(operation) => Some(operation.selection),
+            Self::Streaming { selection, .. } => Some(*selection),
+        }
+    }
+
+    const fn deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Awaiting(operation) => Some(operation.deadline),
+            Self::Streaming {
+                reply: WriteReply::Awaiting { deadline, .. },
+                ..
+            } => Some(*deadline),
+            Self::Idle
+            | Self::Streaming {
+                reply: WriteReply::Abandoned,
+                ..
+            } => None,
+        }
+    }
+}
+
 /// Bounded OSC 5522 selections with serialized requests and session
 /// credentials.
 pub(crate) struct Clipboard {
     password: String,
-    focused: bool,
+    focus: Focus,
     /// Explicit pastes supersede MIME refreshes issued before them.
     epochs: [u64; 2],
-    next: u64,
+    next_operation: u64,
+    next_offer: u64,
     requests: VecDeque<Queued>,
-    active: Option<Operation>,
-    writing: Option<Writing>,
+    channel: Channel,
     notification: Option<Reading>,
     offers: HashMap<ClipboardOfferId, Credentials>,
     actions: VecDeque<Action>,
 }
 
-impl std::fmt::Debug for Clipboard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Clipboard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Clipboard")
-            .field("focused", &self.focused)
+            .field("focus", &self.focus)
             .field("queued_requests", &self.requests.len())
             .finish_non_exhaustive()
     }
@@ -180,12 +315,12 @@ impl Clipboard {
         getrandom::fill(&mut password).map_err(io::Error::other)?;
         Ok(Self {
             password: STANDARD.encode(password),
-            focused: true,
+            focus: Focus::Gained,
             epochs: [0; 2],
-            next: 0,
+            next_operation: 0,
+            next_offer: 0,
             requests: VecDeque::new(),
-            active: None,
-            writing: None,
+            channel: Channel::Idle,
             notification: None,
             offers: HashMap::new(),
             actions: VecDeque::new(),
@@ -193,20 +328,19 @@ impl Clipboard {
     }
 
     /// Resume background refreshes on focus entry and stop them on focus loss.
-    pub(crate) fn focus(&mut self, focus: Focus) {
-        self.focused = focus == Focus::Gained;
-        if self.focused {
-            let _ = self.refresh(Selection::Clipboard, Refresh::Background);
-            let _ = self.refresh(Selection::Primary, Refresh::Background);
-        } else {
-            self.cancel_refresh();
+    pub(crate) fn focus(&mut self, focus: Focus, now: Instant) {
+        self.focus = focus;
+        match focus {
+            Focus::Gained => {
+                let _ = self.refresh(Selection::Clipboard, Refresh::Background, now);
+                let _ = self.refresh(Selection::Primary, Refresh::Background, now);
+            }
+            Focus::Lost => {
+                self.notification = None;
+                self.cancel_lists(Selection::Clipboard);
+                self.cancel_lists(Selection::Primary);
+            }
         }
-    }
-
-    pub(crate) fn cancel_refresh(&mut self) {
-        self.notification = None;
-        self.cancel_lists(Selection::Clipboard);
-        self.cancel_lists(Selection::Primary);
     }
 
     /// Supersede queued metadata refreshes for one selection.
@@ -215,15 +349,23 @@ impl Clipboard {
     }
 
     /// Request MIME metadata, returning the deadline for deferred paste input.
-    pub(crate) fn refresh(&mut self, selection: Selection, refresh: Refresh) -> Option<Instant> {
+    pub(crate) fn refresh(
+        &mut self,
+        selection: Selection,
+        refresh: Refresh,
+        now: Instant,
+    ) -> Option<Instant> {
         if refresh == Refresh::Paste && self.has_selection(selection) {
             return None;
         }
-        self.enqueue(Request::List {
-            selection,
-            shortcut: refresh == Refresh::Paste,
-            epoch: self.epoch(selection),
-        })
+        self.enqueue(
+            Request::List {
+                selection,
+                refresh,
+                epoch: self.epoch(selection),
+            },
+            now,
+        )
     }
 
     /// Queue a representation read from a previously advertised selection
@@ -234,34 +376,36 @@ impl Clipboard {
         offer: ClipboardOfferId,
         mime: String,
         deadline: Deadline,
+        now: Instant,
     ) {
         let selection = self
             .offers
             .get(&offer)
-            .map_or(Selection::Clipboard, |credentials| {
-                if credentials.primary {
-                    Selection::Primary
-                } else {
-                    Selection::Clipboard
-                }
-            });
-        let _ = self.enqueue(Request::Read {
-            selection,
-            request,
-            offer,
-            mime,
-            deadline,
-        });
+            .map_or(Selection::Clipboard, |credentials| credentials.selection);
+        let _ = self.enqueue(
+            Request::Read {
+                selection,
+                request,
+                offer,
+                mime,
+                deadline,
+            },
+            now,
+        );
     }
 
     /// Suppress a pending representation read and any queued reply for it.
     pub(crate) fn cancel(&mut self, request: ClipboardRequestId) {
-        let matches = |candidate: &Request| matches!(candidate, Request::Read { request: number, .. } if *number == request);
-        self.requests.retain(|queued| !matches(&queued.request));
-        if let Some(operation) = &mut self.active
-            && matches(&operation.request)
+        self.requests.retain(|queued| {
+            !matches!(queued.request, Request::Read { request: number, .. } if number == request)
+        });
+        if let Channel::Awaiting(Operation {
+            purpose: Purpose::Read { reply, .. },
+            ..
+        }) = &mut self.channel
+            && *reply == Reply::To(request)
         {
-            operation.cancelled = true;
+            *reply = Reply::Cancelled;
         }
         self.actions.retain(
             |action| !matches!(action, Action::Reply { request: number, .. } if *number == request),
@@ -273,13 +417,11 @@ impl Clipboard {
     }
 
     fn has_selection(&self, selection: Selection) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|operation| request_selection(&operation.request) == selection)
+        self.channel.selection() == Some(selection)
             || self
                 .requests
                 .iter()
-                .any(|queued| request_selection(&queued.request) == selection)
+                .any(|queued| queued.request.selection() == selection)
     }
 
     fn cancel_lists(&mut self, selection: Selection) {
@@ -288,10 +430,10 @@ impl Clipboard {
         self.requests.retain(|queued| match &queued.request {
             Request::List {
                 selection: target,
-                shortcut,
+                refresh,
                 ..
             } if *target == selection => {
-                unblock |= *shortcut;
+                unblock |= *refresh == Refresh::Paste;
                 false
             }
             _ => true,
@@ -303,39 +445,35 @@ impl Clipboard {
 
     /// Queue bounded MIME-aware clipboard contents for the selected
     /// destination.
-    pub(crate) fn copy(&mut self, selection: Selection, data: ClipboardData) {
+    pub(crate) fn copy(&mut self, selection: Selection, data: ClipboardData, now: Instant) {
         if !data.valid() {
             return;
         }
-        let _ = self.enqueue(Request::Write { selection, data });
+        let _ = self.enqueue(Request::Write { selection, data }, now);
     }
 
-    fn enqueue(&mut self, request: Request) -> Option<Instant> {
+    fn enqueue(&mut self, request: Request, now: Instant) -> Option<Instant> {
         let timeout = match &request {
-            Request::List { .. } => Duration::from_secs(1),
+            Request::List { .. } => LIST_TIMEOUT,
             Request::Read { deadline, .. } => deadline.remaining(),
             Request::Write { .. } => TRANSFER_TIMEOUT,
         };
         if timeout.is_zero() {
-            self.failed(&request);
+            self.fail_request(&request);
             return None;
         }
-        let write_selection = match &request {
-            Request::Write { selection, .. } => Some(*selection),
-            _ => None,
-        };
-        if let Some(selection) = write_selection {
+        if let Request::Write { selection, .. } = request {
             self.requests.retain(|queued| {
-                !matches!(&queued.request, Request::Write { selection: target, .. } if *target == selection)
+                !matches!(queued.request, Request::Write { selection: target, .. } if target == selection)
             });
             self.cancel_lists(selection);
         }
         if self.requests.len() >= MAX_REQUESTS {
             tracing::warn!("Clipboard request queue is full");
-            self.failed(&request);
+            self.fail_request(&request);
             return None;
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = now + timeout;
         self.requests.push_back(Queued { request, deadline });
         Some(deadline)
     }
@@ -348,28 +486,40 @@ impl Clipboard {
     /// Earliest request deadline that should wake the terminal session.
     #[must_use]
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.active
-            .as_ref()
-            .map(|operation| operation.deadline)
+        self.channel
+            .deadline()
             .into_iter()
             .chain(self.requests.iter().map(|queued| queued.deadline))
             .min()
     }
 
-    fn expire(&mut self) {
-        let now = Instant::now();
-        if let Some(operation) = self.active.take_if(|active| now >= active.deadline)
-            && !operation.cancelled
-        {
-            tracing::warn!(id = operation.id, "Terminal clipboard request timed out");
-            self.failed(&operation.request);
-        }
-        let mut requests = std::mem::take(&mut self.requests);
+    fn expire(&mut self, now: Instant) {
+        self.channel = match mem::take(&mut self.channel) {
+            Channel::Awaiting(operation) if now >= operation.deadline => {
+                tracing::warn!(id = %operation.id, "Terminal clipboard request timed out");
+                self.fail_purpose(&operation.purpose);
+                Channel::Idle
+            }
+            Channel::Streaming {
+                selection,
+                stream,
+                reply: WriteReply::Awaiting { id, deadline },
+            } if now >= deadline => {
+                tracing::warn!(%id, "Terminal clipboard write timed out");
+                Channel::Streaming {
+                    selection,
+                    stream,
+                    reply: WriteReply::Abandoned,
+                }
+            }
+            channel => channel,
+        };
+        let mut requests = mem::take(&mut self.requests);
         requests.retain(|queued| {
             if now < queued.deadline {
                 true
             } else {
-                self.failed(&queued.request);
+                self.fail_request(&queued.request);
                 false
             }
         });
@@ -377,221 +527,323 @@ impl Clipboard {
     }
 
     /// Expire requests and append the next transfer when output is idle.
-    pub(crate) fn advance(&mut self, output: &mut Vec<u8>) {
-        self.expire();
+    pub(crate) fn advance(&mut self, now: Instant, output: &mut Vec<u8>) {
+        self.expire(now);
         if !output.is_empty() {
             return;
         }
-        if let Some(writing) = &mut self.writing {
-            if writing.advance(output) {
-                self.writing = None;
-            }
-            return;
-        }
-        if self.active.is_some() {
-            return;
-        }
-        while let Some(Queued {
-            mut request,
-            deadline,
-        }) = self.requests.pop_front()
-        {
-            self.next += 1;
-            let id = format!("meowland-{}", self.next);
-            let mut metadata = format!(
-                "id={id}:name={}:pw={}",
-                STANDARD.encode("meowland"),
-                STANDARD.encode(&self.password)
-            );
-            match &mut request {
-                Request::List { selection, .. } => {
-                    if *selection == Selection::Primary {
-                        metadata.push_str(":loc=primary");
+        self.channel = match mem::take(&mut self.channel) {
+            Channel::Streaming {
+                selection,
+                mut stream,
+                reply,
+            } => {
+                if !stream.write_chunk(output) {
+                    Channel::Streaming {
+                        selection,
+                        stream,
+                        reply,
                     }
-                    packet(output, format_args!("type=read:{metadata}"), b".");
+                } else if let WriteReply::Awaiting { id, deadline } = reply {
+                    Channel::Awaiting(Operation {
+                        id,
+                        selection,
+                        deadline,
+                        purpose: Purpose::Write,
+                    })
+                } else {
+                    Channel::Idle
+                }
+            }
+            Channel::Idle => self.start_next(output),
+            channel @ Channel::Awaiting(_) => channel,
+        };
+    }
+
+    fn start_next(&mut self, output: &mut Vec<u8>) -> Channel {
+        while let Some(Queued { request, deadline }) = self.requests.pop_front() {
+            self.next_operation += 1;
+            let id = OperationId(self.next_operation);
+            let selection = request.selection();
+            let session = Requester {
+                id,
+                name: SESSION_NAME,
+                password: &self.password,
+                selection,
+            };
+            let purpose = match request {
+                Request::List { refresh, epoch, .. } => {
+                    packet(
+                        output,
+                        format_args!("type=read:{session}"),
+                        LIST_PAYLOAD.as_bytes(),
+                    );
+                    Purpose::List {
+                        refresh,
+                        epoch,
+                        reading: Reading::AwaitingOk,
+                    }
                 }
                 Request::Read {
-                    request: number,
+                    request,
                     offer,
                     mime,
                     ..
                 } => {
-                    let Some(credentials) = self.offers.get_mut(offer) else {
+                    let Some(credentials) = self.offers.get_mut(&offer) else {
                         self.actions.push_back(Action::Reply {
-                            request: *number,
+                            request,
                             data: None,
                         });
                         continue;
                     };
-                    if credentials.primary {
-                        metadata.push_str(":loc=primary");
+                    match credentials.password.take() {
+                        Some(password) => {
+                            let paste = Requester {
+                                name: PASTE_EVENT_NAME,
+                                password: &password,
+                                ..session
+                            };
+                            packet(output, format_args!("type=read:{paste}"), mime.as_bytes());
+                        }
+                        None => {
+                            packet(output, format_args!("type=read:{session}"), mime.as_bytes());
+                        }
                     }
-                    if let Some(password) = credentials.password.take() {
-                        metadata = format!(
-                            "id={id}:name={}:pw={}{}",
-                            STANDARD.encode("Paste event"),
-                            STANDARD.encode(password),
-                            if credentials.primary {
-                                ":loc=primary"
-                            } else {
-                                ""
-                            }
-                        );
+                    Purpose::Read {
+                        reply: Reply::To(request),
+                        mime,
+                        reading: Reading::AwaitingOk,
                     }
-                    packet(
-                        output,
-                        format_args!("type=read:{metadata}"),
-                        mime.as_bytes(),
-                    );
                 }
-                Request::Write { selection, data } => {
-                    if *selection == Selection::Primary {
-                        metadata.push_str(":loc=primary");
-                    }
-                    packet(output, format_args!("type=write:{metadata}"), b"");
-                    self.writing = Some(Writing {
-                        data: std::mem::take(data),
-                        item: 0,
-                        offset: 0,
-                    });
+                Request::Write { data, .. } => {
+                    packet(output, format_args!("type=write:{session}"), b"");
+                    return Channel::Streaming {
+                        selection,
+                        stream: Stream {
+                            data,
+                            item: 0,
+                            offset: 0,
+                        },
+                        reply: WriteReply::Awaiting { id, deadline },
+                    };
                 }
-            }
-            self.active = Some(Operation {
+            };
+            return Channel::Awaiting(Operation {
                 id,
-                request,
-                reading: Reading::new(),
+                selection,
                 deadline,
-                cancelled: false,
+                purpose,
             });
-            break;
         }
+        Channel::Idle
     }
 
     /// Accept an OSC 5522 reply or paste notification from the terminal.
-    pub(crate) fn packet(&mut self, bytes: &[u8]) {
-        self.expire();
+    pub(crate) fn packet(&mut self, bytes: &[u8], now: Instant) {
+        self.expire(now);
         let Some(packet) = Packet::parse(bytes) else {
             return;
         };
-        if packet.id.is_none() && packet.kind == "read" {
-            if packet.status == "OK" && self.focused {
-                self.notification = Some(Reading::new());
+        let Some(id) = packet.id else {
+            if packet.kind == Kind::Read {
+                self.notification(&packet);
             }
-            if let Some(reading) = &mut self.notification {
-                match reading.accept(&packet, ".", MAX_TYPE_LIST) {
-                    Some(true) => {
-                        let Some(reading) = self.notification.take() else {
-                            return;
-                        };
-                        let selection = if reading.credentials.primary {
-                            Selection::Primary
-                        } else {
-                            Selection::Clipboard
-                        };
-                        self.cancel_lists(selection);
-                        self.offer(reading, selection, Refresh::Paste);
-                        self.actions.push_back(Action::Unblock);
-                    }
-                    Some(false) => {}
-                    None => {
-                        self.notification = None;
-                    }
-                }
-            }
-            return;
-        }
-        let Some(operation) = &mut self.active else {
             return;
         };
-        if packet.id != Some(operation.id.as_str()) {
-            return;
-        }
-        let done = match &operation.request {
-            Request::Write { .. } if packet.kind == "write" => match packet.status {
-                "DONE" => Some(true),
-                _ => None,
-            },
-            Request::List { .. } if packet.kind == "read" => {
-                operation.reading.accept(&packet, ".", MAX_TYPE_LIST)
+        let id = OperationId::parse(id);
+        self.channel = match mem::take(&mut self.channel) {
+            Channel::Awaiting(operation) if id == Some(operation.id) => {
+                self.reply(operation, &packet)
             }
-            Request::Read { mime, .. } if packet.kind == "read" => {
-                operation.reading.accept(&packet, mime, MAX_BYTES)
-            }
-            _ => None,
-        };
-        if done == Some(false) {
-            return;
-        }
-        let Some(operation) = self.active.take() else {
-            return;
-        };
-        if operation.cancelled {
-            return;
-        }
-        if done.is_none() {
-            tracing::warn!(
-                status = packet.status,
-                id = operation.id,
-                "Terminal clipboard request failed"
-            );
-            self.failed(&operation.request);
-            return;
-        }
-        match operation.request {
-            Request::List {
+            Channel::Streaming {
                 selection,
-                shortcut,
-                epoch,
-            } if epoch == self.epoch(selection) => {
-                self.offer(operation.reading, selection, Refresh::Background);
-                if shortcut {
-                    self.actions.push_back(Action::Unblock);
+                stream,
+                reply: WriteReply::Awaiting { id: awaited, .. },
+            } if id == Some(awaited) => {
+                tracing::warn!(
+                    status = ?packet.status,
+                    id = %awaited,
+                    "Terminal clipboard write ended before its data was sent"
+                );
+                Channel::Streaming {
+                    selection,
+                    stream,
+                    reply: WriteReply::Abandoned,
                 }
             }
-            Request::Read { request, .. } => self.actions.push_back(Action::Reply {
-                request,
-                data: Some(operation.reading.bytes),
-            }),
-            Request::List { shortcut, .. } => {
-                if shortcut {
-                    self.actions.push_back(Action::Unblock);
-                }
+            channel => channel,
+        };
+    }
+
+    fn notification(&mut self, packet: &Packet<'_>) {
+        if packet.status == Status::Ok && self.focus == Focus::Gained {
+            self.notification = Some(Reading::AwaitingOk);
+        }
+        let Some(reading) = self.notification.take() else {
+            return;
+        };
+        match reading.accept(packet, LIST_PAYLOAD, MAX_TYPE_LIST) {
+            Progress::Pending(reading) => self.notification = Some(reading),
+            Progress::Complete(received) => {
+                let selection = received.credentials.selection;
+                self.cancel_lists(selection);
+                self.offer(received, selection, OfferIntent::Paste);
+                self.actions.push_back(Action::Unblock);
             }
-            Request::Write { .. } => {}
+            Progress::Failed => {}
         }
     }
 
-    fn offer(&mut self, reading: Reading, selection: Selection, refresh: Refresh) {
-        let Ok(types) = String::from_utf8(reading.bytes) else {
+    fn reply(&mut self, operation: Operation, packet: &Packet<'_>) -> Channel {
+        let Operation {
+            id,
+            selection,
+            deadline,
+            purpose,
+        } = operation;
+        let progress = match (purpose, packet.kind) {
+            (Purpose::Write, Kind::Write) if packet.status == Status::Done => return Channel::Idle,
+            (
+                Purpose::List {
+                    refresh,
+                    epoch,
+                    reading,
+                },
+                Kind::Read,
+            ) => match reading.accept(packet, LIST_PAYLOAD, MAX_TYPE_LIST) {
+                Progress::Pending(reading) => Ok(Purpose::List {
+                    refresh,
+                    epoch,
+                    reading,
+                }),
+                Progress::Complete(received) => {
+                    if epoch == self.epoch(selection) {
+                        self.offer(received, selection, OfferIntent::Refresh);
+                    }
+                    if refresh == Refresh::Paste {
+                        self.actions.push_back(Action::Unblock);
+                    }
+                    return Channel::Idle;
+                }
+                Progress::Failed => Err(Purpose::List {
+                    refresh,
+                    epoch,
+                    reading: Reading::AwaitingOk,
+                }),
+            },
+            (
+                Purpose::Read {
+                    reply,
+                    mime,
+                    reading,
+                },
+                Kind::Read,
+            ) => match reading.accept(packet, &mime, MAX_BYTES) {
+                Progress::Pending(reading) => Ok(Purpose::Read {
+                    reply,
+                    mime,
+                    reading,
+                }),
+                Progress::Complete(received) => {
+                    if let Reply::To(request) = reply {
+                        self.actions.push_back(Action::Reply {
+                            request,
+                            data: Some(received.bytes),
+                        });
+                    }
+                    return Channel::Idle;
+                }
+                Progress::Failed => Err(Purpose::Read {
+                    reply,
+                    mime,
+                    reading: Reading::AwaitingOk,
+                }),
+            },
+            (purpose, _) => Err(purpose),
+        };
+        match progress {
+            Ok(purpose) => Channel::Awaiting(Operation {
+                id,
+                selection,
+                deadline,
+                purpose,
+            }),
+            Err(purpose) => {
+                if !matches!(
+                    purpose,
+                    Purpose::Read {
+                        reply: Reply::Cancelled,
+                        ..
+                    }
+                ) {
+                    tracing::warn!(
+                        status = ?packet.status,
+                        %id,
+                        "Terminal clipboard request failed"
+                    );
+                }
+                self.fail_purpose(&purpose);
+                Channel::Idle
+            }
+        }
+    }
+
+    fn offer(&mut self, received: Received, selection: Selection, intent: OfferIntent) {
+        let Ok(types) = String::from_utf8(received.bytes) else {
             return;
         };
         let mimes = mime_types(types.split_ascii_whitespace().map(str::to_owned));
-        self.next += 1;
-        let offer = ClipboardOfferId::from(self.next);
+        self.next_offer += 1;
+        let offer = ClipboardOfferId::from(self.next_offer);
         if self.offers.len() >= MAX_OFFERS
             && let Some(oldest) = self.offers.keys().min().copied()
         {
             self.offers.remove(&oldest);
         }
-        let mut credentials = reading.credentials;
-        credentials.primary = selection == Selection::Primary;
-        self.offers.insert(offer, credentials);
+        self.offers.insert(
+            offer,
+            Credentials {
+                selection,
+                password: received.credentials.password,
+            },
+        );
         self.actions.push_back(Action::Offer {
             selection,
             offer,
             mimes,
-            paste: refresh == Refresh::Paste,
+            intent,
         });
     }
 
-    fn failed(&mut self, request: &Request) {
-        match request {
-            Request::List { shortcut: true, .. } => self.actions.push_back(Action::Unblock),
+    fn fail_request(&mut self, request: &Request) {
+        match *request {
+            Request::List {
+                refresh: Refresh::Paste,
+                ..
+            } => self.actions.push_back(Action::Unblock),
             Request::Read { request, .. } => self.actions.push_back(Action::Reply {
-                request: *request,
+                request,
                 data: None,
             }),
-            _ => {}
+            Request::List { .. } | Request::Write { .. } => {}
+        }
+    }
+
+    fn fail_purpose(&mut self, purpose: &Purpose) {
+        match *purpose {
+            Purpose::List {
+                refresh: Refresh::Paste,
+                ..
+            } => self.actions.push_back(Action::Unblock),
+            Purpose::Read {
+                reply: Reply::To(request),
+                ..
+            } => self.actions.push_back(Action::Reply {
+                request,
+                data: None,
+            }),
+            Purpose::List { .. } | Purpose::Read { .. } | Purpose::Write => {}
         }
     }
 }
@@ -603,11 +855,29 @@ const fn selection_index(selection: Selection) -> usize {
     }
 }
 
-const fn request_selection(request: &Request) -> Selection {
-    match request {
-        Request::List { selection, .. }
-        | Request::Read { selection, .. }
-        | Request::Write { selection, .. } => *selection,
+/// Request metadata identifying the requester to the terminal's permission
+/// prompt.
+#[derive(Clone, Copy)]
+struct Requester<'a> {
+    id: OperationId,
+    name: &'a str,
+    password: &'a str,
+    selection: Selection,
+}
+
+impl fmt::Display for Requester<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "id={}:name={}:pw={}",
+            self.id,
+            Base64Display::new(self.name.as_bytes(), &STANDARD),
+            Base64Display::new(self.password.as_bytes(), &STANDARD)
+        )?;
+        if self.selection == Selection::Primary {
+            f.write_str(":loc=primary")?;
+        }
+        Ok(())
     }
 }
 
@@ -620,13 +890,38 @@ fn packet(output: &mut Vec<u8>, metadata: impl fmt::Display, payload: &[u8]) {
     .expect("writing to a Vec cannot fail");
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Read,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status<'a> {
+    Ok,
+    Data,
+    Done,
+    Error(&'a str),
+}
+
+impl<'a> Status<'a> {
+    fn parse(status: &'a str) -> Self {
+        match status {
+            "OK" => Self::Ok,
+            "DATA" => Self::Data,
+            "DONE" => Self::Done,
+            error => Self::Error(error),
+        }
+    }
+}
+
 struct Packet<'a> {
-    kind: &'a str,
-    status: &'a str,
+    kind: Kind,
+    status: Status<'a>,
     id: Option<&'a str>,
     mime: Option<String>,
     password: Option<String>,
-    primary: bool,
+    selection: Selection,
     payload: &'a str,
 }
 
@@ -648,21 +943,29 @@ impl<'a> Packet<'a> {
             }
             String::from_utf8(decoded).ok()
         };
+        let optional = |key| {
+            if fields.contains_key(key) {
+                decode(key).map(Some)
+            } else {
+                Some(None)
+            }
+        };
+        let kind = match *fields.get("type")? {
+            "read" => Kind::Read,
+            "write" => Kind::Write,
+            _ => return None,
+        };
         Some(Self {
-            kind: fields.get("type")?,
-            status: fields.get("status")?,
+            kind,
+            status: Status::parse(fields.get("status")?),
             id: fields.get("id").copied(),
-            mime: if fields.contains_key("mime") {
-                Some(decode("mime")?)
+            mime: optional("mime")?,
+            password: optional("pw")?,
+            selection: if fields.get("loc") == Some(&"primary") {
+                Selection::Primary
             } else {
-                None
+                Selection::Clipboard
             },
-            password: if fields.contains_key("pw") {
-                Some(decode("pw")?)
-            } else {
-                None
-            },
-            primary: fields.get("loc") == Some(&"primary"),
             payload,
         })
     }
@@ -708,28 +1011,30 @@ mod tests {
                 data: vec![7; WRITE_CHUNK_BYTES],
             },
         ];
+        let now = Instant::now();
         let mut clipboard = Clipboard::new().expect("clipboard credentials");
         clipboard.copy(
             Selection::Clipboard,
             ClipboardData {
                 items: items.clone(),
             },
+            now,
         );
         let mut output = Vec::new();
         let mut wire = Vec::new();
         loop {
-            clipboard.advance(&mut output);
+            clipboard.advance(now, &mut output);
             assert!(
                 !output.is_empty(),
                 "each drain must be followed by write progress"
             );
             assert!(output.len() < 8192, "write output must remain bounded");
             let queued_len = output.len();
-            clipboard.advance(&mut output);
+            clipboard.advance(now, &mut output);
             assert_eq!(output.len(), queued_len, "undrained output must not grow");
             wire.extend_from_slice(&output);
             output.clear();
-            if clipboard.writing.is_none() {
+            if matches!(clipboard.channel, Channel::Awaiting(_)) {
                 break;
             }
         }
@@ -792,6 +1097,7 @@ mod tests {
 
     #[test]
     fn timed_out_write_finishes_before_next_request_and_ignores_late_reply() {
+        let now = Instant::now();
         let mut clipboard = Clipboard::new().expect("clipboard credentials");
         clipboard.copy(
             Selection::Clipboard,
@@ -801,42 +1107,45 @@ mod tests {
                     data: vec![1; WRITE_CHUNK_BYTES + 1],
                 }],
             },
+            now,
         );
         let mut output = Vec::new();
-        clipboard.advance(&mut output);
+        clipboard.advance(now, &mut output);
         output.clear();
-        clipboard.copy(Selection::Primary, ClipboardData::default());
-        clipboard
-            .active
-            .as_mut()
-            .expect("first write is active")
-            .deadline = Instant::now();
+        assert_eq!(clipboard.deadline(), Some(now + TRANSFER_TIMEOUT));
+        clipboard.copy(
+            Selection::Primary,
+            ClipboardData::default(),
+            now + Duration::from_secs(1),
+        );
 
+        let expired = now + TRANSFER_TIMEOUT;
         let mut wire = Vec::new();
-        while clipboard.writing.is_some() {
-            clipboard.advance(&mut output);
+        while matches!(clipboard.channel, Channel::Streaming { .. }) {
+            clipboard.advance(expired, &mut output);
             assert!(!output.is_empty(), "timed-out write must still finish");
             wire.extend_from_slice(&output);
             output.clear();
         }
-        assert!(
-            clipboard.active.is_none(),
-            "expired request must be removed"
-        );
         let packets = decode_packets(&wire);
         assert_eq!(packets.len(), 3, "two data chunks and one terminator");
         assert_eq!(packets.last().expect("terminator").0, "type=wdata");
 
-        clipboard.advance(&mut output);
+        clipboard.advance(expired, &mut output);
         let header = decode_packets(&output);
         assert!(header[0].0.starts_with("type=write:id=meowland-2:"));
-        clipboard.packet(b"type=write:status=DONE:id=meowland-1;");
-        assert_eq!(
-            clipboard
-                .active
-                .as_ref()
-                .map(|operation| operation.id.as_str()),
-            Some("meowland-2"),
+        clipboard.packet(b"type=write:status=DONE:id=meowland-1;", expired);
+        assert!(
+            matches!(
+                clipboard.channel,
+                Channel::Streaming {
+                    reply: WriteReply::Awaiting {
+                        id: OperationId(2),
+                        ..
+                    },
+                    ..
+                }
+            ),
             "a late reply must not finish the next request"
         );
     }
@@ -847,29 +1156,29 @@ mod tests {
             b"type=read:status=OK:id=abc:mime=dGV4dC9wbGFpbg==:pw=c2VjcmV0:loc=primary;cGF5bG9hZA==",
         )
         .expect("valid packet");
-        assert_eq!(packet.kind, "read");
-        assert_eq!(packet.status, "OK");
+        assert_eq!(packet.kind, Kind::Read);
+        assert_eq!(packet.status, Status::Ok);
         assert_eq!(packet.id, Some("abc"));
         assert_eq!(packet.mime.as_deref(), Some("text/plain"));
         assert_eq!(packet.password.as_deref(), Some("secret"));
-        assert!(packet.primary);
+        assert_eq!(packet.selection, Selection::Primary);
         assert_eq!(packet.payload, "cGF5bG9hZA==");
     }
 
     #[test]
     fn packet_parses_optional_fields_and_defaults() {
         let packet = Packet::parse(b"type=write:status=DONE;").expect("valid packet");
-        assert_eq!(packet.kind, "write");
-        assert_eq!(packet.status, "DONE");
+        assert_eq!(packet.kind, Kind::Write);
+        assert_eq!(packet.status, Status::Done);
         assert_eq!(packet.id, None);
         assert_eq!(packet.mime, None);
         assert_eq!(packet.password, None);
-        assert!(!packet.primary);
+        assert_eq!(packet.selection, Selection::Clipboard);
         assert_eq!(packet.payload, "");
 
         let packet =
             Packet::parse(b"type=read:status=OK:loc=secondary;payload").expect("valid packet");
-        assert!(!packet.primary);
+        assert_eq!(packet.selection, Selection::Clipboard);
         assert_eq!(packet.payload, "payload");
     }
 

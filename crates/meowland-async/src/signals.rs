@@ -47,12 +47,19 @@ impl Signal {
     }
 
     /// Receive the next pending signal.
+    ///
+    /// # Panics
+    /// Never: the registered callback owns the sender for as long as this
+    /// subscription exists.
     #[expect(
         clippy::future_not_send,
         reason = "signal subscriptions belong to the owner thread"
     )]
-    pub async fn recv(&mut self) -> Option<UnixSignal> {
-        self.receiver.next().await
+    pub async fn recv(&mut self) -> UnixSignal {
+        self.receiver
+            .next()
+            .await
+            .expect("the signal callback owns the sender while the subscription lives")
     }
 }
 
@@ -86,8 +93,8 @@ impl Termination {
     )]
     pub async fn recv(&mut self) -> TerminationSignal {
         match self.0.recv().await {
-            Some(UnixSignal::SIGINT) => TerminationSignal::Interrupt,
-            Some(UnixSignal::SIGHUP) => TerminationSignal::Hangup,
+            UnixSignal::SIGINT => TerminationSignal::Interrupt,
+            UnixSignal::SIGHUP => TerminationSignal::Hangup,
             _ => TerminationSignal::Terminate,
         }
     }

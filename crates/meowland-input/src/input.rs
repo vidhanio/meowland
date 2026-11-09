@@ -10,5 +10,5 @@ mod parser;
 mod reader;
 
 pub use csi::number;
-pub use event::{Event, Key, Kind};
+pub use event::{Event, Focus, Key, Kind};
 pub use reader::Reader;

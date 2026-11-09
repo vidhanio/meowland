@@ -25,6 +25,7 @@ meowland-protocol = { path = "crates/meowland-protocol" }
 meowland-readback = { path = "crates/meowland-readback" }
 meowland-kitty = { path = "crates/meowland-kitty" }
 meowland-terminal = { path = "crates/meowland-terminal" }
+meowland-settings = { path = "crates/meowland-settings" }
 meowland-compositor = { path = "crates/meowland-compositor" }
 meowland-server = { path = "crates/meowland-server" }
 anyhow = "1"

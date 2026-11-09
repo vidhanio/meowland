@@ -27,6 +27,15 @@ pub struct Key {
     pub text: Option<String>,
 }
 
+/// Terminal focus transition reported by focus-event mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// The terminal pane gained focus.
+    Gained,
+    /// The terminal pane lost focus.
+    Lost,
+}
+
 /// Decoded terminal event, with bounded text and control-sequence payloads.
 #[derive(Debug, PartialEq)]
 pub enum Event {
@@ -36,8 +45,8 @@ pub enum Event {
     Text(String),
     /// Pixel-accurate pointer input, including signed drag coordinates.
     Pointer(Input),
-    /// Whether the terminal pane gained focus.
-    Focus(bool),
+    /// The terminal pane gained or lost focus.
+    Focus(Focus),
     /// Kernel-reported terminal size changed.
     Resize,
     /// Completed bracketed paste containing valid UTF-8.

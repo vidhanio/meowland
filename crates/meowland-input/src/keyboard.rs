@@ -4,7 +4,7 @@
 //! compositor knows the configured XKB layout. Keep key lifetimes and modifier
 //! snapshots here and forward the identities untranslated.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeMap;
 
 use meowland_protocol::{
     Input, KEY_INSERT, KEY_V, MAX_HELD_KEYS, Modifiers, Transition, valid_key_identity,
@@ -12,11 +12,20 @@ use meowland_protocol::{
 
 use super::input::{Key, Kind};
 
+/// What happens to a held key's later events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// The press was forwarded; its release will be too.
+    Forwarded,
+    /// A compositor shortcut consumed the press; repeats and the release are
+    /// suppressed.
+    Intercepted,
+}
+
 /// Held keys and releases intercepted by compositor shortcuts.
 #[derive(Debug, Default)]
 pub struct Keyboard {
-    intercepted: HashSet<u32>,
-    held: BTreeSet<u32>,
+    keys: BTreeMap<u32, Held>,
     modifiers: Modifiers,
 }
 
@@ -27,45 +36,43 @@ impl Keyboard {
             return None;
         }
         self.modifiers = event.modifiers;
-        if event.kind == Kind::Repeat
-            || self.intercepted.contains(&event.code) && event.kind == Kind::Press
-        {
-            return None;
-        }
-        let pressed = event.kind == Kind::Press;
-        if !pressed {
-            if self.intercepted.remove(&event.code) || !self.held.contains(&event.code) {
+        let state = match (event.kind, self.keys.get(&event.code)) {
+            (Kind::Press, Some(Held::Forwarded)) => Transition::Pressed,
+            (Kind::Press, None) if self.keys.len() < MAX_HELD_KEYS => Transition::Pressed,
+            (Kind::Release, Some(Held::Forwarded)) => Transition::Released,
+            (Kind::Release, Some(Held::Intercepted)) => {
+                self.keys.remove(&event.code);
                 return None;
             }
-        } else if !self.held.contains(&event.code)
-            && self.held.len() + self.intercepted.len() >= MAX_HELD_KEYS
-        {
-            return None;
-        }
-        let held = self.held.iter().copied().collect();
-        if pressed {
-            self.held.insert(event.code);
-        } else {
-            self.held.remove(&event.code);
-        }
+            _ => return None,
+        };
+        let held = self.forwarded();
+        match state {
+            Transition::Pressed => self.keys.insert(event.code, Held::Forwarded),
+            Transition::Released => self.keys.remove(&event.code),
+        };
         Some(Input::Key {
             key: event.code,
-            state: if pressed {
-                Transition::Pressed
-            } else {
-                Transition::Released
-            },
+            state,
             modifiers: event.modifiers,
             text: event.text,
             held,
         })
     }
 
+    fn forwarded(&self) -> Vec<u32> {
+        self.keys
+            .iter()
+            .filter(|&(_, &held)| held == Held::Forwarded)
+            .map(|(&code, _)| code)
+            .collect()
+    }
+
     /// Consume a shortcut press so its later release is not forwarded to the
     /// application.
     pub fn intercept(&mut self, key: u32) {
-        if self.held.remove(&key) {
-            self.intercepted.insert(key);
+        if let Some(held) = self.keys.get_mut(&key) {
+            *held = Held::Intercepted;
         }
     }
 
@@ -73,15 +80,14 @@ impl Keyboard {
     #[must_use]
     pub fn enter(&self) -> Input {
         Input::KeyboardEnter {
-            keys: self.held.iter().copied().collect(),
+            keys: self.forwarded(),
             modifiers: self.modifiers,
         }
     }
 
     /// Forget held keys, intercepted releases, and modifiers after focus loss.
     pub fn reset(&mut self) {
-        self.intercepted.clear();
-        self.held.clear();
+        self.keys.clear();
         self.modifiers = Modifiers::empty();
     }
 }
@@ -128,7 +134,7 @@ mod tests {
         assert_eq!(held.len(), MAX_HELD_KEYS);
         assert!(keyboard.input(key(1000, Kind::Press)).is_some());
         let Input::KeyboardEnter { keys, .. } = keyboard.enter() else {
-            unreachable!()
+            panic!("keyboard enter produced another input");
         };
         assert_eq!(keys.len(), MAX_HELD_KEYS);
         assert!(!keys.contains(&1));

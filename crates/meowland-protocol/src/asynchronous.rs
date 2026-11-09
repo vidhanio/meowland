@@ -11,15 +11,24 @@ use crate::{
 };
 const IO_BUDGET: usize = 64 * 1024;
 
+/// Where the reader is within the next packet.
+#[derive(Clone, Copy, Debug)]
+enum Phase {
+    /// `read` bytes of the length header have arrived.
+    Header { read: usize },
+    /// `read` of the `size` body bytes have arrived.
+    Body { size: usize, read: usize },
+    /// A read failed; the stream position is no longer known.
+    Failed,
+}
+
 /// A bounded packet reader retaining progress between readiness turns.
 #[derive(Debug)]
 pub struct Reader<R> {
     stream: R,
     header: [u8; HEADER],
-    header_read: usize,
     body: Vec<u8>,
-    body_size: usize,
-    body_read: usize,
+    phase: Phase,
 }
 
 impl<R: AsyncRead + Unpin> Reader<R> {
@@ -28,10 +37,8 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         Self {
             stream,
             header: [0; HEADER],
-            header_read: 0,
             body: Vec::new(),
-            body_size: 0,
-            body_read: 0,
+            phase: Phase::Header { read: 0 },
         }
     }
 
@@ -39,10 +46,15 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     /// Cancellation retains all partial header and body bytes.
     ///
     /// # Errors
-    /// Returns an error on EOF, invalid packets, or transport failure.
+    /// Returns an error on EOF, invalid packets, or transport failure, and on
+    /// every read after such an error.
     pub async fn read<T: DeserializeOwned>(&mut self) -> io::Result<T> {
         loop {
-            if let Some(message) = self.read_chunk().await? {
+            let chunk = self.read_chunk().await;
+            if chunk.is_err() {
+                self.phase = Phase::Failed;
+            }
+            if let Some(message) = chunk? {
                 return Ok(message);
             }
             meowland_async::future::yield_now().await;
@@ -50,40 +62,41 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     }
 
     async fn read_chunk<T: DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
-        if self.header_read < HEADER {
-            let read = self
-                .stream
-                .read(&mut self.header[self.header_read..])
-                .await?;
-            if read == 0 {
+        if let Phase::Header { read } = self.phase {
+            let count = self.stream.read(&mut self.header[read..]).await?;
+            if count == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
-            self.header_read += read;
-            if self.header_read < HEADER {
+            let read = read + count;
+            if read < HEADER {
+                self.phase = Phase::Header { read };
                 return Ok(None);
             }
-            self.body_size = message_size(self.header)?;
+            self.phase = Phase::Body {
+                size: message_size(self.header)?,
+                read: 0,
+            };
         }
-        if self.body_read < self.body_size {
-            let end = (self.body_read + IO_BUDGET).min(self.body_size);
+        let Phase::Body { size, mut read } = self.phase else {
+            return Err(io::Error::other("a previous read failed"));
+        };
+        if read < size {
+            let end = (read + IO_BUDGET).min(size);
             if self.body.len() < end {
                 self.body.resize(end, 0);
             }
-            let read = self
-                .stream
-                .read(&mut self.body[self.body_read..end])
-                .await?;
-            if read == 0 {
+            let count = self.stream.read(&mut self.body[read..end]).await?;
+            if count == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
-            self.body_read += read;
-            if self.body_read < self.body_size {
+            read += count;
+            if read < size {
+                self.phase = Phase::Body { size, read };
                 return Ok(None);
             }
         }
-        self.header_read = 0;
-        self.body_read = 0;
-        let decoded = decode(&self.body[..self.body_size]);
+        self.phase = Phase::Header { read: 0 };
+        let decoded = decode(&self.body[..size]);
         release_oversized(&mut self.body);
         decoded.map(Some)
     }
@@ -98,16 +111,21 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 #[derive(Debug, Default)]
 pub struct Outgoing {
     chunks: VecDeque<Vec<u8>>,
+    /// Bytes of the front chunk already written.
     offset: usize,
-    queued: usize,
     spare: Vec<u8>,
 }
 
 impl Outgoing {
     /// Whether any encoded packet bytes remain to be written.
     #[must_use]
-    pub const fn pending(&self) -> bool {
-        self.queued != 0
+    pub fn pending(&self) -> bool {
+        !self.chunks.is_empty()
+    }
+
+    /// Encoded bytes not yet written.
+    fn queued(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum::<usize>() - self.offset
     }
 
     /// Append a complete packet without a thread-local staging buffer.
@@ -167,7 +185,7 @@ impl Outgoing {
     fn reserve_packet(&self, size: usize) -> io::Result<()> {
         if size > MAX_MESSAGE
             || self
-                .queued
+                .queued()
                 .checked_add(HEADER + size)
                 .is_none_or(|queued| queued > HEADER + MAX_MESSAGE)
         {
@@ -178,7 +196,6 @@ impl Outgoing {
 
     fn push(&mut self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            self.queued += bytes.len();
             self.chunks.push_back(bytes);
         }
     }
@@ -198,7 +215,6 @@ impl Outgoing {
             return Err(io::ErrorKind::WriteZero.into());
         }
         self.offset += written;
-        self.queued -= written;
         if self.offset == len {
             self.release_front();
         }
@@ -316,25 +332,19 @@ mod tests {
         let mut future = Box::pin(reader.read::<String>());
         assert!(poll_once(&mut future).is_pending());
         drop(future);
-        assert_eq!(reader.header_read, 2);
 
         let mut future = Box::pin(reader.read::<String>());
         assert!(poll_once(&mut future).is_pending());
         assert!(poll_once(&mut future).is_pending());
         drop(future);
-        assert_eq!(reader.header_read, 4);
-        assert_eq!(reader.body_size, body.len());
-        assert_eq!(reader.body_read, 0);
 
         let mut future = Box::pin(reader.read::<String>());
         assert!(poll_once(&mut future).is_pending());
         drop(future);
-        assert_eq!(reader.body_read, body_split);
 
         let mut future = Box::pin(reader.read::<String>());
         assert!(poll_once(&mut future).is_pending());
         drop(future);
-        assert_eq!(reader.body_read, body_split);
 
         let mut future = Box::pin(reader.read::<String>());
         let result = poll_once(&mut future);
@@ -343,8 +353,6 @@ mod tests {
             Poll::Ready(Ok(decoded)) => assert_eq!(decoded, message),
             other => panic!("expected the completed message, got {other:?}"),
         }
-        assert_eq!(reader.header_read, 0);
-        assert_eq!(reader.body_read, 0);
     }
 
     #[derive(Default)]
@@ -468,15 +476,15 @@ mod tests {
             let result = poll_once(&mut future);
             drop(future);
             if result.is_pending() {
-                let before = outgoing.queued;
+                let before = outgoing.queued();
                 let mut future = Box::pin(outgoing.write_ready(&mut writer));
                 assert!(matches!(poll_once(&mut future), Poll::Ready(Ok(()))));
                 drop(future);
-                assert!(outgoing.queued < before);
+                assert!(outgoing.queued() < before);
             } else {
                 assert!(matches!(result, Poll::Ready(Ok(()))));
             }
-            assert_eq!(outgoing.queued, expected.len() - writer.bytes.len());
+            assert_eq!(outgoing.queued(), expected.len() - writer.bytes.len());
             assert_eq!(writer.bytes, expected[..writer.bytes.len()]);
         }
         assert_eq!(writer.bytes, expected);
@@ -486,12 +494,12 @@ mod tests {
     fn rejected_packet_preserves_previously_queued_non_frame_packet() {
         let mut outgoing = Outgoing::default();
         outgoing.send_pane(ServerToPane::Bell).expect("queue bell");
-        let queued = outgoing.queued;
+        let queued = outgoing.queued();
         let error = outgoing
             .send_pane(ServerToPane::Title("x".repeat(MAX_MESSAGE - 5)))
             .expect_err("packet exceeding the remaining queue limit must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(outgoing.queued, queued);
+        assert_eq!(outgoing.queued(), queued);
         let bytes = drain(&mut outgoing);
         let decoded = run(Reader::new(futures::io::Cursor::new(bytes)).read::<ServerToPane>())
             .expect("decode queued bell");

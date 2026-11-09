@@ -16,9 +16,9 @@ meowland-loop = { workspace = true }
 meowland-panes = { workspace = true }
 meowland-protocol = { workspace = true }
 meowland-selection = { workspace = true }
+meowland-settings = { workspace = true }
 calloop = { workspace = true }
-rustix = { workspace = true, features = ["event", "fs", "pipe"] }
-serde = { workspace = true, features = ["derive"] }
+rustix = { workspace = true }
 smithay = { workspace = true, features = [
   "wayland_frontend",
   "desktop",
@@ -29,6 +29,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-toml = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 wayland-client = { workspace = true }
 wayland-protocols = { workspace = true, features = ["client"] }

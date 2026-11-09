@@ -13,12 +13,38 @@ use crate::WindowId;
 const ID_SUFFIX_LEN: usize = 4;
 const ID_SUFFIX_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
+/// Where a window is in its map/unmap lifecycle.
+#[derive(Debug)]
+enum Lifecycle {
+    /// Created but never mapped, so it has no unique ID yet.
+    Registered,
+    /// Drawable; `order` ranks it among mapped windows by recency.
+    Mapped { id: String, order: u64 },
+    /// Mapped before and keeping its unique ID.
+    Unmapped { id: String },
+}
+
 #[derive(Debug)]
 struct Metadata {
-    id: Option<String>,
     app_id: String,
     title: String,
-    mapped_at: Option<u64>,
+    lifecycle: Lifecycle,
+}
+
+impl Metadata {
+    fn id(&self) -> Option<&str> {
+        match &self.lifecycle {
+            Lifecycle::Registered => None,
+            Lifecycle::Mapped { id, .. } | Lifecycle::Unmapped { id } => Some(id),
+        }
+    }
+
+    const fn mapped_order(&self) -> Option<u64> {
+        match self.lifecycle {
+            Lifecycle::Mapped { order, .. } => Some(order),
+            Lifecycle::Registered | Lifecycle::Unmapped { .. } => None,
+        }
+    }
 }
 
 /// Window identities, mapping order, focus, and selection policy.
@@ -43,10 +69,9 @@ impl WindowCatalog {
         self.windows.insert(
             id,
             Metadata {
-                id: None,
                 app_id,
                 title,
-                mapped_at: None,
+                lifecycle: Lifecycle::Registered,
             },
         );
         id
@@ -68,43 +93,48 @@ impl WindowCatalog {
         let Some(window) = self.windows.get(&id) else {
             return false;
         };
-        if window.mapped_at.is_some() {
-            return false;
-        }
-        let unique = window
-            .id
-            .is_none()
-            .then(|| id_prefix(&window.app_id))
-            .map(|prefix| self.unique_id(&prefix));
+        let unique = match &window.lifecycle {
+            Lifecycle::Mapped { .. } => return false,
+            Lifecycle::Unmapped { id } => id.clone(),
+            Lifecycle::Registered => {
+                let prefix = id_prefix(&window.app_id);
+                self.unique_id(&prefix)
+            }
+        };
+        self.mapping_order += 1;
+        let order = self.mapping_order;
         let Some(window) = self.windows.get_mut(&id) else {
             return false;
         };
-        self.mapping_order += 1;
-        if unique.is_some() {
-            window.id = unique;
-        }
-        window.mapped_at = Some(self.mapping_order);
+        window.lifecycle = Lifecycle::Mapped { id: unique, order };
         true
     }
 
     /// Mark a window as no longer drawable, returning whether that changed.
     pub fn unmap(&mut self, id: WindowId) -> bool {
-        let changed = self
-            .windows
-            .get_mut(&id)
-            .and_then(|window| window.mapped_at.take())
-            .is_some();
         if self.focused == Some(id) {
             self.focused = None;
         }
-        changed
+        let Some(window) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        match std::mem::replace(&mut window.lifecycle, Lifecycle::Registered) {
+            Lifecycle::Mapped { id, .. } => {
+                window.lifecycle = Lifecycle::Unmapped { id };
+                true
+            }
+            lifecycle => {
+                window.lifecycle = lifecycle;
+                false
+            }
+        }
     }
 
     /// Whether the window is mapped and may be shown in a pane.
     pub fn drawable(&self, id: WindowId) -> bool {
         self.windows
             .get(&id)
-            .is_some_and(|window| window.mapped_at.is_some())
+            .is_some_and(|window| window.mapped_order().is_some())
     }
 
     /// Most recently mapped drawable window.
@@ -123,25 +153,20 @@ impl WindowCatalog {
         std::mem::replace(&mut self.focused, window)
     }
 
-    /// Public description of a window for pane clients.
-    pub fn info(&self, id: WindowId) -> WindowInfo {
-        let (unique, app_id, title) = self.windows.get(&id).map_or_default(|window| {
-            (
-                window.id.clone().unwrap_or_default(),
-                window.app_id.clone(),
-                window.title.clone(),
-            )
-        });
-        WindowInfo {
-            id: unique,
-            app_id,
-            title,
+    /// Public description of a window for pane clients, once it has been
+    /// mapped and therefore has a unique ID.
+    pub fn info(&self, id: WindowId) -> Option<WindowInfo> {
+        let window = self.windows.get(&id)?;
+        Some(WindowInfo {
+            id: window.id()?.to_owned(),
+            app_id: window.app_id.clone(),
+            title: window.title.clone(),
             state: if self.focused == Some(id) {
                 WindowState::Active
             } else {
                 WindowState::Inactive
             },
-        }
+        })
     }
 
     /// Current title of a window, or an empty string when it is unknown.
@@ -163,7 +188,7 @@ impl WindowCatalog {
     /// equals the selector's value.
     pub fn select(&self, selector: &Selector) -> Option<WindowId> {
         self.newest_matching(|window| match selector {
-            Selector::Id(id) => window.id.as_ref() == Some(id),
+            Selector::Id(id) => window.id() == Some(id.as_str()),
             Selector::AppId(app_id) => window.app_id == *app_id,
             Selector::Title(title) => window.title == *title,
         })
@@ -179,7 +204,7 @@ impl WindowCatalog {
         self.windows
             .iter()
             .filter(|(_, window)| predicate(window))
-            .filter_map(|(id, window)| window.mapped_at.map(|order| (order, *id)))
+            .filter_map(|(id, window)| window.mapped_order().map(|order| (order, *id)))
             .max_by_key(|(order, _)| *order)
             .map(|(_, id)| id)
     }
@@ -197,7 +222,7 @@ impl WindowCatalog {
             if !self
                 .windows
                 .values()
-                .any(|window| window.id.as_deref() == Some(id.as_str()))
+                .any(|window| window.id() == Some(id.as_str()))
             {
                 return id;
             }

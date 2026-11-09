@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 meowland-core = { workspace = true }
 libloading = { workspace = true }
+rustix = { workspace = true, features = ["event"] }
 smithay = { workspace = true, features = [
   "wayland_frontend",
   "desktop",

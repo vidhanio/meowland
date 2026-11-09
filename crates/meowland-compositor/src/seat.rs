@@ -35,10 +35,21 @@ use smithay::{
 
 use super::{AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, input};
 
+/// Whether cursor images reach panes as soon as clients set them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CursorDelivery {
+    #[default]
+    Live,
+    /// Pointer events are being dispatched; the dispatcher delivers the
+    /// cursor of the final pointer focus afterwards.
+    Deferred,
+}
+
 #[derive(Default)]
 pub(crate) struct CursorState {
     pub shape: Option<String>,
     pub sent: Option<(PaneId, Option<String>)>,
+    delivery: CursorDelivery,
 }
 
 impl Compositor {
@@ -72,7 +83,7 @@ impl Compositor {
             self.refresh_popup_grab();
         }
         input::reset_keyboard(self);
-        self.input.keyboard_state.serials.clear();
+        self.input.keyboard_state.forget_serials();
         let previous = self.windows.catalog.focus(Some(window));
         let surface = self
             .windows
@@ -86,13 +97,24 @@ impl Compositor {
         self.apply_window_state(window);
     }
 
+    /// Dispatch pointer events with cursor delivery deferred, so a cursor
+    /// image set mid-dispatch is checked against the final pointer focus.
+    pub(crate) fn dispatch_pointer(
+        &mut self,
+        dispatch: impl FnOnce(&mut Self, &PointerHandle<Self>),
+    ) {
+        let pointer = self.input.pointer.clone();
+        self.input.cursor.delivery = CursorDelivery::Deferred;
+        dispatch(self, &pointer);
+        self.input.cursor.delivery = CursorDelivery::Live;
+    }
+
     pub(crate) fn send_pane_cursor(&mut self, pane: PaneId) {
         let window = self.attachments.get(pane).and_then(AttachedPane::window);
         let focused = self
             .input
             .pointer
-            .as_ref()
-            .and_then(PointerHandle::current_focus)
+            .current_focus()
             .and_then(|surface| self.window_for_surface(&surface));
         let shape = if window.is_some() && window == focused {
             self.input.cursor.shape.clone()
@@ -103,24 +125,19 @@ impl Compositor {
     }
 
     /// Drop pointer focus on a window that is going away.
-    ///
-    /// The handle stays taken across `motion` so the `cursor_image` callback
-    /// it can trigger does not deliver a cursor mid-move; the delivery below
-    /// sees the new focus instead.
     pub(crate) fn clear_window_pointer(&mut self, window: WindowId) {
         let focused = self
             .input
             .pointer
-            .as_ref()
-            .and_then(PointerHandle::current_focus)
+            .current_focus()
             .and_then(|surface| self.window_for_surface(&surface));
         if focused != Some(window) {
             return;
         }
-        if let Some(pointer) = self.input.pointer.take() {
-            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
+        self.dispatch_pointer(|state, pointer| {
+            pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), InputTime::now());
             pointer.motion(
-                self,
+                state,
                 None,
                 &MotionEvent {
                     location: (0.0, 0.0).into(),
@@ -128,9 +145,8 @@ impl Compositor {
                     time: InputTime::now(),
                 },
             );
-            pointer.frame(self);
-            self.input.pointer = Some(pointer);
-        }
+            pointer.frame(state);
+        });
         if let Some(pane) = self.input.last_input_pane {
             self.send_pane_cursor(pane);
         }
@@ -161,15 +177,15 @@ impl SeatHandler for Compositor {
         set_primary_focus(&self.display, seat, client);
     }
 
-    /// During pointer motion, delivery waits until the caller restores the
-    /// pointer handle so the destination can be checked against its focus.
+    /// During pointer dispatch, delivery waits until the dispatcher checks
+    /// the destination against the final focus.
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         let shape = match image {
             CursorImageStatus::Named(icon) => Some(cursor_name(icon).to_owned()),
             CursorImageStatus::Hidden | CursorImageStatus::Surface(_) => None,
         };
         self.input.cursor.shape = shape;
-        if self.input.pointer.is_some()
+        if self.input.cursor.delivery == CursorDelivery::Live
             && let Some(pane) = self.input.last_input_pane
         {
             self.send_pane_cursor(pane);

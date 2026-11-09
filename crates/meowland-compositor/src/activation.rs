@@ -33,7 +33,6 @@ impl Compositor {
                 expires,
             },
         );
-        self.refresh_activation_deadline();
         token
     }
 
@@ -42,7 +41,16 @@ impl Compositor {
         self.protocols
             .activation
             .remove_token(&token.to_owned().into());
-        self.refresh_activation_deadline();
+    }
+
+    /// Forget a launch once no attached pane waits for it.
+    pub(crate) fn release_activation(&mut self, token: &str) {
+        let waited = self.attachments.iter().any(
+            |(_, entry)| matches!(entry.waiting(), Some(Target::Activation(pending)) if pending == token),
+        );
+        if !waited {
+            self.forget_activation(token);
+        }
     }
 
     /// Revoke a launch token and release panes waiting for it.
@@ -75,10 +83,9 @@ impl Compositor {
         }
     }
 
-    /// Recompute the earliest launch or external-token expiry.
-    pub(crate) fn refresh_activation_deadline(&mut self) {
-        self.protocols.activation_deadline = self
-            .protocols
+    /// Earliest launch or external-token expiry.
+    pub(crate) fn activation_deadline(&self) -> Option<Instant> {
+        self.protocols
             .launches
             .values()
             .map(|launch| launch.expires)
@@ -88,15 +95,14 @@ impl Compositor {
                     .tokens()
                     .map(|(_, data)| data.timestamp + TOKEN_LIFETIME),
             )
-            .min();
+            .min()
     }
 
     /// Expiry is scheduled by the readiness loop, not window-detection polling.
     pub(crate) fn expire_activation_tokens(&mut self) {
         let now = Instant::now();
         if self
-            .protocols
-            .activation_deadline
+            .activation_deadline()
             .is_none_or(|deadline| now < deadline)
         {
             return;
@@ -117,7 +123,6 @@ impl Compositor {
         self.protocols
             .activation
             .retain_tokens(|_, data| now < data.timestamp + TOKEN_LIFETIME);
-        self.refresh_activation_deadline();
     }
 }
 
@@ -128,22 +133,12 @@ impl XdgActivationHandler for Compositor {
 
     /// Only the focused Wayland client may delegate activation to another app.
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
-        let accepted = self
-            .windows
+        self.windows
             .catalog
             .focused()
             .and_then(|window| self.windows.by_id.get(&window))
             .and_then(|window| window.surface.wl_surface().client())
-            .is_some_and(|client| data.client_id == Some(client.id()));
-        if accepted {
-            let expires = data.timestamp + TOKEN_LIFETIME;
-            self.protocols.activation_deadline = Some(
-                self.protocols
-                    .activation_deadline
-                    .map_or(expires, |deadline| deadline.min(expires)),
-            );
-        }
-        accepted
+            .is_some_and(|client| data.client_id == Some(client.id()))
     }
 
     fn request_activation(
@@ -163,7 +158,6 @@ impl XdgActivationHandler for Compositor {
         if let Some(launch) = self.protocols.launches.get_mut(token.as_str()) {
             launch.window = Some(window);
         }
-        self.refresh_activation_deadline();
         self.resolve_pending_panes();
         if self.windows.catalog.drawable(window) {
             self.focus_window(window);

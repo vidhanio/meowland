@@ -10,14 +10,12 @@ use futures::{
     channel::{mpsc, oneshot},
     future::AbortHandle,
 };
-use meowland_compositor::{Command, Compositor, Event, PaneId, Runtime};
-pub use meowland_compositor::{
-    InvalidOutputSize, InvalidRepeatDelay, InvalidRepeatRate, KeyboardSettings, RepeatDelay,
-    RepeatRate, Settings,
-};
+use meowland_compositor::{Command, Compositor, Event, Runtime};
+use meowland_panes::PaneId;
 use meowland_protocol::{
     ControlRequest, ControlResponse, Hello, PaneAction, Paths, ServerToPane, Shortcuts,
 };
+use meowland_settings::Settings;
 
 mod actor;
 mod control;
@@ -29,7 +27,7 @@ mod transport;
 
 pub use error::{Error, Result};
 use lifecycle::Shutdown;
-use transport::{ConnectionKind, PaneTransport};
+use transport::{ConnectionKind, PaneTransport, Sent};
 
 /// One socket budget, with the last slot reserved for control traffic.
 const MAX_CONNECTIONS: usize = 256;
@@ -37,6 +35,9 @@ const MAX_CONNECTIONS: usize = 256;
 type IncomingSender = mpsc::Sender<Incoming>;
 
 /// Identity of one accepted socket, minted before it proves it carries a pane.
+///
+/// A pane is identified by the connection that carries it, so the two IDs
+/// convert into each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ConnectionId(u64);
 
@@ -50,6 +51,38 @@ impl From<PaneId> for ConnectionId {
     fn from(pane: PaneId) -> Self {
         Self(pane.get())
     }
+}
+
+/// What an accepted connection carries.
+enum Role {
+    /// A control conversation, or a pane that has not been admitted yet.
+    Pending,
+    /// An admitted pane and its ordered output.
+    Pane(PaneTransport),
+}
+
+struct Connection {
+    task: AbortHandle,
+    role: Role,
+}
+
+impl Connection {
+    fn release(&mut self, reason: &str) {
+        if let Role::Pane(pane) = &mut self.role {
+            pane.release(reason.to_owned());
+        }
+    }
+}
+
+/// Outcome of queueing a message for a pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    Queued,
+    /// No admitted pane with that ID, or the pane was released.
+    Unavailable,
+    /// The pane exceeded its output budget or its writer is gone; it was
+    /// disconnected and detached.
+    Disconnected,
 }
 
 enum Incoming {
@@ -81,8 +114,7 @@ struct Server {
     )>,
     incoming: IncomingSender,
     listeners: Vec<Listener>,
-    connections: HashMap<ConnectionId, AbortHandle>,
-    panes: HashMap<PaneId, PaneTransport>,
+    connections: HashMap<ConnectionId, Connection>,
     next_connection: u64,
     shortcuts: Shortcuts,
     children: Vec<Child>,
@@ -114,31 +146,37 @@ impl Server {
     fn incoming(&mut self, message: Incoming) {
         match message {
             Incoming::Control(request, reply) => self.control(request, reply),
-            Incoming::Focus(id, hello, pane) => {
-                if self.shutdown.running() && self.connections.contains_key(&ConnectionId::from(id))
-                {
-                    self.panes.insert(id, pane);
-                    let greeted = self.send_to_pane(
-                        id,
-                        ServerToPane::HelloOk {
-                            shortcuts: self.shortcuts,
-                        },
-                    );
-                    if !greeted {
-                        return;
-                    }
-                    self.send_command(Command::Focus {
-                        pane: id,
-                        target: hello.target,
-                        follow: hello.follow,
-                        size: hello.size,
-                    });
+            Incoming::Focus(id, hello, mut pane) => {
+                let running = self.shutdown.running();
+                let Some(connection) = self
+                    .connections
+                    .get_mut(&ConnectionId::from(id))
+                    .filter(|connection| matches!(connection.role, Role::Pending))
+                else {
+                    pane.release("duplicate pane hello".to_owned());
+                    return;
+                };
+                if !running {
+                    pane.release("server stopped".to_owned());
+                    return;
                 }
+                connection.role = Role::Pane(pane);
+                let shortcuts = self.shortcuts;
+                if self.send_to_pane(id, ServerToPane::HelloOk { shortcuts }) != Delivery::Queued {
+                    return;
+                }
+                self.send_command(Command::Focus {
+                    pane: id,
+                    target: hello.target,
+                    follow: hello.follow,
+                    size: hello.size,
+                });
             }
             Incoming::PaneMessage(pane, action) => {
-                if self.shutdown.running()
-                    && self.panes.get(&pane).is_some_and(PaneTransport::active)
-                {
+                let active = self.connections.get(&ConnectionId::from(pane)).is_some_and(
+                    |connection| matches!(&connection.role, Role::Pane(pane) if pane.active()),
+                );
+                if self.shutdown.running() && active {
                     self.send_command(Command::Pane { pane, action });
                 }
             }
@@ -147,45 +185,50 @@ impl Server {
 
     fn event(&mut self, Event { pane, message }: Event) {
         if let ServerToPane::Release(reason) = message {
-            if let Some(pane) = self.panes.get_mut(&pane) {
-                pane.release(reason);
+            if let Some(connection) = self.connections.get_mut(&ConnectionId::from(pane)) {
+                connection.release(&reason);
             }
         } else {
             self.send_to_pane(pane, message);
         }
     }
 
-    /// Queue a message for an active pane, returning whether it was enqueued.
-    ///
-    /// A pane whose output cannot be enqueued is disconnected and detached.
-    fn send_to_pane(&mut self, id: PaneId, message: ServerToPane) -> bool {
-        let Some(pane) = self.panes.get(&id).filter(|pane| pane.active()) else {
-            return false;
+    /// Queue a message for an admitted pane, disconnecting a pane whose output
+    /// cannot be queued.
+    fn send_to_pane(&mut self, id: PaneId, message: ServerToPane) -> Delivery {
+        let Some(Connection {
+            role: Role::Pane(pane),
+            ..
+        }) = self.connections.get(&ConnectionId::from(id))
+        else {
+            return Delivery::Unavailable;
         };
-        if pane.send(message) {
-            return true;
+        match pane.send(message) {
+            Sent::Queued => Delivery::Queued,
+            Sent::Released => Delivery::Unavailable,
+            Sent::Rejected => {
+                tracing::warn!(?id, "pane output exceeded its byte budget or disconnected");
+                if let Some(connection) = self.connections.remove(&ConnectionId::from(id)) {
+                    connection.task.abort();
+                }
+                self.send_command(Command::Detach { pane: id });
+                Delivery::Disconnected
+            }
         }
-        tracing::warn!(?id, "pane output exceeded its byte budget or disconnected");
-        if let Some(task) = self.connections.remove(&ConnectionId::from(id)) {
-            task.abort();
-        }
-        self.pane_gone(id);
-        false
     }
 
     fn send_command(&mut self, command: Command) {
         self.compositor.handle_command(command);
     }
 
-    fn pane_gone(&mut self, id: PaneId) {
-        if self.panes.remove(&id).is_some() {
-            self.send_command(Command::Detach { pane: id });
-        }
-    }
-
     fn connection_finished(&mut self, id: ConnectionId, result: io::Result<()>) {
-        self.connections.remove(&id);
-        self.pane_gone(id.into());
+        if let Some(Connection {
+            role: Role::Pane(_),
+            ..
+        }) = self.connections.remove(&id)
+        {
+            self.send_command(Command::Detach { pane: id.into() });
+        }
         if let Err(error) = result {
             tracing::debug!(?id, %error, "connection ended");
         }
@@ -194,8 +237,8 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        for task in self.connections.values() {
-            task.abort();
+        for connection in self.connections.values() {
+            connection.task.abort();
         }
         if let Some((token, executor)) = self.executor.take() {
             self.handle.remove(token);

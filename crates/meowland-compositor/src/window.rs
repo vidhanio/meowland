@@ -11,7 +11,7 @@ use smithay::{
     wayland::compositor::{BufferAssignment, SurfaceData},
 };
 
-use super::{Compositor, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
+use super::{Compositor, Remap, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
 
 impl Window {
     fn with_surface_trees(&self, mut visit: impl FnMut(&WlSurface)) {
@@ -50,15 +50,14 @@ impl Compositor {
         if let Some(entry) = window.and_then(|id| self.windows.by_id.get_mut(&id))
             && entry.surface.wl_surface() == surface
         {
-            match assignment {
-                Some(BufferAssignment::NewBuffer(_)) => entry.awaiting_remap_commit = false,
-                None | Some(BufferAssignment::Removed) if entry.awaiting_remap_commit => {
-                    entry.awaiting_remap_commit = false;
+            entry.remap = match (entry.remap, assignment) {
+                (Remap::AwaitingInitialCommit, None | Some(BufferAssignment::Removed)) => {
                     entry.surface.send_configure();
+                    Remap::Idle
                 }
-                Some(BufferAssignment::Removed) => entry.awaiting_remap_commit = true,
-                None => {}
-            }
+                (Remap::Idle, Some(BufferAssignment::Removed)) => Remap::AwaitingInitialCommit,
+                (_, Some(BufferAssignment::NewBuffer(_))) | (Remap::Idle, None) => Remap::Idle,
+            };
         }
     }
 
@@ -128,9 +127,7 @@ impl Compositor {
         let surfaces: Vec<_> = self
             .windows
             .surface_cache
-            .snapshots
-            .keys()
-            .chain(self.windows.surface_cache.spares.keys())
+            .surfaces()
             .filter(|surface| self.window_for_surface(surface) == Some(id))
             .cloned()
             .collect();
@@ -143,7 +140,6 @@ impl Compositor {
                 .id_by_surface
                 .remove(window.surface.wl_surface());
         }
-        self.refresh_callback_deadline();
         self.protocols.toplevels.remove(id);
         self.attachments.forget_window(id);
         self.windows.catalog.remove(id);
@@ -221,5 +217,18 @@ mod tests {
         toplevel.role.set_fullscreen(None);
         fixture.roundtrip();
         assert!(fixture.app.configures.len() > before);
+    }
+
+    #[test]
+    fn destroyed_toplevels_leave_no_cached_surface_state() {
+        let mut fixture = Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        assert_ne!(fixture.state.windows.surface_cache.surfaces().count(), 0);
+
+        toplevel.role.destroy();
+        toplevel.xdg.destroy();
+        fixture.roundtrip();
+        assert_eq!(fixture.state.windows.surface_cache.surfaces().count(), 0);
     }
 }

@@ -43,6 +43,15 @@ impl SurfaceCache {
         self.buffer_sizes.remove(surface);
     }
 
+    /// Every surface with cached state.
+    pub(crate) fn surfaces(&self) -> impl Iterator<Item = &WlSurface> {
+        self.snapshots
+            .keys()
+            .chain(self.spares.keys())
+            .chain(self.missed.iter())
+            .chain(self.buffer_sizes.keys())
+    }
+
     fn valid_viewport(
         &mut self,
         surface: &WlSurface,

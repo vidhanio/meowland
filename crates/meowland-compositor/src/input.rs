@@ -1,6 +1,6 @@
 //! Terminal-pane keyboard and pointer events mapped into Wayland input.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 
 use meowland_protocol::{
     Button, Input, KEY_V, MAX_HELD_KEYS, Modifiers, Scroll, Transition, valid_key_identity,
@@ -11,7 +11,7 @@ use smithay::{
     },
     input::{
         keyboard::{KeyboardHandle, ModifiersState},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::{Resource, backend::ClientId},
     utils::{Point, SERIAL_COUNTER, Serial},
@@ -19,13 +19,56 @@ use smithay::{
 
 use super::{AttachedPane, Compositor, PaneId, WindowId, WlSurface, keymap, text};
 
+/// Which pane the Wayland keyboard follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Owner {
+    #[default]
+    Nobody,
+    /// The pane focused the keyboard without reporting its held keys.
+    Activated(PaneId),
+    /// The held keys match the pane's latest snapshot.
+    Synced(PaneId),
+}
+
+impl Owner {
+    const fn pane(self) -> Option<PaneId> {
+        match self {
+            Self::Nobody => None,
+            Self::Activated(pane) | Self::Synced(pane) => Some(pane),
+        }
+    }
+}
+
+/// Whether the focused client saw a held key's press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    Forwarded,
+    /// Pressed while a grab owned the keyboard; its release is not forwarded.
+    Suppressed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    code: u16,
+    delivery: Delivery,
+}
+
 #[derive(Default)]
 pub(crate) struct KeyboardState {
-    pub owner: Option<PaneId>,
-    pub held: HashMap<u32, u16>,
-    suppressed: HashSet<u32>,
-    pub known: bool,
-    pub serials: VecDeque<(Serial, ClientId)>,
+    owner: Owner,
+    held: HashMap<u32, Held>,
+    serials: VecDeque<(Serial, ClientId)>,
+}
+
+impl KeyboardState {
+    pub(crate) fn owned_by(&self, pane: PaneId) -> bool {
+        self.owner.pane() == Some(pane)
+    }
+
+    /// Stop accepting serials sent before a keyboard focus change.
+    pub(crate) fn forget_serials(&mut self) {
+        self.serials.clear();
+    }
 }
 
 const SERIAL_HISTORY: usize = 32;
@@ -57,7 +100,7 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
     }
     state.refresh_popup_grab();
     if matches!(event, Input::ResetKeyboard) {
-        if state.input.keyboard_state.owner == Some(pane) {
+        if state.input.keyboard_state.owned_by(pane) {
             reset_keyboard(state);
         }
         return;
@@ -68,7 +111,7 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
             state: Transition::Released,
             ..
         }
-    ) && state.input.keyboard_state.owner != Some(pane)
+    ) && !state.input.keyboard_state.owned_by(pane)
     {
         return;
     }
@@ -91,10 +134,10 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
             ref held,
         } => {
             keymap::refresh(state);
-            if state.input.keyboard_state.owner != Some(pane) || !state.input.keyboard_state.known {
-                enter_keyboard(state, pane, window, held, modifiers);
-            } else {
+            if state.input.keyboard_state.owner == Owner::Synced(pane) {
                 activate_keyboard(state, pane, window);
+            } else {
+                enter_keyboard(state, pane, window, held, modifiers);
             }
             key_transition(
                 state,
@@ -114,7 +157,7 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
             keymap::refresh(state);
             enter_keyboard(state, pane, window, keys, modifiers);
         }
-        Input::ResetKeyboard => unreachable!(),
+        Input::ResetKeyboard => unreachable!("keyboard resets return before window routing"),
         Input::Text(ref text) => {
             activate_keyboard(state, pane, window);
             text::commit(state, text);
@@ -125,11 +168,7 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
             button,
             scroll,
         } => {
-            let grabbed = state
-                .input
-                .pointer
-                .as_ref()
-                .is_some_and(PointerHandle::is_grabbed);
+            let grabbed = state.input.pointer.is_grabbed();
             if !grabbed && button.is_some_and(|(_, transition)| transition == Transition::Pressed) {
                 activate_keyboard(state, pane, window);
             }
@@ -177,7 +216,14 @@ fn key_transition(
             );
         }
     } else {
-        let code = code.or_else(|| state.input.keyboard_state.held.get(&key).copied());
+        let code = code.or_else(|| {
+            state
+                .input
+                .keyboard_state
+                .held
+                .get(&key)
+                .map(|held| held.code)
+        });
         if let Some(code) = code
             && let Some(keyboard) = state.input.keyboard.clone()
         {
@@ -213,7 +259,7 @@ fn pointer_input(
             .hit_test(root, &state.windows.surface_cache.snapshots, x, y)
     });
     let location = Point::from((x, y));
-    if let Some(pointer) = state.input.pointer.take() {
+    state.dispatch_pointer(|state, pointer| {
         let time = InputTime::now();
         pointer.motion(
             state,
@@ -244,8 +290,7 @@ fn pointer_input(
             pointer.axis(state, frame);
         }
         pointer.frame(state);
-        state.input.pointer = Some(pointer);
-    }
+    });
 }
 
 /// Map a terminal pointer button to its Linux input code.
@@ -304,25 +349,32 @@ fn enter_keyboard(
         state.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
         set_modifiers(&keyboard, state, snapshot(bits));
         for key in keys {
-            if let Some(code) = state.input.keymap.lookup(*key)
-                && state.input.keyboard_state.held.insert(*key, code).is_none()
-            {
-                if keyboard_grabbed(state) {
-                    state.input.keyboard_state.suppressed.insert(*key);
-                } else {
-                    forward(&keyboard, state, code, KeyState::Pressed);
-                }
+            let Some(code) = state.input.keymap.lookup(*key) else {
+                continue;
+            };
+            if state.input.keyboard_state.held.contains_key(key) {
+                continue;
             }
+            let delivery = if keyboard_grabbed(state) {
+                Delivery::Suppressed
+            } else {
+                forward(&keyboard, state, code, KeyState::Pressed);
+                Delivery::Forwarded
+            };
+            state
+                .input
+                .keyboard_state
+                .held
+                .insert(*key, Held { code, delivery });
         }
         let surface = state.windows.by_id[&window].surface.wl_surface().clone();
         state.set_keyboard_focus(Some(surface), SERIAL_COUNTER.next_serial());
     }
-    state.input.keyboard_state.owner = Some(pane);
-    state.input.keyboard_state.known = true;
+    state.input.keyboard_state.owner = Owner::Synced(pane);
 }
 
 fn activate_keyboard(state: &mut Compositor, pane: PaneId, window: WindowId) {
-    let changed = state.input.keyboard_state.owner != Some(pane);
+    let changed = !state.input.keyboard_state.owned_by(pane);
     if changed {
         reset_keyboard(state);
     }
@@ -333,7 +385,9 @@ fn activate_keyboard(state: &mut Compositor, pane: PaneId, window: WindowId) {
             state.set_keyboard_focus(Some(surface), SERIAL_COUNTER.next_serial());
         }
     }
-    state.input.keyboard_state.owner = Some(pane);
+    if changed {
+        state.input.keyboard_state.owner = Owner::Activated(pane);
+    }
 }
 
 fn keyboard_grabbed(state: &Compositor) -> bool {
@@ -366,11 +420,7 @@ pub(crate) fn valid_serial(state: &Compositor, serial: Serial, surface: &WlSurfa
             .keyboard
             .as_ref()
             .and_then(KeyboardHandle::current_focus);
-        let pointer = state
-            .input
-            .pointer
-            .as_ref()
-            .and_then(PointerHandle::current_focus);
+        let pointer = state.input.pointer.current_focus();
         let root = state.window_for_surface(surface);
         let focused = root.is_some()
             && keyboard
@@ -390,15 +440,13 @@ pub(crate) fn valid_serial(state: &Compositor, serial: Serial, surface: &WlSurfa
 /// A pane cannot leave keys or snapshot-only modifiers down when it loses
 /// focus, disconnects, or starts showing a different window.
 pub(crate) fn reset_keyboard(state: &mut Compositor) {
-    state.input.keyboard_state.owner = None;
-    state.input.keyboard_state.known = false;
-    let keys = std::mem::take(&mut state.input.keyboard_state.held);
-    let suppressed = std::mem::take(&mut state.input.keyboard_state.suppressed);
+    state.input.keyboard_state.owner = Owner::Nobody;
+    let held = std::mem::take(&mut state.input.keyboard_state.held);
     if let Some(keyboard) = state.input.keyboard.clone() {
         set_modifiers(&keyboard, state, ModifiersState::default());
-        for (key, code) in keys {
-            if !suppressed.contains(&key) {
-                forward(&keyboard, state, code, KeyState::Released);
+        for held in held.into_values() {
+            if held.delivery == Delivery::Forwarded {
+                forward(&keyboard, state, held.code, KeyState::Released);
             }
         }
         state.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
@@ -438,13 +486,17 @@ fn inject_key(
     bits: Modifiers,
 ) {
     set_modifiers(keyboard, state, snapshot(bits));
+    let held = &mut state.input.keyboard_state.held;
     let (changed, code) = if transition == KeyState::Pressed {
-        (
-            state.input.keyboard_state.held.insert(key, code).is_none(),
+        let entry = held.entry(key);
+        let fresh = matches!(entry, Entry::Vacant(_));
+        entry.or_insert(Held {
             code,
-        )
-    } else if let Some(code) = state.input.keyboard_state.held.remove(&key) {
-        (!state.input.keyboard_state.suppressed.remove(&key), code)
+            delivery: Delivery::Forwarded,
+        });
+        (fresh, code)
+    } else if let Some(Held { code, delivery }) = held.remove(&key) {
+        (delivery == Delivery::Forwarded, code)
     } else {
         (false, code)
     };
@@ -477,7 +529,13 @@ pub(crate) fn paste_action(state: &mut Compositor, pane: PaneId) {
         return;
     };
     activate_keyboard(state, pane, window);
-    if state.input.keyboard_state.held.contains_key(&KEY_V) {
+    if state
+        .input
+        .keyboard_state
+        .held
+        .get(&KEY_V)
+        .is_some_and(|held| held.delivery == Delivery::Forwarded)
+    {
         return;
     }
     let Some(code) = state.input.keymap.lookup(KEY_V) else {

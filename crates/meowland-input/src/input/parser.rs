@@ -4,7 +4,7 @@
 use std::{cell::Cell, rc::Rc};
 use std::{
     collections::VecDeque,
-    io,
+    io, mem,
     time::{Duration, Instant},
 };
 
@@ -17,6 +17,10 @@ use super::{
     mouse::{MAX_MOUSE, MOUSE_PREFIX, mouse},
 };
 
+const ESC: u8 = 0x1b;
+const BEL: u8 = 0x07;
+/// C1 string terminator.
+const ST: u8 = 0x9c;
 const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
 /// Bytes an oversized control sequence or bracketed paste may discard after
 /// its limit before it must have terminated.
@@ -24,6 +28,7 @@ const MAX_DISCARDED: usize = MAX_CONTROL * 4;
 /// Time an oversized control sequence or bracketed paste has to terminate
 /// once it exceeds its limit.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+const PASTE_START: [CsiParam; 1] = [CsiParam::Integer(200)];
 const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Time source for recovery deadlines that tests can freeze.
@@ -50,19 +55,6 @@ impl Clock {
     pub(super) fn freeze(&self, now: Instant) {
         self.frozen.set(Some(now));
     }
-}
-
-/// Decode signed mouse coordinates before the VT parser rejects their minus
-/// signs.
-pub(super) struct Parser {
-    terminal: VTParser,
-    decoder: Decoder,
-    mouse: Vec<u8>,
-    control_bytes: usize,
-    /// OSC reply whose string ended at an ESC, complete only if the next byte
-    /// finishes the `ESC \` string terminator.
-    osc_escape: Option<Event>,
-    clock: Clock,
 }
 
 /// An oversized input element that did not terminate within the recovery
@@ -102,245 +94,64 @@ impl From<InputError> for io::Error {
 struct Recovery {
     deadline: Instant,
     discarded: usize,
-    error: InputError,
 }
 
 impl Recovery {
-    fn new(now: Instant, error: InputError) -> Self {
+    fn new(now: Instant) -> Self {
         Self {
             deadline: now + RECOVERY_TIMEOUT,
             discarded: 0,
-            error,
         }
     }
 
     /// Count one more discarded byte, failing once the budget is exhausted.
-    const fn discard(&mut self) -> Result<(), InputError> {
+    const fn discard(&mut self, error: InputError) -> Result<(), InputError> {
         self.discarded += 1;
         if self.discarded > MAX_DISCARDED {
-            return Err(self.error);
+            return Err(error);
         }
         Ok(())
     }
 
     /// Fail if the element is still unterminated at `now`.
-    fn check(&self, now: Instant) -> Result<(), InputError> {
+    fn check(&self, now: Instant, error: InputError) -> Result<(), InputError> {
         if now >= self.deadline {
-            return Err(self.error);
+            return Err(error);
         }
         Ok(())
     }
 }
 
-impl Parser {
-    pub(super) fn new() -> Self {
+/// An SGR mouse report being collected, starting with [`MOUSE_PREFIX`].
+#[derive(Clone, Copy)]
+struct Report {
+    bytes: [u8; MAX_MOUSE],
+    len: usize,
+}
+
+impl Report {
+    fn new() -> Self {
+        let mut bytes = [0; MAX_MOUSE];
+        bytes[..MOUSE_PREFIX.len()].copy_from_slice(MOUSE_PREFIX);
         Self {
-            terminal: VTParser::new(),
-            decoder: Decoder::default(),
-            mouse: Vec::new(),
-            control_bytes: 0,
-            osc_escape: None,
-            clock: Clock::default(),
+            bytes,
+            len: MOUSE_PREFIX.len(),
         }
     }
 
-    /// Whether decoded events are waiting to be popped.
-    pub(super) fn pending(&self) -> bool {
-        !self.decoder.events.is_empty()
+    /// Append a byte, returning false if the report is already full.
+    const fn push(&mut self, byte: u8) -> bool {
+        if self.len == MAX_MOUSE {
+            return false;
+        }
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        true
     }
 
-    /// Pop the oldest decoded event.
-    pub(super) fn next_event(&mut self) -> Option<Event> {
-        self.decoder.events.pop_front()
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
-
-    /// Deadline by which an oversized control sequence or bracketed paste
-    /// must terminate.
-    pub(super) fn recovery_deadline(&self) -> Option<Instant> {
-        self.decoder.recovery().map(|recovery| recovery.deadline)
-    }
-
-    /// Clock shared with tests that advance time while a read is pending.
-    #[cfg(test)]
-    pub(super) const fn clock(&self) -> &Clock {
-        &self.clock
-    }
-
-    fn begin_muted(&mut self) {
-        if self.decoder.is_muted() {
-            return;
-        }
-        self.decoder.muted = Some(Recovery::new(self.clock.now(), InputError::Control));
-        tracing::warn!("Discarding oversized terminal control sequence");
-    }
-
-    fn check_recovery(&self, now: Instant) -> Result<(), InputError> {
-        self.decoder
-            .recovery()
-            .map_or(Ok(()), |recovery| recovery.check(now))
-    }
-
-    pub(super) fn check_recovery_now(&self) -> Result<(), InputError> {
-        self.check_recovery(self.clock.now())
-    }
-
-    fn discard_mouse(&mut self, byte: u8) -> Result<(), InputError> {
-        let mut pending = std::mem::take(&mut self.mouse);
-        self.begin_muted();
-        pending.push(byte);
-        for byte in pending {
-            self.terminal_byte(byte)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn push(&mut self, byte: u8) -> Result<(), InputError> {
-        if self.decoder.is_muted() {
-            return self.terminal_byte(byte);
-        }
-        if self.decoder.paste.is_some() {
-            return self.paste_byte(byte);
-        }
-        if self.mouse.starts_with(MOUSE_PREFIX) {
-            match byte {
-                b'M' | b'm' => {
-                    if self.mouse.len() < MAX_MOUSE {
-                        self.mouse.push(byte);
-                        if let Some(event) = mouse(&self.mouse) {
-                            self.decoder.events.push_back(event);
-                        }
-                        self.mouse.clear();
-                    } else {
-                        return self.discard_mouse(byte);
-                    }
-                }
-                b'0'..=b'9' | b';' | b'-' => {
-                    if self.mouse.len() < MAX_MOUSE {
-                        self.mouse.push(byte);
-                    } else {
-                        return self.discard_mouse(byte);
-                    }
-                }
-                _ => {
-                    self.mouse.clear();
-                    return self.push(byte);
-                }
-            }
-            return Ok(());
-        }
-        if !self.mouse.is_empty() {
-            if byte == b'\x1b' {
-                self.mouse.truncate(1);
-                return Ok(());
-            }
-            self.mouse.push(byte);
-            if MOUSE_PREFIX.starts_with(&self.mouse) {
-                return Ok(());
-            }
-            let mut pending = std::mem::take(&mut self.mouse);
-            for &byte in &pending {
-                self.terminal_byte(byte)?;
-            }
-            pending.clear();
-            self.mouse = pending;
-            return Ok(());
-        }
-        if self.terminal.is_ground() && byte == b'\x1b' {
-            self.mouse.push(byte);
-            Ok(())
-        } else {
-            self.terminal_byte(byte)
-        }
-    }
-
-    /// Collect one bracketed paste byte, discarding a paste that outgrows
-    /// [`MAX_TEXT`] while still watching for its terminator.
-    fn paste_byte(&mut self, byte: u8) -> Result<(), InputError> {
-        let Some(paste) = &mut self.decoder.paste else {
-            return Ok(());
-        };
-        match paste {
-            Paste::Text(bytes) => {
-                bytes.push(byte);
-                if bytes.ends_with(PASTE_END) {
-                    bytes.truncate(bytes.len() - PASTE_END.len());
-                    let bytes = std::mem::take(bytes);
-                    self.decoder.paste = None;
-                    if let Ok(text) = String::from_utf8(bytes) {
-                        self.decoder.events.push_back(Event::Paste(text));
-                    }
-                } else if bytes.len() >= MAX_TEXT + PASTE_END.len() {
-                    let tail = bytes.split_off(bytes.len() - (PASTE_END.len() - 1));
-                    *paste = Paste::Oversized {
-                        tail,
-                        recovery: Recovery::new(self.clock.now(), InputError::Paste),
-                    };
-                    tracing::warn!("Discarding oversized bracketed paste");
-                }
-            }
-            Paste::Oversized { tail, recovery } => {
-                tail.push(byte);
-                if tail.ends_with(PASTE_END) {
-                    recovery.check(self.clock.now())?;
-                    self.decoder.paste = None;
-                } else {
-                    recovery.discard()?;
-                    tail.drain(..tail.len().saturating_sub(PASTE_END.len() - 1));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn terminal_byte(&mut self, byte: u8) -> Result<(), InputError> {
-        if !self.decoder.is_muted()
-            && !self.terminal.is_ground()
-            && self.control_bytes >= MAX_CONTROL
-        {
-            self.begin_muted();
-        }
-        let escaped = self.osc_escape.take();
-        self.terminal.parse_byte(byte, &mut self.decoder);
-        if let Some(event) = escaped
-            && byte == b'\\'
-        {
-            self.decoder.events.push_back(event);
-        }
-        if let Some(event) = self.decoder.osc.take() {
-            match byte {
-                b'\x07' | b'\x9c' => self.decoder.events.push_back(event),
-                b'\x1b' => self.osc_escape = Some(event),
-                _ => {}
-            }
-        }
-        self.control_bytes = if self.terminal.is_ground() {
-            0
-        } else {
-            self.control_bytes.saturating_add(1)
-        };
-        if let Some(recovery) = &mut self.decoder.muted {
-            if self.terminal.is_ground() {
-                recovery.check(self.clock.now())?;
-                self.decoder.muted = None;
-            } else {
-                recovery.discard()?;
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct Decoder {
-    events: VecDeque<Event>,
-    paste: Option<Paste>,
-    /// Recovery from an oversized control sequence, set exactly while its
-    /// bytes are being discarded.
-    muted: Option<Recovery>,
-    /// Recognized OSC reply whose string just ended; the parser publishes it
-    /// only if the byte that ended it was a string terminator rather than a
-    /// cancellation.
-    osc: Option<Event>,
 }
 
 /// Bracketed paste between its start and end markers.
@@ -353,42 +164,313 @@ enum Paste {
     Oversized { tail: Vec<u8>, recovery: Recovery },
 }
 
-impl Decoder {
-    const fn is_muted(&self) -> bool {
-        self.muted.is_some()
+/// What the next input byte means.
+#[derive(Default)]
+enum Mode {
+    /// Bytes go to the VT parser.
+    #[default]
+    Ground,
+    /// The first `n` bytes of [`MOUSE_PREFIX`] arrived while the VT parser
+    /// was in ground state; they are held back because the VT parser would
+    /// reject the minus signs of signed SGR pixel coordinates.
+    MousePrefix(usize),
+    /// Collecting the parameters of an SGR mouse report.
+    Mouse(Report),
+    /// A recognized OSC reply whose string ended at an ESC; it is complete
+    /// only if the next byte finishes the `ESC \` terminator.
+    OscTerminator(Event),
+    /// Collecting a bracketed paste.
+    Paste(Paste),
+    /// Discarding an oversized control sequence until the VT parser returns
+    /// to ground.
+    Muted(Recovery),
+}
+
+/// Decode signed mouse coordinates before the VT parser rejects their minus
+/// signs.
+pub(super) struct Parser {
+    terminal: VTParser,
+    decoder: Decoder,
+    events: VecDeque<Event>,
+    mode: Mode,
+    /// Bytes the VT parser has spent in its current control sequence.
+    control_bytes: usize,
+    clock: Clock,
+}
+
+impl Parser {
+    pub(super) fn new() -> Self {
+        Self {
+            terminal: VTParser::new(),
+            decoder: Decoder::default(),
+            events: VecDeque::new(),
+            mode: Mode::Ground,
+            control_bytes: 0,
+            clock: Clock::default(),
+        }
     }
 
-    /// Recovery in progress from an oversized control sequence or paste.
-    const fn recovery(&self) -> Option<&Recovery> {
-        match &self.paste {
-            Some(Paste::Oversized { recovery, .. }) => Some(recovery),
-            _ => self.muted.as_ref(),
+    /// Whether decoded events are waiting to be popped.
+    pub(super) fn pending(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    /// Pop the oldest decoded event.
+    pub(super) fn next_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+
+    /// Deadline by which an oversized control sequence or bracketed paste
+    /// must terminate.
+    pub(super) const fn recovery_deadline(&self) -> Option<Instant> {
+        match &self.mode {
+            Mode::Muted(recovery) | Mode::Paste(Paste::Oversized { recovery, .. }) => {
+                Some(recovery.deadline)
+            }
+            _ => None,
+        }
+    }
+
+    /// Clock shared with tests that advance time while a read is pending.
+    #[cfg(test)]
+    pub(super) const fn clock(&self) -> &Clock {
+        &self.clock
+    }
+
+    fn check_recovery(&self, now: Instant) -> Result<(), InputError> {
+        match &self.mode {
+            Mode::Muted(recovery) => recovery.check(now, InputError::Control),
+            Mode::Paste(Paste::Oversized { recovery, .. }) => {
+                recovery.check(now, InputError::Paste)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(super) fn check_recovery_now(&self) -> Result<(), InputError> {
+        self.check_recovery(self.clock.now())
+    }
+
+    fn mute(&mut self) {
+        self.mode = Mode::Muted(Recovery::new(self.clock.now()));
+        tracing::warn!("Discarding oversized terminal control sequence");
+    }
+
+    pub(super) fn push(&mut self, byte: u8) -> Result<(), InputError> {
+        match mem::take(&mut self.mode) {
+            mode @ Mode::Muted(_) => {
+                self.mode = mode;
+                self.terminal_byte(byte)
+            }
+            mode @ Mode::Paste(_) => {
+                self.mode = mode;
+                self.paste_byte(byte)
+            }
+            Mode::Mouse(report) => self.mouse_byte(report, byte),
+            Mode::MousePrefix(matched) => self.prefix_byte(matched, byte),
+            Mode::OscTerminator(event) => {
+                self.terminal_byte(byte)?;
+                if byte == b'\\' {
+                    self.events.push_back(event);
+                }
+                Ok(())
+            }
+            Mode::Ground if self.terminal.is_ground() && byte == ESC => {
+                self.mode = Mode::MousePrefix(1);
+                Ok(())
+            }
+            Mode::Ground => self.terminal_byte(byte),
+        }
+    }
+
+    fn prefix_byte(&mut self, matched: usize, byte: u8) -> Result<(), InputError> {
+        if byte == ESC {
+            self.mode = Mode::MousePrefix(1);
+            return Ok(());
+        }
+        if MOUSE_PREFIX[matched] == byte {
+            self.mode = if matched + 1 == MOUSE_PREFIX.len() {
+                Mode::Mouse(Report::new())
+            } else {
+                Mode::MousePrefix(matched + 1)
+            };
+            return Ok(());
+        }
+        for &held in &MOUSE_PREFIX[..matched] {
+            self.terminal_byte(held)?;
+        }
+        self.terminal_byte(byte)
+    }
+
+    fn mouse_byte(&mut self, mut report: Report, byte: u8) -> Result<(), InputError> {
+        match byte {
+            b'M' | b'm' | b'0'..=b'9' | b';' | b'-' if !report.push(byte) => {
+                self.discard_mouse(&report, byte)
+            }
+            b'M' | b'm' => {
+                if let Some(event) = mouse(report.as_bytes()) {
+                    self.events.push_back(event);
+                }
+                Ok(())
+            }
+            b'0'..=b'9' | b';' | b'-' => {
+                self.mode = Mode::Mouse(report);
+                Ok(())
+            }
+            _ => self.push(byte),
+        }
+    }
+
+    /// Hand an oversized mouse report to the VT parser while discarding it,
+    /// so recovery ends where the VT parser finds its final byte.
+    fn discard_mouse(&mut self, report: &Report, byte: u8) -> Result<(), InputError> {
+        self.mute();
+        for &byte in report.as_bytes().iter().chain([&byte]) {
+            self.terminal_byte(byte)?;
+        }
+        Ok(())
+    }
+
+    /// Collect one bracketed paste byte, discarding a paste that outgrows
+    /// [`MAX_TEXT`] while still watching for its terminator.
+    fn paste_byte(&mut self, byte: u8) -> Result<(), InputError> {
+        let Mode::Paste(paste) = &mut self.mode else {
+            return Ok(());
+        };
+        match paste {
+            Paste::Text(bytes) => {
+                bytes.push(byte);
+                if bytes.ends_with(PASTE_END) {
+                    bytes.truncate(bytes.len() - PASTE_END.len());
+                    let bytes = mem::take(bytes);
+                    self.mode = Mode::Ground;
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        self.events.push_back(Event::Paste(text));
+                    }
+                } else if bytes.len() >= MAX_TEXT + PASTE_END.len() {
+                    let tail = bytes.split_off(bytes.len() - (PASTE_END.len() - 1));
+                    *paste = Paste::Oversized {
+                        tail,
+                        recovery: Recovery::new(self.clock.now()),
+                    };
+                    tracing::warn!("Discarding oversized bracketed paste");
+                }
+            }
+            Paste::Oversized { tail, recovery } => {
+                tail.push(byte);
+                if tail.ends_with(PASTE_END) {
+                    recovery.check(self.clock.now(), InputError::Paste)?;
+                    self.mode = Mode::Ground;
+                } else {
+                    recovery.discard(InputError::Paste)?;
+                    tail.drain(..tail.len().saturating_sub(PASTE_END.len() - 1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Feed one byte to the VT parser while in [`Mode::Ground`] or
+    /// [`Mode::Muted`].
+    fn terminal_byte(&mut self, byte: u8) -> Result<(), InputError> {
+        if !matches!(self.mode, Mode::Muted(_))
+            && !self.terminal.is_ground()
+            && self.control_bytes >= MAX_CONTROL
+        {
+            self.mute();
+        }
+        self.decoder.sink = if matches!(self.mode, Mode::Muted(_)) {
+            Sink::Discard
+        } else {
+            Sink::Collect
+        };
+        self.terminal.parse_byte(byte, &mut self.decoder);
+        for decoded in self.decoder.output.drain(..) {
+            match decoded {
+                Decoded::Event(event) => self.events.push_back(event),
+                Decoded::PasteStart => self.mode = Mode::Paste(Paste::Text(Vec::new())),
+                Decoded::Osc(event) => match byte {
+                    BEL | ST => self.events.push_back(event),
+                    ESC => self.mode = Mode::OscTerminator(event),
+                    _ => {}
+                },
+            }
+        }
+        self.control_bytes = if self.terminal.is_ground() {
+            0
+        } else {
+            self.control_bytes.saturating_add(1)
+        };
+        if let Mode::Muted(recovery) = &mut self.mode {
+            if self.terminal.is_ground() {
+                recovery.check(self.clock.now(), InputError::Control)?;
+                self.mode = Mode::Ground;
+            } else {
+                recovery.discard(InputError::Control)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one VT parser action produced.
+enum Decoded {
+    Event(Event),
+    PasteStart,
+    /// A recognized OSC reply whose string just ended; the parser publishes
+    /// it only if the byte that ended it was a string terminator rather than
+    /// a cancellation.
+    Osc(Event),
+}
+
+/// VT parser actions collected for the byte being parsed.
+#[derive(Default)]
+struct Decoder {
+    output: Vec<Decoded>,
+    sink: Sink,
+}
+
+impl Decoder {
+    fn push(&mut self, decoded: Decoded) {
+        if self.sink == Sink::Collect {
+            self.output.push(decoded);
         }
     }
 }
 
+/// Whether the [`Decoder`] keeps what it decodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Sink {
+    #[default]
+    Collect,
+    /// The parser is muted; decoding would only produce discarded output.
+    Discard,
+}
+
 impl VTActor for Decoder {
     fn csi_dispatch(&mut self, params: &[CsiParam], truncated: bool, byte: u8) {
-        if self.is_muted() || truncated {
+        if truncated {
             return;
         }
-        if params == [CsiParam::Integer(200)] && byte == b'~' {
-            self.paste = Some(Paste::Text(Vec::new()));
+        if params == PASTE_START && byte == b'~' {
+            self.push(Decoded::PasteStart);
         } else if let Some(event) = csi(params, byte) {
-            self.events.push_back(event);
+            self.push(Decoded::Event(event));
         }
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]]) {
-        if self.is_muted() {
+        if self.sink == Sink::Discard {
             return;
         }
-        self.osc = osc(params);
+        if let Some(event) = osc(params) {
+            self.push(Decoded::Osc(event));
+        }
     }
 
     fn print(&mut self, character: char) {
-        if !self.is_muted() && !character.is_control() {
-            self.events.push_back(Event::Text(character.to_string()));
+        if !character.is_control() {
+            self.push(Decoded::Event(Event::Text(character.to_string())));
         }
     }
 
@@ -435,7 +517,7 @@ pub(super) mod tests {
     use meowland_protocol::{Button, Modifiers, Transition};
 
     use super::*;
-    use crate::input::{csi::tests::key, mouse::tests::pointer};
+    use crate::input::{csi::tests::key, event::Focus, mouse::tests::pointer};
 
     fn parse_result(bytes: &[u8]) -> (Result<(), InputError>, Vec<Event>) {
         let mut parser = Parser::new();
@@ -446,7 +528,7 @@ pub(super) mod tests {
                 break;
             }
         }
-        (result, parser.decoder.events.into_iter().collect())
+        (result, parser.events.into_iter().collect())
     }
 
     fn parse(bytes: &[u8]) -> Vec<Event> {
@@ -480,7 +562,10 @@ pub(super) mod tests {
         for &byte in &oversized_mouse(0) {
             parser.push(byte).expect("muted mouse report");
         }
-        assert!(parser.decoder.is_muted(), "parser must be muted");
+        assert!(
+            matches!(parser.mode, Mode::Muted(_)),
+            "parser must be muted"
+        );
         parser
     }
 
@@ -490,7 +575,7 @@ pub(super) mod tests {
             panic!("{name}: {error}");
         }
         assert!(
-            matches!(events.as_slice(), [Event::Focus(true)]),
+            matches!(events.as_slice(), [Event::Focus(Focus::Gained)]),
             "{name}: {events:?}"
         );
     }
@@ -503,7 +588,7 @@ pub(super) mod tests {
                 for &byte in *chunk {
                     parser.push(byte).expect("valid terminal input");
                 }
-                parser.decoder.events.drain(..).collect()
+                parser.events.drain(..).collect()
             })
             .collect()
     }
@@ -514,7 +599,7 @@ pub(super) mod tests {
         let [focus, pointer_event, key_event, paste] = events.as_slice() else {
             panic!("expected four events, got {events:?}");
         };
-        assert!(matches!(focus, Event::Focus(true)));
+        assert!(matches!(focus, Event::Focus(Focus::Gained)));
         let pointer = pointer(pointer_event);
         assert_eq!((pointer.x, pointer.y), (-10.0, 20.0));
         assert_eq!(pointer.button, Some((Button::Left, Transition::Pressed)));
@@ -530,7 +615,7 @@ pub(super) mod tests {
         let [before, after] = events.as_slice() else {
             panic!("expected two chunks, got {events:?}");
         };
-        assert!(matches!(before.as_slice(), [Event::Focus(true)]));
+        assert!(matches!(before.as_slice(), [Event::Focus(Focus::Gained)]));
         let [event] = after.as_slice() else {
             panic!("expected one key event, got {after:?}");
         };
@@ -545,7 +630,7 @@ pub(super) mod tests {
         let [before, after] = events.as_slice() else {
             panic!("expected two chunks, got {events:?}");
         };
-        assert!(matches!(before.as_slice(), [Event::Focus(true)]));
+        assert!(matches!(before.as_slice(), [Event::Focus(Focus::Gained)]));
         let [event] = after.as_slice() else {
             panic!("expected one pointer event, got {after:?}");
         };
@@ -556,10 +641,13 @@ pub(super) mod tests {
 
     #[test]
     fn parser_keeps_escape_prefix_ambiguity() {
-        assert!(matches!(parse(b"\x1b[I").as_slice(), [Event::Focus(true)]));
+        assert!(matches!(
+            parse(b"\x1b[I").as_slice(),
+            [Event::Focus(Focus::Gained)]
+        ));
         assert!(matches!(
             parse(b"\x1b\x1b[I").as_slice(),
-            [Event::Focus(true)]
+            [Event::Focus(Focus::Gained)]
         ));
 
         let events = parse(b"\x1b[<0;1;2M\x1b[I");
@@ -568,10 +656,12 @@ pub(super) mod tests {
             pointer(&events[0]).button,
             Some((Button::Left, Transition::Pressed))
         );
-        assert!(matches!(events[1], Event::Focus(true)));
+        assert!(matches!(events[1], Event::Focus(Focus::Gained)));
 
         let events = parse(b"\x1b[<0;1;2X\x1b[I");
-        assert!(matches!(&events[..], [Event::Text(text), Event::Focus(true)] if text == "X"));
+        assert!(
+            matches!(&events[..], [Event::Text(text), Event::Focus(Focus::Gained)] if text == "X")
+        );
     }
 
     #[test]
@@ -614,7 +704,7 @@ pub(super) mod tests {
         bytes.extend_from_slice(&payload);
         bytes.extend_from_slice(b"\x1b[201~\x1b[I");
         let events = parse(&bytes);
-        assert!(matches!(&events[..], [Event::Focus(true)]));
+        assert!(matches!(&events[..], [Event::Focus(Focus::Gained)]));
     }
 
     #[test]
@@ -707,15 +797,15 @@ pub(super) mod tests {
 
         let mut recovered = muted_parser();
         recovered.push(b'M').expect("terminated mouse report");
-        assert!(!recovered.decoder.is_muted());
+        assert!(!matches!(recovered.mode, Mode::Muted(_)));
         for &byte in b"\x1b[I" {
             recovered.push(byte).expect("input after recovery");
         }
         assert!(matches!(
-            recovered.decoder.events.front(),
-            Some(Event::Focus(true))
+            recovered.events.front(),
+            Some(Event::Focus(Focus::Gained))
         ));
-        assert_eq!(recovered.decoder.events.len(), 1);
+        assert_eq!(recovered.events.len(), 1);
     }
 
     #[test]
@@ -727,10 +817,10 @@ pub(super) mod tests {
         parser.clock.freeze(deadline);
         assert_eq!(parser.push(b'M'), Err(InputError::Control));
         assert!(
-            parser.decoder.is_muted(),
+            matches!(parser.mode, Mode::Muted(_)),
             "an expired deadline must not be cleared"
         );
-        assert!(parser.decoder.events.is_empty());
+        assert!(parser.events.is_empty());
     }
 
     #[test]
@@ -777,7 +867,7 @@ pub(super) mod tests {
             let events: Vec<Event> = std::iter::from_fn(|| parser.next_event()).collect();
             assert_eq!(
                 events,
-                [Event::Text("x".to_owned()), Event::Focus(true)],
+                [Event::Text("x".to_owned()), Event::Focus(Focus::Gained)],
                 "split {split}"
             );
         }
@@ -829,7 +919,7 @@ pub(super) mod tests {
             if complete {
                 expected.push(Event::ClipboardText(b"aGk=".to_vec()));
             }
-            expected.push(Event::Focus(true));
+            expected.push(Event::Focus(Focus::Gained));
             for cut in 0..=bytes.len() {
                 let chunks: [&[u8]; 2] = bytes.split_at(cut).into();
                 let events: Vec<Event> = parse_chunks_after_drain(&chunks)

@@ -914,6 +914,7 @@ dependencies = [
  "dirs",
  "meowland-protocol",
  "meowland-server",
+ "meowland-settings",
  "meowland-terminal",
  "serde_json",
  "tempfile",
@@ -957,11 +958,10 @@ dependencies = [
  "meowland-readback",
  "meowland-render",
  "meowland-selection",
+ "meowland-settings",
  "rustix 1.1.5",
- "serde",
  "smithay",
  "thiserror",
- "toml",
  "tracing",
  "wayland-client",
  "wayland-protocols",
@@ -1081,7 +1081,9 @@ dependencies = [
  "listenfd",
  "meowland-async",
  "meowland-compositor",
+ "meowland-panes",
  "meowland-protocol",
+ "meowland-settings",
  "nix",
  "postcard",
  "rustix 1.1.5",
@@ -1089,6 +1091,17 @@ dependencies = [
  "serde",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "meowland-settings"
+version = "0.1.0"
+dependencies = [
+ "meowland-core",
+ "meowland-protocol",
+ "serde",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

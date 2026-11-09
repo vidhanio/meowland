@@ -1,8 +1,16 @@
 //! Native-fence DMA-BUF submission and completion-gated CPU readback.
 
-use std::{error::Error as _, ffi::OsStr, fs::OpenOptions, io, os::fd::OwnedFd, time::Duration};
+use std::{
+    error::Error as _,
+    ffi::OsStr,
+    fs::OpenOptions,
+    io,
+    os::fd::{AsFd, OwnedFd},
+    time::Duration,
+};
 
 use meowland_core::pixels::FrameSize;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use smithay::{
     backend::{
         allocator::{
@@ -53,37 +61,47 @@ enum BackendError {
     ReadbackLength,
 }
 
+/// Whether a client buffer may be released after a failed readback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferRelease {
+    /// No GPU work references the buffer any more.
+    Safe,
+    /// GPU work may still sample the buffer and no fence reports when it
+    /// finishes.
+    Unsafe,
+}
+
 /// DMA-BUF failure recording whether the client buffer can safely be released.
 #[derive(Debug, Error)]
 #[error("{source}")]
 pub struct SnapshotError {
     #[source]
     source: BackendError,
-    release_safe: bool,
+    release: BufferRelease,
 }
 
 impl SnapshotError {
     fn safe(source: impl Into<BackendError>) -> Self {
         Self {
             source: source.into(),
-            release_safe: true,
+            release: BufferRelease::Safe,
         }
     }
 
     /// Whether GPU work is absent or completed, so releasing the client buffer
     /// is safe.
     #[must_use]
-    pub const fn release_safe(&self) -> bool {
-        self.release_safe
+    pub const fn release(&self) -> BufferRelease {
+        self.release
     }
 }
 
 /// Submitted GPU work and the native fence that gates its readback.
 #[derive(Debug)]
 pub struct Submission {
-    /// Wait for this native fence to become readable before completing the
-    /// readback.
-    pub fd: OwnedFd,
+    /// Becomes readable once the GPU finished; pass it to
+    /// [`Readback::signaled`].
+    pub fence: OwnedFd,
     /// Resources retained until the fence signals and completion maps the
     /// pixels.
     pub readback: Readback,
@@ -91,6 +109,10 @@ pub struct Submission {
 
 /// Pending GPU pixels whose texture, target, and fence remain alive until
 /// completion.
+///
+/// A render or copy failure is kept until completion: the native fence still
+/// covers whatever GPU work was submitted, so the buffer is released only
+/// after it signals.
 pub struct Readback {
     mapping: Result<GlesMapping, BackendError>,
     size: FrameSize,
@@ -98,6 +120,26 @@ pub struct Readback {
     _texture: GlesTexture,
     _target: GlesRenderbuffer,
     _fence: EGLFence,
+}
+
+/// A readback whose native fence has signaled, ready for
+/// [`DmabufBackend::complete`].
+#[derive(Debug)]
+pub struct Signaled(Readback);
+
+impl Readback {
+    /// Confirm the submission's native fence signaled, so the GPU finished the
+    /// render and copy that completion maps.
+    ///
+    /// # Errors
+    /// Returns the readback unchanged while the fence is still pending.
+    pub fn signaled(self, fence: impl AsFd) -> Result<Signaled, Self> {
+        let mut fds = [PollFd::new(&fence, PollFlags::IN)];
+        match poll(&mut fds, Some(&Timespec::default())) {
+            Ok(_) if fds[0].revents().contains(PollFlags::IN) => Ok(Signaled(self)),
+            _ => Err(self),
+        }
+    }
 }
 
 /// Thread-confined EGL renderer for importing DMA-BUFs and submitting fenced
@@ -375,10 +417,10 @@ impl DmabufBackend {
         let mapping = self.readback(dmabuf, &texture);
         let (fence, fd) = self.native_fence().map_err(|source| SnapshotError {
             source,
-            release_safe: false,
+            release: BufferRelease::Unsafe,
         })?;
         Ok(Submission {
-            fd,
+            fence: fd,
             readback: Readback {
                 mapping,
                 size,
@@ -390,7 +432,7 @@ impl DmabufBackend {
         })
     }
 
-    /// Map only after the submission's native fence has reported completion.
+    /// Map the pixels of a readback whose fence has signaled.
     ///
     /// `previous` is recycled as the destination storage when it fits, which
     /// avoids a fresh allocation per frame. It is left untouched on error.
@@ -399,11 +441,16 @@ impl DmabufBackend {
     /// Returns an error if mapping or pixel conversion fails.
     pub fn complete(
         &mut self,
-        readback: Readback,
+        readback: Signaled,
         previous: &mut Option<Snapshot>,
     ) -> Result<Snapshot, SnapshotError> {
-        let size = readback.size;
-        let mapping = readback.mapping.map_err(SnapshotError::safe)?;
+        let Readback {
+            mapping,
+            size,
+            force_opaque,
+            ..
+        } = readback.0;
+        let mapping = mapping.map_err(SnapshotError::safe)?;
         let top_down = mapping.flipped();
         let bytes = self
             .renderer
@@ -425,7 +472,7 @@ impl DmabufBackend {
                 destination.copy_from_slice(source);
             }
         }
-        let opacity = if readback.force_opaque {
+        let opacity = if force_opaque {
             Opacity::Force
         } else {
             Opacity::Source

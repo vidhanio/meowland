@@ -38,6 +38,9 @@ pub enum Error {
     /// The server did not answer the initial pane handshake in time.
     #[error("pane handshake timed out")]
     PaneHandshakeTimeout,
+    /// The server sent a frame before the previous one was acknowledged.
+    #[error("server sent a frame before the previous one was acknowledged")]
+    UnacknowledgedFrame,
     /// Computed pane dimensions exceed the compositor's frame limits.
     #[error("pane dimensions {width}x{height} are outside the supported limits")]
     InvalidPaneSize {

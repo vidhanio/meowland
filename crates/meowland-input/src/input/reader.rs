@@ -44,7 +44,7 @@ impl Reader {
     /// Deadline by which an oversized control sequence or bracketed paste
     /// must terminate.
     #[must_use]
-    pub fn recovery_deadline(&self) -> Option<Instant> {
+    pub const fn recovery_deadline(&self) -> Option<Instant> {
         self.parser.recovery_deadline()
     }
 
@@ -61,6 +61,15 @@ impl Reader {
     /// Pop a decoded terminal event.
     pub fn next_event(&mut self) -> Option<Event> {
         self.parser.next_event()
+    }
+
+    /// Forget partially decoded input and undelivered events.
+    ///
+    /// Presentation start flushes the terminal's input queue; this discards
+    /// the decoder's share of that stale input, so capability replies read
+    /// with [`Self::read_raw`] never continue a sequence begun before.
+    pub fn reset(&mut self) {
+        self.parser = Parser::new();
     }
 
     /// Read and decode the next bounded input chunk.

@@ -20,15 +20,20 @@ impl Compositor {
     /// Remove every pane-keyed entry and restore the remaining window size
     /// owner.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
-        if self.input.keyboard_state.owner == Some(pane) {
+        let removed = self.detach_pane(pane)?;
+        self.release_waited_activation(&removed);
+        removed.window()
+    }
+
+    /// [`Self::remove_pane`] without releasing the launch the pane waited
+    /// for, so a replacement attachment can keep waiting for it.
+    fn detach_pane(&mut self, pane: PaneId) -> Option<AttachedPane> {
+        if self.input.keyboard_state.owned_by(pane) {
             input::reset_keyboard(self);
         }
         let removed = self.attachments.remove(pane);
         let window = removed.as_ref().and_then(AttachedPane::window);
         clipboard::detach(self, pane);
-        if let Some(Target::Activation(token)) = removed.as_ref().and_then(AttachedPane::waiting) {
-            self.forget_activation(token);
-        }
         if self.input.last_input_pane == Some(pane) {
             self.input.last_input_pane = None;
         }
@@ -47,7 +52,13 @@ impl Compositor {
                 self.apply_window_state(window);
             }
         }
-        window
+        removed
+    }
+
+    fn release_waited_activation(&mut self, removed: &AttachedPane) {
+        if let Some(Target::Activation(token)) = removed.waiting() {
+            self.release_activation(token);
+        }
     }
 
     /// Move focus to another attached window when the released window is no
@@ -91,7 +102,15 @@ impl Compositor {
             self.emit(pane, ServerToPane::Release("no such window".into()));
             return;
         }
+        let replaced = if self.attachments.contains(pane) {
+            self.detach_pane(pane)
+        } else {
+            None
+        };
         self.attachments.insert(pane, target, follow, size);
+        if let Some(replaced) = &replaced {
+            self.release_waited_activation(replaced);
+        }
         if let Some(window) = window {
             self.show_pane_window(pane, window);
         }
@@ -121,7 +140,7 @@ impl Compositor {
             }
         }
         if previous != Some(window) {
-            if self.input.keyboard_state.owner == Some(pane) {
+            if self.input.keyboard_state.owned_by(pane) {
                 input::reset_keyboard(self);
             }
             if let Some(previous) = previous {
@@ -309,5 +328,74 @@ mod tests {
         fixture.state.focus_window(windows[2]);
         fixture.state.release_pane_window(PaneId::from(3));
         assert_eq!(fixture.state.windows.catalog.focused(), Some(windows[1]));
+    }
+
+    fn size() -> FrameSize {
+        FrameSize::new(64, 64).expect("test size")
+    }
+
+    #[test]
+    fn a_launch_outlives_one_of_two_panes_waiting_for_it() {
+        let mut fixture = Fixture::new();
+        let token = fixture.state.create_activation_token();
+        let (first, second) = (PaneId::from(1), PaneId::from(2));
+        for pane in [first, second] {
+            fixture.state.focus_pane(
+                pane,
+                Target::Activation(token.clone()),
+                Follow::First,
+                size(),
+            );
+        }
+
+        fixture.state.remove_pane(first);
+        assert!(fixture.state.protocols.launches.contains_key(&token));
+        fixture.state.remove_pane(second);
+        assert!(!fixture.state.protocols.launches.contains_key(&token));
+    }
+
+    #[test]
+    fn refocusing_a_pane_releases_the_launch_it_waited_for() {
+        let mut fixture = Fixture::new();
+        let token = fixture.state.create_activation_token();
+        let pane = PaneId::from(1);
+        fixture.state.focus_pane(
+            pane,
+            Target::Activation(token.clone()),
+            Follow::First,
+            size(),
+        );
+
+        fixture.state.focus_pane(
+            pane,
+            Target::Selector(Selector::AppId("app".into())),
+            Follow::First,
+            size(),
+        );
+        assert!(!fixture.state.protocols.launches.contains_key(&token));
+    }
+
+    #[test]
+    fn refocusing_a_pane_on_the_same_launch_keeps_waiting_for_it() {
+        let mut fixture = Fixture::new();
+        let token = fixture.state.create_activation_token();
+        let pane = PaneId::from(1);
+        for _ in 0..2 {
+            fixture.state.focus_pane(
+                pane,
+                Target::Activation(token.clone()),
+                Follow::First,
+                size(),
+            );
+        }
+        assert!(fixture.state.protocols.launches.contains_key(&token));
+        assert_eq!(
+            fixture
+                .state
+                .attachments
+                .get(pane)
+                .and_then(AttachedPane::waiting),
+            Some(&Target::Activation(token))
+        );
     }
 }

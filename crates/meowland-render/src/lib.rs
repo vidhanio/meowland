@@ -8,7 +8,7 @@ mod render;
 mod snapshot;
 
 pub use damage::{Scene, SurfaceDamage};
-pub use dmabuf::{DmabufBackend, Readback, SnapshotError, Submission};
+pub use dmabuf::{BufferRelease, DmabufBackend, Readback, Signaled, SnapshotError, Submission};
 pub use geometry::{SurfaceGeometry, source_bound, surface_geometry};
 pub use render::{Changed, Renderer, window_geometry};
 pub use snapshot::Snapshot;

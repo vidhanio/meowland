@@ -13,10 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use calloop::{Interest, Mode, PostAction, generic::Generic};
+use calloop::{
+    Interest, Mode, PostAction,
+    generic::Generic,
+    timer::{TimeoutAction, Timer},
+};
 use meowland_core::{latency::Latency, pixels::FrameSize};
 use meowland_loop::{Handle, Sources};
-use meowland_render::{DmabufBackend, Readback, Snapshot, Submission, source_bound};
+use meowland_render::{BufferRelease, DmabufBackend, Readback, Snapshot, Submission, source_bound};
 use smithay::{
     backend::allocator::{Buffer, dmabuf::Dmabuf},
     reexports::wayland_server::{
@@ -34,6 +38,12 @@ mod fences;
 
 const MAX_PENDING: usize = 32;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+/// How long a client's write fences may keep its commit blocked.
+///
+/// The fences belong to the client, which can keep them unsignaled forever.
+/// Past this deadline the readback is abandoned: the commit applies without
+/// new pixels and the reservation returns to the budget.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Default, Debug)]
 struct Budget {
@@ -83,17 +93,43 @@ impl Drop for Reservation {
     }
 }
 
+/// What a readback slot holds.
+#[derive(Debug)]
+enum Fill {
+    /// The readback is still running and holds its budget.
+    Pending(Reservation),
+    /// The GPU produced pixels; the budget stays held until the commit
+    /// that carries them applies.
+    Ready {
+        snapshot: Snapshot,
+        _reservation: Reservation,
+    },
+    /// The readback ended without pixels and returned its budget.
+    Empty,
+}
+
 #[derive(Debug)]
 struct Slot {
     started: Instant,
-    snapshot: Mutex<Option<Snapshot>>,
-    _reservation: Reservation,
+    fill: Mutex<Fill>,
 }
 
+impl Slot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Fill> {
+        self.fill.lock().expect("readback snapshot lock poisoned")
+    }
+}
+
+/// The readback a surface commit carries.
 #[derive(Default, Debug)]
-struct PreparedSnapshot {
-    changed: bool,
-    slot: Option<Arc<Slot>>,
+enum PreparedSnapshot {
+    /// The commit leaves the previous readback in place.
+    #[default]
+    Unchanged,
+    /// The commit has no readback.
+    Cleared,
+    /// The commit's readback, filled once the GPU finishes.
+    Prepared(Arc<Slot>),
 }
 
 impl Cacheable for PreparedSnapshot {
@@ -102,7 +138,7 @@ impl Cacheable for PreparedSnapshot {
     }
 
     fn merge_into(self, into: &mut Self, _: &DisplayHandle) {
-        if self.changed {
+        if !matches!(self, Self::Unchanged) {
             *into = self;
         }
     }
@@ -111,44 +147,42 @@ impl Cacheable for PreparedSnapshot {
 /// Mark a surface as having no prepared readback snapshot.
 pub fn clear(surface: &WlSurface) {
     with_states(surface, |states| {
-        *states.cached_state.get::<PreparedSnapshot>().pending() = PreparedSnapshot {
-            changed: true,
-            slot: None,
-        };
+        *states.cached_state.get::<PreparedSnapshot>().pending() = PreparedSnapshot::Cleared;
     });
 }
 
 /// When the current readback for a surface started acquiring, if any.
 pub fn prepared_at(surface: &WlSurface) -> Option<Instant> {
     with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<PreparedSnapshot>()
-            .current()
-            .slot
-            .as_ref()
-            .map(|slot| slot.started)
+        match &*states.cached_state.get::<PreparedSnapshot>().current() {
+            PreparedSnapshot::Prepared(slot) => Some(slot.started),
+            PreparedSnapshot::Unchanged | PreparedSnapshot::Cleared => None,
+        }
     })
 }
 
-/// Take the already-completed snapshot for a surface, if one is ready.
+/// Take the current readback's snapshot.
+///
+/// Returns `None` if the surface has no readback, or if the readback was
+/// abandoned before the GPU produced pixels, so the commit applied without
+/// them.
 ///
 /// # Panics
 /// Panics if a snapshot lock was poisoned by another thread panicking.
 pub fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
     with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<PreparedSnapshot>()
-            .current()
-            .slot
-            .take()
-            .and_then(|slot| {
-                slot.snapshot
-                    .lock()
-                    .expect("readback snapshot lock poisoned")
-                    .take()
-            })
+        let prepared = std::mem::replace(
+            states.cached_state.get::<PreparedSnapshot>().current(),
+            PreparedSnapshot::Cleared,
+        );
+        let PreparedSnapshot::Prepared(slot) = prepared else {
+            return None;
+        };
+        let fill = std::mem::replace(&mut *slot.lock(), Fill::Empty);
+        match fill {
+            Fill::Ready { snapshot, .. } => Some(snapshot),
+            Fill::Pending(_) | Fill::Empty => None,
+        }
     })
 }
 
@@ -161,6 +195,10 @@ struct BufferReaders {
 /// Gate every transaction using a buffer until all its submitted readers
 /// finish, including readers on other surfaces that Smithay might otherwise
 /// supersede.
+///
+/// Once any reader fails with GPU work still referencing the buffer, every
+/// transaction using the buffer is cancelled: the client must not reuse a
+/// buffer whose sampling cannot be shown to have finished.
 #[derive(Clone, Debug)]
 struct BufferBlocker(Arc<BufferReaders>);
 
@@ -176,15 +214,36 @@ impl Blocker for BufferBlocker {
     }
 }
 
+/// GPU work one reader has outstanding on its buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// Nothing submitted; releasing the buffer is always safe.
+    Waiting,
+    /// Rendering and readback were submitted and may still sample the buffer.
+    Submitted,
+    /// The GPU finished with the buffer.
+    Finished,
+}
+
+/// One reader's hold on a buffer, released when dropped.
 struct BufferUse {
     readers: Arc<BufferReaders>,
-    submitted: bool,
-    finished: bool,
+    stage: Stage,
+}
+
+impl BufferUse {
+    fn new(readers: Arc<BufferReaders>) -> Self {
+        readers.pending.fetch_add(1, Ordering::AcqRel);
+        Self {
+            readers,
+            stage: Stage::Waiting,
+        }
+    }
 }
 
 impl Drop for BufferUse {
     fn drop(&mut self) {
-        if self.submitted && !self.finished {
+        if self.stage == Stage::Submitted {
             self.readers.failed.store(true, Ordering::Release);
         }
         self.readers.pending.fetch_sub(1, Ordering::AcqRel);
@@ -192,35 +251,51 @@ impl Drop for BufferUse {
 }
 
 /// Bookkeeping for one buffer that must stay alive until its readback ends.
-struct Operation<H> {
+struct Operation {
     surface: Weak<WlSurface>,
     client: Client,
     slot: Arc<Slot>,
     buffer: BufferUse,
-    sources: Sources<H>,
     bound: Option<(u32, u32)>,
+}
+
+impl Drop for Operation {
+    /// A readback that ends without filling its slot returns its budget
+    /// now, even if the commit carrying the slot never applies.
+    fn drop(&mut self) {
+        let mut fill = self.slot.lock();
+        if matches!(*fill, Fill::Pending(_)) {
+            *fill = Fill::Empty;
+        }
+    }
 }
 
 /// A reader waiting for the buffer's writers before the GPU can sample it.
 struct Acquiring<H> {
-    operation: Operation<H>,
+    operation: Operation,
     dmabuf: Dmabuf,
-    acquire_sources: Vec<Sources<H>>,
-    acquire_pending: usize,
+    /// One registration per write fence; each is cleared once it signals.
+    fences: Vec<Option<Sources<H>>>,
+    timeout: Sources<H>,
 }
 
 /// A submitted GPU readback waiting for its completion fence.
 struct Reading<H> {
-    operation: Operation<H>,
+    operation: Operation,
     readback: Readback,
     submitted: Instant,
+    completion: Sources<H>,
+}
+
+enum Phase<H> {
+    Acquiring(Acquiring<H>),
+    Reading(Reading<H>),
 }
 
 /// In-flight readbacks, buffer blockers, and latency accounting.
 pub struct Readbacks<H> {
     next: u64,
-    acquiring: HashMap<u64, Acquiring<H>>,
-    reading: HashMap<u64, Reading<H>>,
+    operations: HashMap<u64, Phase<H>>,
     buffers: HashMap<ObjectId, SyncWeak<BufferReaders>>,
     budget: Arc<Budget>,
     stats: ReadbackStats,
@@ -230,8 +305,7 @@ impl<H> Default for Readbacks<H> {
     fn default() -> Self {
         Self {
             next: 0,
-            acquiring: HashMap::new(),
-            reading: HashMap::new(),
+            operations: HashMap::new(),
             buffers: HashMap::new(),
             budget: Arc::default(),
             stats: ReadbackStats::default(),
@@ -243,8 +317,7 @@ impl<H> fmt::Debug for Readbacks<H> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Readbacks")
-            .field("acquiring", &self.acquiring.len())
-            .field("reading", &self.reading.len())
+            .field("operations", &self.operations.len())
             .field("buffers", &self.buffers.len())
             .finish_non_exhaustive()
     }
@@ -359,80 +432,130 @@ pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dm
         properties
     });
     let bound = source_bound(host.pane_bound(surface), scale, transform);
-    readers.pending.fetch_add(1, Ordering::AcqRel);
     let slot = Arc::new(Slot {
         started,
-        snapshot: Mutex::new(None),
-        _reservation: reservation,
+        fill: Mutex::new(Fill::Pending(reservation)),
     });
     with_states(surface, |states| {
-        states.cached_state.get::<PreparedSnapshot>().pending().slot = Some(Arc::clone(&slot));
+        *states.cached_state.get::<PreparedSnapshot>().pending() =
+            PreparedSnapshot::Prepared(Arc::clone(&slot));
     });
     host.readbacks().next += 1;
     let id = host.readbacks().next;
-    let sources = Sources::new(host.handle());
-    host.readbacks().acquiring.insert(
+    let operation = Operation {
+        surface: surface.downgrade(),
+        client,
+        slot,
+        buffer: BufferUse::new(readers),
+        bound,
+    };
+    let fences = match fences::watch(host, id, dmabuf) {
+        fences::Watch::Ready => {
+            submit(host, id, operation, dmabuf);
+            return;
+        }
+        fences::Watch::Pending(fences) => fences,
+        fences::Watch::Failed => {
+            let client = operation.client.clone();
+            drop(operation);
+            host.notify_client(&client);
+            return;
+        }
+    };
+    let mut timeout = Sources::new(host.handle());
+    match host
+        .handle()
+        .insert_source(Timer::from_duration(ACQUIRE_TIMEOUT), move |_, (), host| {
+            abandon(host, id);
+            TimeoutAction::Drop
+        }) {
+        Ok(token) => timeout.timer = Some(token),
+        Err(error) => {
+            tracing::warn!(%error, "Cannot register DMA-BUF acquire timeout");
+            let client = operation.client.clone();
+            drop(operation);
+            host.notify_client(&client);
+            return;
+        }
+    }
+    host.readbacks().operations.insert(
         id,
-        Acquiring {
-            operation: Operation {
-                surface: surface.downgrade(),
-                client,
-                slot,
-                buffer: BufferUse {
-                    readers,
-                    submitted: false,
-                    finished: false,
-                },
-                sources,
-                bound,
-            },
+        Phase::Acquiring(Acquiring {
+            operation,
             dmabuf: dmabuf.clone(),
-            acquire_sources: Vec::new(),
-            acquire_pending: 0,
-        },
+            fences: fences.into_iter().map(Some).collect(),
+            timeout,
+        }),
     );
-    fences::watch(host, id, dmabuf);
 }
 
-fn submit<H: Host>(host: &mut H, id: u64) {
-    let Some(mut acquiring) = host.readbacks().acquiring.remove(&id) else {
+/// Record a signaled write fence, submitting once every fence signaled.
+fn acquired<H: Host>(host: &mut H, id: u64, index: usize) {
+    let operations = &mut host.readbacks().operations;
+    let Some(Phase::Acquiring(acquiring)) = operations.get_mut(&id) else {
         return;
     };
-    if acquiring.operation.surface.upgrade().is_err() {
-        let client = acquiring.operation.client.clone();
-        drop(acquiring);
+    if let Some(mut fence) = acquiring.fences.get_mut(index).and_then(Option::take) {
+        fence.io = None;
+    }
+    if acquiring.fences.iter().any(Option::is_some) {
+        return;
+    }
+    let Some(Phase::Acquiring(acquiring)) = operations.remove(&id) else {
+        return;
+    };
+    let Acquiring {
+        operation, dmabuf, ..
+    } = acquiring;
+    submit(host, id, operation, &dmabuf);
+}
+
+/// Give up on a readback whose write fences did not signal in time.
+fn abandon<H: Host>(host: &mut H, id: u64) {
+    let operations = &mut host.readbacks().operations;
+    let Some(Phase::Acquiring(mut acquiring)) = operations.remove(&id) else {
+        return;
+    };
+    acquiring.timeout.timer = None;
+    tracing::warn!("DMA-BUF write fences did not signal; retaining previous pixels");
+    let client = acquiring.operation.client.clone();
+    drop(acquiring);
+    host.notify_client(&client);
+}
+
+fn submit<H: Host>(host: &mut H, id: u64, mut operation: Operation, dmabuf: &Dmabuf) {
+    if operation.surface.upgrade().is_err() {
+        let client = operation.client.clone();
+        drop(operation);
         host.notify_client(&client);
         return;
     }
-    acquiring.acquire_sources.clear();
     let Some(gpu) = host.gpu() else {
-        let client = acquiring.operation.client.clone();
-        drop(acquiring);
+        let client = operation.client.clone();
+        drop(operation);
         host.notify_client(&client);
         return;
     };
     let submitted = Instant::now();
-    acquiring.operation.buffer.submitted = true;
-    match gpu.submit(&acquiring.dmabuf, acquiring.operation.bound) {
-        Ok(Submission { fd, readback }) => {
+    operation.buffer.stage = Stage::Submitted;
+    match gpu.submit(dmabuf, operation.bound) {
+        Ok(Submission { fence, readback }) => {
             match host
                 .handle()
-                .insert_source(Generic::new(fd, Interest::READ, Mode::Level), {
-                    move |_, _, host| {
-                        complete(host, id);
-                        Ok(PostAction::Remove)
-                    }
+                .insert_source(Generic::new(fence, Interest::READ, Mode::Level), {
+                    move |_, fence, host| Ok(complete(host, id, fence))
                 }) {
                 Ok(token) => {
-                    let Acquiring { mut operation, .. } = acquiring;
-                    operation.sources.io = Some(token);
-                    host.readbacks().reading.insert(
+                    let mut completion = Sources::new(host.handle());
+                    completion.io = Some(token);
+                    host.readbacks().operations.insert(
                         id,
-                        Reading {
+                        Phase::Reading(Reading {
                             operation,
                             readback,
                             submitted,
-                        },
+                            completion,
+                        }),
                     );
                 }
                 Err(error) => {
@@ -442,44 +565,60 @@ fn submit<H: Host>(host: &mut H, id: u64) {
             }
         }
         Err(error) => {
-            acquiring.operation.buffer.finished = error.release_safe();
-            tracing::warn!(
-                %error,
-                release_safe = error.release_safe(),
-                "Cannot submit DMA-BUF readback"
-            );
-            if !error.release_safe() {
-                host.request_shutdown();
+            let release = error.release();
+            tracing::warn!(%error, ?release, "Cannot submit DMA-BUF readback");
+            match release {
+                BufferRelease::Safe => operation.buffer.stage = Stage::Finished,
+                BufferRelease::Unsafe => host.request_shutdown(),
             }
-            let client = acquiring.operation.client.clone();
-            drop(acquiring);
+            let client = operation.client.clone();
+            drop(operation);
             host.notify_client(&client);
         }
     }
 }
 
-fn complete<H: Host>(host: &mut H, id: u64) {
-    let Some(Reading {
+fn complete<H: Host>(host: &mut H, id: u64, fence: impl std::os::fd::AsFd) -> PostAction {
+    let operations = &mut host.readbacks().operations;
+    let Some(Phase::Reading(reading)) = operations.remove(&id) else {
+        return PostAction::Remove;
+    };
+    let Reading {
         mut operation,
         readback,
         submitted,
-    }) = host.readbacks().reading.remove(&id)
-    else {
-        return;
+        mut completion,
+    } = reading;
+    let readback = match readback.signaled(fence) {
+        Ok(signaled) => signaled,
+        Err(readback) => {
+            operations.insert(
+                id,
+                Phase::Reading(Reading {
+                    operation,
+                    readback,
+                    submitted,
+                    completion,
+                }),
+            );
+            return PostAction::Continue;
+        }
     };
-    operation.sources.io = None;
+    completion.io = None;
     let ready = Instant::now();
-    operation.buffer.finished = true;
+    operation.buffer.stage = Stage::Finished;
     if let Ok(surface) = operation.surface.upgrade() {
         let mut previous = host.take_spare(&surface);
         if let Some(gpu) = host.gpu() {
             match gpu.complete(readback, &mut previous) {
                 Ok(snapshot) => {
-                    *operation
-                        .slot
-                        .snapshot
-                        .lock()
-                        .expect("readback snapshot lock poisoned") = Some(snapshot);
+                    let mut fill = operation.slot.lock();
+                    if let Fill::Pending(reservation) = std::mem::replace(&mut *fill, Fill::Empty) {
+                        *fill = Fill::Ready {
+                            snapshot,
+                            _reservation: reservation,
+                        };
+                    }
                 }
                 Err(error) => {
                     if let Some(previous) = previous {
@@ -495,10 +634,10 @@ fn complete<H: Host>(host: &mut H, id: u64) {
     host.readbacks()
         .stats
         .complete(operation.slot.started, submitted, ready);
-    let client = operation.client;
-    drop(operation.buffer);
-    drop(operation.sources);
+    let client = operation.client.clone();
+    drop(operation);
     host.notify_client(&client);
+    PostAction::Remove
 }
 
 /// Cancel acquisition for a destroyed surface.
@@ -507,14 +646,14 @@ fn complete<H: Host>(host: &mut H, id: u64) {
 /// dropping the reservation early would let the client reuse a buffer the GPU
 /// still samples. Completion skips the slot when the surface is gone.
 pub fn destroyed<H: Host>(host: &mut H, surface: &WlSurface) {
+    let surface = surface.downgrade();
     let mut clients = Vec::new();
-    host.readbacks().acquiring.retain(|_, acquiring| {
-        if acquiring.operation.surface == surface.downgrade() {
+    host.readbacks().operations.retain(|_, phase| match phase {
+        Phase::Acquiring(acquiring) if acquiring.operation.surface == surface => {
             clients.push(acquiring.operation.client.clone());
             false
-        } else {
-            true
         }
+        Phase::Acquiring(_) | Phase::Reading(_) => true,
     });
     for client in clients {
         host.notify_client(&client);

@@ -1,7 +1,7 @@
 //! TOML settings deserialization and shortcut parsing.
 
-use meowland_compositor::Settings;
 use meowland_protocol::{KeyBinding, Modifiers};
+use meowland_settings::Settings;
 
 fn parse(source: &str) -> Settings {
     toml::from_str(source).unwrap_or_else(|error| panic!("{source:?}: {error}"))

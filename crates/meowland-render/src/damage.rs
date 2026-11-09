@@ -62,6 +62,11 @@ impl SurfaceDamage {
         Self(Some(Rectangle::from_size(geometry.dst.to_f64())))
     }
 
+    /// The accumulated rectangle, if any content changed.
+    pub(crate) const fn rect(self) -> Option<Rectangle<f64, Logical>> {
+        self.0
+    }
+
     fn add(&mut self, rect: Rectangle<f64, Logical>) {
         if rect.size.w > 0.0 && rect.size.h > 0.0 {
             self.0 = Some(self.0.map_or(rect, |previous| previous.merge(rect)));
@@ -76,39 +81,62 @@ pub(crate) struct Layer {
     pub geometry: SurfaceGeometry,
 }
 
+/// Whether retained pixels hold a composition that damage can update.
+#[derive(Debug, Default)]
+pub(crate) enum Composition {
+    /// Nothing composed yet, or the composition was invalidated: the next
+    /// update recomposes the whole pane.
+    #[default]
+    Stale,
+    /// The pixels compose `layers` at `size` and `scale`; `damage` collects
+    /// content changes since.
+    Composed {
+        size: FrameSize,
+        scale: f64,
+        layers: Vec<Layer>,
+        damage: HashMap<WlSurface, SurfaceDamage>,
+    },
+}
+
 /// Retained RGB pixels, geometry, and pending damage for one pane.
 #[derive(Debug, Default)]
 pub struct Scene {
     pub(crate) pixels: Vec<u8>,
-    pub(crate) layers: Vec<Layer>,
-    pub(crate) basis: Option<(FrameSize, f64)>,
-    pub(crate) damage: HashMap<WlSurface, SurfaceDamage>,
+    pub(crate) composition: Composition,
 }
 
 impl Scene {
-    /// Read the complete RGB image after the renderer has applied pending
-    /// damage.
+    /// Read the complete RGB image composed by the last renderer update.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
-    /// Forget the retained basis after rebinding or a structural change.
+    /// Forget the composition after rebinding or a structural change.
     pub fn invalidate(&mut self) {
-        self.basis = None;
-        self.damage.clear();
+        self.composition = Composition::Stale;
     }
 
     /// Merge a commit while retaining a bounded rectangle per surface.
+    ///
+    /// A stale composition is recomposed in full, so its damage is not kept.
     pub fn damage(&mut self, surface: &WlSurface, damage: SurfaceDamage) {
-        if self.basis.is_some()
+        if let Composition::Composed {
+            damage: pending, ..
+        } = &mut self.composition
             && let Some(rect) = damage.0
         {
-            self.damage.entry(surface.clone()).or_default().add(rect);
+            pending.entry(surface.clone()).or_default().add(rect);
         }
     }
+}
 
-    pub(crate) fn damaged(&self, layer: &Layer) -> Option<Rectangle<f64, Logical>> {
-        self.damage.get(&layer.surface)?.0
+impl Composition {
+    /// Layers of the current composition; none while stale.
+    pub(crate) fn layers(&self) -> &[Layer] {
+        match self {
+            Self::Composed { layers, .. } => layers,
+            Self::Stale => &[],
+        }
     }
 }
 

@@ -1,12 +1,5 @@
 //! Ordered, resumable terminal writes with a bounded per-turn budget.
-use std::{
-    fs::File,
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{cell::Cell, fs::File, io, rc::Rc};
 
 use futures::io::{AsyncWrite, AsyncWriteExt};
 use meowland_protocol::release_oversized;
@@ -45,12 +38,16 @@ pub(crate) fn write_best_effort(bytes: &[u8]) {
     }
 }
 
+/// Terminal bytes queued in order, with the stream position of the bytes
+/// already written shared with whoever needs to know what reached the
+/// terminal.
 #[derive(Default)]
 pub(crate) struct Output {
     bytes: Vec<u8>,
     offset: usize,
-    written: Arc<AtomicUsize>,
+    written: Rc<Cell<usize>>,
 }
+
 impl Output {
     pub(crate) const fn pending(&self) -> bool {
         self.offset < self.bytes.len()
@@ -68,12 +65,14 @@ impl Output {
         self.bytes.len()
     }
 
-    pub(crate) fn progress(&self) -> Arc<AtomicUsize> {
-        Arc::clone(&self.written)
+    /// Stream position of the bytes written so far, updated as writes land.
+    pub(crate) fn progress(&self) -> Rc<Cell<usize>> {
+        Rc::clone(&self.written)
     }
 
+    /// Stream position just past the last queued byte.
     pub(crate) fn end_position(&self) -> usize {
-        self.written.load(Ordering::Relaxed) + self.bytes.len() - self.offset
+        self.written.get() + self.bytes.len() - self.offset
     }
 
     /// Drop every queued byte instead of writing it.
@@ -84,6 +83,10 @@ impl Output {
     }
 
     /// Never monopolize the input loop, even when the terminal is writable.
+    #[expect(
+        clippy::future_not_send,
+        reason = "terminal output belongs to the calloop owner thread"
+    )]
     pub(crate) async fn drain(&mut self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
         let end = self.bytes.len().min(self.offset + WRITE_BUDGET);
         if self.offset < end {
@@ -92,7 +95,7 @@ impl Output {
                 return Err(io::ErrorKind::WriteZero.into());
             }
             self.offset += written;
-            self.written.fetch_add(written, Ordering::Relaxed);
+            self.written.set(self.written.get() + written);
         }
         if !self.pending() {
             self.bytes.clear();
@@ -100,5 +103,57 @@ impl Output {
             release_oversized(&mut self.bytes);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use futures::FutureExt;
+
+    use super::*;
+
+    struct ShortWriter(usize);
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len().min(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stream_positions_survive_partial_writes_and_queue_resets() {
+        let mut output = Output::default();
+        let progress = output.progress();
+        output.append(b"push");
+        let push_end = output.end_position();
+        output.append(b"restore");
+        let mut writer = futures::io::AllowStdIo::new(ShortWriter(push_end - 1));
+        output
+            .drain(&mut writer)
+            .now_or_never()
+            .expect("ready")
+            .expect("partial write");
+        assert_eq!(progress.get(), push_end - 1);
+        assert_eq!(output.end_position(), b"pushrestore".len());
+
+        writer.get_mut().0 = usize::MAX;
+        output
+            .drain(&mut writer)
+            .now_or_never()
+            .expect("ready")
+            .expect("complete write");
+        assert!(!output.pending());
+        output.append(b"next");
+        assert_eq!(
+            output.end_position(),
+            b"pushrestorenext".len(),
+            "positions keep counting after the drained queue is reset"
+        );
     }
 }

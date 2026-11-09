@@ -6,13 +6,14 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use meowland_protocol::clipboard::{Selection, Transport};
-use meowland_terminal_clipboard::{Clipboard, Focus, Refresh};
+use meowland_terminal_clipboard::{Clipboard, Refresh};
 
 #[derive(Debug, Arbitrary)]
 enum Op {
     Packet(Vec<u8>),
     Text(Vec<u8>),
-    Focus(bool),
+    FocusGained,
+    FocusLost,
     Refresh { primary: bool, paste: bool },
     Advance,
 }
@@ -35,8 +36,9 @@ fuzz_target!(|session: Session| {
         match op {
             Op::Packet(bytes) => clipboard.packet(&bytes),
             Op::Text(bytes) => clipboard.text(&bytes),
-            Op::Focus(gained) => {
-                clipboard.focus(if gained { Focus::Gained } else { Focus::Lost });
+            Op::FocusGained => clipboard.focus_gained(),
+            Op::FocusLost => {
+                clipboard.focus_lost();
             }
             Op::Refresh { primary, paste } => {
                 let selection = if primary {

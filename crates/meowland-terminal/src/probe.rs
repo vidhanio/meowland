@@ -13,7 +13,7 @@ use meowland_async::{
 };
 use meowland_core::pixels::FrameSize;
 use meowland_input as input;
-use meowland_kitty::{query_frame_edits, query_shared};
+use meowland_kitty::{FRAME_EDIT_PROBE_ID, SHARED_PROBE_ID, query_frame_edits, query_shared};
 use meowland_protocol::SharedObject;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
@@ -26,8 +26,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Quiet period after device attributes, allowing late probe replies.
 const PROBE_QUIET: Duration = Duration::from_millis(25);
 const PROBE_MAXIMUM: usize = 64 * 1024;
-const FRAME_EDIT_ID: u32 = 30;
-const SHARED_ID: u32 = 32;
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q";
 /// Query device attributes last so their reply starts the handshake's quiet
 /// window.
@@ -81,7 +79,7 @@ pub(crate) async fn terminal_probe(
     let shared_probe = shared_probe();
     let mut pending = output::Output::default();
     pending.append(PROBE_QUERY);
-    pending.append(&query_frame_edits(FRAME_EDIT_ID));
+    pending.append(&query_frame_edits());
     if let Some((_, command)) = &shared_probe {
         pending.append(command);
     }
@@ -117,7 +115,7 @@ pub(crate) async fn terminal_probe(
 fn shared_probe() -> Option<(SharedObject, Vec<u8>)> {
     let (object, mut file) = SharedObject::create(FrameSize::new(1, 1)?).ok()?;
     file.write_all(&[0; 3]).ok()?;
-    let command = query_shared(object.frame(), SHARED_ID);
+    let command = query_shared(object.frame());
     Some((object, command))
 }
 
@@ -160,10 +158,10 @@ impl ProbeParser {
         match action {
             VTAction::ApcDispatch(data) => {
                 if let Some(body) = data.strip_prefix(b"G") {
-                    if let Some(ok) = kitty_reply(body, FRAME_EDIT_ID) {
+                    if let Some(ok) = kitty_reply(body, FRAME_EDIT_PROBE_ID) {
                         self.info.frame_edits = ok;
                     }
-                    if let Some(ok) = kitty_reply(body, SHARED_ID) {
+                    if let Some(ok) = kitty_reply(body, SHARED_PROBE_ID) {
                         self.info.shared_memory = ok;
                     }
                 }

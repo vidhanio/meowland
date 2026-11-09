@@ -23,11 +23,10 @@ impl Compositor {
             let focus = grab.current_grab().filter(Resource::is_alive);
             self.set_keyboard_focus(focus, SERIAL_COUNTER.next_serial());
         }
-        if let Some(pointer) = self.input.pointer.take() {
-            if pointer.has_grab(grab.serial()) {
-                pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
-            }
-            self.input.pointer = Some(pointer);
+        if self.input.pointer.has_grab(grab.serial()) {
+            self.dispatch_pointer(|state, pointer| {
+                pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), InputTime::now());
+            });
         }
     }
 }

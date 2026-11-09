@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
-    fmt, io,
+    fmt, io, mem,
     os::fd::OwnedFd,
     sync::Arc,
 };
@@ -21,7 +21,7 @@ use meowland_protocol::{
     ClipboardOfferId, ClipboardRequestId, OfferIntent, ServerToPane,
     clipboard::{
         ClipboardData, Deadline, Item, MAX_BYTES, MAX_TEXT, Selection as ClipboardSelection,
-        TRANSFER_TIMEOUT, Transport, mime_types,
+        TEXT_MIMES, TRANSFER_TIMEOUT, Transport, mime_types,
     },
 };
 use rustix::{
@@ -44,17 +44,105 @@ pub enum Source {
     },
 }
 
-struct Export<H> {
-    id: u64,
-    target: SelectionTarget,
+/// Most deliveries in progress at once.
+const MAX_DELIVERIES: usize = 16;
+/// Bytes written to a client per readiness event.
+const WRITE_BUDGET: usize = 64 * 1024;
+/// Bytes read from the selection owner per read call.
+const READ_CHUNK: usize = 16 * 1024;
+/// Read calls per readiness event.
+const READS_PER_EVENT: usize = 4;
+
+/// Representations copied so far from the selection owner for one pane.
+struct Export {
     pane: PaneId,
     mimes: VecDeque<String>,
-    active: Option<Sources<H>>,
     data: ClipboardData,
     bytes: usize,
     /// Aggregate bytes this transport can use, from [`export_limit`].
     limit: usize,
     deadline: Deadline,
+}
+
+/// Progress of the export for one seat selection.
+enum Phase<H> {
+    Idle,
+    /// Waiting for Smithay to finish replacing the seat selection.
+    Scheduled {
+        export: Export,
+        timer: Sources<H>,
+    },
+    /// Asking the selection owner for a representation. The export lives on
+    /// the requesting stack frame; this marks whose request a re-entrant
+    /// detach cancels.
+    Requesting {
+        pane: PaneId,
+    },
+    /// Reading one representation from the owner's pipe.
+    Reading {
+        export: Export,
+        sources: Sources<H>,
+    },
+}
+
+/// One seat selection's export, versioned so callbacks of a superseded
+/// export recognize they are stale.
+struct Slot<H> {
+    epoch: u64,
+    phase: Phase<H>,
+}
+
+impl<H> Slot<H> {
+    const fn new() -> Self {
+        Self {
+            epoch: 0,
+            phase: Phase::Idle,
+        }
+    }
+
+    /// Supersede the current export, returning the new epoch.
+    fn replace(&mut self, phase: Phase<H>) -> u64 {
+        self.epoch += 1;
+        self.phase = phase;
+        self.epoch
+    }
+
+    const fn pane(&self) -> Option<PaneId> {
+        match &self.phase {
+            Phase::Idle => None,
+            Phase::Scheduled { export, .. } | Phase::Reading { export, .. } => Some(export.pane),
+            Phase::Requesting { pane } => Some(*pane),
+        }
+    }
+
+    /// Advance an export still at `epoch`, reporting whether it was current.
+    fn advance(&mut self, epoch: u64, phase: Phase<H>) -> bool {
+        if self.epoch != epoch {
+            return false;
+        }
+        self.phase = phase;
+        true
+    }
+
+    fn take_scheduled(&mut self, epoch: u64) -> Option<(Export, Sources<H>)> {
+        match mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Scheduled { export, timer } if self.epoch == epoch => Some((export, timer)),
+            phase => {
+                self.phase = phase;
+                None
+            }
+        }
+    }
+
+    fn take_reading(&mut self, epoch: u64) -> Option<(Export, Sources<H>)> {
+        match mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Reading { export, sources } if self.epoch == epoch => Some((export, sources)),
+            phase => {
+                self.phase = phase;
+                None
+            }
+        }
+    }
 }
 
 enum DeliveryPhase {
@@ -94,8 +182,8 @@ const fn wayland_selection(selection: ClipboardSelection) -> SelectionTarget {
 /// Text leads because it is what a terminal pastes, and because legacy OSC 52
 /// panes can paste nothing else.
 const TEXT_EXPORT_MIMES: [&str; 5] = [
-    "text/plain;charset=utf-8",
-    "text/plain",
+    TEXT_MIMES[0],
+    TEXT_MIMES[1],
     "UTF8_STRING",
     "TEXT",
     "STRING",
@@ -137,28 +225,19 @@ fn export_types(advertised: impl IntoIterator<Item = String>, transport: Transpo
     }
 }
 
-struct InFlight {
-    pane: PaneId,
-    generation: u64,
-}
-
 /// Host-owned selection exports, deliveries, and pending transfer state.
 pub struct Bridge<H> {
-    exports: [Option<Export<H>>; 2],
-    in_flight: [Option<InFlight>; 2],
+    slots: [Slot<H>; 2],
     deliveries: HashMap<ClipboardRequestId, Delivery<H>>,
-    generations: [u64; 2],
-    next: u64,
+    next_request: u64,
 }
 
 impl<H> Default for Bridge<H> {
     fn default() -> Self {
         Self {
-            exports: [None, None],
-            in_flight: [None, None],
+            slots: [Slot::new(), Slot::new()],
             deliveries: HashMap::new(),
-            generations: [0; 2],
-            next: 0,
+            next_request: 0,
         }
     }
 }
@@ -167,37 +246,31 @@ impl<H> fmt::Debug for Bridge<H> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Bridge")
-            .field("exports", &self.exports.iter().flatten().count())
+            .field(
+                "exports",
+                &self
+                    .slots
+                    .iter()
+                    .filter(|slot| !matches!(slot.phase, Phase::Idle))
+                    .count(),
+            )
             .field("deliveries", &self.deliveries.len())
             .finish_non_exhaustive()
     }
 }
 
 impl<H> Bridge<H> {
-    const fn id(&mut self) -> u64 {
-        self.next += 1;
-        self.next
+    fn request(&mut self) -> ClipboardRequestId {
+        self.next_request += 1;
+        ClipboardRequestId::from(self.next_request)
     }
 
-    const fn export(&self, target: SelectionTarget) -> Option<&Export<H>> {
-        self.exports[target_index(target)].as_ref()
+    const fn slot(&mut self, target: SelectionTarget) -> &mut Slot<H> {
+        &mut self.slots[target_index(target)]
     }
 
-    const fn export_mut(&mut self, target: SelectionTarget) -> Option<&mut Export<H>> {
-        self.exports[target_index(target)].as_mut()
-    }
-
-    const fn take_export(&mut self, target: SelectionTarget) -> Option<Export<H>> {
-        self.exports[target_index(target)].take()
-    }
-
-    const fn generation(&self, target: SelectionTarget) -> u64 {
-        self.generations[target_index(target)]
-    }
-
-    fn set_export(&mut self, target: SelectionTarget, export: Option<Export<H>>) {
-        self.exports[target_index(target)] = export;
-        self.generations[target_index(target)] += 1;
+    fn cancel(&mut self, target: SelectionTarget) {
+        self.slot(target).replace(Phase::Idle);
     }
 
     /// Forget every delivery and export owned by a detached pane.
@@ -205,23 +278,9 @@ impl<H> Bridge<H> {
         self.deliveries.retain(|_, delivery| {
             !matches!(delivery.phase, DeliveryPhase::AwaitingTerminal { pane: owner, .. } if owner == pane)
         });
-        for ((export, in_flight), generation) in self
-            .exports
-            .iter_mut()
-            .zip(&mut self.in_flight)
-            .zip(&mut self.generations)
-        {
-            let detached = if export.as_ref().is_some_and(|export| export.pane == pane) {
-                *export = None;
-                true
-            } else {
-                false
-            };
-            let in_flight = in_flight.as_ref().is_some_and(|in_flight| {
-                in_flight.pane == pane && in_flight.generation == *generation
-            });
-            if detached || in_flight {
-                *generation += 1;
+        for slot in &mut self.slots {
+            if slot.pane() == Some(pane) {
+                slot.replace(Phase::Idle);
             }
         }
     }
@@ -273,7 +332,7 @@ pub trait Host: Sized + 'static {
 /// yields no representation, because none is supported or every transfer
 /// fails, leaves the pane's clipboard untouched.
 pub fn selection<H: Host>(host: &mut H, target: SelectionTarget, source: Option<SelectionSource>) {
-    host.bridge().set_export(target, None);
+    host.bridge().cancel(target);
     let Some(pane) = host.selection_pane() else {
         return;
     };
@@ -287,100 +346,77 @@ pub fn selection<H: Host>(host: &mut H, target: SelectionTarget, source: Option<
         );
         return;
     };
-    let id = host.bridge().id();
     let transport = host.pane_transport(pane).unwrap_or(Transport::Kitty);
-    host.bridge().set_export(
-        target,
-        Some(Export {
-            id,
-            target,
-            pane,
-            mimes: export_types(source.mime_types(), transport).into(),
-            active: None,
-            data: ClipboardData::default(),
-            bytes: 0,
-            limit: export_limit(transport),
-            deadline: Deadline::new(TRANSFER_TIMEOUT),
-        }),
-    );
-    schedule_export(host, target, id);
+    let export = Export {
+        pane,
+        mimes: export_types(source.mime_types(), transport).into(),
+        data: ClipboardData::default(),
+        bytes: 0,
+        limit: export_limit(transport),
+        deadline: Deadline::new(TRANSFER_TIMEOUT),
+    };
+    schedule_export(host, target, export);
 }
 
 /// Smithay updates the seat selection after returning from `new_selection`.
-fn schedule_export<H: Host>(host: &mut H, target: SelectionTarget, id: u64) {
-    let mut sources = Sources::new(host.handle());
+fn schedule_export<H: Host>(host: &mut H, target: SelectionTarget, export: Export) {
+    let epoch = host.bridge().slot(target).replace(Phase::Idle);
+    let mut timer = Sources::new(host.handle());
     match host
         .handle()
         .insert_source(Timer::immediate(), move |_, (), host| {
-            if let Some(export) = host.bridge().export_mut(target)
-                && export.id == id
-            {
-                if let Some(sources) = &mut export.active {
-                    sources.timer = None;
-                }
-                export.active = None;
-                export_next(host, target);
+            if let Some((export, mut timer)) = host.bridge().slot(target).take_scheduled(epoch) {
+                timer.timer = None;
+                export_next(host, target, epoch, export);
             }
             TimeoutAction::Drop
         }) {
         Ok(token) => {
-            sources.timer = Some(token);
-            if let Some(export) = host.bridge().export_mut(target) {
-                export.active = Some(sources);
-            }
+            timer.timer = Some(token);
+            host.bridge()
+                .slot(target)
+                .advance(epoch, Phase::Scheduled { export, timer });
         }
-        Err(error) => {
-            tracing::warn!(%error, "Cannot schedule clipboard export");
-            host.bridge().set_export(target, None);
-        }
+        Err(error) => tracing::warn!(%error, "Cannot schedule clipboard export"),
     }
 }
 
-fn export_next<H: Host>(host: &mut H, target: SelectionTarget) {
-    let Some(export) = host.bridge().take_export(target) else {
-        return;
-    };
-    let generation = host.bridge().generation(target);
-    host.bridge().in_flight[target_index(target)] = Some(InFlight {
-        pane: export.pane,
-        generation,
-    });
-    export_attempt(host, target, export, generation);
-    host.bridge().in_flight[target_index(target)] = None;
-}
-
-fn export_attempt<H: Host>(
-    host: &mut H,
-    target: SelectionTarget,
-    mut export: Export<H>,
-    generation: u64,
-) {
+fn export_next<H: Host>(host: &mut H, target: SelectionTarget, epoch: u64, mut export: Export) {
     if export.deadline.expired() || !host.contains_pane(export.pane) {
+        host.bridge().slot(target).advance(epoch, Phase::Idle);
         return;
     }
-    if host.bridge().generation(target) != generation {
-        return;
-    }
+    let pane = export.pane;
     while let Some(mime) = export.mimes.pop_front() {
-        let result = export_source(host, &export, mime.clone(), generation);
-        match result {
+        if !host
+            .bridge()
+            .slot(target)
+            .advance(epoch, Phase::Requesting { pane })
+        {
+            return;
+        }
+        match export_source(host, target, epoch, &export, mime.clone()) {
             Ok(Some(sources)) => {
-                export.active = Some(sources);
-                host.bridge().set_export(target, Some(export));
+                host.bridge()
+                    .slot(target)
+                    .advance(epoch, Phase::Reading { export, sources });
                 return;
             }
-            Ok(None) => return,
+            Ok(None) => {
+                host.bridge().slot(target).advance(epoch, Phase::Idle);
+                return;
+            }
             Err(error) => tracing::warn!(%error, %mime, "Cannot read client clipboard"),
         }
     }
-    if export.data.items.is_empty()
-        || host.bridge().generation(target) != generation
-        || !host.contains_pane(export.pane)
+    if !host.bridge().slot(target).advance(epoch, Phase::Idle)
+        || export.data.items.is_empty()
+        || !host.contains_pane(pane)
     {
         return;
     }
     host.emit(
-        export.pane,
+        pane,
         ServerToPane::ClipboardWrite {
             selection: wire_selection(target),
             data: export.data,
@@ -388,17 +424,18 @@ fn export_attempt<H: Host>(
     );
 }
 
+/// Request one representation, returning its registrations, or `None` if
+/// the export was superseded or its pane detached during the request.
 fn export_source<H: Host>(
     host: &mut H,
-    export: &Export<H>,
+    target: SelectionTarget,
+    epoch: u64,
+    export: &Export,
     mime: String,
-    generation: u64,
 ) -> io::Result<Option<Sources<H>>> {
     let (read, write) = rustix::pipe::pipe()?;
     nonblocking(&read)?;
     let mut sources = Sources::new(host.handle());
-    let id = export.id;
-    let target = export.target;
     let deadline = export.deadline;
     let limit = export.limit.saturating_sub(export.bytes);
     let mut bytes = Vec::new();
@@ -408,47 +445,40 @@ fn export_source<H: Host>(
             .insert_source(
                 Generic::new(read, Interest::READ, Mode::Level),
                 move |_, fd, host| {
-                    if host
-                        .bridge()
-                        .export(target)
-                        .is_none_or(|export| export.id != id)
-                    {
+                    if host.bridge().slot(target).epoch != epoch {
                         return Ok(PostAction::Remove);
                     }
                     if deadline.expired() {
-                        if let Some(mut export) = host.bridge().take_export(target)
-                            && let Some(sources) = &mut export.active
+                        if let Some((_, mut sources)) =
+                            host.bridge().slot(target).take_reading(epoch)
                         {
                             sources.io = None;
                         }
                         return Ok(PostAction::Remove);
                     }
-                    let result = receive(fd, &mut bytes, limit);
-                    if matches!(result, Ok(false)) {
-                        return Ok(PostAction::Continue);
-                    }
-                    let Some(export) = host.bridge().export_mut(target) else {
-                        return Ok(PostAction::Remove);
-                    };
-                    if let Some(sources) = &mut export.active {
-                        sources.io = None;
-                    }
-                    export.active = None;
-                    match result {
-                        Ok(true) => {
-                            export.bytes += bytes.len();
-                            export.data.items.push(Item {
-                                mime: mime.clone(),
-                                data: std::mem::take(&mut bytes),
-                            });
-                            export_next(host, target);
-                        }
+                    let received = match receive(fd, &mut bytes, limit) {
+                        Ok(false) => return Ok(PostAction::Continue),
+                        Ok(true) => Some(mem::take(&mut bytes)),
                         Err(error) => {
                             tracing::warn!(%error, %mime, "Cannot transfer client clipboard");
-                            export_next(host, target);
+                            None
                         }
-                        Ok(false) => unreachable!(),
+                    };
+                    let Some((mut export, mut sources)) =
+                        host.bridge().slot(target).take_reading(epoch)
+                    else {
+                        return Ok(PostAction::Remove);
+                    };
+                    sources.io = None;
+                    drop(sources);
+                    if let Some(data) = received {
+                        export.bytes += data.len();
+                        export.data.items.push(Item {
+                            mime: mime.clone(),
+                            data,
+                        });
                     }
+                    export_next(host, target, epoch, export);
                     Ok(PostAction::Remove)
                 },
             )
@@ -459,12 +489,8 @@ fn export_source<H: Host>(
             .insert_source(
                 Timer::from_duration(export.deadline.remaining()),
                 move |_, (), host| {
-                    if let Some(mut export) = host.bridge().exports[target_index(target)]
-                        .take_if(|export| export.id == id)
-                    {
-                        if let Some(sources) = &mut export.active {
-                            sources.timer = None;
-                        }
+                    if let Some((_, mut sources)) = host.bridge().slot(target).take_reading(epoch) {
+                        sources.timer = None;
                         tracing::warn!("Client clipboard export timed out");
                     }
                     TimeoutAction::Drop
@@ -473,7 +499,7 @@ fn export_source<H: Host>(
             .map_err(io::Error::other)?,
     );
     let request = host.request_selection(target, requested_mime, write);
-    if host.bridge().generation(target) != generation || !host.contains_pane(export.pane) {
+    if host.bridge().slot(target).epoch != epoch || !host.contains_pane(export.pane) {
         return Ok(None);
     }
     request?;
@@ -481,8 +507,8 @@ fn export_source<H: Host>(
 }
 
 fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io::Result<bool> {
-    let mut chunk = [0; 16 * 1024];
-    for _ in 0..4 {
+    let mut chunk = [0; READ_CHUNK];
+    for _ in 0..READS_PER_EVENT {
         match rustix::io::read(fd, &mut chunk) {
             Ok(0) => return Ok(true),
             Ok(read) => {
@@ -501,21 +527,22 @@ fn receive(fd: &impl std::os::fd::AsFd, bytes: &mut Vec<u8>, limit: usize) -> io
 
 /// Deliver one representation of the seat selection to a client.
 pub fn send<H: Host>(host: &mut H, fd: OwnedFd, mime: &str, source: &Source) {
-    if host.bridge().deliveries.len() >= 16 {
+    if host.bridge().deliveries.len() >= MAX_DELIVERIES {
         return;
     }
     let deadline = Deadline::new(TRANSFER_TIMEOUT);
     match source {
         Source::Local(data) => {
             if let Some(item) = data.items.iter().find(|item| item.mime == mime) {
-                write(host, fd, item.data.clone(), deadline);
+                let request = host.bridge().request();
+                write(host, request, fd, item.data.clone(), deadline);
             }
         }
         Source::Terminal { pane, offer } => {
             if !host.contains_pane(*pane) {
                 return;
             }
-            let request = ClipboardRequestId::from(host.bridge().id());
+            let request = host.bridge().request();
             let Ok(sources) = delivery_timer(host, request, deadline) else {
                 return;
             };
@@ -570,11 +597,17 @@ fn nonblocking(fd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-fn write<H: Host>(host: &mut H, fd: OwnedFd, data: Vec<u8>, deadline: Deadline) {
+/// Write `data` to a client under the delivery identity `request`.
+fn write<H: Host>(
+    host: &mut H,
+    request: ClipboardRequestId,
+    fd: OwnedFd,
+    data: Vec<u8>,
+    deadline: Deadline,
+) {
     if data.is_empty() || data.len() > MAX_BYTES || deadline.expired() {
         return;
     }
-    let request = ClipboardRequestId::from(host.bridge().id());
     let result = (|| -> io::Result<Sources<H>> {
         nonblocking(&fd)?;
         let mut sources = delivery_timer(host, request, deadline)?;
@@ -590,7 +623,7 @@ fn write<H: Host>(host: &mut H, fd: OwnedFd, data: Vec<u8>, deadline: Deadline) 
                             }
                             return Ok(PostAction::Remove);
                         }
-                        let mut budget = 64 * 1024;
+                        let mut budget = WRITE_BUDGET;
                         while sent < data.len() && budget > 0 {
                             let end = (sent + budget).min(data.len());
                             match rustix::io::write(&*fd, &data[sent..end]) {
@@ -656,7 +689,7 @@ pub fn reply<H: Host>(
     if let DeliveryPhase::AwaitingTerminal { fd, .. } = phase
         && let Some(data) = data.filter(|data| data.len() <= MAX_BYTES)
     {
-        write(host, fd, data, deadline);
+        write(host, request, fd, data, deadline);
     }
 }
 
@@ -686,7 +719,7 @@ pub fn offer<H: Host>(host: &mut H, pane: PaneId, offer: TerminalOffer) {
     }
     let target = wayland_selection(selection);
     let mimes = mime_types(mimes);
-    host.bridge().set_export(target, None);
+    host.bridge().cancel(target);
     host.set_selection(target, mimes, Source::Terminal { pane, offer });
     if intent == OfferIntent::Paste
         && target == SelectionTarget::Clipboard
@@ -701,7 +734,7 @@ pub fn paste<H: Host>(host: &mut H, pane: PaneId, text: &str) {
     if text.len() > MAX_TEXT || !host.pane_has_window(pane) {
         return;
     }
-    host.bridge().set_export(SelectionTarget::Clipboard, None);
+    host.bridge().cancel(SelectionTarget::Clipboard);
     let data = Arc::new(ClipboardData::text(text));
     let mimes = data.items.iter().map(|item| item.mime.clone()).collect();
     host.set_selection(SelectionTarget::Clipboard, mimes, Source::Local(data));
@@ -768,23 +801,27 @@ mod tests {
             (event_loop, host)
         }
 
-        fn attach_export(&mut self, pane: PaneId, mimes: &[&str], limit: usize) {
+        /// Start a clipboard export of `mimes` and request its first
+        /// representation.
+        fn start_export(&mut self, pane: PaneId, mimes: &[&str], limit: usize) {
             let target = SelectionTarget::Clipboard;
-            let id = self.bridge.id();
-            self.bridge.set_export(
-                target,
-                Some(Export {
-                    id,
-                    target,
-                    pane,
-                    mimes: mimes.iter().map(|mime| (*mime).to_owned()).collect(),
-                    active: None,
-                    data: ClipboardData::default(),
-                    bytes: 0,
-                    limit,
-                    deadline: Deadline::new(TRANSFER_TIMEOUT),
-                }),
-            );
+            let epoch = self.bridge.slot(target).replace(Phase::Idle);
+            let export = Export {
+                pane,
+                mimes: mimes.iter().map(|mime| (*mime).to_owned()).collect(),
+                data: ClipboardData::default(),
+                bytes: 0,
+                limit,
+                deadline: Deadline::new(TRANSFER_TIMEOUT),
+            };
+            export_next(self, target, epoch, export);
+        }
+
+        fn exporting(&mut self) -> bool {
+            !matches!(
+                self.bridge.slot(SelectionTarget::Clipboard).phase,
+                Phase::Idle
+            )
         }
 
         fn serve(&mut self, mime: &str, data: Option<&[u8]>) {
@@ -795,7 +832,7 @@ mod tests {
         /// Run transfers until the clipboard export finishes.
         fn settle(&mut self, event_loop: &mut EventLoop<'static, Self>) {
             for _ in 0..16 {
-                if self.bridge.export(SelectionTarget::Clipboard).is_none() {
+                if !self.exporting() {
                     return;
                 }
                 event_loop
@@ -969,53 +1006,50 @@ mod tests {
         let target = SelectionTarget::Clipboard;
         let (_event_loop, mut host) = FakeHost::new();
 
-        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.on_request = Some(Box::new(move |host| {
             host.bridge.detach(pane);
             Ok(())
         }));
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         assert_eq!(host.requests.len(), 1);
-        assert!(host.bridge.export(target).is_none());
+        assert!(!host.exporting());
         assert!(host.emitted.is_empty());
 
         host.requests.clear();
-        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.on_request = Some(Box::new(move |host| {
-            host.bridge.set_export(target, None);
+            host.bridge.cancel(target);
             Err(io::Error::other("request failed"))
         }));
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         assert_eq!(host.requests.len(), 1);
-        assert!(host.bridge.export(target).is_none());
+        assert!(!host.exporting());
 
         host.requests.clear();
-        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.on_request = Some(Box::new(|_| Err(io::Error::other("request failed"))));
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         assert_eq!(
             host.requests.iter().map(String::as_str).collect::<Vec<_>>(),
             ["text/plain", "text/html"]
         );
-        assert!(host.bridge.export(target).is_some());
+        assert!(matches!(
+            host.bridge.slot(target).phase,
+            Phase::Reading { .. }
+        ));
         assert!(host.emitted.is_empty());
     }
 
     #[test]
     fn unusable_exports_leave_the_terminal_clipboard_untouched() {
         let pane = PaneId::from(7);
-        let target = SelectionTarget::Clipboard;
         let (mut event_loop, mut host) = FakeHost::new();
 
-        host.attach_export(pane, &[], MAX_BYTES);
-        export_next(&mut host, target);
+        host.start_export(pane, &[], MAX_BYTES);
         host.settle(&mut event_loop);
         assert!(host.emitted.is_empty());
 
         host.serve("text/plain", None);
         host.serve("text/html", None);
-        host.attach_export(pane, &["text/plain", "text/html"], MAX_BYTES);
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/plain", "text/html"], MAX_BYTES);
         host.settle(&mut event_loop);
         assert_eq!(host.requests, ["text/plain", "text/html"]);
         assert!(host.emitted.is_empty());
@@ -1024,21 +1058,18 @@ mod tests {
     #[test]
     fn oversized_representations_keep_the_others() {
         let pane = PaneId::from(7);
-        let target = SelectionTarget::Clipboard;
         let (mut event_loop, mut host) = FakeHost::new();
 
         host.serve("text/plain", Some(b"hello"));
         host.serve("text/html", Some(b"<b>hello</b>"));
-        host.attach_export(pane, &["text/plain", "text/html"], 8);
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/plain", "text/html"], 8);
         host.settle(&mut event_loop);
         assert_eq!(host.written(), [[("text/plain", &b"hello"[..])]]);
 
         host.emitted.clear();
         host.serve("text/html", Some(b"<b>hello</b>"));
         host.serve("text/plain", Some(b"hello"));
-        host.attach_export(pane, &["text/html", "text/plain"], 8);
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/html", "text/plain"], 8);
         host.settle(&mut event_loop);
         assert_eq!(host.written(), [[("text/plain", &b"hello"[..])]]);
     }
@@ -1054,8 +1085,7 @@ mod tests {
 
         host.emitted.clear();
         host.serve("text/plain", Some(b""));
-        host.attach_export(pane, &["text/plain"], MAX_BYTES);
-        export_next(&mut host, target);
+        host.start_export(pane, &["text/plain"], MAX_BYTES);
         host.settle(&mut event_loop);
         assert_eq!(host.written(), [[("text/plain", &b""[..])]]);
     }

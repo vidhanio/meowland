@@ -3,6 +3,7 @@
 use std::{
     fs::File,
     io::Write as _,
+    mem,
     time::{Duration, Instant},
 };
 
@@ -20,12 +21,25 @@ use super::transfer_columns;
 /// the rectangle is smaller, even after zlib, and skips the publication write.
 const SHARED_AREA_DIVISOR: u64 = 4;
 
+/// How far one frame's shared publication has progressed.
+enum Stage {
+    /// The frame goes out as RGB bands.
+    Inline,
+    /// Shared transport, but nothing published yet; publication starts once
+    /// a changed rectangle is worth a whole frame, or at once for a frame the
+    /// pane has no basis for.
+    Waiting { whole: bool },
+    /// Composed rows stream into the object as they become ready.
+    Streaming {
+        object: SharedObject,
+        file: File,
+        written: usize,
+    },
+}
+
 pub(super) struct Publication {
     size: FrameSize,
-    force: bool,
-    pub transport: FrameTransport,
-    object: Option<(SharedObject, File)>,
-    written: usize,
+    stage: Stage,
     pub elapsed: Duration,
 }
 
@@ -35,33 +49,41 @@ impl Publication {
         transport: FrameTransport,
         basis: Option<FrameSize>,
     ) -> Self {
+        let stage = match transport {
+            FrameTransport::Inline => Stage::Inline,
+            FrameTransport::Shared => Stage::Waiting {
+                whole: basis != Some(size),
+            },
+        };
         Self {
             size,
-            force: basis != Some(size),
-            transport,
-            object: None,
-            written: 0,
+            stage,
             elapsed: Duration::ZERO,
         }
     }
 
+    /// Transport the frame uses, which falls back to inline once a
+    /// publication write fails.
+    pub(super) const fn transport(&self) -> FrameTransport {
+        match self.stage {
+            Stage::Inline => FrameTransport::Inline,
+            Stage::Waiting { .. } | Stage::Streaming { .. } => FrameTransport::Shared,
+        }
+    }
+
+    /// Publish the composed prefix `ready` if this frame goes out shared.
     pub(super) fn changed(&mut self, changed: Option<&Changed>, ready: &[u8]) {
-        if self.transport != FrameTransport::Shared {
-            return;
-        }
-        if self.object.is_none()
-            && !self.force
-            && !changed.is_some_and(|changed| self.prefers_shared(changed))
-        {
-            return;
-        }
-        let started = Instant::now();
-        let result = self.write(ready);
-        self.elapsed += started.elapsed();
-        if let Err(error) = result {
-            tracing::warn!(%error, "shared-memory publication failed; using RGB bands");
-            self.object = None;
-            self.transport = FrameTransport::Inline;
+        let start = match self.stage {
+            Stage::Inline => false,
+            Stage::Waiting { whole } => {
+                whole || changed.is_some_and(|changed| self.prefers_shared(changed))
+            }
+            Stage::Streaming { .. } => true,
+        };
+        if start {
+            let started = Instant::now();
+            self.write(ready);
+            self.elapsed += started.elapsed();
         }
     }
 
@@ -74,21 +96,51 @@ impl Publication {
             >= u64::from(self.size.width()) * u64::from(self.size.height())
     }
 
-    fn write(&mut self, ready: &[u8]) -> std::io::Result<()> {
-        if self.object.is_none() {
-            self.object = Some(SharedObject::create(self.size)?);
+    fn write(&mut self, ready: &[u8]) {
+        let result = match mem::replace(&mut self.stage, Stage::Inline) {
+            Stage::Inline => return,
+            Stage::Waiting { .. } => {
+                SharedObject::create(self.size).map(|(object, file)| (object, file, 0))
+            }
+            Stage::Streaming {
+                object,
+                file,
+                written,
+            } => Ok((object, file, written)),
         }
-        if let Some((_, file)) = &mut self.object {
-            file.write_all(&ready[self.written..])?;
-            self.written = ready.len();
+        .and_then(|(object, mut file, written)| {
+            let pending = ready.get(written..).expect("composed prefixes only grow");
+            file.write_all(pending)?;
+            Ok((object, file, ready.len()))
+        });
+        match result {
+            Ok((object, file, written)) => {
+                self.stage = Stage::Streaming {
+                    object,
+                    file,
+                    written,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(%error, "shared-memory publication failed; using RGB bands");
+            }
         }
-        Ok(())
     }
 
+    /// Publish the rest of a streamed frame and hand over its object.
     pub(super) fn finish(&mut self, pixels: &[u8]) -> Option<SharedObject> {
-        if self.object.is_some() {
-            self.changed(None, pixels);
+        if matches!(self.stage, Stage::Streaming { .. }) {
+            self.write(pixels);
         }
-        self.object.take().map(|(object, _)| object)
+        match mem::replace(&mut self.stage, Stage::Inline) {
+            Stage::Streaming { object, .. } => {
+                self.stage = Stage::Waiting { whole: false };
+                Some(object)
+            }
+            stage => {
+                self.stage = stage;
+                None
+            }
+        }
     }
 }

@@ -55,14 +55,12 @@ mod runtime;
 mod scaling;
 mod seat;
 mod selection;
-mod settings;
 mod shell;
 mod text;
 mod toplevels;
 mod window;
 
-pub use meowland_panes::PaneId;
-use meowland_panes::{WindowCatalog, WindowId};
+use meowland_panes::{PaneId, WindowCatalog, WindowId};
 
 pub(crate) type AttachedPane = meowland_panes::AttachedPane<frame::PaneState>;
 pub(crate) type Attachments = meowland_panes::Attachments<frame::PaneState>;
@@ -73,12 +71,9 @@ pub type CompositorHandle = meowland_loop::Handle<Compositor>;
 use meowland_readback as readback;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
 use meowland_selection as clipboard;
+use meowland_settings::Settings;
 use runtime::ClientState;
 pub use runtime::Runtime;
-pub use settings::{
-    InvalidOutputSize, InvalidRepeatDelay, InvalidRepeatRate, KeyboardSettings, RepeatDelay,
-    RepeatRate, Settings,
-};
 
 /// An owned notification ready for delivery to one terminal pane.
 #[derive(Debug)]
@@ -89,11 +84,23 @@ pub struct Event {
     pub message: ServerToPane,
 }
 
+/// Whether an unmapped toplevel waits for the bufferless commit that starts
+/// its remap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Remap {
+    Idle,
+    /// The client removed its buffer; the next bufferless commit gets the
+    /// configure that lets it map again.
+    AwaitingInitialCommit,
+}
+
 struct Window {
     surface: ToplevelSurface,
     fullscreen: bool,
-    awaiting_remap_commit: bool,
+    remap: Remap,
+    /// Earliest time the next frame callback may be sent.
     callback_due: Instant,
+    /// Whether the client asked for a frame callback.
     callback_pending: bool,
 }
 
@@ -105,7 +112,6 @@ struct Protocols {
     xdg: XdgShellState,
     activation: XdgActivationState,
     launches: HashMap<String, activation::Launch>,
-    activation_deadline: Option<Instant>,
     _decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
     _viewporter: ViewporterState,
@@ -129,7 +135,7 @@ struct Input {
     keyboard_state: input::KeyboardState,
     shortcuts: Shortcuts,
     keymap: keymap::Keymap,
-    pointer: Option<PointerHandle<Compositor>>,
+    pointer: PointerHandle<Compositor>,
     cursor: seat::CursorState,
     popup_grab: Option<PopupGrab<Compositor>>,
     /// Most recent input source, also used to route selection exports.
@@ -140,7 +146,6 @@ struct Input {
 struct Windows {
     by_id: HashMap<WindowId, Window>,
     id_by_surface: HashMap<WlSurface, WindowId>,
-    callback_deadline: Option<Instant>,
     surface_cache: buffer::SurfaceCache,
     catalog: WindowCatalog,
     popups: PopupManager,
@@ -219,7 +224,7 @@ impl Compositor {
         let scale = settings.scale;
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "meowland");
-        let pointer = Some(seat.add_pointer());
+        let pointer = seat.add_pointer();
         let text_input = text::manager(&display_handle, &seat);
         let (output_manager, output, mode) = scaling::output(
             &display_handle,
@@ -264,7 +269,6 @@ impl Compositor {
             windows: Windows {
                 by_id: HashMap::new(),
                 id_by_surface: HashMap::new(),
-                callback_deadline: None,
                 surface_cache: buffer::SurfaceCache::default(),
                 catalog: WindowCatalog::default(),
                 popups: PopupManager::default(),
@@ -336,7 +340,6 @@ impl Compositor {
                 xdg,
                 activation,
                 launches: HashMap::new(),
-                activation_deadline: None,
                 _decoration: decoration,
                 kde_decoration,
                 _viewporter: viewporter,
@@ -445,7 +448,7 @@ impl Compositor {
         windows.sort_unstable();
         windows
             .into_iter()
-            .map(|id| self.windows.catalog.info(id))
+            .filter_map(|id| self.windows.catalog.info(id))
             .collect()
     }
 

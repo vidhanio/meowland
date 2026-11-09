@@ -12,6 +12,8 @@ workspace = true
 meowland-async = { workspace = true }
 meowland-protocol = { workspace = true, features = ["async"] }
 meowland-compositor = { workspace = true }
+meowland-panes = { workspace = true }
+meowland-settings = { workspace = true }
 calloop = { workspace = true }
 listenfd = { workspace = true }
 nix = { workspace = true, features = ["signal"] }

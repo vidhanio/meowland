@@ -1,7 +1,7 @@
 use std::{fs, io, path::Path};
 
 use anyhow::{Context, Result};
-use meowland_server::Settings;
+use meowland_settings::Settings;
 
 pub(crate) fn load(path: Option<&Path>) -> Result<Settings> {
     let default_path;

@@ -18,7 +18,7 @@ use smithay::{
 
 use super::{
     Scene, Snapshot,
-    damage::Layer,
+    damage::{Composition, Layer},
     geometry::{SurfaceGeometry, rounded, surface_geometry},
 };
 
@@ -91,11 +91,12 @@ impl Renderer {
             1.0
         };
         let damage = self.prepare(scene, root, snapshots, size, scale)?;
-        let covered = opaque_cover(snapshots, &scene.layers, size.width(), size.height(), scale);
+        let layers = scene.composition.layers();
+        let covered = opaque_cover(snapshots, layers, size.width(), size.height(), scale);
         let layers = if covered {
-            &scene.layers[scene.layers.len() - 1..]
+            &layers[layers.len() - 1..]
         } else {
-            &scene.layers
+            layers
         };
         let columns = damage.loc.x..damage.loc.x + damage.size.w;
         let changed_columns = u32::try_from(columns.start).expect("clipped column is nonnegative")
@@ -151,6 +152,10 @@ impl Renderer {
         })
     }
 
+    #[expect(
+        clippy::float_cmp,
+        reason = "the pane scale is reused verbatim, so only the identical value keeps a composition"
+    )]
     fn prepare(
         &mut self,
         scene: &mut Scene,
@@ -182,13 +187,17 @@ impl Renderer {
             )
                 .into(),
         );
-        let damage = if scene.basis != Some((size, scale)) || scene.layers != self.layers {
-            Some(bounds)
-        } else {
-            self.layers
+        let damage = match &scene.composition {
+            Composition::Composed {
+                size: composed,
+                scale: composed_scale,
+                layers,
+                damage,
+            } if *composed == size && *composed_scale == scale && *layers == self.layers => self
+                .layers
                 .iter()
                 .filter_map(|layer| {
-                    let damage = scene.damaged(layer)?;
+                    let damage = damage.get(&layer.surface)?.rect()?;
                     let dst = placement(layer.origin, layer.geometry.dst, scale)?;
                     let rect = Rectangle::new(
                         (
@@ -208,12 +217,29 @@ impl Renderer {
                     );
                     rect.to_i32_up::<i32>().intersection(bounds)
                 })
-                .reduce(Rectangle::merge)
+                .reduce(Rectangle::merge),
+            Composition::Composed { .. } | Composition::Stale => Some(bounds),
         };
-        std::mem::swap(&mut scene.layers, &mut self.layers);
-        scene.basis = Some((size, scale));
-        scene.damage.clear();
-        self.layers.clear();
+        let layers = std::mem::take(&mut self.layers);
+        let pending = if let Composition::Composed {
+            layers: mut previous,
+            damage: mut stale,
+            ..
+        } = std::mem::take(&mut scene.composition)
+        {
+            previous.clear();
+            self.layers = previous;
+            stale.clear();
+            stale
+        } else {
+            HashMap::new()
+        };
+        scene.composition = Composition::Composed {
+            size,
+            scale,
+            layers,
+            damage: pending,
+        };
         damage
     }
 }

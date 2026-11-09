@@ -6,7 +6,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use meowland_input::{
-    Event,
+    Event, Focus,
     fuzzing::{Parser, mouse},
 };
 
@@ -42,7 +42,7 @@ fuzz_target!(|report: Report| {
     let events: Vec<Event> = std::iter::from_fn(|| parser.next_event()).collect();
     let (focus, reports) = events.split_last().expect("focus after mouse report");
     assert!(
-        matches!(focus, Event::Focus(true)),
+        matches!(focus, Event::Focus(Focus::Gained)),
         "parser did not return to ground: {events:?}"
     );
     if bytes.len() <= BUFFERED {

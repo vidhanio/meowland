@@ -106,12 +106,37 @@ pub struct Window {
     pub active: bool,
 }
 
+/// Whether a process exiting fails the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exit {
+    Unexpected,
+    Expected,
+}
+
 #[derive(Debug)]
 struct Process {
     name: &'static str,
     child: Child,
-    /// Whether exiting is a failure rather than expected.
-    required: bool,
+    exit: Exit,
+}
+
+/// Whether the workload is meant to keep running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workload {
+    Running,
+    /// Its window was asked to close; the workload and the pane showing it
+    /// may exit.
+    Quitting,
+}
+
+/// How fast the harness reads terminal output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pace {
+    Unlimited,
+    /// Read at most [`THROTTLE_READ`] bytes, no sooner than `next`.
+    Throttled {
+        next: Duration,
+    },
 }
 
 /// A running server, pane, and workload behind a headless terminal.
@@ -125,7 +150,7 @@ pub struct Session {
     listener: UnixListener,
     control: Option<UnixStream>,
     control_pending: Vec<u8>,
-    closing: bool,
+    workload: Workload,
     endpoint: Endpoint,
     buffer: Vec<u8>,
     replies: Vec<u8>,
@@ -134,8 +159,7 @@ pub struct Session {
     frames: HashMap<u64, Duration>,
     deliveries: Vec<Frame>,
     app: Option<u32>,
-    throttled: bool,
-    next_read: Duration,
+    pace: Pace,
 }
 
 impl Session {
@@ -174,7 +198,7 @@ impl Session {
             listener,
             control: None,
             control_pending: Vec::new(),
-            closing: false,
+            workload: Workload::Running,
             endpoint: Endpoint::new(
                 config.width,
                 config.height,
@@ -188,8 +212,7 @@ impl Session {
             frames: HashMap::new(),
             deliveries: Vec::new(),
             app: None,
-            throttled: false,
-            next_read: Duration::ZERO,
+            pace: Pace::Unlimited,
         };
         session.until("server sockets", STEP_TIMEOUT, |session| {
             ["meowland-control.sock", "meowland-pane.sock"]
@@ -245,7 +268,7 @@ impl Session {
             "launch",
             (Stdio::null(), Stdio::null()),
         )?;
-        launcher.required = false;
+        launcher.exit = Exit::Expected;
         self.processes.push(launcher);
         let index = self.processes.len() - 1;
         let deadline = control::now() + STEP_TIMEOUT;
@@ -298,8 +321,10 @@ impl Session {
 
     /// Limit terminal reads to 16 KiB every 2 ms from now on, emulating a
     /// terminal that cannot keep up.
-    pub const fn throttle(&mut self) {
-        self.throttled = true;
+    pub fn throttle(&mut self) {
+        self.pace = Pace::Throttled {
+            next: control::now(),
+        };
     }
 
     /// Send `command` to the workload.
@@ -426,19 +451,21 @@ impl Session {
     /// process them.
     ///
     /// # Errors
-    /// Returns an error if a required process exited, the workload
+    /// Returns an error if a process exited unexpectedly, the workload
     /// disconnected unexpectedly, or the terminal output is invalid.
     pub fn pump(&mut self, timeout: Duration) -> anyhow::Result<()> {
         self.check()?;
         let now = control::now();
-        let reading = !self.throttled || now >= self.next_read;
-        let timeout = if reading {
-            timeout
-        } else {
-            timeout.min(self.next_read.saturating_sub(now))
+        let reading = match self.pace {
+            Pace::Unlimited => true,
+            Pace::Throttled { next } => now >= next,
+        };
+        let timeout = match self.pace {
+            Pace::Throttled { next } if !reading => timeout.min(next.saturating_sub(now)),
+            Pace::Unlimited | Pace::Throttled { .. } => timeout,
         };
         let timeout = Timespec::try_from(timeout)?;
-        let accepting = if self.control.is_none() && !self.closing {
+        let accepting = if self.control.is_none() && self.workload == Workload::Running {
             PollFlags::IN
         } else {
             PollFlags::empty()
@@ -500,7 +527,7 @@ impl Session {
         if count == 0 {
             self.control = None;
             ensure!(
-                self.closing,
+                self.workload == Workload::Quitting,
                 "workload control socket closed\n{}",
                 self.diagnostics()
             );
@@ -530,10 +557,9 @@ impl Session {
     }
 
     fn read_terminal(&mut self) -> anyhow::Result<()> {
-        let limit = if self.throttled {
-            THROTTLE_READ
-        } else {
-            READ_SIZE
+        let limit = match self.pace {
+            Pace::Unlimited => READ_SIZE,
+            Pace::Throttled { .. } => THROTTLE_READ,
         };
         loop {
             let count = match rustix::io::read(&self.master, &mut self.buffer[..limit]) {
@@ -557,8 +583,8 @@ impl Session {
             }
             write_terminal(&self.master, &self.replies)?;
             self.replies.clear();
-            if self.throttled {
-                self.next_read = control::now() + THROTTLE_INTERVAL;
+            if let Pace::Throttled { next } = &mut self.pace {
+                *next = control::now() + THROTTLE_INTERVAL;
                 break;
             }
         }
@@ -568,7 +594,7 @@ impl Session {
     fn check(&mut self) -> anyhow::Result<()> {
         for index in 0..self.processes.len() {
             let process = &mut self.processes[index];
-            if process.required
+            if process.exit == Exit::Unexpected
                 && let Some(status) = process.child.try_wait()?
             {
                 let name = process.name;
@@ -651,13 +677,18 @@ impl Session {
             .collect()
     }
 
-    /// Ask the window `id` to close with `meowland quit`; the workload
-    /// exiting afterwards is no longer a failure.
+    /// Ask the window `id` to close with `meowland quit`; the workload and
+    /// the pane showing it exiting afterwards is no longer a failure.
     ///
     /// # Errors
     /// Returns an error if the request fails.
     pub fn quit(&mut self, id: &str) -> anyhow::Result<()> {
-        self.closing = true;
+        self.workload = Workload::Quitting;
+        for process in &mut self.processes {
+            if process.name == "pane" {
+                process.exit = Exit::Expected;
+            }
+        }
         self.meowland(["quit", id])?;
         Ok(())
     }
@@ -669,7 +700,7 @@ impl Session {
     /// timeout.
     pub fn stop_server(&mut self, timeout: Duration) -> anyhow::Result<ExitStatus> {
         let server = &mut self.processes[0];
-        server.required = false;
+        server.exit = Exit::Expected;
         rustix::process::kill_process(Pid::from_child(&server.child), Signal::TERM)?;
         let deadline = control::now() + timeout;
         loop {
@@ -852,7 +883,7 @@ fn spawn<I: AsRef<OsStr>>(
     Ok(Process {
         name,
         child,
-        required: true,
+        exit: Exit::Unexpected,
     })
 }
 

@@ -1,11 +1,11 @@
 //! Terminal events and clipboard actions coordinated by one session owner.
 
-use meowland_input::{Event, keyboard};
+use meowland_input::{Event, Focus, keyboard};
 use meowland_protocol::{
     self as protocol, Input, OfferIntent, PaneAction, PaneToServer, Transition,
     clipboard::{MAX_TEXT, Selection},
 };
-use meowland_terminal_clipboard::{Action, Focus, Refresh};
+use meowland_terminal_clipboard::{Action, DeferredInput, Refresh};
 
 use super::{
     TerminalSession,
@@ -44,23 +44,21 @@ impl TerminalSession {
                         .send(Input::Text(text), None, &mut self.tx)?;
                 }
             }
-            Event::Focus(focused) => {
-                let focus = if focused { Focus::Gained } else { Focus::Lost };
-                let preserve = self.clipboard.focus(focus);
-                if focused {
-                    self.input_gate
-                        .send(self.keyboard.enter(), None, &mut self.tx)?;
-                } else {
-                    self.keyboard.reset();
-                    if preserve {
-                        self.input_gate.preserve_focus_loss();
-                    } else {
-                        self.input_gate.reset();
-                    }
-                    self.tx.send(&PaneToServer::Action(PaneAction::Input(
-                        Input::ResetKeyboard,
-                    )))?;
+            Event::Focus(Focus::Gained) => {
+                self.clipboard.focus_gained();
+                self.input_gate
+                    .send(self.keyboard.enter(), None, &mut self.tx)?;
+            }
+            Event::Focus(Focus::Lost) => {
+                let deferred = self.clipboard.focus_lost();
+                self.keyboard.reset();
+                match deferred {
+                    DeferredInput::Keep => self.input_gate.preserve_focus_loss(),
+                    DeferredInput::Discard => self.input_gate.reset(),
                 }
+                self.tx.send(&PaneToServer::Action(PaneAction::Input(
+                    Input::ResetKeyboard,
+                )))?;
             }
             Event::Resize => {
                 let cells = terminal::cells();
@@ -101,13 +99,13 @@ impl TerminalSession {
                     selection,
                     offer,
                     mimes,
-                    paste,
+                    intent,
                 } => {
-                    let deferred_paste = paste && self.input_gate.blocked();
-                    let intent = if paste && !deferred_paste {
-                        OfferIntent::Paste
-                    } else {
+                    let deferred_paste = intent == OfferIntent::Paste && self.input_gate.blocked();
+                    let intent = if deferred_paste {
                         OfferIntent::Refresh
+                    } else {
+                        intent
                     };
                     self.tx
                         .send(&PaneToServer::Action(PaneAction::ClipboardOffer {

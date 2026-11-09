@@ -19,7 +19,7 @@ use smithay::{
     },
 };
 
-use super::{Compositor, Window, WlSurface, input, render};
+use super::{Compositor, Remap, Window, WlSurface, input, render};
 
 impl XdgShellHandler for Compositor {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -37,7 +37,7 @@ impl XdgShellHandler for Compositor {
             Window {
                 surface,
                 fullscreen: false,
-                awaiting_remap_commit: false,
+                remap: Remap::Idle,
                 callback_due: Instant::now(),
                 callback_pending: false,
             },

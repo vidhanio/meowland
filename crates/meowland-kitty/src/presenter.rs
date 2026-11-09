@@ -6,14 +6,37 @@ use meowland_protocol::{FrameBand, SharedFrame};
 
 use crate::encoding::{Encoder, Placement, transmit};
 
-const SCREEN_ID: u32 = 1;
+/// Kitty image identity of the pane's screen image.
+pub const SCREEN_ID: u32 = 1;
+/// Kitty image identity of the in-place frame edit capability probe.
+pub const FRAME_EDIT_PROBE_ID: u32 = 30;
+/// Kitty image identity of the shared-memory capability probe.
+pub const SHARED_PROBE_ID: u32 = 32;
+
+/// The pixels of the last whole frame with every later band applied.
+#[derive(Debug)]
+struct Retained {
+    size: FrameSize,
+    image: Vec<u8>,
+}
+
+/// What the terminal's placement currently shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Displayed {
+    /// Nothing, or a placement a grid change invalidated.
+    #[default]
+    Nothing,
+    /// Exactly the retained pixels.
+    Retained,
+    /// A shared frame shown by reference whose pixels are not retained.
+    Shared,
+}
 
 /// Retains pixels for full-image repaint and edits changed bands in place.
 #[derive(Debug, Default)]
 pub struct Presenter {
-    image: Vec<u8>,
-    size: Option<FrameSize>,
-    displayed: bool,
+    retained: Option<Retained>,
+    displayed: Displayed,
     encoder: Encoder,
 }
 
@@ -24,29 +47,35 @@ pub enum PresentOutcome {
     Unchanged,
     /// Terminal commands were appended to the output buffer.
     Encoded,
-    /// A partial update arrived without a matching full-frame basis.
+    /// No whole frame is retained to apply the update to or repaint from.
     NeedsKeyframe,
 }
 
 impl Presenter {
     /// Forget the displayed placement without discarding retained pixels.
     pub const fn invalidate(&mut self) {
-        self.displayed = false;
+        self.displayed = Displayed::Nothing;
     }
 
     /// Adopt the pixels of a complete frame shown by [`Self::present_shared`].
     ///
-    /// The placement keeps its state: it stays valid unless something
-    /// invalidated it after the shared frame was presented, in which case the
-    /// next update replaces it. Returns false for partial rectangles, leaving
-    /// the presenter unchanged.
+    /// A placement still showing that shared frame now shows the retained
+    /// pixels, so later bands edit it in place. A placement invalidated since
+    /// is replaced by the next update. Returns false for partial rectangles,
+    /// leaving the presenter unchanged.
     pub fn retain_frame(&mut self, band: FrameBand) -> bool {
         if !band.is_whole() {
             return false;
         }
-        let size = band.size();
-        self.image = band.into_rgb();
-        self.size = Some(size);
+        self.retained = Some(Retained {
+            size: band.size(),
+            image: band.into_rgb(),
+        });
+        if self.displayed == Displayed::Shared {
+            self.displayed = Displayed::Retained;
+        } else {
+            self.displayed = Displayed::Nothing;
+        }
         true
     }
 
@@ -56,74 +85,82 @@ impl Presenter {
     /// # Panics
     /// Panics if a validated rectangle does not fit in `usize` offsets.
     pub fn present_into(&mut self, band: FrameBand, out: &mut Vec<u8>) -> PresentOutcome {
-        let whole = band.is_whole();
         let size = band.size();
-        let (x, y, width) = (band.x(), band.y(), band.width());
-        let height = band.height();
-        let pixels = band.into_rgb();
-        let matching = self.size == Some(size);
-        if !whole && !matching {
-            return PresentOutcome::NeedsKeyframe;
+        if band.is_whole() {
+            let showing = self.displayed == Displayed::Retained
+                && self
+                    .retained
+                    .as_ref()
+                    .is_some_and(|retained| retained.size == size && retained.image == band.rgb());
+            if showing {
+                return PresentOutcome::Unchanged;
+            }
+            self.retained = Some(Retained {
+                size,
+                image: band.into_rgb(),
+            });
+            self.invalidate();
+            return self.repaint_into(out);
         }
+        let Some(retained) = self
+            .retained
+            .as_mut()
+            .filter(|retained| retained.size == size)
+        else {
+            return PresentOutcome::NeedsKeyframe;
+        };
+        let (x, y, width, height) = (band.x(), band.y(), band.width(), band.height());
         let row_bytes = usize::try_from(width).expect("validated band width fits usize") * 3;
         let offset = usize::try_from(y).expect("validated band row fits usize") * size.rgb_stride()
             + usize::try_from(x).expect("validated band column fits usize") * 3;
-        if matching
-            && pixels
+        let rows = || {
+            band.rgb()
                 .chunks_exact(row_bytes)
                 .enumerate()
-                .all(|(row, pixels)| {
-                    let start = offset + row * size.rgb_stride();
-                    self.image[start..start + row_bytes] == *pixels
-                })
-        {
+                .map(|(row, pixels)| (offset + row * size.rgb_stride(), pixels))
+        };
+        let changed =
+            rows().any(|(start, pixels)| retained.image[start..start + row_bytes] != *pixels);
+        if !changed && self.displayed == Displayed::Retained {
+            return PresentOutcome::Unchanged;
+        }
+        for (start, pixels) in rows() {
+            retained.image[start..start + row_bytes].copy_from_slice(pixels);
+        }
+        if self.displayed != Displayed::Retained {
             return self.repaint_into(out);
         }
-        let edit = matching && self.displayed && !whole;
-        if edit {
-            out.extend_from_slice(b"\x1b[?2026h");
-            self.encoder.image(
-                out,
-                SCREEN_ID,
-                (width, height),
-                &pixels,
-                Placement::Edit { x, y },
-            );
-            out.extend_from_slice(b"\x1b[?2026l");
-        }
-        if whole {
-            self.image = pixels;
-            self.size = Some(size);
-        } else {
-            for (row, pixels) in pixels.chunks_exact(row_bytes).enumerate() {
-                let start = offset + row * size.rgb_stride();
-                self.image[start..start + row_bytes].copy_from_slice(pixels);
-            }
-        }
-        if edit {
-            PresentOutcome::Encoded
-        } else {
-            self.invalidate();
-            self.repaint_into(out)
-        }
+        out.extend_from_slice(b"\x1b[?2026h");
+        self.encoder.image(
+            out,
+            SCREEN_ID,
+            (width, height),
+            band.rgb(),
+            Placement::Edit { x, y },
+        );
+        out.extend_from_slice(b"\x1b[?2026l");
+        PresentOutcome::Encoded
     }
 
-    /// Append a replacement of the displayed image from retained pixels, if the
-    /// placement was invalidated.
+    /// Append a replacement of the displayed image from retained pixels, if
+    /// the placement no longer shows them.
     pub fn repaint_into(&mut self, out: &mut Vec<u8>) -> PresentOutcome {
-        let Some(size) = self.size.filter(|_| !self.displayed) else {
+        if self.displayed != Displayed::Nothing {
             return PresentOutcome::Unchanged;
+        }
+        let Some(retained) = &self.retained else {
+            return PresentOutcome::NeedsKeyframe;
         };
         begin_image(out);
         self.encoder.image(
             out,
             SCREEN_ID,
-            (size.width(), size.height()),
-            &self.image,
+            (retained.size.width(), retained.size.height()),
+            &retained.image,
             Placement::Whole,
         );
         out.extend_from_slice(b"\x1b[?2026l");
-        self.displayed = true;
+        self.displayed = Displayed::Retained;
         PresentOutcome::Encoded
     }
 
@@ -146,15 +183,16 @@ impl Presenter {
         out.extend_from_slice(b",t=s;");
         out.extend_from_slice(STANDARD.encode(frame.name()).as_bytes());
         out.extend_from_slice(b"\x1b\\\x1b[?2026l");
-        self.displayed = true;
+        self.displayed = Displayed::Shared;
     }
 }
 
-/// Query shared-memory support using a published RGB object and request ID.
+/// Query shared-memory support using a published RGB object; the terminal
+/// answers under [`SHARED_PROBE_ID`].
 #[must_use]
-pub fn query_shared(frame: &SharedFrame, id: u32) -> Vec<u8> {
+pub fn query_shared(frame: &SharedFrame) -> Vec<u8> {
     format!(
-        "\x1b_Ga=q,f=24,s={},v={},i={id},t=s;{}\x1b\\",
+        "\x1b_Ga=q,f=24,s={},v={},i={SHARED_PROBE_ID},t=s;{}\x1b\\",
         frame.size().width(),
         frame.size().height(),
         STANDARD.encode(frame.name())
@@ -163,9 +201,10 @@ pub fn query_shared(frame: &SharedFrame, id: u32) -> Vec<u8> {
 }
 
 /// Query in-place frame edits by transmitting, editing, then deleting a
-/// one-pixel image under `id`.
+/// one-pixel image under [`FRAME_EDIT_PROBE_ID`].
 #[must_use]
-pub fn query_frame_edits(id: u32) -> Vec<u8> {
+pub fn query_frame_edits() -> Vec<u8> {
+    let id = FRAME_EDIT_PROBE_ID;
     format!(
         "\x1b_Ga=t,f=24,s=1,v=1,i={id},q=2;AAAA\x1b\\\
          \x1b_Ga=f,f=24,s=1,v=1,i={id},r=1;AAAA\x1b\\\
@@ -221,7 +260,10 @@ mod tests {
         let (header, decoded, _) = decode_image(&output);
         assert!(header.contains("a=f") && header.contains("x=1,y=1"));
         assert_eq!(decoded, patch);
-        assert_eq!(presenter.image, expected);
+        assert_eq!(
+            presenter.retained.as_ref().map(|retained| &retained.image),
+            Some(&expected)
+        );
 
         output.clear();
         assert_eq!(
@@ -264,5 +306,52 @@ mod tests {
         expected[12..15].copy_from_slice(&patch);
         assert!(header.contains("a=T"));
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn a_frame_matching_stale_pixels_replaces_a_shared_placement() {
+        let size = FrameSize::new(2, 1).expect("valid size");
+        let first = vec![1; 6];
+        let (shared, _file) = SharedObject::create(size).expect("create shared descriptor");
+        let mut presenter = Presenter::default();
+        let mut output = Vec::new();
+        presenter.present_into(band(size, 0, 0, 2, first.clone()), &mut output);
+        presenter.present_shared(shared.frame(), &mut output);
+
+        output.clear();
+        assert_eq!(
+            presenter.present_into(band(size, 0, 0, 2, first.clone()), &mut output),
+            PresentOutcome::Encoded,
+            "the terminal shows the shared frame, not the retained pixels"
+        );
+        assert_eq!(decode_image(&output).1, first);
+    }
+
+    #[test]
+    fn adopted_shared_pixels_accept_in_place_edits() {
+        let size = FrameSize::new(2, 1).expect("valid size");
+        let (shared, _file) = SharedObject::create(size).expect("create shared descriptor");
+        let mut presenter = Presenter::default();
+        let mut output = Vec::new();
+        presenter.present_shared(shared.frame(), &mut output);
+        assert!(presenter.retain_frame(band(size, 0, 0, 2, vec![1; 6])));
+
+        output.clear();
+        assert_eq!(
+            presenter.present_into(band(size, 1, 0, 1, vec![9; 3]), &mut output),
+            PresentOutcome::Encoded
+        );
+        assert!(decode_image(&output).0.contains("a=f"));
+    }
+
+    #[test]
+    fn repainting_without_retained_pixels_needs_a_keyframe() {
+        let mut presenter = Presenter::default();
+        let mut output = Vec::new();
+        assert_eq!(
+            presenter.repaint_into(&mut output),
+            PresentOutcome::NeedsKeyframe
+        );
+        assert_eq!(output, []);
     }
 }

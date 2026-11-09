@@ -2,7 +2,7 @@
 
 use std::os::fd::{FromRawFd as _, OwnedFd};
 
-use calloop::{Interest, Mode, PostAction, RegistrationToken, generic::Generic};
+use calloop::{EventSource, Interest, Mode, PostAction, generic::Generic};
 use meowland_loop::Sources;
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -12,80 +12,61 @@ use smithay::backend::allocator::dmabuf::{AlreadyReady, Dmabuf};
 
 use super::Host;
 
-pub(super) fn watch<H: Host>(host: &mut H, id: u64, dmabuf: &Dmabuf) {
-    if let Some(fences) = snapshot(dmabuf) {
-        host.readbacks()
-            .acquiring
-            .get_mut(&id)
-            .expect("operation exists during acquire setup")
-            .acquire_pending = fences.len();
-        if fences.is_empty() {
-            super::submit(host, id);
-            return;
-        }
-        for (index, fence) in fences.into_iter().enumerate() {
-            let source = Generic::new(fence, Interest::READ, Mode::Level);
-            match host.handle().insert_source(source, move |_, _, host| {
-                acquired(host, id, index);
-                Ok(PostAction::Remove)
-            }) {
-                Ok(token) => add_source(host, id, token),
-                Err(error) => {
-                    tracing::warn!(%error, "Cannot register DMA-BUF acquire fence");
-                    abandon(host, id);
-                    break;
-                }
-            }
-        }
-    } else {
-        host.readbacks()
-            .acquiring
-            .get_mut(&id)
-            .expect("operation exists during acquire setup")
-            .acquire_pending = 1;
-        match dmabuf.generate_blocker(Interest::READ) {
-            Ok((_, source)) => match host.handle().insert_source(source, move |(), _, host| {
-                acquired(host, id, 0);
+/// How a readback waits for the writers of its buffer.
+pub(super) enum Watch<H> {
+    /// No writer is pending; the GPU may sample the buffer now.
+    Ready,
+    /// One registration per pending write fence or readiness source.
+    Pending(Vec<Sources<H>>),
+    /// A wait could not be registered.
+    Failed,
+}
+
+/// Register a wait for every pending writer of `dmabuf`, reporting each
+/// signal to [`super::acquired`] with its index.
+pub(super) fn watch<H: Host>(host: &H, id: u64, dmabuf: &Dmabuf) -> Watch<H> {
+    let Some(fences) = snapshot(dmabuf) else {
+        return match dmabuf.generate_blocker(Interest::READ) {
+            Ok((_, source)) => register(host, source, move |(), _, host| {
+                super::acquired(host, id, 0);
                 Ok(())
-            }) {
-                Ok(token) => add_source(host, id, token),
-                Err(error) => {
-                    tracing::warn!(%error, "Cannot register DMA-BUF acquire readiness");
-                    abandon(host, id);
-                }
-            },
-            Err(AlreadyReady) => super::submit(host, id),
-        }
-    }
-}
-
-fn add_source<H: Host>(host: &mut H, id: u64, token: RegistrationToken) {
-    let mut sources = Sources::new(host.handle());
-    sources.io = Some(token);
-    host.readbacks()
-        .acquiring
-        .get_mut(&id)
-        .expect("operation remains registered during acquire setup")
-        .acquire_sources
-        .push(sources);
-}
-
-fn acquired<H: Host>(host: &mut H, id: u64, index: usize) {
-    let Some(acquiring) = host.readbacks().acquiring.get_mut(&id) else {
-        return;
+            })
+            .map_or(Watch::Failed, |sources| Watch::Pending(vec![sources])),
+            Err(AlreadyReady) => Watch::Ready,
+        };
     };
-    acquiring.acquire_sources[index].io = None;
-    acquiring.acquire_pending -= 1;
-    if acquiring.acquire_pending == 0 {
-        super::submit(host, id);
+    if fences.is_empty() {
+        return Watch::Ready;
     }
+    let mut registered = Vec::with_capacity(fences.len());
+    for (index, fence) in fences.into_iter().enumerate() {
+        let source = Generic::new(fence, Interest::READ, Mode::Level);
+        let Some(sources) = register(host, source, move |_, _, host| {
+            super::acquired(host, id, index);
+            Ok(PostAction::Remove)
+        }) else {
+            return Watch::Failed;
+        };
+        registered.push(sources);
+    }
+    Watch::Pending(registered)
 }
 
-fn abandon<H: Host>(host: &mut H, id: u64) {
-    if let Some(acquiring) = host.readbacks().acquiring.remove(&id) {
-        let client = acquiring.operation.client.clone();
-        drop(acquiring);
-        host.notify_client(&client);
+fn register<H: Host, S, F>(host: &H, source: S, callback: F) -> Option<Sources<H>>
+where
+    S: EventSource + 'static,
+    F: FnMut(S::Event, &mut S::Metadata, &mut H) -> S::Ret + 'static,
+{
+    match host.handle().insert_source(source, callback) {
+        Ok(token) => {
+            let mut sources = Sources::new(host.handle());
+            sources.io = Some(token);
+            Some(sources)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Cannot register DMA-BUF acquire wait");
+            None
+        }
     }
 }
 

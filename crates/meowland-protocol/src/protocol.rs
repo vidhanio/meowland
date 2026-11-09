@@ -343,7 +343,7 @@ pub enum Follow {
 }
 
 /// Window metadata returned by the server's list operation.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WindowInfo {
     /// Server-assigned unique ID, `<app id>_<suffix>`, stable for the
     /// window's lifetime.

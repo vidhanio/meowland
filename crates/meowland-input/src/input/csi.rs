@@ -1,9 +1,24 @@
 //! Kitty keyboard and focus CSI decoding.
 
-use meowland_protocol::Modifiers;
+use meowland_protocol::{KEY_INSERT, Modifiers};
 use vtparse::CsiParam;
 
-use super::event::{Event, Key, Kind};
+use super::event::{Event, Focus, Key, Kind};
+
+/// Kitty functional-key numbers for keys reported with legacy CSI finals.
+const KEY_DELETE: u32 = 57349;
+const KEY_LEFT: u32 = 57350;
+const KEY_RIGHT: u32 = 57351;
+const KEY_UP: u32 = 57352;
+const KEY_DOWN: u32 = 57353;
+const KEY_PAGE_UP: u32 = 57354;
+const KEY_PAGE_DOWN: u32 = 57355;
+const KEY_HOME: u32 = 57356;
+const KEY_END: u32 = 57357;
+const KEY_F1: u32 = 57364;
+const KEY_F6: u32 = 57369;
+const KEY_F11: u32 = 57374;
+const KEY_KP_BEGIN: u32 = 57427;
 
 /// Decode exactly one nonnegative CSI integer fitting in `u32`.
 #[must_use]
@@ -17,8 +32,8 @@ pub fn number(params: &[CsiParam]) -> Option<u32> {
 pub(super) fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
     if params.is_empty() {
         match final_byte {
-            b'I' => return Some(Event::Focus(true)),
-            b'O' => return Some(Event::Focus(false)),
+            b'I' => return Some(Event::Focus(Focus::Gained)),
+            b'O' => return Some(Event::Focus(Focus::Lost)),
             _ => {}
         }
     }
@@ -55,28 +70,28 @@ pub(super) fn csi(params: &[CsiParam], final_byte: u8) -> Option<Event> {
     };
     let code = match final_byte {
         b'u' => number(key)?,
-        b'A' => 57352,
-        b'B' => 57353,
-        b'C' => 57351,
-        b'D' => 57350,
-        b'H' => 57356,
-        b'F' => 57357,
-        b'E' => 57427,
-        b'P' => 57364,
-        b'Q' => 57365,
-        b'R' => 57366,
-        b'S' => 57367,
+        b'A' => KEY_UP,
+        b'B' => KEY_DOWN,
+        b'C' => KEY_RIGHT,
+        b'D' => KEY_LEFT,
+        b'H' => KEY_HOME,
+        b'F' => KEY_END,
+        b'E' => KEY_KP_BEGIN,
+        b'P' => KEY_F1,
+        b'Q' => KEY_F1 + 1,
+        b'R' => KEY_F1 + 2,
+        b'S' => KEY_F1 + 3,
         b'~' => match number(key)? {
-            2 => 57348,
-            3 => 57349,
-            5 => 57354,
-            6 => 57355,
-            1 | 7 => 57356,
-            4 | 8 => 57357,
-            57427 => 57427,
-            n @ 11..=15 => 57364 + n - 11,
-            n @ 17..=21 => 57369 + n - 17,
-            n @ 23..=24 => 57374 + n - 23,
+            2 => KEY_INSERT,
+            3 => KEY_DELETE,
+            5 => KEY_PAGE_UP,
+            6 => KEY_PAGE_DOWN,
+            1 | 7 => KEY_HOME,
+            4 | 8 => KEY_END,
+            KEY_KP_BEGIN => KEY_KP_BEGIN,
+            n @ 11..=15 => KEY_F1 + n - 11,
+            n @ 17..=21 => KEY_F6 + n - 17,
+            n @ 23..=24 => KEY_F11 + n - 23,
             _ => return None,
         },
         _ => return None,
@@ -135,8 +150,8 @@ pub(super) mod tests {
 
     #[test]
     fn csi_decodes_focus_and_rejects_parameterized_focus() {
-        assert!(matches!(csi(&[], b'I'), Some(Event::Focus(true))));
-        assert!(matches!(csi(&[], b'O'), Some(Event::Focus(false))));
+        assert!(matches!(csi(&[], b'I'), Some(Event::Focus(Focus::Gained))));
+        assert!(matches!(csi(&[], b'O'), Some(Event::Focus(Focus::Lost))));
         assert!(csi(&[CsiParam::Integer(1)], b'I').is_none());
         assert!(csi(&[], b'Z').is_none());
     }

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use meowland_panes::{WindowCatalog, WindowId};
-use meowland_protocol::{Selector, WindowState};
+use meowland_protocol::{Selector, WindowInfo, WindowState};
 
 fn id(value: u64) -> WindowId {
     WindowId::from(value)
@@ -13,8 +13,14 @@ fn insert(catalog: &mut WindowCatalog, app_id: &str) -> WindowId {
     catalog.insert(app_id.into(), format!("{app_id} title"))
 }
 
+fn info(catalog: &WindowCatalog, window: WindowId) -> WindowInfo {
+    catalog
+        .info(window)
+        .expect("a mapped window has a unique ID")
+}
+
 fn by_id(catalog: &WindowCatalog, window: WindowId) -> Selector {
-    Selector::Id(catalog.info(window).id)
+    Selector::Id(info(catalog, window).id)
 }
 
 fn split_unique_id(unique: &str) -> (&str, &str) {
@@ -41,17 +47,15 @@ fn insert_assigns_fresh_unmapped_identities() {
     let second = insert(&mut catalog, "second");
 
     assert_ne!(first, second);
-    assert_eq!(catalog.info(first).id, "");
+    assert_eq!(catalog.info(first), None);
     assert!(!catalog.drawable(first));
     assert_eq!(catalog.newest(), None);
     assert_eq!(catalog.focused(), None);
     assert_eq!(catalog.title(first), "first title");
     assert_eq!(catalog.app_id(first), "first");
-    let info = catalog.info(second);
-    assert_eq!(info.id, "");
-    assert_eq!(info.app_id, "second");
-    assert_eq!(info.title, "second title");
-    assert_eq!(info.state, WindowState::Inactive);
+    assert_eq!(catalog.info(second), None);
+    assert_eq!(catalog.app_id(second), "second");
+    assert_eq!(catalog.title(second), "second title");
 }
 
 #[test]
@@ -98,14 +102,14 @@ fn unmapping_the_focused_window_clears_focus() {
 
     assert_eq!(catalog.focus(Some(first)), None);
     assert_eq!(catalog.focused(), Some(first));
-    assert_eq!(catalog.info(first).state, WindowState::Active);
-    assert_eq!(catalog.info(second).state, WindowState::Inactive);
+    assert_eq!(info(&catalog, first).state, WindowState::Active);
+    assert_eq!(info(&catalog, second).state, WindowState::Inactive);
 
     assert_eq!(catalog.focus(Some(second)), Some(first));
     assert_eq!(catalog.focused(), Some(second));
     assert!(catalog.unmap(second));
     assert_eq!(catalog.focused(), None);
-    assert_eq!(catalog.info(second).state, WindowState::Inactive);
+    assert_eq!(info(&catalog, second).state, WindowState::Inactive);
 }
 
 #[test]
@@ -130,12 +134,12 @@ fn unique_id_uses_the_app_id_at_first_map() {
 
     catalog.update(window, "org.example.App".into(), "title".into());
     catalog.map(window);
-    let unique = catalog.info(window).id;
+    let unique = info(&catalog, window).id;
     assert_eq!(split_unique_id(&unique).0, "org.example.App");
     assert_suffix_is_base36(&unique);
 
     catalog.update(window, "renamed".into(), "title".into());
-    assert_eq!(catalog.info(window).id, unique);
+    assert_eq!(info(&catalog, window).id, unique);
     assert_eq!(catalog.app_id(window), "renamed");
 }
 
@@ -144,13 +148,13 @@ fn unique_id_is_stable_across_unmap_and_remap() {
     let mut catalog = WindowCatalog::default();
     let window = insert(&mut catalog, "terminal");
     catalog.map(window);
-    let unique = catalog.info(window).id;
+    let unique = info(&catalog, window).id;
 
     catalog.unmap(window);
-    assert_eq!(catalog.info(window).id, unique);
+    assert_eq!(info(&catalog, window).id, unique);
     catalog.update(window, "other".into(), "title".into());
     catalog.map(window);
-    assert_eq!(catalog.info(window).id, unique);
+    assert_eq!(info(&catalog, window).id, unique);
 }
 
 #[test]
@@ -165,7 +169,7 @@ fn unique_id_prefix_falls_back_and_sanitizes() {
     for (app_id, prefix) in cases {
         let window = insert(&mut catalog, app_id);
         catalog.map(window);
-        let unique = catalog.info(window).id;
+        let unique = info(&catalog, window).id;
         assert_eq!(split_unique_id(&unique).0, prefix, "app id {app_id:?}");
         assert_suffix_is_base36(&unique);
     }
@@ -179,7 +183,7 @@ fn unique_ids_are_distinct_for_many_windows_with_one_app_id() {
     for _ in 0..2000 {
         let window = insert(&mut catalog, "terminal");
         catalog.map(window);
-        let unique = catalog.info(window).id;
+        let unique = info(&catalog, window).id;
         assert!(seen.insert(unique.clone()), "duplicate unique ID {unique}");
     }
 }
@@ -261,7 +265,7 @@ fn update_replaces_metadata_and_affects_selection() {
     catalog.map(window);
 
     catalog.update(window, "new".into(), "New title".into());
-    assert_eq!(catalog.info(window).app_id, "new");
+    assert_eq!(info(&catalog, window).app_id, "new");
     assert_eq!(catalog.title(window), "New title");
     assert_eq!(catalog.select(&Selector::AppId("old".into())), None);
     assert_eq!(catalog.select(&Selector::AppId("new".into())), Some(window));
@@ -287,9 +291,7 @@ fn remove_forgets_identity_metadata_and_drawability() {
     assert_eq!(catalog.focused(), None);
     assert_eq!(catalog.select(&second_id), None);
     assert_eq!(catalog.title(second), "");
-    assert_eq!(catalog.info(second).id, "");
-    assert_eq!(catalog.info(second).app_id, "");
-    assert_eq!(catalog.info(second).state, WindowState::Inactive);
+    assert_eq!(catalog.info(second), None);
 
     catalog.remove(id(99));
 }

@@ -9,7 +9,7 @@ use futures::{
     io::{AsyncReadExt, AsyncWrite},
 };
 use meowland_async::asynchronous::timeout;
-use meowland_compositor::PaneId;
+use meowland_panes::PaneId;
 use meowland_protocol::{
     self as protocol, ControlRequest, PaneToServer, ServerToPane,
     asynchronous::{Outgoing, Reader},
@@ -139,10 +139,31 @@ async fn pane(
     }
 }
 
+/// Ordered, byte-accounted output to one admitted pane.
 pub(crate) struct PaneTransport {
-    sender: Option<mpsc::UnboundedSender<Queued>>,
-    release: Option<oneshot::Sender<String>>,
+    link: Link,
     bytes: Rc<Cell<usize>>,
+}
+
+/// Whether the pane still accepts output.
+enum Link {
+    Open {
+        sender: mpsc::UnboundedSender<Queued>,
+        release: oneshot::Sender<String>,
+    },
+    /// The writer drains queued output and then tells the pane why it was
+    /// released.
+    Released,
+}
+
+/// Outcome of [`PaneTransport::send`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sent {
+    Queued,
+    /// The pane was released and accepts no more output.
+    Released,
+    /// The message exceeds the output budget or the writer is gone.
+    Rejected,
 }
 
 struct Reservation {
@@ -172,23 +193,22 @@ impl PaneTransport {
         let (sender, messages) = mpsc::unbounded();
         let (release, reason) = oneshot::channel();
         let transport = Self {
-            sender: Some(sender),
-            release: Some(release),
+            link: Link::Open { sender, release },
             bytes: Rc::new(Cell::new(0)),
         };
         (transport, PaneQueue { messages, reason })
     }
 
     pub(crate) const fn active(&self) -> bool {
-        self.sender.is_some()
+        matches!(self.link, Link::Open { .. })
     }
 
-    pub(crate) fn send(&self, message: ServerToPane) -> bool {
-        let Some(sender) = &self.sender else {
-            return false;
+    pub(crate) fn send(&self, message: ServerToPane) -> Sent {
+        let Link::Open { sender, .. } = &self.link else {
+            return Sent::Released;
         };
         let Ok(size) = postcard::experimental::serialized_size(&message) else {
-            return false;
+            return Sent::Rejected;
         };
         let bytes = size + std::mem::size_of::<Queued>();
         let limit = protocol::MAX_MESSAGE + std::mem::size_of::<Queued>();
@@ -198,23 +218,25 @@ impl PaneTransport {
             .checked_add(bytes)
             .filter(|&total| total <= limit && size <= protocol::MAX_MESSAGE)
         else {
-            return false;
+            return Sent::Rejected;
         };
         self.bytes.set(total);
-        sender
-            .unbounded_send(Queued {
-                message,
-                _reservation: Reservation {
-                    total: Rc::clone(&self.bytes),
-                    bytes,
-                },
-            })
-            .is_ok()
+        let queued = Queued {
+            message,
+            _reservation: Reservation {
+                total: Rc::clone(&self.bytes),
+                bytes,
+            },
+        };
+        if sender.unbounded_send(queued).is_ok() {
+            Sent::Queued
+        } else {
+            Sent::Rejected
+        }
     }
 
     pub(crate) fn release(&mut self, reason: String) {
-        self.sender.take();
-        if let Some(release) = self.release.take() {
+        if let Link::Open { release, .. } = std::mem::replace(&mut self.link, Link::Released) {
             let _ = release.send(reason);
         }
     }
@@ -294,7 +316,10 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().expect("socket pair");
         let mut writer = handle.adapt_io(socket).expect("adapt socket");
         let (mut transport, queue) = PaneTransport::new();
-        assert!(transport.send(ServerToPane::Title("x".repeat(8 << 20))));
+        assert_eq!(
+            transport.send(ServerToPane::Title("x".repeat(8 << 20))),
+            Sent::Queued
+        );
         let writing = handle.clone();
         scheduler
             .schedule(async move { pane_writer(&mut writer, queue, &writing).await })
@@ -342,7 +367,10 @@ mod tests {
         let mut writer = handle.adapt_io(socket).expect("adapt socket");
         let (mut transport, queue) = PaneTransport::new();
         let title = "x".repeat(8 << 20);
-        assert!(transport.send(ServerToPane::Title(title.clone())));
+        assert_eq!(
+            transport.send(ServerToPane::Title(title.clone())),
+            Sent::Queued
+        );
         let writing = handle.clone();
         scheduler
             .schedule(async move { pane_writer(&mut writer, queue, &writing).await })

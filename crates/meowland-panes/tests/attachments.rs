@@ -634,6 +634,14 @@ fn operation_strategy() -> impl Strategy<Value = Operation> {
     ]
 }
 
+/// A pane that stops showing a window gives up deciding that window's size
+/// and input.
+fn release_claim(deciding: &mut HashMap<WindowId, PaneId>, window: WindowId, pane: PaneId) {
+    if deciding.get(&window) == Some(&pane) {
+        deciding.remove(&window);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 96,
@@ -659,7 +667,9 @@ proptest! {
                     size,
                 } => {
                     attachments.insert(*pane, selection.clone(), Follow::Every, *size);
-                    bound.insert(*pane, None);
+                    if let Some(Some(previous)) = bound.insert(*pane, None) {
+                        release_claim(&mut deciding, previous, *pane);
+                    }
                     tokens.insert(*pane, token_of(selection));
                     sizes.insert(*pane, *size);
                     dirty.insert(*pane, true);
@@ -667,9 +677,16 @@ proptest! {
                 Operation::Show { pane, window } => {
                     let token = attachments.show(*pane, *window);
                     let expected_token = bound.get_mut(pane).and_then(|binding| {
-                        let was_waiting = binding.replace(*window).is_none();
+                        let previous = binding.replace(*window);
+                        if let Some(previous) = previous.filter(|previous| previous != window) {
+                            release_claim(&mut deciding, previous, *pane);
+                        }
                         dirty.insert(*pane, true);
-                        tokens.get(pane).cloned().flatten().filter(|_| was_waiting)
+                        tokens
+                            .get(pane)
+                            .cloned()
+                            .flatten()
+                            .filter(|_| previous.is_none())
                     });
                     prop_assert_eq!(
                         token,
@@ -682,7 +699,9 @@ proptest! {
                 Operation::Unbind { pane } => {
                     attachments.unbind(*pane);
                     if let Some(binding) = bound.get_mut(pane) {
-                        *binding = None;
+                        if let Some(previous) = binding.take() {
+                            release_claim(&mut deciding, previous, *pane);
+                        }
                         dirty.insert(*pane, true);
                     }
                 }
@@ -694,11 +713,12 @@ proptest! {
                 }
                 Operation::Remove { pane } => {
                     attachments.remove(*pane);
-                    bound.remove(pane);
+                    if let Some(Some(previous)) = bound.remove(pane) {
+                        release_claim(&mut deciding, previous, *pane);
+                    }
                     tokens.remove(pane);
                     sizes.remove(pane);
                     dirty.remove(pane);
-                    deciding.retain(|_, owner| *owner != *pane);
                 }
                 Operation::Resize { pane, size } => {
                     attachments.resize(*pane, *size);

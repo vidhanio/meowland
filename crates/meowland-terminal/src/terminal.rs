@@ -1,6 +1,6 @@
 //! Terminal mode ownership, pane geometry, and terminal control output.
 
-use std::io;
+use std::{cell::Cell, io, rc::Rc};
 
 use crossterm::{
     event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
@@ -96,18 +96,57 @@ pub(crate) fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
     format!("\x1b]22;{name}\x1b\\").into_bytes()
 }
 
+/// Pushes the window title onto the terminal's title stack.
+const TITLE_PUSH: &[u8] = b"\x1b[22;0t";
+/// Pops the title stack back to the title saved by [`TITLE_PUSH`].
+pub(crate) const TITLE_POP: &[u8] = b"\x1b[23;0t";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClipboardMode {
     Enabled,
     Disabled,
 }
 
-/// Restores the terminal modes enabled by this pane.
-pub(crate) struct TerminalGuard {
-    active: bool,
+/// Where the title push ends in the output stream, so a stalled restore pops
+/// the title stack only if the push reached the terminal and the queued pop
+/// did not.
+#[derive(Clone)]
+pub(crate) struct TitlePush {
+    written: Rc<Cell<usize>>,
+    end: usize,
+}
+
+impl TitlePush {
+    fn landed(&self) -> bool {
+        self.written.get() >= self.end
+    }
+
+    /// Whether a pop queued to end at stream position `pop_end` must be
+    /// written again.
+    pub(crate) fn needs_pop(&self, pop_end: usize) -> bool {
+        self.landed() && self.written.get() < pop_end
+    }
+}
+
+/// Modes this pane switched on, undone by [`TerminalGuard::restore`].
+struct Modes {
     mouse: bool,
     clipboard: Option<ClipboardMode>,
-    title: Option<(std::sync::Arc<std::sync::atomic::AtomicUsize>, usize)>,
+    title: TitlePush,
+}
+
+/// Sequences undoing a [`TerminalGuard`], without the title pop.
+pub(crate) struct Restore {
+    /// Mode restore sequence to queue or write directly.
+    pub(crate) bytes: Vec<u8>,
+    /// Result of leaving raw mode, which happens immediately.
+    pub(crate) raw: io::Result<()>,
+    pub(crate) title: TitlePush,
+}
+
+/// Restores the terminal modes enabled by this pane, best effort on drop.
+pub(crate) struct TerminalGuard {
+    modes: Option<Modes>,
 }
 
 impl TerminalGuard {
@@ -117,27 +156,31 @@ impl TerminalGuard {
     /// so it never reaches the window about to be shown.
     ///
     /// Escape sequences are appended to `out`, the session's ordered output
-    /// queue, so they can never interleave with a partially written frame. Raw
-    /// mode itself is a termios change and takes effect immediately.
+    /// queue ending at stream position `end`, so they can never interleave
+    /// with a partially written frame. Raw mode itself is a termios change and
+    /// takes effect immediately.
     pub(crate) fn enter(
         out: &mut Vec<u8>,
-        progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        written: Rc<Cell<usize>>,
         end: usize,
     ) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         rustix::termios::tcflush(io::stdin(), rustix::termios::QueueSelector::IFlush)?;
-        let guard = Self {
-            active: true,
-            mouse: false,
-            clipboard: None,
-            title: Some((progress, end + b"\x1b[22;0t".len())),
-        };
         Self::append_enter(out);
-        Ok(guard)
+        Ok(Self {
+            modes: Some(Modes {
+                mouse: false,
+                clipboard: None,
+                title: TitlePush {
+                    written,
+                    end: end + TITLE_PUSH.len(),
+                },
+            }),
+        })
     }
 
     fn append_enter(out: &mut Vec<u8>) {
-        out.extend_from_slice(b"\x1b[22;0t");
+        out.extend_from_slice(TITLE_PUSH);
         queue!(
             out,
             terminal::EnterAlternateScreen,
@@ -150,145 +193,137 @@ impl TerminalGuard {
     }
 
     pub(crate) fn enable_mouse(&mut self, out: &mut Vec<u8>) {
-        self.mouse = true;
-        out.extend_from_slice(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h");
+        if let Some(modes) = &mut self.modes {
+            modes.mouse = true;
+            out.extend_from_slice(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h");
+        }
     }
 
     pub(crate) fn enable_clipboard(&mut self, previous: ClipboardMode, out: &mut Vec<u8>) {
-        self.clipboard = Some(previous);
-        out.extend_from_slice(b"\x1b[?5522h");
+        if let Some(modes) = &mut self.modes {
+            modes.clipboard = Some(previous);
+            out.extend_from_slice(b"\x1b[?5522h");
+        }
     }
 
-    /// Append the sequences that undo this guard and disable raw mode.
+    /// Leave raw mode and return the sequences that undo the pane modes.
     ///
-    /// Cancel interrupted control strings and end synchronized updates before
-    /// restoring modes. Every step is appended even though disabling raw mode
-    /// can fail; the first failure is returned once all bytes are queued.
-    pub(crate) fn restore_into(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
-        if !self.active {
-            return Ok(());
-        }
-        self.active = false;
+    /// The sequences first cancel interrupted control strings and end
+    /// synchronized updates. Raw mode is left even if building the sequences
+    /// is all that succeeds; its result is reported separately.
+    pub(crate) fn restore(mut self) -> Restore {
+        let modes = self
+            .modes
+            .take()
+            .expect("only restoring or dropping a guard takes its modes");
         let raw = terminal::disable_raw_mode();
-        self.append_restore(out);
-        raw
-    }
-
-    fn append_restore(&mut self, out: &mut Vec<u8>) {
-        out.extend_from_slice(b"\x18\x1b\\");
-        queue!(out, terminal::EndSynchronizedUpdate)
-            .expect("writing terminal commands to a byte buffer cannot fail");
-        if self.mouse {
-            self.mouse = false;
-            out.extend_from_slice(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
-        }
-        if let Some(previous) = self.clipboard.take() {
-            out.extend_from_slice(if previous == ClipboardMode::Enabled {
-                b"\x1b[?5522h"
-            } else {
-                b"\x1b[?5522l"
-            });
-        }
-        out.extend_from_slice(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\");
-        out.extend_from_slice(&cursor_bytes(None));
-        queue!(
-            out,
-            event::DisableFocusChange,
-            event::PopKeyboardEnhancementFlags,
-            crossterm::cursor::Show,
-            terminal::LeaveAlternateScreen
-        )
-        .expect("writing terminal commands to a byte buffer cannot fail");
-    }
-
-    pub(crate) fn title_pushed(&self) -> bool {
-        self.title.as_ref().is_some_and(|(written, end)| {
-            written.load(std::sync::atomic::Ordering::Relaxed) >= *end
-        })
-    }
-
-    fn restore_best_effort(&mut self) {
-        if self.active {
-            let mut bytes = Vec::new();
-            let _ = self.restore_into(&mut bytes);
-            if self.title_pushed() {
-                bytes.extend_from_slice(b"\x1b[23;0t");
-            }
-            output::write_best_effort(&bytes);
+        let mut bytes = Vec::new();
+        append_restore(&modes, &mut bytes);
+        Restore {
+            bytes,
+            raw,
+            title: modes.title,
         }
     }
 }
 
+fn append_restore(modes: &Modes, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\x18\x1b\\");
+    queue!(out, terminal::EndSynchronizedUpdate)
+        .expect("writing terminal commands to a byte buffer cannot fail");
+    if modes.mouse {
+        out.extend_from_slice(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    }
+    if let Some(previous) = modes.clipboard {
+        out.extend_from_slice(match previous {
+            ClipboardMode::Enabled => b"\x1b[?5522h",
+            ClipboardMode::Disabled => b"\x1b[?5522l",
+        });
+    }
+    out.extend_from_slice(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\");
+    out.extend_from_slice(&cursor_bytes(None));
+    queue!(
+        out,
+        event::DisableFocusChange,
+        event::PopKeyboardEnhancementFlags,
+        crossterm::cursor::Show,
+        terminal::LeaveAlternateScreen
+    )
+    .expect("writing terminal commands to a byte buffer cannot fail");
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        self.restore_best_effort();
+        let Some(modes) = self.modes.take() else {
+            return;
+        };
+        let _ = terminal::disable_raw_mode();
+        let mut bytes = Vec::new();
+        append_restore(&modes, &mut bytes);
+        if modes.title.landed() {
+            bytes.extend_from_slice(TITLE_POP);
+        }
+        output::write_best_effort(&bytes);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardMode, TerminalGuard};
+    use super::*;
+
+    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|part| part == needle)
+    }
+
     #[test]
-    fn presentation_pushes_and_restoration_pops_title() {
+    fn presentation_pushes_the_title_first() {
         let mut entered = Vec::new();
         TerminalGuard::append_enter(&mut entered);
-        assert!(entered.starts_with(b"\x1b[22;0t"));
+        assert!(entered.starts_with(TITLE_PUSH));
+    }
 
-        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(7));
-        let guard = TerminalGuard {
-            active: false,
-            mouse: false,
-            clipboard: None,
-            title: Some((std::sync::Arc::clone(&progress), 8)),
+    #[test]
+    fn only_a_landed_push_with_an_unwritten_pop_is_popped_again() {
+        let written = Rc::new(Cell::new(7));
+        let title = TitlePush {
+            written: Rc::clone(&written),
+            end: 8,
         };
-        assert!(!guard.title_pushed());
-        progress.store(8, std::sync::atomic::Ordering::Relaxed);
-        assert!(guard.title_pushed());
+        assert!(!title.needs_pop(30), "the push never reached the terminal");
+        written.set(29);
+        assert!(title.needs_pop(30));
+        written.set(30);
+        assert!(!title.needs_pop(30), "the queued pop already landed");
     }
 
     #[test]
     fn restoration_restores_enabled_modes() {
-        let mut guard = TerminalGuard {
-            active: false,
-            mouse: true,
-            clipboard: Some(ClipboardMode::Disabled),
-            title: None,
+        let title = TitlePush {
+            written: Rc::default(),
+            end: 0,
         };
         let mut bytes = Vec::new();
-        guard.append_restore(&mut bytes);
-        assert!(
-            bytes
-                .windows(b"\x1b[?1016l".len())
-                .any(|part| part == b"\x1b[?1016l")
+        append_restore(
+            &Modes {
+                mouse: true,
+                clipboard: Some(ClipboardMode::Disabled),
+                title: title.clone(),
+            },
+            &mut bytes,
         );
-        assert!(
-            bytes
-                .windows(b"\x1b[?5522l".len())
-                .any(|part| part == b"\x1b[?5522l")
-        );
-        assert!(!guard.mouse);
-        assert_eq!(guard.clipboard, None);
-    }
+        assert!(contains(&bytes, b"\x1b[?1016l"));
+        assert!(contains(&bytes, b"\x1b[?5522l"));
 
-    #[test]
-    fn restoration_preserves_enabled_clipboard_and_is_idempotent_when_inactive() {
-        let mut guard = TerminalGuard {
-            active: false,
-            mouse: false,
-            clipboard: Some(ClipboardMode::Enabled),
-            title: None,
-        };
         let mut bytes = Vec::new();
-        guard.append_restore(&mut bytes);
-        assert!(
-            bytes
-                .windows(b"\x1b[?5522h".len())
-                .any(|part| part == b"\x1b[?5522h")
+        append_restore(
+            &Modes {
+                mouse: false,
+                clipboard: Some(ClipboardMode::Enabled),
+                title,
+            },
+            &mut bytes,
         );
-        let len = bytes.len();
-        guard
-            .restore_into(&mut bytes)
-            .expect("inactive guard restores successfully");
-        assert_eq!(bytes.len(), len);
+        assert!(contains(&bytes, b"\x1b[?5522h"));
+        assert!(!contains(&bytes, b"\x1b[?1016l"));
     }
 }

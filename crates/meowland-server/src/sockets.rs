@@ -47,6 +47,8 @@ impl Drop for SocketPath {
 
 pub(crate) struct BoundSocket {
     listener: StdListener,
+    /// Removes the path on drop when this server bound it; `None` when the
+    /// service manager owns the socket.
     _path: Option<SocketPath>,
 }
 

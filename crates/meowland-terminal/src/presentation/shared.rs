@@ -4,9 +4,11 @@
 use std::{
     fs::File,
     io::{self, Read},
+    mem,
     time::{Duration, Instant},
 };
 
+use meowland_core::pixels::FrameSize;
 use meowland_protocol::{FrameBand, SharedFrame};
 
 /// How long to wait for the terminal to unlink a shared object before falling
@@ -27,103 +29,127 @@ const MAXIMUM_POLL_DELAY: Duration = Duration::from_millis(16);
 /// turns, well before an inline band usually follows.
 const READ_CHUNK: usize = 256 * 1024;
 
-pub(super) enum Consumption {
-    Waiting(Instant),
-    Complete,
-    Expired,
-}
-
-/// How much of a consumed frame has been copied out of the shared object.
-enum Readback {
-    /// Nothing copied yet: the terminal may still be reading the object.
-    Idle,
-    /// `pixels[..offset]` came from the object.
-    Reading { pixels: Vec<u8>, offset: usize },
-    /// A complete frame, ready for the presenter without another read.
-    Ready(FrameBand),
-}
-
-pub(super) struct SharedPresentation {
-    pub(super) frame: SharedFrame,
+/// A shared frame shown by reference that the terminal has not read yet.
+pub(super) struct Unread {
+    frame: SharedFrame,
     file: File,
     deadline: Instant,
     poll_delay: Duration,
-    pub(super) consumed: bool,
-    readback: Readback,
+    next_poll: Instant,
 }
 
-impl SharedPresentation {
-    pub(super) fn new(frame: SharedFrame) -> io::Result<Self> {
+/// The outcome of checking whether the terminal read a shared frame.
+pub(super) enum Polled {
+    /// Still unread; check again at [`Unread::next_poll`].
+    Unread(Unread),
+    /// The terminal unlinked the object; its pixels are being retained.
+    Consumed(Readback),
+    /// The terminal did not read the object in time.
+    Expired(Unread),
+}
+
+impl Unread {
+    /// Open the object so its pixels stay readable after the terminal unlinks
+    /// it, and poll for consumption immediately.
+    pub(super) fn new(frame: SharedFrame, now: Instant) -> io::Result<Self> {
         let file = frame.open()?;
         Ok(Self {
             frame,
             file,
-            deadline: Instant::now() + TIMEOUT,
+            deadline: now + TIMEOUT,
             poll_delay: INITIAL_POLL_DELAY,
-            consumed: false,
-            readback: Readback::Idle,
+            next_poll: now,
         })
     }
 
+    pub(super) const fn frame(&self) -> &SharedFrame {
+        &self.frame
+    }
+
+    pub(super) const fn next_poll(&self) -> Instant {
+        self.next_poll
+    }
+
     /// Check consumption, backing off so a slow terminal costs few syscalls.
-    pub(super) fn poll(&mut self) -> Consumption {
+    pub(super) fn poll(mut self, now: Instant) -> Polled {
         match self.frame.exists() {
-            Ok(false) => {
-                self.consumed = true;
-                Consumption::Complete
-            }
-            Ok(true) if Instant::now() < self.deadline => {
-                let next = (Instant::now() + self.poll_delay).min(self.deadline);
+            Ok(false) => Polled::Consumed(Readback::new(self.frame.size(), self.file)),
+            Ok(true) if now < self.deadline => {
+                self.next_poll = (now + self.poll_delay).min(self.deadline);
                 self.poll_delay = (self.poll_delay * 2).min(MAXIMUM_POLL_DELAY);
-                Consumption::Waiting(next)
+                Polled::Unread(self)
             }
-            Ok(true) => Consumption::Expired,
+            Ok(true) => Polled::Expired(self),
             Err(error) => {
                 tracing::warn!(%error, "checking upstream shared-frame consumption failed");
-                Consumption::Expired
+                Polled::Expired(self)
             }
+        }
+    }
+
+    /// Read the whole frame synchronously.
+    ///
+    /// # Errors
+    /// Returns an error if the shared object cannot be read or does not form a
+    /// whole frame.
+    pub(super) fn into_band(self) -> io::Result<FrameBand> {
+        Readback::new(self.frame.size(), self.file).into_band()
+    }
+}
+
+/// How much of a consumed frame has been copied out of the shared object.
+pub(super) enum Readback {
+    /// `pixels[..offset]` came from the object.
+    Reading {
+        file: File,
+        size: FrameSize,
+        pixels: Vec<u8>,
+        offset: usize,
+    },
+    /// A complete frame, ready for the presenter without another read.
+    Ready(FrameBand),
+}
+
+impl Readback {
+    fn new(size: FrameSize, file: File) -> Self {
+        Self::Reading {
+            file,
+            size,
+            pixels: vec![0; size.rgb_len()],
+            offset: 0,
         }
     }
 
     /// Whether the whole frame already lives in memory.
-    pub(super) const fn retained(&self) -> bool {
-        matches!(self.readback, Readback::Ready(_))
+    pub(super) const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
     }
 
-    /// Copy one bounded chunk of a consumed frame into memory.
+    /// Copy one bounded chunk into memory.
     ///
     /// Called once per scheduling turn after the terminal confirms consumption,
     /// so the next inline band finds the retained pixels ready instead of
-    /// reading the whole object on its own critical path. Does nothing before
-    /// consumption or once the frame is retained.
+    /// reading the whole object on its own critical path.
     ///
     /// # Errors
     /// Returns an error if the shared object cannot be read.
-    pub(super) fn retain_step(&mut self) -> io::Result<()> {
-        if self.retained() || !self.consumed {
+    pub(super) fn step(&mut self) -> io::Result<()> {
+        let Self::Reading {
+            file,
+            size,
+            pixels,
+            offset,
+        } = self
+        else {
             return Ok(());
-        }
-        if matches!(self.readback, Readback::Idle) {
-            self.readback = Readback::Reading {
-                pixels: vec![0; self.frame.size().rgb_len()],
-                offset: 0,
-            };
-        }
-        let Readback::Reading { pixels, offset } = &mut self.readback else {
-            unreachable!("a consumed frame is either being read or already retained");
         };
         let end = (*offset + READ_CHUNK).min(pixels.len());
-        self.file.read_exact(&mut pixels[*offset..end])?;
+        file.read_exact(&mut pixels[*offset..end])?;
         *offset = end;
-        if *offset < pixels.len() {
-            return Ok(());
+        if end == pixels.len() {
+            let band = whole_band(*size, mem::take(pixels))?;
+            *self = Self::Ready(band);
         }
-        let Readback::Reading { pixels, .. } =
-            std::mem::replace(&mut self.readback, Readback::Idle)
-        else {
-            unreachable!("the readback was just filled");
-        };
-        self.readback = Readback::Ready(whole_band(&self.frame, pixels)?);
         Ok(())
     }
 
@@ -132,20 +158,23 @@ impl SharedPresentation {
     /// # Errors
     /// Returns an error if the shared object cannot be read or does not form a
     /// whole frame.
-    pub(super) fn into_band(mut self) -> io::Result<FrameBand> {
-        let size = self.frame.size();
-        let (mut pixels, offset) = match std::mem::replace(&mut self.readback, Readback::Idle) {
-            Readback::Ready(band) => return Ok(band),
-            Readback::Reading { pixels, offset } => (pixels, offset),
-            Readback::Idle => (vec![0; size.rgb_len()], 0),
-        };
-        self.file.read_exact(&mut pixels[offset..])?;
-        whole_band(&self.frame, pixels)
+    pub(super) fn into_band(self) -> io::Result<FrameBand> {
+        match self {
+            Self::Ready(band) => Ok(band),
+            Self::Reading {
+                mut file,
+                size,
+                mut pixels,
+                offset,
+            } => {
+                file.read_exact(&mut pixels[offset..])?;
+                whole_band(size, pixels)
+            }
+        }
     }
 }
 
-fn whole_band(frame: &SharedFrame, pixels: Vec<u8>) -> io::Result<FrameBand> {
-    let size = frame.size();
+fn whole_band(size: FrameSize, pixels: Vec<u8>) -> io::Result<FrameBand> {
     FrameBand::new(size, 0, 0, size.width(), pixels)
         .ok_or_else(|| io::Error::other("invalid retained shared frame"))
 }

@@ -12,11 +12,12 @@ use calloop::{
     generic::Generic,
     signals::{Signal, Signals},
 };
-use meowland_compositor::{CompositorHandle, Runtime, Settings};
+use meowland_compositor::{CompositorHandle, Runtime};
 use meowland_protocol::Paths;
+use meowland_settings::Settings;
 
 use super::{
-    Completion, ConnectionId, Error, Listener, MAX_CONNECTIONS, Result, Server,
+    Completion, Connection, ConnectionId, Error, Listener, MAX_CONNECTIONS, Result, Role, Server,
     lifecycle::Shutdown,
     notify, sockets,
     transport::{self, ConnectionKind},
@@ -102,7 +103,6 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
         incoming,
         listeners: registered,
         connections: HashMap::new(),
-        panes: HashMap::new(),
         next_connection: 1,
         shortcuts: settings.shortcuts,
         children: Vec::new(),
@@ -120,7 +120,8 @@ pub(crate) fn serve(paths: &Paths, settings: &Settings) -> Result<()> {
 fn run(mut event_loop: EventLoop<'static, Server>, mut server: Server) -> Result<()> {
     let mut events = Vec::new();
     while !server.shutdown.stopped() {
-        server.advance_shutdown(Instant::now());
+        let now = Instant::now();
+        server.advance_shutdown(now);
         if server.shutdown.stopped() {
             break;
         }
@@ -132,8 +133,8 @@ fn run(mut event_loop: EventLoop<'static, Server>, mut server: Server) -> Result
             .chain(
                 server
                     .shutdown
-                    .deadline()
-                    .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+                    .wakeup(now)
+                    .map(|wakeup| wakeup.saturating_duration_since(now)),
             )
             .min();
         event_loop
@@ -212,7 +213,13 @@ impl Server {
         let incoming = self.incoming.clone();
         let handle = self.handle.clone();
         let (abort, registration) = AbortHandle::new_pair();
-        self.connections.insert(id, abort);
+        self.connections.insert(
+            id,
+            Connection {
+                task: abort,
+                role: Role::Pending,
+            },
+        );
         self.scheduler
             .schedule(async move {
                 let result = Abortable::new(

@@ -235,7 +235,7 @@ const fn cursor_name(icon: CursorIcon) -> &'static str {
 }
 
 impl SelectionHandler for Compositor {
-    type SelectionUserData = clipboard::Source;
+    type SelectionUserData = clipboard::Text;
 
     fn new_selection(
         &mut self,
@@ -243,18 +243,18 @@ impl SelectionHandler for Compositor {
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
-        clipboard::selection(self, target, source);
+        self.copy_selection(target, source);
     }
 
     fn send_selection(
         &mut self,
         _target: SelectionTarget,
-        mime: String,
+        _mime: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
         source: &Self::SelectionUserData,
     ) {
-        clipboard::send(self, fd, &mime, source);
+        self.send_text(fd, source);
     }
 }
 

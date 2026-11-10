@@ -7,7 +7,7 @@ use meowland_async::asynchronous::{connect, timeout};
 use meowland_protocol::{Follow, Target, asynchronous::Reader};
 
 mod error;
-mod input_gate;
+mod kitty;
 mod output;
 mod presentation;
 mod probe;

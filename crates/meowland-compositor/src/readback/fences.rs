@@ -10,21 +10,21 @@ use rustix::{
 };
 use smithay::backend::allocator::dmabuf::{AlreadyReady, Dmabuf};
 
-use super::Host;
+use super::Compositor;
 
 /// How a readback waits for the writers of its buffer.
-pub(super) enum Watch<H> {
+pub(super) enum Watch {
     /// No writer is pending; the GPU may sample the buffer now.
     Ready,
     /// One registration per pending write fence or readiness source.
-    Pending(Vec<Sources<H>>),
+    Pending(Vec<Sources<Compositor>>),
     /// A wait could not be registered.
     Failed,
 }
 
 /// Register a wait for every pending writer of `dmabuf`, reporting each
 /// signal to [`super::acquired`] with its index.
-pub(super) fn watch<H: Host>(host: &H, id: u64, dmabuf: &Dmabuf) -> Watch<H> {
+pub(super) fn watch(host: &Compositor, id: u64, dmabuf: &Dmabuf) -> Watch {
     let Some(fences) = snapshot(dmabuf) else {
         return match dmabuf.generate_blocker(Interest::READ) {
             Ok((_, source)) => register(host, source, move |(), _, host| {
@@ -52,14 +52,14 @@ pub(super) fn watch<H: Host>(host: &H, id: u64, dmabuf: &Dmabuf) -> Watch<H> {
     Watch::Pending(registered)
 }
 
-fn register<H: Host, S, F>(host: &H, source: S, callback: F) -> Option<Sources<H>>
+fn register<S, F>(host: &Compositor, source: S, callback: F) -> Option<Sources<Compositor>>
 where
     S: EventSource + 'static,
-    F: FnMut(S::Event, &mut S::Metadata, &mut H) -> S::Ret + 'static,
+    F: FnMut(S::Event, &mut S::Metadata, &mut Compositor) -> S::Ret + 'static,
 {
-    match host.handle().insert_source(source, callback) {
+    match host.handle.insert_source(source, callback) {
         Ok(token) => {
-            let mut sources = Sources::new(host.handle());
+            let mut sources = Sources::new(&host.handle);
             sources.io = Some(token);
             Some(sources)
         }

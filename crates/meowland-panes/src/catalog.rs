@@ -139,7 +139,7 @@ impl WindowCatalog {
 
     /// Most recently mapped drawable window.
     pub fn newest(&self) -> Option<WindowId> {
-        self.newest_matching(|_| true)
+        self.newest_matching(|_, _| true)
     }
 
     /// Window that currently has focus.
@@ -184,13 +184,20 @@ impl WindowCatalog {
             .map_or("", |window| window.app_id.as_str())
     }
 
-    /// Most recently mapped drawable window whose unique ID, app ID, or title
-    /// equals the selector's value.
-    pub fn select(&self, selector: &Selector) -> Option<WindowId> {
-        self.newest_matching(|window| match selector {
-            Selector::Id(id) => window.id() == Some(id.as_str()),
-            Selector::AppId(app_id) => window.app_id == *app_id,
-            Selector::Title(title) => window.title == *title,
+    /// Most recently mapped drawable window that is `available` and whose
+    /// unique ID, app ID, or title equals the selector's value.
+    pub fn select(
+        &self,
+        selector: &Selector,
+        available: impl Fn(WindowId) -> bool,
+    ) -> Option<WindowId> {
+        self.newest_matching(|id, window| {
+            available(id)
+                && match selector {
+                    Selector::Id(unique) => window.id() == Some(unique.as_str()),
+                    Selector::AppId(app_id) => window.app_id == *app_id,
+                    Selector::Title(title) => window.title == *title,
+                }
         })
     }
 
@@ -200,10 +207,10 @@ impl WindowCatalog {
         self.windows.remove(&window);
     }
 
-    fn newest_matching(&self, predicate: impl Fn(&Metadata) -> bool) -> Option<WindowId> {
+    fn newest_matching(&self, predicate: impl Fn(WindowId, &Metadata) -> bool) -> Option<WindowId> {
         self.windows
             .iter()
-            .filter(|(_, window)| predicate(window))
+            .filter(|&(&id, window)| predicate(id, window))
             .filter_map(|(id, window)| window.mapped_order().map(|order| (order, *id)))
             .max_by_key(|(order, _)| *order)
             .map(|(_, id)| id)

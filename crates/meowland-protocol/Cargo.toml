@@ -18,8 +18,7 @@ futures = { workspace = true, optional = true }
 meowland-async = { workspace = true, optional = true }
 meowland-core = { workspace = true, features = ["serde"] }
 postcard = { workspace = true, features = ["use-std"] }
-rustix = { workspace = true, features = ["time", "shm", "fs"] }
+rustix = { workspace = true, features = ["shm", "fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_bytes = { workspace = true }
 thiserror = { workspace = true }
-mime = { workspace = true }

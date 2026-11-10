@@ -1,7 +1,7 @@
 //! Commit-blocked DMA-BUF acquire, submission, and readback completion.
 //!
-//! The state machine owns no compositor fields. A host supplies the GPU
-//! backend, pane bounds, snapshot spares, client wakeups, and shutdown.
+//! A DMA-BUF commit stays blocked until the GPU has copied its pixels into
+//! a snapshot, so the commit applies with them.
 
 use std::{
     collections::HashMap,
@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex, Weak as SyncWeak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use calloop::{
@@ -18,9 +18,9 @@ use calloop::{
     generic::Generic,
     timer::{TimeoutAction, Timer},
 };
-use meowland_core::{latency::Latency, pixels::FrameSize};
-use meowland_loop::{Handle, Sources};
-use meowland_render::{BufferRelease, DmabufBackend, Readback, Snapshot, Submission, source_bound};
+use meowland_core::pixels::FrameSize;
+use meowland_loop::Sources;
+use meowland_render::{BufferRelease, Readback, Snapshot, Submission, source_bound};
 use smithay::{
     backend::allocator::{Buffer, dmabuf::Dmabuf},
     reexports::wayland_server::{
@@ -33,6 +33,8 @@ use smithay::{
         Blocker, BlockerState, Cacheable, SurfaceAttributes, add_blocker, with_states,
     },
 };
+
+use super::{ClientState, Compositor};
 
 mod fences;
 
@@ -110,7 +112,6 @@ enum Fill {
 
 #[derive(Debug)]
 struct Slot {
-    started: Instant,
     fill: Mutex<Fill>,
 }
 
@@ -145,20 +146,10 @@ impl Cacheable for PreparedSnapshot {
 }
 
 /// Mark a surface as having no prepared readback snapshot.
-pub fn clear(surface: &WlSurface) {
+pub(crate) fn clear(surface: &WlSurface) {
     with_states(surface, |states| {
         *states.cached_state.get::<PreparedSnapshot>().pending() = PreparedSnapshot::Cleared;
     });
-}
-
-/// When the current readback for a surface started acquiring, if any.
-pub fn prepared_at(surface: &WlSurface) -> Option<Instant> {
-    with_states(surface, |states| {
-        match &*states.cached_state.get::<PreparedSnapshot>().current() {
-            PreparedSnapshot::Prepared(slot) => Some(slot.started),
-            PreparedSnapshot::Unchanged | PreparedSnapshot::Cleared => None,
-        }
-    })
 }
 
 /// Take the current readback's snapshot.
@@ -169,7 +160,7 @@ pub fn prepared_at(surface: &WlSurface) -> Option<Instant> {
 ///
 /// # Panics
 /// Panics if a snapshot lock was poisoned by another thread panicking.
-pub fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
+pub(crate) fn snapshot(surface: &WlSurface) -> Option<Snapshot> {
     with_states(surface, |states| {
         let prepared = std::mem::replace(
             states.cached_state.get::<PreparedSnapshot>().current(),
@@ -271,49 +262,36 @@ impl Drop for Operation {
 }
 
 /// A reader waiting for the buffer's writers before the GPU can sample it.
-struct Acquiring<H> {
+struct Acquiring {
     operation: Operation,
     dmabuf: Dmabuf,
     /// One registration per write fence; each is cleared once it signals.
-    fences: Vec<Option<Sources<H>>>,
-    timeout: Sources<H>,
+    fences: Vec<Option<Sources<Compositor>>>,
+    timeout: Sources<Compositor>,
 }
 
 /// A submitted GPU readback waiting for its completion fence.
-struct Reading<H> {
+struct Reading {
     operation: Operation,
     readback: Readback,
-    submitted: Instant,
-    completion: Sources<H>,
+    completion: Sources<Compositor>,
 }
 
-enum Phase<H> {
-    Acquiring(Acquiring<H>),
-    Reading(Reading<H>),
+enum Phase {
+    Acquiring(Acquiring),
+    Reading(Reading),
 }
 
-/// In-flight readbacks, buffer blockers, and latency accounting.
-pub struct Readbacks<H> {
+/// In-flight readbacks and buffer blockers.
+#[derive(Default)]
+pub(crate) struct Readbacks {
     next: u64,
-    operations: HashMap<u64, Phase<H>>,
+    operations: HashMap<u64, Phase>,
     buffers: HashMap<ObjectId, SyncWeak<BufferReaders>>,
     budget: Arc<Budget>,
-    stats: ReadbackStats,
 }
 
-impl<H> Default for Readbacks<H> {
-    fn default() -> Self {
-        Self {
-            next: 0,
-            operations: HashMap::new(),
-            buffers: HashMap::new(),
-            budget: Arc::default(),
-            stats: ReadbackStats::default(),
-        }
-    }
-}
-
-impl<H> fmt::Debug for Readbacks<H> {
+impl fmt::Debug for Readbacks {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Readbacks")
@@ -323,49 +301,7 @@ impl<H> fmt::Debug for Readbacks<H> {
     }
 }
 
-struct ReadbackStats {
-    window: Instant,
-    completed: u32,
-    acquire: Latency,
-    readback: Latency,
-    copy: Latency,
-}
-
-impl Default for ReadbackStats {
-    fn default() -> Self {
-        Self {
-            window: Instant::now(),
-            completed: 0,
-            acquire: Latency::default(),
-            readback: Latency::default(),
-            copy: Latency::default(),
-        }
-    }
-}
-
-impl ReadbackStats {
-    fn complete(&mut self, started: Instant, submitted: Instant, ready: Instant) {
-        self.acquire
-            .record(submitted.saturating_duration_since(started));
-        self.readback
-            .record(ready.saturating_duration_since(submitted));
-        self.copy.record(ready.elapsed());
-        self.completed += 1;
-        if self.window.elapsed() >= Duration::from_secs(1) {
-            tracing::debug!(
-                completed = self.completed,
-                acquire_us = ?self.acquire.summarize(),
-                readback_us = ?self.readback.summarize(),
-                copy_us = ?self.copy.summarize(),
-                "DMA-BUF latency"
-            );
-            self.completed = 0;
-            self.window = Instant::now();
-        }
-    }
-}
-
-impl<H> Readbacks<H> {
+impl Readbacks {
     fn readers(&mut self, buffer: &WlBuffer) -> Arc<BufferReaders> {
         self.buffers.retain(|_, readers| readers.strong_count() > 0);
         self.buffers
@@ -379,33 +315,29 @@ impl<H> Readbacks<H> {
     }
 }
 
-/// Host operations the readback state machine needs.
-pub trait Host: Sized + 'static {
-    /// Event-loop projection for fences and completion readiness.
-    fn handle(&self) -> &Handle<Self>;
-    /// Host-owned readback state.
-    fn readbacks(&mut self) -> &mut Readbacks<Self>;
-    /// GPU backend that submits and completes readbacks.
-    fn gpu(&mut self) -> Option<&mut DmabufBackend>;
-    /// Logical buffer bound of the pane showing a surface.
-    fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)>;
-    /// Take a snapshot buffer parked for reuse after a previous readback.
-    fn take_spare(&mut self, surface: &WlSurface) -> Option<Snapshot>;
-    /// Park a reused snapshot buffer after a failed readback.
-    fn return_spare(&mut self, surface: WlSurface, snapshot: Snapshot);
-    /// Notify a client that its buffer blockers were released.
-    fn notify_client(&mut self, client: &Client);
-    /// Stop the compositor because a readback cannot safely release its buffer.
-    fn request_shutdown(&mut self);
+impl Compositor {
+    /// Let a client's blocked transactions apply once their blockers clear.
+    fn notify_client(&mut self, client: &Client) {
+        if let Some(client_state) = client.get_data::<ClientState>() {
+            let display = self.display.clone();
+            client_state
+                .compositor_state
+                .blocker_cleared(self, &display);
+        }
+    }
 }
 
 /// Start a commit-blocked readback for a DMA-BUF surface buffer.
-pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dmabuf: &Dmabuf) {
-    let started = Instant::now();
+pub(crate) fn prepare(
+    host: &mut Compositor,
+    surface: &WlSurface,
+    buffer: &WlBuffer,
+    dmabuf: &Dmabuf,
+) {
     let Some(client) = surface.client() else {
         return;
     };
-    let readers = host.readbacks().readers(buffer);
+    let readers = host.readbacks.readers(buffer);
     add_blocker(surface, BufferBlocker(Arc::clone(&readers)));
     clear(surface);
     let size = dmabuf.size();
@@ -417,7 +349,7 @@ pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dm
         return;
     };
     let bytes = size.rgba_len();
-    let Some(reservation) = Reservation::new(&host.readbacks().budget, bytes) else {
+    let Some(reservation) = Reservation::new(&host.readbacks.budget, bytes) else {
         tracing::warn!("DMA-BUF readback budget exhausted; retaining previous pixels");
         return;
     };
@@ -433,15 +365,14 @@ pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dm
     });
     let bound = source_bound(host.pane_bound(surface), scale, transform);
     let slot = Arc::new(Slot {
-        started,
         fill: Mutex::new(Fill::Pending(reservation)),
     });
     with_states(surface, |states| {
         *states.cached_state.get::<PreparedSnapshot>().pending() =
             PreparedSnapshot::Prepared(Arc::clone(&slot));
     });
-    host.readbacks().next += 1;
-    let id = host.readbacks().next;
+    host.readbacks.next += 1;
+    let id = host.readbacks.next;
     let operation = Operation {
         surface: surface.downgrade(),
         client,
@@ -462,9 +393,9 @@ pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dm
             return;
         }
     };
-    let mut timeout = Sources::new(host.handle());
+    let mut timeout = Sources::new(&host.handle);
     match host
-        .handle()
+        .handle
         .insert_source(Timer::from_duration(ACQUIRE_TIMEOUT), move |_, (), host| {
             abandon(host, id);
             TimeoutAction::Drop
@@ -478,7 +409,7 @@ pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dm
             return;
         }
     }
-    host.readbacks().operations.insert(
+    host.readbacks.operations.insert(
         id,
         Phase::Acquiring(Acquiring {
             operation,
@@ -490,8 +421,8 @@ pub fn prepare<H: Host>(host: &mut H, surface: &WlSurface, buffer: &WlBuffer, dm
 }
 
 /// Record a signaled write fence, submitting once every fence signaled.
-fn acquired<H: Host>(host: &mut H, id: u64, index: usize) {
-    let operations = &mut host.readbacks().operations;
+fn acquired(host: &mut Compositor, id: u64, index: usize) {
+    let operations = &mut host.readbacks.operations;
     let Some(Phase::Acquiring(acquiring)) = operations.get_mut(&id) else {
         return;
     };
@@ -511,8 +442,8 @@ fn acquired<H: Host>(host: &mut H, id: u64, index: usize) {
 }
 
 /// Give up on a readback whose write fences did not signal in time.
-fn abandon<H: Host>(host: &mut H, id: u64) {
-    let operations = &mut host.readbacks().operations;
+fn abandon(host: &mut Compositor, id: u64) {
+    let operations = &mut host.readbacks.operations;
     let Some(Phase::Acquiring(mut acquiring)) = operations.remove(&id) else {
         return;
     };
@@ -523,44 +454,42 @@ fn abandon<H: Host>(host: &mut H, id: u64) {
     host.notify_client(&client);
 }
 
-fn submit<H: Host>(host: &mut H, id: u64, mut operation: Operation, dmabuf: &Dmabuf) {
+fn submit(host: &mut Compositor, id: u64, mut operation: Operation, dmabuf: &Dmabuf) {
     if operation.surface.upgrade().is_err() {
         let client = operation.client.clone();
         drop(operation);
         host.notify_client(&client);
         return;
     }
-    let Some(gpu) = host.gpu() else {
+    let Some(gpu) = host.gpu.as_mut() else {
         let client = operation.client.clone();
         drop(operation);
         host.notify_client(&client);
         return;
     };
-    let submitted = Instant::now();
     operation.buffer.stage = Stage::Submitted;
     match gpu.submit(dmabuf, operation.bound) {
         Ok(Submission { fence, readback }) => {
             match host
-                .handle()
+                .handle
                 .insert_source(Generic::new(fence, Interest::READ, Mode::Level), {
                     move |_, fence, host| Ok(complete(host, id, fence))
                 }) {
                 Ok(token) => {
-                    let mut completion = Sources::new(host.handle());
+                    let mut completion = Sources::new(&host.handle);
                     completion.io = Some(token);
-                    host.readbacks().operations.insert(
+                    host.readbacks.operations.insert(
                         id,
                         Phase::Reading(Reading {
                             operation,
                             readback,
-                            submitted,
                             completion,
                         }),
                     );
                 }
                 Err(error) => {
                     tracing::error!(%error, "Cannot register GPU completion; stopping without releasing the buffer");
-                    host.request_shutdown();
+                    host.shutdown = true;
                 }
             }
         }
@@ -569,7 +498,7 @@ fn submit<H: Host>(host: &mut H, id: u64, mut operation: Operation, dmabuf: &Dma
             tracing::warn!(%error, ?release, "Cannot submit DMA-BUF readback");
             match release {
                 BufferRelease::Safe => operation.buffer.stage = Stage::Finished,
-                BufferRelease::Unsafe => host.request_shutdown(),
+                BufferRelease::Unsafe => host.shutdown = true,
             }
             let client = operation.client.clone();
             drop(operation);
@@ -578,15 +507,14 @@ fn submit<H: Host>(host: &mut H, id: u64, mut operation: Operation, dmabuf: &Dma
     }
 }
 
-fn complete<H: Host>(host: &mut H, id: u64, fence: impl std::os::fd::AsFd) -> PostAction {
-    let operations = &mut host.readbacks().operations;
+fn complete(host: &mut Compositor, id: u64, fence: impl std::os::fd::AsFd) -> PostAction {
+    let operations = &mut host.readbacks.operations;
     let Some(Phase::Reading(reading)) = operations.remove(&id) else {
         return PostAction::Remove;
     };
     let Reading {
         mut operation,
         readback,
-        submitted,
         mut completion,
     } = reading;
     let readback = match readback.signaled(fence) {
@@ -597,7 +525,6 @@ fn complete<H: Host>(host: &mut H, id: u64, fence: impl std::os::fd::AsFd) -> Po
                 Phase::Reading(Reading {
                     operation,
                     readback,
-                    submitted,
                     completion,
                 }),
             );
@@ -605,35 +532,27 @@ fn complete<H: Host>(host: &mut H, id: u64, fence: impl std::os::fd::AsFd) -> Po
         }
     };
     completion.io = None;
-    let ready = Instant::now();
     operation.buffer.stage = Stage::Finished;
-    if let Ok(surface) = operation.surface.upgrade() {
-        let mut previous = host.take_spare(&surface);
-        if let Some(gpu) = host.gpu() {
-            match gpu.complete(readback, &mut previous) {
-                Ok(snapshot) => {
-                    let mut fill = operation.slot.lock();
-                    if let Fill::Pending(reservation) = std::mem::replace(&mut *fill, Fill::Empty) {
-                        *fill = Fill::Ready {
-                            snapshot,
-                            _reservation: reservation,
-                        };
-                    }
-                }
-                Err(error) => {
-                    if let Some(previous) = previous {
-                        host.return_spare(surface, previous);
-                    }
-                    tracing::warn!(%error, "DMA-BUF readback failed");
+    if let Ok(surface) = operation.surface.upgrade()
+        && let Some(gpu) = host.gpu.as_mut()
+    {
+        let mut spare = host.windows.surface_cache.spares.remove(&surface);
+        match gpu.complete(readback, &mut spare) {
+            Ok(snapshot) => {
+                let mut fill = operation.slot.lock();
+                if let Fill::Pending(reservation) = std::mem::replace(&mut *fill, Fill::Empty) {
+                    *fill = Fill::Ready {
+                        snapshot,
+                        _reservation: reservation,
+                    };
                 }
             }
-        } else if let Some(previous) = previous {
-            host.return_spare(surface, previous);
+            Err(error) => tracing::warn!(%error, "DMA-BUF readback failed"),
+        }
+        if let Some(spare) = spare {
+            host.windows.surface_cache.spares.insert(surface, spare);
         }
     }
-    host.readbacks()
-        .stats
-        .complete(operation.slot.started, submitted, ready);
     let client = operation.client.clone();
     drop(operation);
     host.notify_client(&client);
@@ -645,10 +564,10 @@ fn complete<H: Host>(host: &mut H, id: u64, fence: impl std::os::fd::AsFd) -> Po
 /// Submitted reads stay registered until their native fence signals, because
 /// dropping the reservation early would let the client reuse a buffer the GPU
 /// still samples. Completion skips the slot when the surface is gone.
-pub fn destroyed<H: Host>(host: &mut H, surface: &WlSurface) {
+pub(crate) fn destroyed(host: &mut Compositor, surface: &WlSurface) {
     let surface = surface.downgrade();
     let mut clients = Vec::new();
-    host.readbacks().operations.retain(|_, phase| match phase {
+    host.readbacks.operations.retain(|_, phase| match phase {
         Phase::Acquiring(acquiring) if acquiring.operation.surface == surface => {
             clients.push(acquiring.operation.client.clone());
             false

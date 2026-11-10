@@ -23,6 +23,10 @@ fn by_id(catalog: &WindowCatalog, window: WindowId) -> Selector {
     Selector::Id(info(catalog, window).id)
 }
 
+fn select(catalog: &WindowCatalog, selector: &Selector) -> Option<WindowId> {
+    catalog.select(selector, |_| true)
+}
+
 fn split_unique_id(unique: &str) -> (&str, &str) {
     unique
         .rsplit_once('_')
@@ -197,16 +201,16 @@ fn id_selection_finds_only_the_drawable_window_with_that_id() {
     catalog.map(second);
     let first_id = by_id(&catalog, first);
 
-    assert_eq!(catalog.select(&first_id), Some(first));
-    assert_eq!(catalog.select(&by_id(&catalog, second)), Some(second));
+    assert_eq!(select(&catalog, &first_id), Some(first));
+    assert_eq!(select(&catalog, &by_id(&catalog, second)), Some(second));
 
     catalog.unmap(first);
-    assert_eq!(catalog.select(&first_id), None);
+    assert_eq!(select(&catalog, &first_id), None);
     catalog.map(first);
-    assert_eq!(catalog.select(&first_id), Some(first));
+    assert_eq!(select(&catalog, &first_id), Some(first));
 
-    assert_eq!(catalog.select(&Selector::Id(String::new())), None);
-    assert_eq!(catalog.select(&Selector::Id("missing_0000".into())), None);
+    assert_eq!(select(&catalog, &Selector::Id(String::new())), None);
+    assert_eq!(select(&catalog, &Selector::Id("missing_0000".into())), None);
 }
 
 #[test]
@@ -221,16 +225,21 @@ fn app_id_selection_uses_the_newest_matching_mapping() {
     catalog.map(other);
 
     let terminal = Selector::AppId("terminal".into());
-    assert_eq!(catalog.select(&terminal), Some(newer));
-    assert_eq!(catalog.select(&Selector::AppId("term".into())), None);
+    assert_eq!(select(&catalog, &terminal), Some(newer));
+    assert_eq!(select(&catalog, &Selector::AppId("term".into())), None);
+    assert_eq!(
+        catalog.select(&terminal, |window| window != newer),
+        Some(older),
+        "an unavailable newest match falls back to an older one"
+    );
 
     assert!(catalog.unmap(newer));
-    assert_eq!(catalog.select(&terminal), Some(older));
+    assert_eq!(select(&catalog, &terminal), Some(older));
 
     assert!(catalog.unmap(older));
-    assert_eq!(catalog.select(&terminal), None);
+    assert_eq!(select(&catalog, &terminal), None);
     assert!(!catalog.drawable(unmapped));
-    assert_eq!(catalog.select(&Selector::AppId("missing".into())), None);
+    assert_eq!(select(&catalog, &Selector::AppId("missing".into())), None);
 }
 
 #[test]
@@ -243,17 +252,20 @@ fn title_selection_uses_the_newest_matching_mapping_and_follows_updates() {
     catalog.map(newer);
 
     let notes = Selector::Title("notes.txt".into());
-    assert_eq!(catalog.select(&notes), Some(newer));
-    assert_eq!(catalog.select(&Selector::Title("notes".into())), None);
-    assert_eq!(catalog.select(&Selector::Title("secret.txt".into())), None);
+    assert_eq!(select(&catalog, &notes), Some(newer));
+    assert_eq!(select(&catalog, &Selector::Title("notes".into())), None);
+    assert_eq!(
+        select(&catalog, &Selector::Title("secret.txt".into())),
+        None
+    );
     assert!(!catalog.drawable(hidden));
 
     catalog.update(newer, "editor".into(), "renamed.md".into());
-    assert_eq!(catalog.select(&notes), Some(older));
+    assert_eq!(select(&catalog, &notes), Some(older));
     catalog.update(older, "editor".into(), "draft.md".into());
-    assert_eq!(catalog.select(&notes), None);
+    assert_eq!(select(&catalog, &notes), None);
     assert_eq!(
-        catalog.select(&Selector::Title("renamed.md".into())),
+        select(&catalog, &Selector::Title("renamed.md".into())),
         Some(newer)
     );
 }
@@ -267,8 +279,11 @@ fn update_replaces_metadata_and_affects_selection() {
     catalog.update(window, "new".into(), "New title".into());
     assert_eq!(info(&catalog, window).app_id, "new");
     assert_eq!(catalog.title(window), "New title");
-    assert_eq!(catalog.select(&Selector::AppId("old".into())), None);
-    assert_eq!(catalog.select(&Selector::AppId("new".into())), Some(window));
+    assert_eq!(select(&catalog, &Selector::AppId("old".into())), None);
+    assert_eq!(
+        select(&catalog, &Selector::AppId("new".into())),
+        Some(window)
+    );
 
     catalog.update(id(99), "missing".into(), "missing".into());
     assert_eq!(catalog.title(id(99)), "");
@@ -289,7 +304,7 @@ fn remove_forgets_identity_metadata_and_drawability() {
     assert!(!catalog.drawable(second));
     assert_eq!(catalog.newest(), Some(first));
     assert_eq!(catalog.focused(), None);
-    assert_eq!(catalog.select(&second_id), None);
+    assert_eq!(select(&catalog, &second_id), None);
     assert_eq!(catalog.title(second), "");
     assert_eq!(catalog.info(second), None);
 

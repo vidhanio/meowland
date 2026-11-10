@@ -1,9 +1,8 @@
-//! Validated value types and latency summaries.
+//! Validated value types.
 
 use std::time::Duration;
 
 use meowland_core::{
-    latency::Latency,
     pixels::{FrameSize, MAX_SURFACE_SIDE},
     scale::UiScale,
     timing::RefreshRate,
@@ -106,61 +105,5 @@ fn refresh_rate_validates_and_converts_to_time() {
     assert_eq!(
         RefreshRate::try_from(1000).unwrap().interval(),
         Duration::from_millis(1)
-    );
-}
-
-#[test]
-fn latency_uses_nearest_rank_percentiles() {
-    let mut latency = Latency::default();
-    assert_eq!(latency.summarize().p50, 0);
-
-    for micros in 1..=100 {
-        latency.record(Duration::from_micros(micros));
-    }
-    let summary = latency.summarize();
-    assert_eq!((summary.p50, summary.p95, summary.p99), (50, 95, 99));
-
-    for micros in [100, 1, 50, 2] {
-        latency.record(Duration::from_micros(micros));
-    }
-    let summary = latency.summarize();
-    assert_eq!((summary.p50, summary.p95, summary.p99), (2, 100, 100));
-
-    latency.record(Duration::from_micros(7));
-    let summary = latency.summarize();
-    assert_eq!((summary.p50, summary.p95, summary.p99), (7, 7, 7));
-}
-
-#[test]
-fn latency_summaries_reset_the_window() {
-    let mut latency = Latency::default();
-    latency.record(Duration::from_micros(10));
-    assert_eq!(latency.summarize().p50, 10);
-
-    let summary = latency.summarize();
-    assert_eq!((summary.p50, summary.p95, summary.p99), (0, 0, 0));
-}
-
-#[test]
-fn latency_keeps_a_bounded_rolling_window() {
-    let mut latency = Latency::default();
-    for micros in 1..=2049 {
-        latency.record(Duration::from_micros(micros));
-    }
-    let summary = latency.summarize();
-    assert_eq!(summary.p50, 1025);
-    assert_eq!(summary.p95, 1947);
-    assert_eq!(summary.p99, 2029);
-}
-
-#[test]
-fn latency_saturates_long_durations() {
-    let mut latency = Latency::default();
-    latency.record(Duration::MAX);
-
-    let summary = latency.summarize();
-    assert_eq!(
-        (summary.p50, summary.p95, summary.p99),
-        (u64::MAX, u64::MAX, u64::MAX)
     );
 }

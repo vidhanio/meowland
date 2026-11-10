@@ -3,8 +3,12 @@
 
 use std::{
     fs::File,
-    io::{ErrorKind, Write},
-    os::{fd::AsFd, unix::net::UnixStream},
+    io::{self, ErrorKind, Read, Write},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    time::Duration,
 };
 
 use calloop::EventLoop;
@@ -12,11 +16,15 @@ use smithay::reexports::wayland_server::Resource;
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     backend::{ObjectId, WaylandError},
-    delegate_noop,
+    delegate_noop, event_created_child,
     protocol::{
         wl_buffer::WlBuffer,
         wl_callback::{self, WlCallback},
         wl_compositor::WlCompositor,
+        wl_data_device::{self, WlDataDevice},
+        wl_data_device_manager::WlDataDeviceManager,
+        wl_data_offer::WlDataOffer,
+        wl_data_source::{self, WlDataSource},
         wl_keyboard::{self, WlKeyboard},
         wl_registry::{self, WlRegistry},
         wl_seat::WlSeat,
@@ -26,7 +34,13 @@ use wayland_client::{
     },
 };
 use wayland_protocols::{
-    wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+    wp::{
+        linux_dmabuf::zv1::client::{
+            zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+            zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        },
+        viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+    },
     xdg::shell::client::{
         xdg_surface::{self, XdgSurface},
         xdg_toplevel::XdgToplevel,
@@ -45,6 +59,11 @@ pub(crate) struct App {
     pub configures: Vec<u32>,
     /// Surface holding keyboard focus.
     pub keyboard_focus: Option<ObjectId>,
+    /// Clipboard offer the compositor most recently announced.
+    pub selection: Option<WlDataOffer>,
+    /// Clipboard reads the compositor requested from this client's sources,
+    /// with the requested MIME type, in arrival order.
+    pub sends: Vec<(WlDataSource, String, OwnedFd)>,
 }
 
 impl Dispatch<WlRegistry, ()> for App {
@@ -129,6 +148,40 @@ impl Dispatch<WlKeyboard, ()> for App {
     }
 }
 
+impl Dispatch<WlDataDevice, ()> for App {
+    event_created_child!(App, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+
+    fn event(
+        state: &mut Self,
+        _: &WlDataDevice,
+        event: wl_data_device::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_device::Event::Selection { id } = event {
+            state.selection = id;
+        }
+    }
+}
+
+impl Dispatch<WlDataSource, ()> for App {
+    fn event(
+        state: &mut Self,
+        source: &WlDataSource,
+        event: wl_data_source::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_source::Event::Send { mime_type, fd } = event {
+            state.sends.push((source.clone(), mime_type, fd));
+        }
+    }
+}
+
 delegate_noop!(App: WlCompositor);
 delegate_noop!(App: WlShmPool);
 delegate_noop!(App: ignore WlSeat);
@@ -138,6 +191,80 @@ delegate_noop!(App: ignore WlBuffer);
 delegate_noop!(App: ignore XdgToplevel);
 delegate_noop!(App: WpViewporter);
 delegate_noop!(App: WpViewport);
+delegate_noop!(App: WlDataDeviceManager);
+delegate_noop!(App: ignore WlDataOffer);
+delegate_noop!(App: ignore ZwpLinuxDmabufV1);
+delegate_noop!(App: ignore ZwpLinuxBufferParamsV1);
+
+/// `struct udmabuf_create` from `linux/udmabuf.h`.
+#[repr(C)]
+struct UdmabufCreate {
+    memfd: u32,
+    flags: u32,
+    offset: u64,
+    size: u64,
+}
+
+/// `UDMABUF_CREATE`, which turns sealed memfd pages into a DMA-BUF.
+struct CreateUdmabuf(UdmabufCreate);
+
+// SAFETY: The opcode is the kernel's write-only `UDMABUF_CREATE`, the pointer
+// addresses a `repr(C)` request matching `struct udmabuf_create`, and the
+// kernel returns a new descriptor on success.
+unsafe impl rustix::ioctl::Ioctl for CreateUdmabuf {
+    type Output = OwnedFd;
+
+    const IS_MUTATING: bool = false;
+
+    fn opcode(&self) -> rustix::ioctl::Opcode {
+        rustix::ioctl::opcode::write::<UdmabufCreate>(b'u', 0x42)
+    }
+
+    fn as_ptr(&mut self) -> *mut std::ffi::c_void {
+        (&raw mut self.0).cast()
+    }
+
+    unsafe fn output_from_ptr(
+        out: rustix::ioctl::IoctlOutput,
+        _: *mut std::ffi::c_void,
+    ) -> rustix::io::Result<OwnedFd> {
+        // SAFETY: A successful `UDMABUF_CREATE` returns a new descriptor the
+        // caller now exclusively owns.
+        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(out) })
+    }
+}
+
+/// A DMA-BUF of `pixels` backed by host memory, or `None` where `udmabuf`
+/// is unavailable.
+fn udmabuf(pixels: &[u8]) -> Option<OwnedFd> {
+    use rustix::fs::{MemfdFlags, SealFlags};
+    let page = rustix::param::page_size();
+    let size = pixels.len().div_ceil(page) * page;
+    let memfd = rustix::fs::memfd_create(
+        "meowland-dmabuf",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .ok()?;
+    let mut file = File::from(memfd);
+    file.write_all(pixels).ok()?;
+    file.set_len(u64::try_from(size).ok()?).ok()?;
+    rustix::fs::fcntl_add_seals(&file, SealFlags::SHRINK).ok()?;
+    let device = rustix::fs::open(
+        "/dev/udmabuf",
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    let request = CreateUdmabuf(UdmabufCreate {
+        memfd: u32::try_from(std::os::fd::AsRawFd::as_raw_fd(&file)).ok()?,
+        flags: 1,
+        offset: 0,
+        size: u64::try_from(size).ok()?,
+    });
+    // SAFETY: `device` is an open udmabuf device and `request` names a live
+    // sealed memfd covering whole pages.
+    unsafe { rustix::ioctl::ioctl(&device, request) }.ok()
+}
 
 /// One client toplevel.
 pub(crate) struct Toplevel {
@@ -150,7 +277,7 @@ pub(crate) struct Toplevel {
 pub(crate) struct Fixture {
     pub state: Compositor,
     runtime: Runtime,
-    _event_loop: EventLoop<'static, Compositor>,
+    event_loop: EventLoop<'static, Compositor>,
     connection: Connection,
     queue: EventQueue<App>,
     qh: QueueHandle<App>,
@@ -159,7 +286,10 @@ pub(crate) struct Fixture {
     shm: WlShm,
     wm_base: XdgWmBase,
     viewporter: WpViewporter,
+    dmabuf: Option<ZwpLinuxDmabufV1>,
     _keyboard: WlKeyboard,
+    data_devices: WlDataDeviceManager,
+    data_device: WlDataDevice,
 }
 
 impl Fixture {
@@ -175,6 +305,7 @@ impl Fixture {
         let qh = queue.handle();
         let registry = connection.display().get_registry(&qh, ());
         let mut partial = PartialFixture {
+            event_loop,
             state,
             runtime,
             connection,
@@ -187,10 +318,19 @@ impl Fixture {
         let shm: WlShm = partial.bind(&registry, 1);
         let wm_base: XdgWmBase = partial.bind(&registry, 6);
         let viewporter: WpViewporter = partial.bind(&registry, 1);
+        let dmabuf = partial
+            .app
+            .globals
+            .iter()
+            .any(|(_, global, _)| global == ZwpLinuxDmabufV1::interface().name)
+            .then(|| partial.bind(&registry, 3));
         let seat: WlSeat = partial.bind(&registry, 9);
         let keyboard = seat.get_keyboard(&partial.qh, ());
+        let data_devices: WlDataDeviceManager = partial.bind(&registry, 3);
+        let data_device = data_devices.get_data_device(&seat, &partial.qh, ());
         partial.roundtrip();
         let PartialFixture {
+            event_loop,
             state,
             runtime,
             connection,
@@ -201,7 +341,7 @@ impl Fixture {
         Self {
             state,
             runtime,
-            _event_loop: event_loop,
+            event_loop,
             connection,
             queue,
             qh,
@@ -210,13 +350,17 @@ impl Fixture {
             shm,
             wm_base,
             viewporter,
+            dmabuf,
             _keyboard: keyboard,
+            data_devices,
+            data_device,
         }
     }
 
     /// Deliver every queued request and wait for the compositor's reply.
     pub(crate) fn roundtrip(&mut self) {
         pump(
+            &mut self.event_loop,
             &mut self.runtime,
             &mut self.state,
             &self.connection,
@@ -224,6 +368,51 @@ impl Fixture {
             &self.qh,
             &mut self.app,
         );
+    }
+
+    /// Offer a new clipboard selection with the given MIME types.
+    pub(crate) fn copy(&mut self, mimes: &[&str]) -> WlDataSource {
+        let source = self.data_devices.create_data_source(&self.qh, ());
+        for mime in mimes {
+            source.offer((*mime).to_owned());
+        }
+        self.data_device.set_selection(Some(&source), 0);
+        self.roundtrip();
+        source
+    }
+
+    /// Answer the compositor's pending read of a source with `text`.
+    pub(crate) fn answer(&mut self, source: &WlDataSource, text: &[u8]) -> io::Result<()> {
+        let index = self
+            .app
+            .sends
+            .iter()
+            .position(|(requested, _, _)| requested == source)
+            .expect("the compositor requested the source's data");
+        let (_, _, fd) = self.app.sends.remove(index);
+        File::from(fd).write_all(text)
+    }
+
+    /// Read the announced clipboard offer in one MIME type until EOF.
+    pub(crate) fn read_selection(&mut self, mime: &str) -> Vec<u8> {
+        let offer = self.app.selection.clone().expect("a clipboard offer");
+        let (read, write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .expect("pipe");
+        offer.receive(mime.to_owned(), write.as_fd());
+        drop(write);
+        let mut file = File::from(read);
+        let mut bytes = Vec::new();
+        for _ in 0..64 {
+            self.roundtrip();
+            match file.read_to_end(&mut bytes) {
+                Ok(_) => return bytes,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => panic!("reading clipboard offer: {error}"),
+            }
+        }
+        panic!("clipboard offer never finished");
     }
 
     pub(crate) fn viewport(&self, surface: &WlSurface) -> WpViewport {
@@ -292,6 +481,27 @@ impl Fixture {
         buffer
     }
 
+    /// A linear XRGB8888 DMA-BUF filled with one color, or `None` without a
+    /// GPU backend or `udmabuf`.
+    pub(crate) fn dmabuf(&self, width: i32, height: i32, pixel: [u8; 4]) -> Option<WlBuffer> {
+        const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+        let dmabuf = self.dmabuf.as_ref()?;
+        let len = usize::try_from(width * height).ok()?;
+        let fd = udmabuf(&pixel.repeat(len))?;
+        let params = dmabuf.create_params(&self.qh, ());
+        params.add(fd.as_fd(), 0, 0, u32::try_from(width * 4).ok()?, 0, 0);
+        let buffer = params.create_immed(
+            width,
+            height,
+            XRGB8888,
+            wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::Flags::empty(),
+            &self.qh,
+            (),
+        );
+        params.destroy();
+        Some(buffer)
+    }
+
     /// Attach a fresh full-damage buffer and commit it.
     pub(crate) fn present(&mut self, surface: &WlSurface, width: i32, height: i32, pixel: [u8; 4]) {
         let buffer = self.buffer(width, height, pixel);
@@ -316,6 +526,7 @@ impl Fixture {
 
 /// Fixture state before the globals are bound.
 struct PartialFixture {
+    event_loop: EventLoop<'static, Compositor>,
     state: Compositor,
     runtime: Runtime,
     connection: Connection,
@@ -327,6 +538,7 @@ struct PartialFixture {
 impl PartialFixture {
     fn roundtrip(&mut self) {
         pump(
+            &mut self.event_loop,
             &mut self.runtime,
             &mut self.state,
             &self.connection,
@@ -352,6 +564,7 @@ impl PartialFixture {
 }
 
 fn pump(
+    event_loop: &mut EventLoop<'static, Compositor>,
     runtime: &mut Runtime,
     state: &mut Compositor,
     connection: &Connection,
@@ -364,6 +577,9 @@ fn pump(
     for _ in 0..64 {
         connection.flush().expect("flush client requests");
         runtime.dispatch(state).expect("compositor dispatch");
+        event_loop
+            .dispatch(Some(Duration::ZERO), state)
+            .expect("event loop dispatch");
         if let Some(guard) = queue.prepare_read() {
             match guard.read() {
                 Ok(_) => {}

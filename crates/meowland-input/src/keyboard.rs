@@ -6,9 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use meowland_protocol::{
-    Input, KEY_INSERT, KEY_V, MAX_HELD_KEYS, Modifiers, Transition, valid_key_identity,
-};
+use meowland_protocol::{Input, MAX_HELD_KEYS, Modifiers, Transition, valid_key_identity};
 
 use super::input::{Key, Kind};
 
@@ -90,14 +88,6 @@ impl Keyboard {
         self.keys.clear();
         self.modifiers = Modifiers::empty();
     }
-}
-
-/// Recognize Control-V or Shift-Insert, ignoring lock modifiers.
-#[must_use]
-pub const fn paste(key: u32, bits: Modifiers) -> bool {
-    let bits = bits.difference(Modifiers::CAPS_LOCK.union(Modifiers::NUM_LOCK));
-    (key == KEY_V && bits.bits() == Modifiers::CONTROL.bits())
-        || (key == KEY_INSERT && bits.bits() == Modifiers::SHIFT.bits())
 }
 
 #[cfg(test)]

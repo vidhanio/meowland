@@ -61,10 +61,6 @@ impl Output {
         &mut self.bytes
     }
 
-    pub(crate) const fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
     /// Stream position of the bytes written so far, updated as writes land.
     pub(crate) fn progress(&self) -> Rc<Cell<usize>> {
         Rc::clone(&self.written)

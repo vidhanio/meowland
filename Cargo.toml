@@ -18,12 +18,8 @@ meowland-async = { path = "crates/meowland-async" }
 meowland-input = { path = "crates/meowland-input" }
 meowland-loop = { path = "crates/meowland-loop" }
 meowland-panes = { path = "crates/meowland-panes" }
-meowland-terminal-clipboard = { path = "crates/meowland-terminal-clipboard" }
 meowland-render = { path = "crates/meowland-render" }
-meowland-selection = { path = "crates/meowland-selection" }
 meowland-protocol = { path = "crates/meowland-protocol" }
-meowland-readback = { path = "crates/meowland-readback" }
-meowland-kitty = { path = "crates/meowland-kitty" }
 meowland-terminal = { path = "crates/meowland-terminal" }
 meowland-settings = { path = "crates/meowland-settings" }
 meowland-compositor = { path = "crates/meowland-compositor" }
@@ -49,7 +45,6 @@ proptest = "1.12.0"
 crossterm = { git = "https://github.com/crossterm-rs/crossterm.git", rev = "78eff60fdcfdf62ef9247c13d18e2c9de9452750", default-features = false }
 flate2 = "1.1.10"
 libloading = "0.9.0"
-mime = "0.3.17"
 nix = { version = "0.31", default-features = false }
 vtparse = "0.7.0"
 getrandom = { version = "0.4.3", default-features = false }

@@ -16,7 +16,6 @@ meowland-protocol = { path = "../crates/meowland-protocol" }
 meowland-terminal = { path = "../crates/meowland-terminal", features = [
   "fuzzing",
 ] }
-meowland-terminal-clipboard = { path = "../crates/meowland-terminal-clipboard" }
 vtparse = "0.7.0"
 
 [[bin]]
@@ -43,13 +42,6 @@ bench = false
 [[bin]]
 name = "probe_parser"
 path = "fuzz_targets/probe_parser.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "clipboard_packet"
-path = "fuzz_targets/clipboard_packet.rs"
 test = false
 doc = false
 bench = false

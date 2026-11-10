@@ -6,16 +6,6 @@ use meowland_core::pixels::FrameSize;
 use rustix::{fs::Mode, shm};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-/// Pixel transport selected after probing the terminal's shared-memory support.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub enum FrameTransport {
-    /// Send owned RGB bands through the pane socket.
-    #[default]
-    Inline,
-    /// Publish immutable whole frames through named POSIX shared memory.
-    Shared,
-}
-
 /// Validated dimensions and an unguessable name for an immutable RGB object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedFrame {
@@ -64,22 +54,6 @@ impl SharedFrame {
     #[must_use]
     pub fn name(&self) -> &str {
         std::str::from_utf8(&self.name).expect("shared frame names are ASCII hex")
-    }
-
-    /// Open a published object and validate its complete RGB length.
-    ///
-    /// # Errors
-    /// Returns an error if the object is missing, inaccessible, or incorrectly
-    /// sized.
-    pub fn open(&self) -> io::Result<File> {
-        let file = File::from(shm::open(self.name(), shm::OFlags::RDONLY, Mode::empty())?);
-        if file.metadata()?.len() != u64::try_from(self.size.rgb_len()).map_err(io::Error::other)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid shared frame length",
-            ));
-        }
-        Ok(file)
     }
 
     /// Whether the terminal has not yet unlinked this object's name.

@@ -18,10 +18,9 @@ use super::{
 };
 
 const ESC: u8 = 0x1b;
-const BEL: u8 = 0x07;
-/// C1 string terminator.
-const ST: u8 = 0x9c;
-const MAX_CONTROL: usize = MAX_TEXT.div_ceil(3) * 4 + 64;
+/// Bytes a control sequence may span before it is discarded; terminal
+/// input carries no control sequence this parser keeps that comes close.
+const MAX_CONTROL: usize = 4096;
 /// Bytes an oversized control sequence or bracketed paste may discard after
 /// its limit before it must have terminated.
 const MAX_DISCARDED: usize = MAX_CONTROL * 4;
@@ -176,9 +175,6 @@ enum Mode {
     MousePrefix(usize),
     /// Collecting the parameters of an SGR mouse report.
     Mouse(Report),
-    /// A recognized OSC reply whose string ended at an ESC; it is complete
-    /// only if the next byte finishes the `ESC \` terminator.
-    OscTerminator(Event),
     /// Collecting a bracketed paste.
     Paste(Paste),
     /// Discarding an oversized control sequence until the VT parser returns
@@ -268,13 +264,6 @@ impl Parser {
             }
             Mode::Mouse(report) => self.mouse_byte(report, byte),
             Mode::MousePrefix(matched) => self.prefix_byte(matched, byte),
-            Mode::OscTerminator(event) => {
-                self.terminal_byte(byte)?;
-                if byte == b'\\' {
-                    self.events.push_back(event);
-                }
-                Ok(())
-            }
             Mode::Ground if self.terminal.is_ground() && byte == ESC => {
                 self.mode = Mode::MousePrefix(1);
                 Ok(())
@@ -389,11 +378,6 @@ impl Parser {
             match decoded {
                 Decoded::Event(event) => self.events.push_back(event),
                 Decoded::PasteStart => self.mode = Mode::Paste(Paste::Text(Vec::new())),
-                Decoded::Osc(event) => match byte {
-                    BEL | ST => self.events.push_back(event),
-                    ESC => self.mode = Mode::OscTerminator(event),
-                    _ => {}
-                },
             }
         }
         self.control_bytes = if self.terminal.is_ground() {
@@ -417,10 +401,6 @@ impl Parser {
 enum Decoded {
     Event(Event),
     PasteStart,
-    /// A recognized OSC reply whose string just ended; the parser publishes
-    /// it only if the byte that ended it was a string terminator rather than
-    /// a cancellation.
-    Osc(Event),
 }
 
 /// VT parser actions collected for the byte being parsed.
@@ -459,14 +439,7 @@ impl VTActor for Decoder {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]]) {
-        if self.sink == Sink::Discard {
-            return;
-        }
-        if let Some(event) = osc(params) {
-            self.push(Decoded::Osc(event));
-        }
-    }
+    fn osc_dispatch(&mut self, _params: &[&[u8]]) {}
 
     fn print(&mut self, character: char) {
         if !character.is_control() {
@@ -492,24 +465,6 @@ impl VTActor for Decoder {
     }
 
     fn apc_dispatch(&mut self, _data: Vec<u8>) {}
-}
-
-/// Decode a Kitty OSC 5522 clipboard packet or an OSC 52 text reply.
-fn osc(params: &[&[u8]]) -> Option<Event> {
-    if let [b"5522", metadata, rest @ ..] = params
-        && rest.len() <= 1
-    {
-        let mut packet = metadata.to_vec();
-        if let Some(payload) = rest.first() {
-            packet.push(b';');
-            packet.extend_from_slice(payload);
-        }
-        Some(Event::Clipboard(packet))
-    } else if let [b"52", b"c" | b"", payload] = params {
-        Some(Event::ClipboardText(payload.to_vec()))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -901,32 +856,31 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn parser_publishes_osc_replies_only_after_a_string_terminator() {
-        let cases: [(&str, &[u8], bool); 7] = [
-            ("BEL", b"\x07", true),
-            ("C1 ST", b"\x9c", true),
-            ("UTF-8 C1 ST", b"\xc2\x9c", true),
-            ("ESC ST", b"\x1b\\", true),
-            ("CAN", b"\x18", false),
-            ("SUB", b"\x1a", false),
-            ("ESC without ST", b"\x1b", false),
+    fn parser_ignores_osc_strings_however_they_end() {
+        let terminators: [&[u8]; 7] = [
+            b"\x07",
+            b"\x9c",
+            b"\xc2\x9c",
+            b"\x1b\\",
+            b"\x18",
+            b"\x1a",
+            b"\x1b",
         ];
-        for (name, terminator, complete) in cases {
+        for terminator in terminators {
             let mut bytes = b"\x1b]52;c;aGk=".to_vec();
             bytes.extend_from_slice(terminator);
             bytes.extend_from_slice(b"\x1b[I");
-            let mut expected = Vec::new();
-            if complete {
-                expected.push(Event::ClipboardText(b"aGk=".to_vec()));
-            }
-            expected.push(Event::Focus(Focus::Gained));
             for cut in 0..=bytes.len() {
                 let chunks: [&[u8]; 2] = bytes.split_at(cut).into();
                 let events: Vec<Event> = parse_chunks_after_drain(&chunks)
                     .into_iter()
                     .flatten()
                     .collect();
-                assert_eq!(events, expected, "{name} cut at {cut}");
+                assert_eq!(
+                    events,
+                    [Event::Focus(Focus::Gained)],
+                    "{terminator:?} cut at {cut}"
+                );
             }
         }
     }

@@ -41,6 +41,7 @@ use smithay::{
 mod activation;
 mod bell;
 mod buffer;
+mod clipboard;
 mod commands;
 mod decoration;
 #[cfg(test)]
@@ -50,14 +51,12 @@ mod input;
 mod keymap;
 mod panes;
 mod popup;
-mod readback_host;
+mod readback;
 mod runtime;
 mod scaling;
 mod seat;
-mod selection;
 mod shell;
 mod text;
-mod toplevels;
 mod window;
 
 use meowland_panes::{PaneId, WindowCatalog, WindowId};
@@ -68,9 +67,7 @@ pub use commands::{CloseWindowError, Command};
 /// A compositor projection of a host event loop.
 pub type CompositorHandle = meowland_loop::Handle<Compositor>;
 
-use meowland_readback as readback;
 use meowland_render::{self as render, DmabufBackend, Renderer, Snapshot};
-use meowland_selection as clipboard;
 use meowland_settings::Settings;
 use runtime::ClientState;
 pub use runtime::Runtime;
@@ -124,7 +121,6 @@ struct Protocols {
     primary_selection: PrimarySelectionState,
     _cursor_shape: CursorShapeManagerState,
     _text_input: TextInputManagerState,
-    toplevels: toplevels::Toplevels,
 }
 
 /// Seat, keyboard, pointer, and popup-grab state.
@@ -160,9 +156,9 @@ pub struct Compositor {
     input: Input,
     windows: Windows,
     gpu: Option<DmabufBackend>,
-    readbacks: readback::Readbacks<Self>,
+    readbacks: readback::Readbacks,
     attachments: Attachments,
-    clipboard: clipboard::Bridge<Self>,
+    clipboard: clipboard::Clipboard,
     bell: bell::Bell,
     scale: UiScale,
     refresh_rate: RefreshRate,
@@ -277,7 +273,7 @@ impl Compositor {
             gpu,
             readbacks: readback::Readbacks::default(),
             attachments: Attachments::default(),
-            clipboard: clipboard::Bridge::default(),
+            clipboard: clipboard::Clipboard::default(),
             bell,
             scale,
             refresh_rate: settings.refresh_rate,
@@ -331,7 +327,6 @@ impl Compositor {
         let data_device = DataDeviceState::new::<Self>(display_handle);
         let cursor_shape = CursorShapeManagerState::new::<Self>(display_handle);
         let bell = bell::Bell::new(display_handle);
-        let toplevels = toplevels::Toplevels::new(display_handle);
         (
             Protocols {
                 surfaces,
@@ -352,30 +347,20 @@ impl Compositor {
                 primary_selection,
                 _cursor_shape: cursor_shape,
                 _text_input: text_input,
-                toplevels,
             },
             bell,
         )
     }
 
-    /// Logical buffer limit: twice the widest and tallest attached
-    /// panes, independently, to allow an in-flight resize. Without an attached
-    /// pane only the global surface limits apply.
+    /// Logical buffer limit: twice the size of the pane showing the window,
+    /// to allow an in-flight resize. Without a pane only the global surface
+    /// limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
-        let window = self.window_for_surface(surface)?;
-        let scale = self.scale;
-        let mut bound: Option<(u32, u32)> = None;
-        self.attachments.for_each_showing(window, |_, pane| {
-            let pane = (
-                scale.logical(pane.presentation.size.width()).unsigned_abs() * 2,
-                scale
-                    .logical(pane.presentation.size.height())
-                    .unsigned_abs()
-                    * 2,
-            );
-            bound = Some(bound.map_or(pane, |bound| (bound.0.max(pane.0), bound.1.max(pane.1))));
-        });
-        bound
+        let size = self.shown_state(self.window_for_surface(surface)?)?.size;
+        Some((
+            self.scale.logical(size.width()).unsigned_abs() * 2,
+            self.scale.logical(size.height()).unsigned_abs() * 2,
+        ))
     }
 
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
@@ -406,24 +391,15 @@ impl Compositor {
         None
     }
 
-    fn touch(&mut self, window: WindowId) {
-        self.attachments
-            .for_each_showing_mut(window, |_, presentation| presentation.mark_dirty());
-    }
-
     fn send_title(&mut self, pane: PaneId, window: WindowId) {
         let title = meowland_protocol::sanitize(self.windows.catalog.title(window));
         self.emit(pane, ServerToPane::Title(title));
     }
 
     fn send_titles(&mut self, window: WindowId) {
-        let title = meowland_protocol::sanitize(self.windows.catalog.title(window));
-        self.attachments.for_each_showing(window, |pane, _| {
-            self.events.push(Event {
-                pane,
-                message: ServerToPane::Title(title.clone()),
-            });
-        });
+        if let Some(pane) = self.attachments.showing(window) {
+            self.send_title(pane, window);
+        }
     }
 
     fn emit(&mut self, pane: PaneId, message: ServerToPane) {
@@ -459,7 +435,7 @@ impl Compositor {
     }
 
     fn enter_output(&self, window: WindowId) {
-        if !self.attachments.visible(window) {
+        if self.attachments.showing(window).is_none() {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window)
@@ -470,7 +446,7 @@ impl Compositor {
     }
 
     fn leave_output(&self, window: WindowId) {
-        if self.attachments.visible(window) && self.windows.catalog.drawable(window) {
+        if self.attachments.showing(window).is_some() && self.windows.catalog.drawable(window) {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window) {

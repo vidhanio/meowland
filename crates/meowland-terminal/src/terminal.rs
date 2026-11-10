@@ -2,6 +2,7 @@
 
 use std::{cell::Cell, io, rc::Rc};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{self, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     queue, terminal,
@@ -85,6 +86,14 @@ pub(crate) fn title_bytes(title: &str) -> Vec<u8> {
     format!("\x1b]2;{clean}\x07").into_bytes()
 }
 
+/// Copy text to the terminal's clipboard with OSC 52.
+pub(crate) fn copy_bytes(text: &[u8]) -> Vec<u8> {
+    let mut sequence = String::from("\x1b]52;c;");
+    STANDARD.encode_string(text, &mut sequence);
+    sequence.push('\x07');
+    sequence.into_bytes()
+}
+
 /// Set the kitty pointer shape; an empty name restores the terminal default.
 pub(crate) fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
     let name: String = shape
@@ -100,12 +109,6 @@ pub(crate) fn cursor_bytes(shape: Option<&str>) -> Vec<u8> {
 const TITLE_PUSH: &[u8] = b"\x1b[22;0t";
 /// Pops the title stack back to the title saved by [`TITLE_PUSH`].
 pub(crate) const TITLE_POP: &[u8] = b"\x1b[23;0t";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ClipboardMode {
-    Enabled,
-    Disabled,
-}
 
 /// Where the title push ends in the output stream, so a stalled restore pops
 /// the title stack only if the push reached the terminal and the queued pop
@@ -131,7 +134,6 @@ impl TitlePush {
 /// Modes this pane switched on, undone by [`TerminalGuard::restore`].
 struct Modes {
     mouse: bool,
-    clipboard: Option<ClipboardMode>,
     title: TitlePush,
 }
 
@@ -170,7 +172,6 @@ impl TerminalGuard {
         Ok(Self {
             modes: Some(Modes {
                 mouse: false,
-                clipboard: None,
                 title: TitlePush {
                     written,
                     end: end + TITLE_PUSH.len(),
@@ -196,13 +197,6 @@ impl TerminalGuard {
         if let Some(modes) = &mut self.modes {
             modes.mouse = true;
             out.extend_from_slice(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1016h");
-        }
-    }
-
-    pub(crate) fn enable_clipboard(&mut self, previous: ClipboardMode, out: &mut Vec<u8>) {
-        if let Some(modes) = &mut self.modes {
-            modes.clipboard = Some(previous);
-            out.extend_from_slice(b"\x1b[?5522h");
         }
     }
 
@@ -233,12 +227,6 @@ fn append_restore(modes: &Modes, out: &mut Vec<u8>) {
         .expect("writing terminal commands to a byte buffer cannot fail");
     if modes.mouse {
         out.extend_from_slice(b"\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
-    }
-    if let Some(previous) = modes.clipboard {
-        out.extend_from_slice(match previous {
-            ClipboardMode::Enabled => b"\x1b[?5522h",
-            ClipboardMode::Disabled => b"\x1b[?5522l",
-        });
     }
     out.extend_from_slice(b"\x1b[?2004l\x1b[?7h\x1b_Ga=d,d=A,q=2;\x1b\\");
     out.extend_from_slice(&cursor_bytes(None));
@@ -297,7 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn restoration_restores_enabled_modes() {
+    fn copy_writes_base64_text_to_the_clipboard_selection() {
+        assert_eq!(copy_bytes(b"hi\n"), b"\x1b]52;c;aGkK\x07");
+    }
+
+    #[test]
+    fn restoration_disables_mouse_reporting_only_when_enabled() {
         let title = TitlePush {
             written: Rc::default(),
             end: 0,
@@ -306,24 +299,20 @@ mod tests {
         append_restore(
             &Modes {
                 mouse: true,
-                clipboard: Some(ClipboardMode::Disabled),
                 title: title.clone(),
             },
             &mut bytes,
         );
         assert!(contains(&bytes, b"\x1b[?1016l"));
-        assert!(contains(&bytes, b"\x1b[?5522l"));
 
         let mut bytes = Vec::new();
         append_restore(
             &Modes {
                 mouse: false,
-                clipboard: Some(ClipboardMode::Enabled),
                 title,
             },
             &mut bytes,
         );
-        assert!(contains(&bytes, b"\x1b[?5522h"));
         assert!(!contains(&bytes, b"\x1b[?1016l"));
     }
 }

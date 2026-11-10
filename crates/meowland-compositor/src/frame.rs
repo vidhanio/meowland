@@ -1,85 +1,43 @@
 //! Independent Wayland callback clocks and damage-aware retained pane frames.
 
 use std::{
+    fs::File,
+    io::{self, Write as _},
     ops::Range,
     time::{Duration, Instant},
 };
 
-use meowland_core::{latency::Latency, pixels::FrameSize};
-use meowland_protocol::{FrameAck, FrameBand, FrameTransport, SharedObject};
+use meowland_core::pixels::FrameSize;
+use meowland_protocol::{FrameBand, SharedObject};
 use meowland_render::{Changed, Renderer, Scene, Snapshot, SurfaceDamage};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-use super::{Compositor, Event, PaneId, ServerToPane};
+use super::{Compositor, Event, ServerToPane};
 
-mod publication;
-
-use publication::Publication;
+/// Publish whole frames through SHM when the changed rectangle covers at least
+/// this fraction of the frame area.
+///
+/// A shared frame transfers every pixel once; an inline rectangle transfers
+/// only the changed columns for the changed rows. Below a quarter of the frame
+/// the rectangle is smaller, even after zlib, and skips the publication write.
+const SHARED_AREA_DIVISOR: u64 = 4;
 
 /// Where a pane's next frame stands.
 #[derive(Debug)]
 enum Presentation {
     /// The pane shows the latest composition.
     Clean,
-    /// Content changed at `since` and a frame is waiting for dispatch.
-    Dirty { since: Instant },
+    /// Content changed and a frame is waiting for dispatch.
+    Dirty,
     /// A frame is awaiting its acknowledgement.
     InFlight {
-        /// When the content the frame shows first changed.
-        changed: Instant,
-        sent: Instant,
         /// The shared object the frame references, kept alive until the pane
-        /// read it.
-        _shared: Option<SharedObject>,
-        /// When content changed again since the frame was sent.
-        pending: Option<Instant>,
+        /// read it. The open file keeps its pages allocated, so freeing them
+        /// never lands on the terminal's critical path when it closes them.
+        _shared: Option<(SharedObject, File)>,
+        /// Content changed again since the frame was sent.
+        dirty: bool,
     },
-}
-
-struct FrameStats {
-    window: Instant,
-    frames: u32,
-    render: Latency,
-    publish: Latency,
-    change_to_render: Latency,
-    send_to_ack: Latency,
-    change_to_ack: Latency,
-}
-
-impl FrameStats {
-    fn new() -> Self {
-        Self {
-            window: Instant::now(),
-            frames: 0,
-            render: Latency::default(),
-            publish: Latency::default(),
-            change_to_render: Latency::default(),
-            send_to_ack: Latency::default(),
-            change_to_ack: Latency::default(),
-        }
-    }
-
-    fn ack(&mut self, pane: PaneId, changed: Instant, sent: Instant) {
-        let now = Instant::now();
-        self.send_to_ack.record(now.saturating_duration_since(sent));
-        self.change_to_ack
-            .record(now.saturating_duration_since(changed));
-        self.frames += 1;
-        if now.duration_since(self.window) >= Duration::from_secs(1) {
-            tracing::debug!(
-                ?pane,
-                frames = self.frames,
-                render_us = ?self.render.summarize(),
-                publish_us = ?self.publish.summarize(),
-                change_to_render_us = ?self.change_to_render.summarize(),
-                send_to_ack_us = ?self.send_to_ack.summarize(),
-                change_to_ack_us = ?self.change_to_ack.summarize(),
-                "pane latency; acknowledgement measures retention, not display presentation"
-            );
-            self.frames = 0;
-            self.window = now;
-        }
-    }
 }
 
 /// Rectangles at least this wide, as a percentage of the frame width, are sent
@@ -93,8 +51,7 @@ const FULL_ROW_PERCENT: u32 = 75;
 /// Columns transferred for a changed rectangle.
 ///
 /// Widening nearly full-width rectangles to whole rows keeps the payload shape
-/// the terminal treats as a plain row range. The same columns are estimated by
-/// the shared-transport decision, so both agree on the bytes involved.
+/// the terminal treats as a plain row range.
 fn transfer_columns(rect: &Changed, size: FrameSize) -> Range<u32> {
     let width = rect.columns.end - rect.columns.start;
     if width * 100 >= size.width() * FULL_ROW_PERCENT {
@@ -104,15 +61,59 @@ fn transfer_columns(rect: &Changed, size: FrameSize) -> Range<u32> {
     }
 }
 
+/// Whether a whole shared frame is cheaper than one inline rectangle.
+fn prefers_shared(rect: &Changed, size: FrameSize) -> bool {
+    let columns = transfer_columns(rect, size);
+    let width = u64::from(columns.end - columns.start);
+    let rows = u64::from(rect.rows.end - rect.rows.start);
+    width * rows * SHARED_AREA_DIVISOR >= u64::from(size.width()) * u64::from(size.height())
+}
+
+/// A whole frame written into a fresh shared object while the renderer
+/// composes it, so each strip is copied while it is still in cache.
+struct Publication {
+    object: SharedObject,
+    file: File,
+    written: usize,
+}
+
+/// Continue the frame's publication with the composed prefix `ready`, first
+/// creating an object for a frame of size `create` if none exists. A failure
+/// stops publication for the frame.
+fn publish(
+    publication: &mut io::Result<Option<Publication>>,
+    create: Option<FrameSize>,
+    ready: &[u8],
+) {
+    let Ok(current) = publication else {
+        return;
+    };
+    let next = match (current.take(), create) {
+        (Some(publication), _) => Ok(publication),
+        (None, Some(size)) => SharedObject::create(size).map(|(object, file)| Publication {
+            object,
+            file,
+            written: 0,
+        }),
+        (None, None) => return,
+    };
+    *publication = next.and_then(|mut publication| {
+        publication.file.write_all(&ready[publication.written..])?;
+        publication.written = ready.len();
+        Ok(Some(publication))
+    });
+}
+
 pub(crate) struct PaneState {
     pub size: FrameSize,
     presentation: Presentation,
     scene: Scene,
-    /// Size of the last complete frame the pane retained; any other size
-    /// needs a complete frame.
+    /// Size of the last complete frame the pane holds; any other size needs
+    /// a complete frame.
     sent_size: Option<FrameSize>,
-    pub(super) transport: FrameTransport,
-    stats: FrameStats,
+    /// Large frames go out as shared objects until the pane reports that its
+    /// terminal cannot read them, or publishing one fails.
+    pub(super) shared: bool,
 }
 
 impl PaneState {
@@ -122,71 +123,59 @@ impl PaneState {
             presentation: Presentation::Clean,
             scene: Scene::default(),
             sent_size: None,
-            transport: FrameTransport::Inline,
-            stats: FrameStats::new(),
+            shared: true,
         }
     }
 
-    fn schedule(&mut self, changed: Instant) {
+    fn schedule(&mut self) {
         match &mut self.presentation {
-            Presentation::Clean => self.presentation = Presentation::Dirty { since: changed },
-            Presentation::Dirty { since } => *since = (*since).min(changed),
-            Presentation::InFlight { pending, .. } => {
-                *pending = Some(pending.map_or(changed, |previous| previous.min(changed)));
-            }
+            Presentation::Clean => self.presentation = Presentation::Dirty,
+            Presentation::Dirty => {}
+            Presentation::InFlight { dirty, .. } => *dirty = true,
         }
     }
 
     pub(crate) fn mark_dirty(&mut self) {
         self.scene.invalidate();
-        self.schedule(Instant::now());
+        self.schedule();
     }
 
     /// Drop pending work while the pane shows no window. An in-flight frame
-    /// still waits for its acknowledgement; the pane renegotiates its
-    /// transport when presentation restarts, and the next frame is complete.
+    /// still waits for its acknowledgement, and the next frame is complete.
     pub(crate) fn unbind(&mut self) {
         self.scene.invalidate();
         self.sent_size = None;
-        self.transport = FrameTransport::Inline;
         match &mut self.presentation {
-            Presentation::Dirty { .. } => self.presentation = Presentation::Clean,
-            Presentation::InFlight { pending, .. } => *pending = None,
+            Presentation::Dirty => self.presentation = Presentation::Clean,
+            Presentation::InFlight { dirty, .. } => *dirty = false,
             Presentation::Clean => {}
         }
     }
 
-    pub(crate) fn damage(&mut self, surface: &WlSurface, damage: SurfaceDamage, changed: Instant) {
+    pub(crate) fn damage(&mut self, surface: &WlSurface, damage: SurfaceDamage) {
         self.scene.damage(surface, damage);
-        self.schedule(changed);
+        self.schedule();
     }
 
-    pub(crate) fn ack(&mut self, pane: PaneId, ack: FrameAck) {
-        let (changed, sent, pending) =
-            match std::mem::replace(&mut self.presentation, Presentation::Clean) {
-                Presentation::InFlight {
-                    changed,
-                    sent,
-                    pending,
-                    ..
-                } => (changed, sent, pending),
-                presentation => {
-                    self.presentation = presentation;
-                    return;
-                }
+    /// Release the in-flight frame, freeing the pane for the next one.
+    pub(crate) fn ack(&mut self) {
+        if let Presentation::InFlight { dirty, .. } = self.presentation {
+            self.presentation = if dirty {
+                Presentation::Dirty
+            } else {
+                Presentation::Clean
             };
-        self.stats.ack(pane, changed, sent);
-        if let Some(since) = pending {
-            self.presentation = Presentation::Dirty { since };
         }
-        if ack == FrameAck::Resync {
-            self.sent_size = None;
-            self.mark_dirty();
-        }
+    }
+
+    /// Send the next frame whole, because the pane holds no image to edit.
+    pub(crate) fn keyframe(&mut self) {
+        self.sent_size = None;
+        self.schedule();
     }
 
     pub(crate) const fn due(&self) -> bool {
-        matches!(self.presentation, Presentation::Dirty { .. })
+        matches!(self.presentation, Presentation::Dirty)
     }
 
     fn frame(
@@ -196,54 +185,50 @@ impl PaneState {
         snapshots: &std::collections::HashMap<WlSurface, Snapshot>,
         scale: f64,
     ) -> Option<ServerToPane> {
-        let started = Instant::now();
-        let changed = match std::mem::replace(&mut self.presentation, Presentation::Clean) {
-            Presentation::Dirty { since } => since,
-            Presentation::Clean => started,
-            presentation @ Presentation::InFlight { .. } => {
-                self.presentation = presentation;
-                return None;
-            }
-        };
-        let mut publication = Publication::new(self.size, self.transport, self.sent_size);
+        if matches!(self.presentation, Presentation::InFlight { .. }) {
+            return None;
+        }
+        self.presentation = Presentation::Clean;
+        let size = self.size;
+        let shared = self.shared;
+        let whole = self.sent_size != Some(size);
+        let mut publication = Ok(None);
         let rect = renderer.update(
             &mut self.scene,
             root,
             snapshots,
-            self.size,
+            size,
             scale,
-            |changed, ready| publication.changed(changed, ready),
+            |changed, ready| {
+                let start = shared && (whole || changed.is_some_and(|c| prefers_shared(c, size)));
+                publish(&mut publication, start.then_some(size), ready);
+            },
         );
-        self.transport = publication.transport();
-        let rect = if self.sent_size == Some(self.size) {
-            rect?
-        } else {
+        let rect = if whole {
             Changed {
-                columns: 0..self.size.width(),
-                rows: 0..self.size.height(),
+                columns: 0..size.width(),
+                rows: 0..size.height(),
             }
+        } else {
+            rect?
         };
-        self.stats
-            .render
-            .record(started.elapsed().saturating_sub(publication.elapsed));
-        self.stats
-            .change_to_render
-            .record(started.saturating_duration_since(changed));
-        self.sent_size = Some(self.size);
-        let publishing = Instant::now();
-        let streamed = publication.elapsed;
-        let shared = publication.finish(self.scene.pixels());
-        self.transport = publication.transport();
+        self.sent_size = Some(size);
+        let start = shared && (whole || prefers_shared(&rect, size));
+        publish(&mut publication, start.then_some(size), self.scene.pixels());
+        let shared = publication
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "shared-memory publication failed; using RGB bands");
+                self.shared = false;
+                None
+            })
+            .map(|publication| (publication.object, publication.file));
         let message = shared.as_ref().map_or_else(
             || self.band(&rect),
-            |object| ServerToPane::SharedFrame(*object.frame()),
+            |(object, _)| ServerToPane::SharedFrame(*object.frame()),
         );
-        self.stats.publish.record(streamed + publishing.elapsed());
         self.presentation = Presentation::InFlight {
-            changed,
-            sent: Instant::now(),
             _shared: shared,
-            pending: None,
+            dirty: false,
         };
         Some(message)
     }
@@ -277,7 +262,7 @@ impl Compositor {
     /// Wait for frame or activation deadlines; transfers wake through readiness
     /// sources.
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Duration> {
-        if self.attachments.due_frames() > 0 {
+        if self.frames_due() {
             return Some(Duration::ZERO);
         }
         self.activation_deadline()
@@ -306,11 +291,12 @@ impl Compositor {
             if !window.callback_pending || now < window.callback_due {
                 continue;
             }
-            let interval = if self.attachments.visible(id) && self.windows.catalog.drawable(id) {
-                self.refresh_rate.interval()
-            } else {
-                Duration::from_secs(1)
-            };
+            let interval =
+                if self.attachments.showing(id).is_some() && self.windows.catalog.drawable(id) {
+                    self.refresh_rate.interval()
+                } else {
+                    Duration::from_secs(1)
+                };
             let late = now
                 .saturating_duration_since(window.callback_due)
                 .as_nanos();
@@ -329,7 +315,7 @@ impl Compositor {
     }
 
     pub(crate) fn resume_callbacks(&mut self, window: super::WindowId) {
-        if self.attachments.visible(window)
+        if self.attachments.showing(window).is_some()
             && let Some(window) = self.windows.by_id.get_mut(&window)
         {
             window.callback_due = window
@@ -339,32 +325,31 @@ impl Compositor {
     }
 
     pub(crate) fn dispatch_frames(&mut self) {
-        if self.attachments.due_frames() == 0 {
+        if !self.frames_due() {
             return;
         }
         let renderer = &mut self.renderer;
         let windows = &self.windows;
         let scale = self.scale.factor();
         let events = &mut self.events;
-        self.attachments
-            .for_each_presentation_mut(|pane, window, presentation| {
-                if !presentation.due() {
-                    return;
-                }
-                let Some(window) = window else {
-                    presentation.unbind();
-                    return;
-                };
-                let root = Some(window)
-                    .filter(|&id| windows.catalog.drawable(id))
-                    .and_then(|id| windows.by_id.get(&id))
-                    .map(|window| window.surface.wl_surface());
-                if let Some(message) =
-                    presentation.frame(renderer, root, &windows.surface_cache.snapshots, scale)
-                {
-                    events.push(Event { pane, message });
-                }
-            });
+        for (pane, window, state) in self.attachments.iter_mut() {
+            if !state.due() {
+                continue;
+            }
+            let Some(window) = window else {
+                state.unbind();
+                continue;
+            };
+            let root = Some(window)
+                .filter(|&id| windows.catalog.drawable(id))
+                .and_then(|id| windows.by_id.get(&id))
+                .map(|window| window.surface.wl_surface());
+            if let Some(message) =
+                state.frame(renderer, root, &windows.surface_cache.snapshots, scale)
+            {
+                events.push(Event { pane, message });
+            }
+        }
     }
 }
 
@@ -372,135 +357,84 @@ impl Compositor {
 mod tests {
     use std::collections::HashMap;
 
-    use meowland_protocol::{Follow, Selector, Target};
-
     use super::*;
-    use crate::{Attachments, WindowId};
 
-    fn pane() -> PaneId {
-        PaneId::from(1)
+    fn shown() -> PaneState {
+        let mut state = PaneState::new(FrameSize::new(4, 2).expect("test size is valid"));
+        state.mark_dirty();
+        state
     }
 
-    fn shown_pane() -> Attachments {
-        let mut attachments = Attachments::default();
-        attachments.insert(
-            pane(),
-            Target::Selector(Selector::AppId("app".into())),
-            Follow::First,
-            FrameSize::new(4, 2).expect("test size is valid"),
-        );
-        attachments.show(pane(), WindowId::from(1));
-        attachments
-    }
-
-    fn send_due_frames(attachments: &mut Attachments, renderer: &mut Renderer) -> usize {
-        let mut sent = 0;
-        attachments.for_each_presentation_mut(|_, _, presentation| {
-            if presentation.due()
-                && presentation
-                    .frame(renderer, None, &HashMap::new(), 1.0)
-                    .is_some()
-            {
-                sent += 1;
-            }
-        });
-        sent
-    }
-
-    fn presentation(attachments: &Attachments) -> &Presentation {
-        &attachments
-            .get(pane())
-            .expect("test pane is attached")
-            .presentation
-            .presentation
-    }
-
-    fn change(attachments: &mut Attachments) {
-        attachments.for_each_showing_mut(WindowId::from(1), |_, presentation| {
-            presentation.mark_dirty();
-        });
+    fn send(state: &mut PaneState, renderer: &mut Renderer) -> Option<ServerToPane> {
+        state
+            .due()
+            .then(|| state.frame(renderer, None, &HashMap::new(), 1.0))
+            .flatten()
     }
 
     #[test]
-    fn retained_ack_without_changes_leaves_the_pane_clean() {
+    fn ack_without_changes_leaves_the_pane_clean() {
         let mut renderer = Renderer::default();
-        let mut attachments = shown_pane();
-        assert_eq!(send_due_frames(&mut attachments, &mut renderer), 1);
-        assert!(matches!(
-            presentation(&attachments),
-            Presentation::InFlight { .. }
-        ));
+        let mut state = shown();
+        assert!(send(&mut state, &mut renderer).is_some());
+        assert!(matches!(state.presentation, Presentation::InFlight { .. }));
 
-        attachments.ack(pane(), FrameAck::Retained);
+        state.ack();
 
-        assert!(matches!(presentation(&attachments), Presentation::Clean));
-        assert_eq!(attachments.due_frames(), 0);
+        assert!(matches!(state.presentation, Presentation::Clean));
+        assert!(!state.due());
     }
 
     #[test]
-    fn changes_during_flight_wait_for_the_retained_ack() {
+    fn changes_during_flight_wait_for_the_ack() {
         let mut renderer = Renderer::default();
-        let mut attachments = shown_pane();
-        send_due_frames(&mut attachments, &mut renderer);
+        let mut state = shown();
+        send(&mut state, &mut renderer);
 
-        change(&mut attachments);
-        assert!(matches!(
-            presentation(&attachments),
-            Presentation::InFlight { .. }
-        ));
-        assert_eq!(attachments.due_frames(), 0);
+        state.mark_dirty();
+        assert!(matches!(state.presentation, Presentation::InFlight { .. }));
+        assert!(!state.due());
 
-        attachments.ack(pane(), FrameAck::Retained);
+        state.ack();
 
-        assert!(matches!(
-            presentation(&attachments),
-            Presentation::Dirty { .. }
-        ));
-        assert_eq!(attachments.due_frames(), 1);
+        assert!(matches!(state.presentation, Presentation::Dirty));
+        assert!(state.due());
     }
 
     #[test]
-    fn resync_ack_schedules_a_full_frame() {
+    fn a_keyframe_request_sends_a_whole_frame_after_the_ack() {
         let mut renderer = Renderer::default();
-        let mut attachments = shown_pane();
-        send_due_frames(&mut attachments, &mut renderer);
+        let mut state = shown();
+        state.shared = false;
+        send(&mut state, &mut renderer);
+        state.ack();
 
-        attachments.ack(pane(), FrameAck::Resync);
+        state.keyframe();
+        state.keyframe();
+        assert!(state.due());
+        send(&mut state, &mut renderer);
+        state.keyframe();
+        assert!(!state.due(), "the frame in flight is unacknowledged");
+        state.ack();
 
-        assert!(matches!(
-            presentation(&attachments),
-            Presentation::Dirty { .. }
-        ));
-        assert_eq!(attachments.due_frames(), 1);
-        assert_eq!(
-            attachments
-                .get(pane())
-                .expect("test pane is attached")
-                .presentation
-                .sent_size,
-            None
+        let message = send(&mut state, &mut renderer);
+        assert!(
+            matches!(&message, Some(ServerToPane::Frame(band)) if band.is_whole()),
+            "{message:?}"
         );
     }
 
     #[test]
     fn acks_without_a_frame_in_flight_are_ignored() {
         let mut renderer = Renderer::default();
-        let mut attachments = shown_pane();
-        for ack in [FrameAck::Retained, FrameAck::Resync] {
-            attachments.ack(pane(), ack);
-            assert!(matches!(
-                presentation(&attachments),
-                Presentation::Dirty { .. }
-            ));
-            assert_eq!(attachments.due_frames(), 1);
-        }
+        let mut state = shown();
+        state.ack();
+        assert!(matches!(state.presentation, Presentation::Dirty));
 
-        send_due_frames(&mut attachments, &mut renderer);
-        attachments.ack(pane(), FrameAck::Retained);
-        for ack in [FrameAck::Retained, FrameAck::Resync] {
-            attachments.ack(pane(), ack);
-            assert!(matches!(presentation(&attachments), Presentation::Clean));
-            assert_eq!(attachments.due_frames(), 0);
-        }
+        send(&mut state, &mut renderer);
+        state.ack();
+        state.ack();
+        assert!(matches!(state.presentation, Presentation::Clean));
+        assert!(!state.due());
     }
 }

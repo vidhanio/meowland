@@ -1,9 +1,6 @@
 //! Surface commits, copied snapshots, and buffer protocol handling.
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use std::collections::{HashMap, HashSet};
 
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::buffer_dimensions},
@@ -211,7 +208,6 @@ impl CompositorHandler for Compositor {
     fn commit(&mut self, surface: &WlSurface) {
         self.windows.popups.commit(surface);
         let window = self.window_for_surface(surface);
-        let changed = readback::prepared_at(surface).unwrap_or_else(Instant::now);
         let (assignment, damage, scale, transform, callbacks) = committed_attributes(surface);
         if !self.windows.surface_cache.valid_viewport(
             surface,
@@ -287,7 +283,7 @@ impl CompositorHandler for Compositor {
         }
         self.refresh_window_mapping(surface);
         if let Some(window) = window {
-            if self.attachments.visible(window) && self.windows.catalog.drawable(window) {
+            if self.attachments.showing(window).is_some() && self.windows.catalog.drawable(window) {
                 self.output.enter(surface);
             }
             let damage = self
@@ -303,10 +299,11 @@ impl CompositorHandler for Compositor {
                         render::SurfaceDamage::new(&damage, &geometry)
                     }
                 });
-            self.attachments
-                .for_each_showing_mut(window, |_, presentation| {
-                    presentation.damage(surface, damage, changed);
-                });
+            if let Some(pane) = self.attachments.showing(window)
+                && let Some(state) = self.attachments.state_mut(pane)
+            {
+                state.damage(surface, damage);
+            }
         }
     }
 
@@ -409,6 +406,72 @@ mod tests {
         );
         assert_eq!(&scene.pixels()[0..3], &[255, 0, 0]);
         assert_eq!(&scene.pixels()[45..48], &[255, 0, 0]);
+    }
+
+    /// Commit a DMA-BUF, then compose the surface into a 4x4 pane until it
+    /// shows `expected` or the readback deadline passes.
+    fn read_back(
+        fixture: &mut crate::fixture::Fixture,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        buffer: &wayland_client::protocol::wl_buffer::WlBuffer,
+        expected: &[u8],
+    ) -> Vec<u8> {
+        use meowland_core::pixels::FrameSize;
+        use meowland_render::{Renderer, Scene};
+        use smithay::reexports::wayland_server::Resource as _;
+        use wayland_client::Proxy as _;
+
+        surface.attach(Some(buffer), 0, 0);
+        surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        surface.commit();
+        let id = surface.id().protocol_id();
+        let mut composed = Vec::new();
+        for _ in 0..500 {
+            fixture.roundtrip();
+            let snapshots = &fixture.state.windows.surface_cache.snapshots;
+            let root = snapshots
+                .keys()
+                .find(|surface| surface.id().protocol_id() == id);
+            let mut scene = Scene::default();
+            Renderer::default().update(
+                &mut scene,
+                root,
+                snapshots,
+                FrameSize::new(4, 4).expect("frame size"),
+                1.0,
+                |_, _| {},
+            );
+            composed = scene.pixels().to_vec();
+            if composed == expected {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        composed
+    }
+
+    #[test]
+    fn dmabuf_commits_are_read_back_through_the_gpu() {
+        let mut fixture = crate::fixture::Fixture::new();
+        let top = fixture.toplevel("app");
+        let (Some(red), Some(green)) = (
+            fixture.dmabuf(64, 4, [0, 0, 255, 255]),
+            fixture.dmabuf(64, 4, [0, 255, 0, 0]),
+        ) else {
+            eprintln!("skipping: no GPU backend or /dev/udmabuf");
+            return;
+        };
+        let red_rgb = [255, 0, 0].repeat(16);
+        assert_eq!(
+            read_back(&mut fixture, &top.surface, &red, &red_rgb),
+            red_rgb
+        );
+        let green_rgb = [0, 255, 0].repeat(16);
+        assert_eq!(
+            read_back(&mut fixture, &top.surface, &green, &green_rgb),
+            green_rgb,
+            "a replacement buffer with an X channel of zero reads back opaque"
+        );
     }
 
     const TRANSFORMS: [Transform; 8] = [

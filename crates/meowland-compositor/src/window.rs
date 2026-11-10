@@ -76,10 +76,6 @@ impl Compositor {
         if !self.windows.catalog.map(id) {
             return;
         }
-        let catalog = &self.windows.catalog;
-        self.protocols
-            .toplevels
-            .announce(id, catalog.title(id), catalog.app_id(id));
         self.touch(id);
         self.resolve_pending_panes();
         self.apply_window_state(id);
@@ -92,7 +88,6 @@ impl Compositor {
         if !self.windows.catalog.unmap(id) {
             return;
         }
-        self.protocols.toplevels.remove(id);
         self.windows.popups_dirty = true;
         self.leave_output(id);
         self.clear_window_pointer(id);
@@ -104,7 +99,7 @@ impl Compositor {
             self.refresh_popup_grab();
             input::reset_keyboard(self);
         }
-        self.unbind_following_panes(id);
+        self.unbind_following_pane(id);
         if focused {
             let next = self
                 .attachments
@@ -120,7 +115,7 @@ impl Compositor {
     pub(crate) fn remove_window(&mut self, id: WindowId) {
         self.unmap_window(id);
         self.cancel_window_activations(id);
-        for pane in self.attachments.showing(id) {
+        if let Some(pane) = self.attachments.showing(id) {
             self.remove_pane(pane);
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }
@@ -140,8 +135,6 @@ impl Compositor {
                 .id_by_surface
                 .remove(window.surface.wl_surface());
         }
-        self.protocols.toplevels.remove(id);
-        self.attachments.forget_window(id);
         self.windows.catalog.remove(id);
         self.windows.popups.cleanup();
         self.windows.popups_dirty = false;

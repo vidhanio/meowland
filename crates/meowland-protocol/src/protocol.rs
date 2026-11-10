@@ -75,34 +75,6 @@ fn held_keys<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u32>, D::
     bounded_sequence::<D, u32, MAX_HELD_KEYS>(deserializer)
 }
 
-struct BoundedMime(String);
-
-impl<'de> Deserialize<'de> for BoundedMime {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Mime;
-        impl Visitor<'_> for Mime {
-            type Value = BoundedMime;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a MIME type of at most 256 bytes")
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                if value.len() > 256 {
-                    return Err(E::custom("MIME type too long"));
-                }
-                Ok(BoundedMime(value.to_owned()))
-            }
-        }
-        deserializer.deserialize_str(Mime)
-    }
-}
-
-fn offer_mimes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    bounded_sequence::<D, BoundedMime, { crate::clipboard::MAX_TYPES }>(deserializer)
-        .map(|mimes| mimes.into_iter().map(|mime| mime.0).collect())
-}
-
 pub(crate) const HEADER: usize = 4;
 
 /// Largest framing buffer retained for reuse after a message is handled.
@@ -260,53 +232,6 @@ pub enum Shortcut {
     CloseWindow,
     /// Release the terminal pane without closing its window.
     DetachPane,
-}
-
-/// Whether retained pixels remain a valid basis for subsequent frame bands.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum FrameAck {
-    /// The pane retained the update, including updates not yet displayed.
-    Retained,
-    /// The pane requires a complete frame before accepting further bands.
-    Resync,
-}
-
-/// Server-assigned identity of one terminal clipboard read.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
-pub struct ClipboardRequestId(u64);
-
-impl ClipboardRequestId {
-    /// Numeric identity as assigned by the compositor.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for ClipboardRequestId {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-/// Terminal-assigned identity of one clipboard selection offer.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
-pub struct ClipboardOfferId(u64);
-
-impl ClipboardOfferId {
-    /// Numeric identity as assigned by the terminal.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for ClipboardOfferId {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
 }
 
 /// Window selector shared by pane and control requests.
@@ -472,15 +397,6 @@ pub enum PaneToServer {
     Action(PaneAction),
 }
 
-/// Why a terminal published a clipboard offer.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-pub enum OfferIntent {
-    /// Refresh MIME metadata without triggering paste.
-    Refresh,
-    /// Publish the offer and trigger the application's paste shortcut.
-    Paste,
-}
-
 /// Actions accepted after the pane handshake, independent of socket ownership.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum PaneAction {
@@ -491,37 +407,16 @@ pub enum PaneAction {
         /// New physical-pixel bounds, validated during deserialization.
         size: FrameSize,
     },
-    /// Acknowledge retained pixels or request resynchronization.
-    Ack(FrameAck),
-    /// Publish UTF-8 text and trigger the application's paste shortcut.
+    /// The pane finished the last frame; the server may send the next.
+    Ack,
+    /// The terminal holds no whole image to edit: the next frame must be
+    /// complete.
+    Keyframe,
+    /// Replace the seat clipboard with pasted text and trigger the
+    /// application's paste shortcut.
     Paste(String),
-    /// Publish MIME types available from a terminal selection.
-    ClipboardOffer {
-        /// Clipboard or primary selection being replaced.
-        selection: crate::clipboard::Selection,
-        /// Terminal-assigned offer identity for subsequent reads.
-        offer: ClipboardOfferId,
-        /// Available MIME types, validated and bounded by the receiver.
-        #[serde(deserialize_with = "offer_mimes")]
-        mimes: Vec<String>,
-        /// What accepting the offer should do.
-        intent: OfferIntent,
-    },
-    /// Complete a previously requested terminal clipboard read.
-    ClipboardReply {
-        /// Server-assigned request identity.
-        request: ClipboardRequestId,
-        /// Raw bytes on success, or `None` if unavailable or denied.
-        #[serde(with = "serde_bytes")]
-        data: Option<Vec<u8>>,
-    },
-    /// Report the clipboard transport the terminal accepted while probing.
-    ///
-    /// The server reads only representations the pane can apply, so a legacy
-    /// OSC 52 pane never pays for image transfers.
-    ClipboardTransport(crate::clipboard::Transport),
-    /// Select pixel transport after terminal probing or shared-memory failure.
-    FrameTransport(crate::FrameTransport),
+    /// The terminal did not read a shared frame: send RGB bands from now on.
+    Inline,
 }
 
 /// Server packets share one schema for owned frames and split frame headers.
@@ -543,32 +438,12 @@ pub enum PanePacket<F> {
     Title(String),
     /// The pointer shape the terminal should show, or `None` for its own.
     Cursor(Option<String>),
-    /// Copy application-provided data into the terminal selection.
-    ClipboardWrite {
-        /// Selection receiving the copied data.
-        selection: crate::clipboard::Selection,
-        /// Bounded representations of the selection.
-        data: crate::clipboard::ClipboardData,
-    },
-    /// Request one MIME representation from a previously announced offer.
-    ClipboardRead {
-        /// Server-assigned identity used in the reply or cancellation.
-        request: ClipboardRequestId,
-        /// Terminal-assigned identity of the selection offer.
-        offer: ClipboardOfferId,
-        /// Requested MIME representation.
-        mime: String,
-        /// Shared monotonic deadline, including time spent awaiting permission.
-        deadline: crate::clipboard::Deadline,
-    },
-    /// Discard a pending read and suppress any eventual reply.
-    ClipboardCancel {
-        /// Server-assigned identity of the cancelled read.
-        request: ClipboardRequestId,
-    },
+    /// Copy text an application put on the clipboard into the terminal's.
+    Copy(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Ring the terminal's audible or visual bell.
     Bell,
-    /// A complete immutable RGB object, requiring shared-memory negotiation.
+    /// A complete immutable RGB object the terminal reads by name. The server
+    /// sends these until the pane reports [`PaneAction::Inline`].
     SharedFrame(crate::SharedFrame),
     /// The shown window went away and the pane waits for the next matching
     /// window: restore the terminal until another frame arrives.
@@ -761,17 +636,7 @@ mod tests {
 
     #[test]
     fn wire_collections_reject_excess_and_accept_the_limit() {
-        fn offer(mimes: Vec<String>) -> PaneAction {
-            PaneAction::ClipboardOffer {
-                selection: crate::clipboard::Selection::Clipboard,
-                offer: 1.into(),
-                mimes,
-                intent: OfferIntent::Refresh,
-            }
-        }
         let cases = [
-            offer(vec![String::new(); crate::clipboard::MAX_TYPES + 1]),
-            offer(vec!["a".repeat(257)]),
             PaneAction::Input(Input::KeyboardEnter {
                 keys: vec![1; MAX_HELD_KEYS + 1],
                 modifiers: Modifiers::empty(),
@@ -801,31 +666,17 @@ mod tests {
                 }
             }
         }
-        for value in [
-            offer(vec!["a".repeat(256); crate::clipboard::MAX_TYPES]),
-            PaneAction::Input(Input::KeyboardEnter {
-                keys: vec![1; MAX_HELD_KEYS],
-                modifiers: Modifiers::empty(),
-            }),
-        ] {
-            let mut framed = Vec::new();
-            send(&mut framed, &value).expect("encode valid collection");
-            recv::<PaneAction>(&mut Cursor::new(framed)).expect("decode valid collection");
-        }
+        let mut framed = Vec::new();
+        let limit = PaneAction::Input(Input::KeyboardEnter {
+            keys: vec![1; MAX_HELD_KEYS],
+            modifiers: Modifiers::empty(),
+        });
+        send(&mut framed, &limit).expect("encode valid collection");
+        recv::<PaneAction>(&mut Cursor::new(framed)).expect("decode valid collection");
     }
 
     #[test]
     fn compact_declared_lengths_are_rejected() {
-        let mut body = postcard::to_allocvec(&PaneAction::ClipboardOffer {
-            selection: crate::clipboard::Selection::Clipboard,
-            offer: 1.into(),
-            mimes: Vec::new(),
-            intent: OfferIntent::Refresh,
-        })
-        .expect("encode offer");
-        body.truncate(body.len() - 2);
-        body.extend(postcard::to_allocvec(&1_000_000_usize).expect("encode count"));
-        assert!(decode::<PaneAction>(&body).is_err());
         let mut body = postcard::to_allocvec(&Input::KeyboardEnter {
             keys: Vec::new(),
             modifiers: Modifiers::empty(),

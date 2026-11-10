@@ -19,22 +19,19 @@ use meowland_input::{
     {self as input},
 };
 use meowland_protocol::{
-    self as protocol, Follow, FrameTransport, Hello, PaneAction, PaneToServer, ServerToPane,
-    Shortcuts, Target,
+    self as protocol, Follow, Hello, PaneAction, PaneToServer, ServerToPane, Shortcuts, Target,
     asynchronous::{Outgoing, Reader},
-    clipboard::{Selection, Transport},
+    clipboard::MAX_TEXT,
 };
-use meowland_terminal_clipboard::{Clipboard, Refresh};
 type Socket = Async<'static, UnixStream>;
 
 use super::{
-    input_gate::InputGate,
     output,
     presentation::PanePresentation,
     probe::terminal_probe,
     terminal::{
-        self, FALLBACK_CELL, KEYBOARD_FLAGS, Restore, TITLE_POP, TerminalGuard, cursor_bytes,
-        title_bytes,
+        self, FALLBACK_CELL, KEYBOARD_FLAGS, Restore, TITLE_POP, TerminalGuard, copy_bytes,
+        cursor_bytes, title_bytes,
     },
 };
 use crate::{Error, Result};
@@ -75,8 +72,7 @@ enum Lifecycle {
 struct PendingWindow {
     title: Option<String>,
     cursor: Option<String>,
-    clipboard: Option<meowland_protocol::clipboard::ClipboardData>,
-    primary: Option<meowland_protocol::clipboard::ClipboardData>,
+    copy: Option<Vec<u8>>,
 }
 
 enum Ready {
@@ -99,8 +95,6 @@ pub(crate) struct TerminalSession {
     stdout: Descriptor,
     keyboard: Keyboard,
     shortcuts: Shortcuts,
-    input_gate: InputGate,
-    clipboard: Clipboard,
     presentation: PanePresentation,
     cell: Option<(u16, u16)>,
     lifecycle: Lifecycle,
@@ -141,9 +135,7 @@ impl TerminalSession {
             handle,
             keyboard: Keyboard::default(),
             shortcuts: Shortcuts::default(),
-            input_gate: InputGate::default(),
-            clipboard: Clipboard::new(Transport::Osc52)?,
-            presentation: PanePresentation::new(FrameTransport::Inline),
+            presentation: PanePresentation::new(),
             cell,
             lifecycle: Lifecycle::Handshaking {
                 deadline: Instant::now() + protocol::REQUEST_TIMEOUT,
@@ -253,12 +245,8 @@ impl TerminalSession {
         {
             return Err(Error::PaneHandshakeTimeout);
         }
-        if self.input_gate.expired() {
-            self.input_gate.flush(&mut self.tx)?;
-        }
         self.presentation.advance(&mut self.tx)?;
-        self.clipboard.advance(self.presentation.buffer());
-        self.send_clipboard_actions()
+        Ok(())
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -269,9 +257,7 @@ impl TerminalSession {
         handshake
             .into_iter()
             .chain(self.input.recovery_deadline())
-            .chain(self.input_gate.deadline())
             .chain(self.presentation.deadline())
-            .chain(self.clipboard.deadline())
             .min()
     }
 
@@ -301,23 +287,15 @@ impl TerminalSession {
                     self.presentation.append(b"\x07");
                 }
             }
-            ServerToPane::ClipboardWrite { selection, data } => {
-                if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.clipboard
-                        .copy(selection, data, self.presentation.buffer());
-                } else if selection == Selection::Primary {
-                    self.window.primary = Some(data);
+            ServerToPane::Copy(text) => {
+                if text.len() > MAX_TEXT {
+                    tracing::warn!("Ignoring copied text larger than {MAX_TEXT} bytes");
+                } else if matches!(self.lifecycle, Lifecycle::Active(_)) {
+                    self.presentation.append(&copy_bytes(&text));
                 } else {
-                    self.window.clipboard = Some(data);
+                    self.window.copy = Some(text);
                 }
             }
-            ServerToPane::ClipboardRead {
-                request,
-                offer,
-                mime,
-                deadline,
-            } => self.clipboard.read(request, offer, mime, deadline),
-            ServerToPane::ClipboardCancel { request } => self.clipboard.cancel(request),
             ServerToPane::Title(title) => {
                 if matches!(self.lifecycle, Lifecycle::Active(_)) {
                     self.presentation.append(&title_bytes(&title));
@@ -332,22 +310,37 @@ impl TerminalSession {
                     self.window.cursor = shape;
                 }
             }
-            ServerToPane::SharedFrame(frame) => {
-                self.presentation.draw_shared(frame, &mut self.tx)?;
-            }
             ServerToPane::Frame(band) => {
-                let starting = !matches!(self.lifecycle, Lifecycle::Active(_));
-                if starting {
-                    self.start_presentation().await?;
-                    if matches!(self.lifecycle, Lifecycle::Closed) {
-                        return Ok(());
-                    }
-                }
-                self.presentation.draw(band, &mut self.tx)?;
-                if starting {
-                    self.apply_pending_window();
-                }
+                self.present(|presentation, tx| presentation.draw(&band, tx))
+                    .await?;
             }
+            ServerToPane::SharedFrame(frame) => {
+                self.present(|presentation, tx| presentation.draw_shared(frame, tx))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Draw a frame, first starting presentation if the pane was waiting.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the terminal session runs on calloop's local executor"
+    )]
+    async fn present(
+        &mut self,
+        draw: impl FnOnce(&mut PanePresentation, &mut Outgoing) -> Result<()>,
+    ) -> Result<()> {
+        let starting = !matches!(self.lifecycle, Lifecycle::Active(_));
+        if starting {
+            self.start_presentation().await?;
+            if matches!(self.lifecycle, Lifecycle::Closed) {
+                return Ok(());
+            }
+        }
+        draw(&mut self.presentation, &mut self.tx)?;
+        if starting {
+            self.apply_pending_window();
         }
         Ok(())
     }
@@ -356,21 +349,14 @@ impl TerminalSession {
         let PendingWindow {
             title,
             cursor,
-            clipboard: clipboard_data,
-            primary,
+            copy,
         } = std::mem::take(&mut self.window);
         if let Some(title) = title {
             self.presentation.append(&title_bytes(&title));
         }
         self.presentation.append(&cursor_bytes(cursor.as_deref()));
-        for (selection, data) in [
-            (Selection::Clipboard, clipboard_data),
-            (Selection::Primary, primary),
-        ] {
-            if let Some(data) = data {
-                self.clipboard
-                    .copy(selection, data, self.presentation.buffer());
-            }
+        if let Some(text) = copy {
+            self.presentation.append(&copy_bytes(&text));
         }
     }
 
@@ -415,37 +401,11 @@ impl TerminalSession {
             self.cell.unwrap_or(FALLBACK_CELL),
         );
         let size = terminal::frame_size(width, height)?;
-        let transport = if probe.shared_memory {
-            FrameTransport::Shared
-        } else {
-            FrameTransport::Inline
-        };
-        self.presentation.restart(transport);
+        self.presentation.restart();
         if let Lifecycle::Active(mode) = &mut self.lifecycle {
             mode.enable_mouse(self.presentation.buffer());
-            if let Some(previous) = probe.clipboard {
-                mode.enable_clipboard(previous, self.presentation.buffer());
-            }
         }
         self.flush_output().await?;
-        self.tx
-            .send(&PaneToServer::Action(PaneAction::FrameTransport(transport)))?;
-        let clipboard = if probe.clipboard.is_some() {
-            Transport::Kitty
-        } else {
-            Transport::Osc52
-        };
-        self.tx
-            .send(&PaneToServer::Action(PaneAction::ClipboardTransport(
-                clipboard,
-            )))?;
-        self.clipboard = Clipboard::new(clipboard)?;
-        let _ = self
-            .clipboard
-            .refresh(Selection::Clipboard, Refresh::Background);
-        let _ = self
-            .clipboard
-            .refresh(Selection::Primary, Refresh::Background);
         self.tx
             .send(&PaneToServer::Action(PaneAction::Resize { size }))?;
         probe.log_capabilities(width, height);
@@ -463,7 +423,6 @@ impl TerminalSession {
                 continue;
             }
             self.send_event(event)?;
-            self.send_clipboard_actions()?;
         }
         Ok(())
     }
@@ -489,8 +448,6 @@ impl TerminalSession {
             .await?;
         self.presentation.abandon(&mut self.tx)?;
         self.keyboard = Keyboard::default();
-        self.input_gate = InputGate::default();
-        self.clipboard = Clipboard::new(Transport::Osc52)?;
         self.window = PendingWindow::default();
         Ok(())
     }

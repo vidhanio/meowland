@@ -38,7 +38,8 @@ const SCREEN_ID: &str = "1";
 pub enum Transport {
     /// Shared memory and inline data.
     Shared,
-    /// Inline data only; shared-memory queries are refused.
+    /// Inline data only, like a remote terminal: shared-memory uploads
+    /// fail to load and leave their object alone.
     Inline,
 }
 
@@ -319,7 +320,6 @@ impl Endpoint {
             (b">", b'c') => replies.extend_from_slice(b"\x1b[>1;1;0c"),
             (b"?", b'u') => replies.extend_from_slice(b"\x1b[?31u"),
             (b"?1016", b'p') => replies.extend_from_slice(b"\x1b[?1016;2$y"),
-            (b"?5522", b'p') => replies.extend_from_slice(b"\x1b[?5522;2$y"),
             (b"?2026", b'l') => self.present(frames)?,
             (b"?1049", b'h') => self.alternate = true,
             (b"?1049", b'l') => self.alternate = false,
@@ -355,20 +355,9 @@ impl Endpoint {
             });
         let fields = Fields::parse(header)?;
         let action = fields.get(b'a');
-        if action == Some("q") {
-            let shared = fields.is(b't', "s");
-            let supported = !shared || self.transport == Transport::Shared;
-            if supported && shared {
-                read_shared(payload, 3)?;
-            }
-            replies.extend_from_slice(
-                format!(
-                    "\x1b_Gi={};{}\x1b\\",
-                    fields.get(b'i').unwrap_or("0"),
-                    if supported { "OK" } else { "ENOTSUP" }
-                )
-                .as_bytes(),
-            );
+        if self.transfer.is_none() && fields.is(b't', "s") && self.transport == Transport::Inline {
+            ensure!(action == Some("T"), "unsupported shared-memory command");
+            self.image = None;
             return Ok(());
         }
         if fields.is(b'i', PROBE_ID) && fields.is(b's', "1") && fields.is(b'v', "1") {
@@ -631,35 +620,28 @@ mod tests {
         assert_eq!(replies, b"");
     }
 
-    /// The inline-only terminal must refuse shared memory, both when queried
-    /// and when sent an actual upload, or the inline case would silently
-    /// measure the shared path. A refused upload must leave its object alone.
+    /// The inline-only terminal must ignore a shared-memory upload like a
+    /// remote terminal: no frame, no reply, and the object left for the pane
+    /// to notice it was never read.
     #[test]
-    fn inline_transport_refuses_shared_memory() {
+    fn inline_transport_ignores_shared_memory() {
         let (width, height) = (320, 200);
         let mut endpoint = Endpoint::new(width, height, Pattern::Full, Transport::Inline);
         let (mut replies, mut frames) = (Vec::new(), Vec::new());
-        let query = format!(
-            "\x1b_Ga=q,f=24,s=1,v=1,i=32,t=s;{}\x1b\\",
-            STANDARD.encode("/meowland-absent")
-        );
-        endpoint
-            .feed(query.as_bytes(), &mut replies, &mut frames)
-            .unwrap();
-        assert_eq!(replies, b"\x1b_Gi=32;ENOTSUP\x1b\\");
-
         let name = format!("meowland-bench-inline-test-{}", std::process::id());
         let path = Path::new("/dev/shm").join(&name);
         fs::write(&path, image(Pattern::Full, width, height, 0)).unwrap();
         let upload = format!(
-            "\x1b_Ga=T,f=24,s={width},v={height},i=1,t=s;{}\x1b\\",
+            "\x1b[?2026h\x1b_Ga=T,f=24,s={width},v={height},i=1,t=s;{}\x1b\\\x1b[?2026l",
             STANDARD.encode(format!("/{name}"))
         );
         let result = endpoint.feed(upload.as_bytes(), &mut replies, &mut frames);
         let survived = path.exists();
         drop(fs::remove_file(&path));
-        assert!(result.is_err());
+        result.unwrap();
         assert!(survived);
+        assert_eq!(frames, []);
+        assert_eq!(replies, b"");
         assert_eq!(endpoint.counters().shared_uploads, 0);
     }
 

@@ -1,9 +1,9 @@
-//! Inline kitty transfers with reusable compression storage.
+//! Inline kitty transfers with reusable compression state.
 
 use std::io::Write;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use flate2::{Compression, write::ZlibEncoder};
+use flate2::{Compress, Compression, FlushCompress, Status};
 
 const CHUNK: usize = 4096;
 /// Base64 payload bytes per 4096-character chunk.
@@ -15,9 +15,21 @@ enum Encoding {
     Zlib,
 }
 
-#[derive(Debug, Default)]
+/// Compression output and the deflate state, both reused across images so a
+/// small band never pays for allocating a fresh compressor.
+#[derive(Debug)]
 pub(crate) struct Encoder {
     compressed: Vec<u8>,
+    deflate: Compress,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self {
+            compressed: Vec::new(),
+            deflate: Compress::new(Compression::fast(), true),
+        }
+    }
 }
 
 impl Encoder {
@@ -93,27 +105,43 @@ impl Encoder {
         const SAMPLES: usize = 4;
         const SAMPLED_BYTES: usize = SAMPLE_BYTES * SAMPLES;
         if pixels.len() > SAMPLED_BYTES {
-            let samples = (0..SAMPLES).map(|index| {
+            let samples: [&[u8]; SAMPLES] = std::array::from_fn(|index| {
                 let start = (pixels.len() - SAMPLE_BYTES) * index / (SAMPLES - 1);
                 &pixels[start..start + SAMPLE_BYTES]
             });
-            if !Self::zlib(&mut self.compressed, samples)
-                || self.compressed.len() * 4 > SAMPLED_BYTES * 3
-            {
+            if !self.zlib(&samples) || self.compressed.len() * 4 > SAMPLED_BYTES * 3 {
                 return false;
             }
         }
-        Self::zlib(&mut self.compressed, [pixels])
+        self.zlib(&[pixels])
     }
 
-    /// Compress the concatenation of `parts` into `out`.
-    fn zlib<'a>(out: &mut Vec<u8>, parts: impl IntoIterator<Item = &'a [u8]>) -> bool {
+    /// Compress the concatenation of `parts` into `self.compressed`.
+    fn zlib(&mut self, parts: &[&[u8]]) -> bool {
+        self.deflate.reset();
+        let out = &mut self.compressed;
         out.clear();
-        let mut encoder = ZlibEncoder::new(out, Compression::fast());
-        parts
-            .into_iter()
-            .all(|part| encoder.write_all(part).is_ok())
-            && encoder.finish().is_ok()
+        let total: usize = parts.iter().map(|part| part.len()).sum();
+        out.reserve(total + total / 8 + 64);
+        for (index, part) in parts.iter().enumerate() {
+            let flush = if index + 1 == parts.len() {
+                FlushCompress::Finish
+            } else {
+                FlushCompress::None
+            };
+            let start = self.deflate.total_in();
+            loop {
+                let consumed = usize::try_from(self.deflate.total_in() - start)
+                    .expect("consumed input fits usize");
+                match self.deflate.compress_vec(&part[consumed..], out, flush) {
+                    Ok(Status::StreamEnd) => break,
+                    Ok(_) if flush == FlushCompress::None && consumed == part.len() => break,
+                    Ok(_) => out.reserve(out.capacity().max(64)),
+                    Err(_) => return false,
+                }
+            }
+        }
+        true
     }
 }
 
@@ -241,6 +269,22 @@ pub(crate) mod tests {
             assert!(header.contains("o=z"));
             assert!(chunks > 1);
             assert_eq!(decoded, pixels);
+        }
+    }
+
+    #[test]
+    fn a_reused_encoder_compresses_each_image_independently() {
+        let mut encoder = Encoder::default();
+        let large: Vec<u8> = (0..200_000_u32)
+            .map(|index| u8::try_from(index % 7).expect("small"))
+            .collect();
+        let small = vec![9; 3000];
+        for pixels in [&large, &small, &large] {
+            let mut output = Vec::new();
+            encoder.image(&mut output, 1, (1, 1), pixels, Placement::Whole);
+            let (header, decoded, _) = decode_image(&output);
+            assert!(header.contains("o=z"));
+            assert_eq!(&decoded, pixels);
         }
     }
 }

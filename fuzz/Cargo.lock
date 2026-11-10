@@ -357,7 +357,6 @@ dependencies = [
  "meowland-input",
  "meowland-protocol",
  "meowland-terminal",
- "meowland-terminal-clipboard",
  "vtparse",
 ]
 
@@ -375,16 +374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meowland-kitty"
-version = "0.1.0"
-dependencies = [
- "base64",
- "flate2",
- "meowland-core",
- "meowland-protocol",
-]
-
-[[package]]
 name = "meowland-protocol"
 version = "0.1.0"
 dependencies = [
@@ -393,7 +382,6 @@ dependencies = [
  "getrandom",
  "meowland-async",
  "meowland-core",
- "mime",
  "postcard",
  "rustix",
  "serde",
@@ -405,36 +393,20 @@ dependencies = [
 name = "meowland-terminal"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "calloop",
  "crossterm",
+ "flate2",
  "futures",
  "meowland-async",
  "meowland-core",
  "meowland-input",
- "meowland-kitty",
  "meowland-protocol",
- "meowland-terminal-clipboard",
  "rustix",
  "thiserror",
  "tracing",
  "vtparse",
 ]
-
-[[package]]
-name = "meowland-terminal-clipboard"
-version = "0.1.0"
-dependencies = [
- "base64",
- "getrandom",
- "meowland-protocol",
- "tracing",
-]
-
-[[package]]
-name = "mime"
-version = "0.3.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "miniz_oxide"

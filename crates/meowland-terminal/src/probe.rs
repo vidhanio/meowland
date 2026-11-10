@@ -1,9 +1,6 @@
 //! Terminal capability probe and reply decoding.
 
-use std::{
-    io::Write as _,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use calloop::LoopHandle;
 use futures::FutureExt;
@@ -11,13 +8,13 @@ use meowland_async::{
     asynchronous::{Descriptor, sleep_until, when},
     signals,
 };
-use meowland_core::pixels::FrameSize;
 use meowland_input as input;
-use meowland_kitty::{FRAME_EDIT_PROBE_ID, SHARED_PROBE_ID, query_frame_edits, query_shared};
-use meowland_protocol::SharedObject;
 use vtparse::{CollectingVTActor, CsiParam, VTAction, VTParser};
 
-use super::output;
+use super::{
+    kitty::{FRAME_EDIT_PROBE_ID, query_frame_edits},
+    output,
+};
 
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
@@ -29,7 +26,7 @@ const PROBE_MAXIMUM: usize = 64 * 1024;
 const PROBE_QUERY: &[u8] = b"\x1b[16t\x1b[14t\x1b[>q";
 /// Query device attributes last so their reply starts the handshake's quiet
 /// window.
-const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?5522$p\x1b[?u\x1b[c";
+const PROBE_QUERY_TAIL: &[u8] = b"\x1b[?1016$p\x1b[?u\x1b[c";
 
 /// Terminal capabilities discovered during the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -39,10 +36,7 @@ pub(crate) struct ProbeInfo {
     /// Cell size in physical pixels, if the terminal reported it.
     pub cell: Option<(u16, u16)>,
     pub frame_edits: bool,
-    pub shared_memory: bool,
     pub sgr_pixels: bool,
-    /// OSC 5522 support and the paste-notification mode's previous state.
-    pub clipboard: Option<super::terminal::ClipboardMode>,
     /// Kitty's active enhancements after pushing the requested flags.
     pub keyboard_flags: Option<crossterm::event::KeyboardEnhancementFlags>,
     pub name: Option<String>,
@@ -56,10 +50,8 @@ impl ProbeInfo {
             pixels = ?self.pixels,
             terminal = ?self.name,
             frame_edits = self.frame_edits,
-            shared_memory = self.shared_memory,
             sgr_pixels = self.sgr_pixels,
             keyboard_flags = ?self.keyboard_flags,
-            clipboard = ?self.clipboard,
             "pane attached"
         );
     }
@@ -76,13 +68,9 @@ pub(crate) async fn terminal_probe(
     termination: &mut signals::Termination,
     handle: &LoopHandle<'static, ()>,
 ) -> std::io::Result<Option<ProbeInfo>> {
-    let shared_probe = shared_probe();
     let mut pending = output::Output::default();
     pending.append(PROBE_QUERY);
     pending.append(&query_frame_edits());
-    if let Some((_, command)) = &shared_probe {
-        pending.append(command);
-    }
     pending.append(PROBE_QUERY_TAIL);
     let mut parser = ProbeParser::default();
     let mut received = 0;
@@ -107,16 +95,7 @@ pub(crate) async fn terminal_probe(
             }
         }
     }
-    let mut probe = parser.finish();
-    probe.shared_memory &= shared_probe.is_some();
-    Ok(Some(probe))
-}
-
-fn shared_probe() -> Option<(SharedObject, Vec<u8>)> {
-    let (object, mut file) = SharedObject::create(FrameSize::new(1, 1)?).ok()?;
-    file.write_all(&[0; 3]).ok()?;
-    let command = query_shared(object.frame());
-    Some((object, command))
+    Ok(Some(parser.finish()))
 }
 
 struct ProbeParser {
@@ -157,13 +136,10 @@ impl ProbeParser {
     fn apply(&mut self, action: VTAction) {
         match action {
             VTAction::ApcDispatch(data) => {
-                if let Some(body) = data.strip_prefix(b"G") {
-                    if let Some(ok) = kitty_reply(body, FRAME_EDIT_PROBE_ID) {
-                        self.info.frame_edits = ok;
-                    }
-                    if let Some(ok) = kitty_reply(body, SHARED_PROBE_ID) {
-                        self.info.shared_memory = ok;
-                    }
+                if let Some(body) = data.strip_prefix(b"G")
+                    && let Some(ok) = kitty_reply(body, FRAME_EDIT_PROBE_ID)
+                {
+                    self.info.frame_edits = ok;
                 }
             }
             VTAction::DcsHook {
@@ -231,18 +207,10 @@ fn probe_csi(params: &[CsiParam], byte: u8, out: &mut ProbeInfo) {
             }
         }
         b'y' if private.is_some() => {
-            if let Some(value) = fields.next().flatten() {
-                match first {
-                    1016 => out.sgr_pixels = matches!(value, 1..=3),
-                    5522 if matches!(value, 1..=3) => {
-                        out.clipboard = Some(if value == 2 {
-                            super::terminal::ClipboardMode::Disabled
-                        } else {
-                            super::terminal::ClipboardMode::Enabled
-                        });
-                    }
-                    _ => {}
-                }
+            if first == 1016
+                && let Some(value) = fields.next().flatten()
+            {
+                out.sgr_pixels = matches!(value, 1..=3);
             }
         }
         b'u' if private.is_some() => {
@@ -335,20 +303,9 @@ mod tests {
 
     #[test]
     fn probe_decodes_kitty_graphics_replies_by_id() {
-        let info = parse(b"\x1b_Gi=30;OK\x1b\\");
-        assert!(info.frame_edits);
-        assert!(!info.shared_memory);
-
-        let info = parse(b"\x1b_Gi=32;OK\x1b\\");
-        assert!(!info.frame_edits);
-        assert!(info.shared_memory);
-
-        let info = parse(b"\x1b_Gi=30;ENOENT\x1b\\");
-        assert!(!info.frame_edits);
-
-        let info = parse(b"\x1b_Gi=31;OK\x1b\\");
-        assert!(!info.frame_edits);
-        assert!(!info.shared_memory);
+        assert!(parse(b"\x1b_Gi=30;OK\x1b\\").frame_edits);
+        assert!(!parse(b"\x1b_Gi=30;ENOENT\x1b\\").frame_edits);
+        assert!(!parse(b"\x1b_Gi=31;OK\x1b\\").frame_edits);
 
         let info = parse(b"\x1b_Gx=1,i=30;OK\x1b\\");
         assert!(info.frame_edits);
@@ -363,22 +320,6 @@ mod tests {
         for value in [0, 4] {
             let report = format!("\x1b[?1016;{value}$y");
             assert!(!parse(report.as_bytes()).sgr_pixels, "value {value}");
-        }
-
-        let cases = [
-            (1, Some(super::super::terminal::ClipboardMode::Enabled)),
-            (2, Some(super::super::terminal::ClipboardMode::Disabled)),
-            (3, Some(super::super::terminal::ClipboardMode::Enabled)),
-            (0, None),
-            (4, None),
-        ];
-        for (value, expected) in cases {
-            let report = format!("\x1b[?5522;{value}$y");
-            assert_eq!(
-                parse(report.as_bytes()).clipboard,
-                expected,
-                "value {value}"
-            );
         }
     }
 

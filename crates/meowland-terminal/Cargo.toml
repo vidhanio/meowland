@@ -13,13 +13,13 @@ fuzzing = []
 
 [dependencies]
 meowland-input = { workspace = true }
-meowland-terminal-clipboard = { workspace = true }
+base64 = { workspace = true }
 meowland-core = { workspace = true }
 meowland-async = { workspace = true }
 meowland-protocol = { workspace = true, features = ["async"] }
 calloop = { workspace = true }
 futures = { workspace = true }
-meowland-kitty = { workspace = true }
+flate2 = { workspace = true }
 crossterm = { workspace = true, features = ["events"] }
 rustix = { workspace = true, features = ["fs", "termios"] }
 thiserror = { workspace = true }

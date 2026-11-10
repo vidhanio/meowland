@@ -1,49 +1,22 @@
-//! Pane bindings and selection policy, independent of Wayland resources.
+//! Pane bindings, independent of Wayland resources.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     fmt,
 };
 
-use meowland_core::pixels::FrameSize;
-use meowland_protocol::{Follow, FrameAck, FrameTransport, Target, clipboard::Transport};
+use meowland_protocol::{Follow, Target};
 
 use crate::{PaneId, WindowId};
 
-/// Frame pacing state a pane needs from the compositor.
-///
-/// The compositor supplies the concrete presentation type but delegates pane
-/// bookkeeping to [`Attachments`], which only needs these operations.
-pub trait Presentation {
-    /// Create the presentation for a new pane at the given size.
-    fn new(size: FrameSize) -> Self;
-    /// Pixel size the pane currently presents.
-    fn size(&self) -> FrameSize;
-    /// Record a new pane size.
-    fn set_size(&mut self, size: FrameSize);
-    /// Record the transport the pane asked to receive frames on.
-    fn set_transport(&mut self, transport: FrameTransport);
-    /// Whether a frame is dirty and waiting for dispatch.
-    fn due(&self) -> bool;
-    /// Mark the currently presented content as stale.
-    fn mark_dirty(&mut self);
-    /// Apply the pane's frame acknowledgement.
-    fn ack(&mut self, pane: PaneId, ack: FrameAck);
-}
-
-/// A pane attached to a window selector.
+/// A pane attached to a window selector, carrying host state `P`.
 pub struct AttachedPane<P> {
     target: Target,
     window: Option<WindowId>,
     /// How long the pane keeps matching its selection.
     pub follow: Follow,
-    /// Frame pacing state for the pane.
-    pub presentation: P,
-    /// Clipboard transport the pane's terminal reported after probing.
-    ///
-    /// Exports assume full MIME support until a pane reports otherwise, so a
-    /// selection change before the first frame still reaches the terminal.
-    pub clipboard: Transport,
+    /// Host-owned state of the pane, such as its frame presentation.
+    pub state: P,
 }
 
 impl<P> AttachedPane<P> {
@@ -68,44 +41,17 @@ impl<P> fmt::Debug for AttachedPane<P> {
             .field("target", &self.target)
             .field("window", &self.window)
             .field("follow", &self.follow)
-            .field("clipboard", &self.clipboard)
             .finish_non_exhaustive()
     }
 }
 
-impl<P: Presentation> AttachedPane<P> {
-    fn new(target: Target, follow: Follow, size: FrameSize) -> Self {
-        Self {
-            target,
-            window: None,
-            follow,
-            presentation: P::new(size),
-            clipboard: Transport::Kitty,
-        }
-    }
-
-    fn show(&mut self, window: WindowId) -> Option<String> {
-        let previous = self.window.replace(window);
-        self.presentation.mark_dirty();
-        match (&self.target, previous) {
-            (Target::Activation(token), None) => Some(token.clone()),
-            _ => None,
-        }
-    }
-
-    fn unbind(&mut self) {
-        self.window = None;
-        self.presentation.mark_dirty();
-    }
-}
-
-/// Attached panes plus the index from windows to the panes showing them.
+/// Attached panes plus the index from each window to the one pane showing it.
 ///
-/// Binding changes go through this type so the index cannot drift.
+/// Binding changes go through this type so the index cannot drift: a window
+/// is shown by at most one pane, and a pane shows at most one window.
 pub struct Attachments<P> {
     panes: BTreeMap<PaneId, AttachedPane<P>>,
-    by_window: HashMap<WindowId, BTreeSet<PaneId>>,
-    deciding: HashMap<WindowId, PaneId>,
+    by_window: HashMap<WindowId, PaneId>,
 }
 
 impl<P> Default for Attachments<P> {
@@ -113,7 +59,6 @@ impl<P> Default for Attachments<P> {
         Self {
             panes: BTreeMap::new(),
             by_window: HashMap::new(),
-            deciding: HashMap::new(),
         }
     }
 }
@@ -128,7 +73,7 @@ impl<P> fmt::Debug for Attachments<P> {
     }
 }
 
-impl<P: Presentation> Attachments<P> {
+impl<P> Attachments<P> {
     /// Number of attached panes.
     pub fn len(&self) -> usize {
         self.panes.len()
@@ -149,27 +94,35 @@ impl<P: Presentation> Attachments<P> {
         self.panes.get(&pane)
     }
 
-    /// Number of panes whose frame is dirty and waiting for dispatch.
-    pub fn due_frames(&self) -> usize {
-        self.panes
-            .values()
-            .filter(|entry| entry.presentation.due())
-            .count()
+    /// Look up an attached pane's host state for mutation.
+    pub fn state_mut(&mut self, pane: PaneId) -> Option<&mut P> {
+        self.panes.get_mut(&pane).map(|entry| &mut entry.state)
     }
 
     /// Iterate over attached panes in pane-identity order.
-    pub fn iter(&self) -> impl Iterator<Item = (&PaneId, &AttachedPane<P>)> {
-        self.panes.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (PaneId, &AttachedPane<P>)> {
+        self.panes.iter().map(|(&pane, entry)| (pane, entry))
+    }
+
+    /// Visit every attached pane's host state in pane-identity order,
+    /// together with the window it shows.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (PaneId, Option<WindowId>, &mut P)> {
+        self.panes
+            .iter_mut()
+            .map(|(&pane, entry)| (pane, entry.window, &mut entry.state))
     }
 
     /// Attach a pane waiting for its target, replacing any previous
     /// attachment with the same ID.
-    pub fn insert(&mut self, pane: PaneId, target: Target, follow: Follow, size: FrameSize) {
-        let entry = AttachedPane::<P>::new(target, follow, size);
-        if let Some(previous) = self.panes.insert(pane, entry)
-            && let Some(previous) = previous.window()
-        {
-            self.unlink(previous, pane);
+    pub fn insert(&mut self, pane: PaneId, target: Target, follow: Follow, state: P) {
+        let entry = AttachedPane {
+            target,
+            window: None,
+            follow,
+            state,
+        };
+        if let Some(window) = self.panes.insert(pane, entry).and_then(|old| old.window) {
+            self.by_window.remove(&window);
         }
     }
 
@@ -181,188 +134,55 @@ impl<P: Presentation> Attachments<P> {
     }
 
     /// Bind a pane to a window, returning the activation token it was waiting
-    /// for.
+    /// for. A pane that showed the window before stops showing it.
     pub fn show(&mut self, pane: PaneId, window: WindowId) -> Option<String> {
-        let entry = self.panes.get_mut(&pane)?;
-        let previous = entry.window();
-        let token = entry.show(window);
-        if previous != Some(window) {
-            if let Some(previous) = previous {
-                self.unlink(previous, pane);
-            }
-            self.link(window, pane);
+        if !self.panes.contains_key(&pane) {
+            return None;
         }
-        token
+        if let Some(other) = self.by_window.insert(window, pane)
+            && other != pane
+            && let Some(entry) = self.panes.get_mut(&other)
+        {
+            entry.window = None;
+        }
+        let entry = self.panes.get_mut(&pane)?;
+        let previous = entry.window.replace(window);
+        if let Some(previous) = previous.filter(|&previous| previous != window) {
+            self.by_window.remove(&previous);
+        }
+        match (&entry.target, previous) {
+            (Target::Activation(token), None) => Some(token.clone()),
+            _ => None,
+        }
     }
 
-    /// Leave a pane attached but showing no window, waiting on its selection.
+    /// Leave a pane attached but showing no window, waiting on its target.
     pub fn unbind(&mut self, pane: PaneId) {
-        let Some(entry) = self.panes.get_mut(&pane) else {
-            return;
-        };
-        let previous = entry.window();
-        entry.unbind();
-        if let Some(previous) = previous {
-            self.unlink(previous, pane);
+        if let Some(window) = self
+            .panes
+            .get_mut(&pane)
+            .and_then(|entry| entry.window.take())
+        {
+            self.by_window.remove(&window);
         }
     }
 
     /// Detach a pane and return its state.
     pub fn remove(&mut self, pane: PaneId) -> Option<AttachedPane<P>> {
         let removed = self.panes.remove(&pane)?;
-        if let Some(window) = removed.window() {
-            self.unlink(window, pane);
+        if let Some(window) = removed.window {
+            self.by_window.remove(&window);
         }
         Some(removed)
     }
 
-    /// Panes showing a window, in pane-identity order.
-    pub fn showing(&self, window: WindowId) -> Vec<PaneId> {
-        self.by_window
-            .get(&window)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect()
+    /// Pane showing a window.
+    pub fn showing(&self, window: WindowId) -> Option<PaneId> {
+        self.by_window.get(&window).copied()
     }
 
     /// Windows shown by attached panes, in pane-identity order.
     pub fn windows(&self) -> impl Iterator<Item = WindowId> + '_ {
         self.panes.values().filter_map(AttachedPane::window)
-    }
-
-    /// Record the pane that most recently routed input to a window.
-    ///
-    /// Returns whether the pane changed.
-    pub fn decide(&mut self, window: WindowId, pane: PaneId) -> bool {
-        self.deciding.insert(window, pane) != Some(pane)
-    }
-
-    /// Pane whose size and input the window follows.
-    pub fn owner(&self, window: WindowId) -> Option<PaneId> {
-        self.deciding
-            .get(&window)
-            .copied()
-            .filter(|pane| {
-                self.panes
-                    .get(pane)
-                    .is_some_and(|entry| entry.window() == Some(window))
-            })
-            .or_else(|| self.first_showing(window))
-    }
-
-    /// First pane showing a window, in pane-identity order.
-    pub fn first_showing(&self, window: WindowId) -> Option<PaneId> {
-        self.by_window
-            .get(&window)
-            .and_then(|panes| panes.first().copied())
-    }
-
-    /// Size requested by the window's owning pane.
-    pub fn size(&self, window: WindowId) -> Option<FrameSize> {
-        self.owner(window)
-            .and_then(|id| self.panes.get(&id))
-            .map(|pane| pane.presentation.size())
-    }
-
-    /// Whether any pane is showing the window.
-    pub fn visible(&self, window: WindowId) -> bool {
-        self.by_window.contains_key(&window)
-    }
-
-    /// Visit every pane showing a window.
-    pub fn for_each_showing(
-        &self,
-        window: WindowId,
-        mut visit: impl FnMut(PaneId, &AttachedPane<P>),
-    ) {
-        for &pane in self.by_window.get(&window).into_iter().flatten() {
-            if let Some(entry) = self.panes.get(&pane) {
-                visit(pane, entry);
-            }
-        }
-    }
-
-    /// Visit every attached pane's presentation in pane-identity order.
-    ///
-    /// The callback receives the pane ID, the window it shows (if any), and
-    /// only its presentation, so it cannot disturb the window index.
-    pub fn for_each_presentation_mut(
-        &mut self,
-        mut visit: impl FnMut(PaneId, Option<WindowId>, &mut P),
-    ) {
-        for (&pane, entry) in &mut self.panes {
-            visit(pane, entry.window(), &mut entry.presentation);
-        }
-    }
-
-    /// Visit every pane showing a window.
-    ///
-    /// The callback cannot disturb the window index.
-    pub fn for_each_showing_mut(
-        &mut self,
-        window: WindowId,
-        mut visit: impl FnMut(PaneId, &mut P),
-    ) {
-        for &pane in self.by_window.get(&window).into_iter().flatten() {
-            if let Some(entry) = self.panes.get_mut(&pane) {
-                visit(pane, &mut entry.presentation);
-            }
-        }
-    }
-
-    /// Apply a pane's frame acknowledgement.
-    pub fn ack(&mut self, pane: PaneId, ack: FrameAck) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.presentation.ack(pane, ack);
-        }
-    }
-
-    /// Resize a pane and return the window whose state must be reapplied.
-    pub fn resize(&mut self, pane: PaneId, size: FrameSize) -> Option<WindowId> {
-        let entry = self.panes.get_mut(&pane)?;
-        if entry.presentation.size() == size {
-            return None;
-        }
-        entry.presentation.set_size(size);
-        entry.presentation.mark_dirty();
-        entry.window()
-    }
-
-    /// Record the transport a pane wants frames on.
-    pub fn set_transport(&mut self, pane: PaneId, transport: FrameTransport) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.presentation.set_transport(transport);
-        }
-    }
-
-    /// Record the clipboard transport a pane's terminal supports.
-    pub fn set_clipboard_transport(&mut self, pane: PaneId, transport: Transport) {
-        if let Some(entry) = self.panes.get_mut(&pane) {
-            entry.clipboard = transport;
-        }
-    }
-
-    /// Forget which pane last routed input to a removed window.
-    pub fn forget_window(&mut self, window: WindowId) {
-        self.deciding.remove(&window);
-    }
-
-    fn link(&mut self, window: WindowId, pane: PaneId) {
-        self.by_window.entry(window).or_default().insert(pane);
-    }
-
-    /// Remove a pane from a window's index, along with its claim to decide
-    /// that window's size and input.
-    fn unlink(&mut self, window: WindowId, pane: PaneId) {
-        if self.deciding.get(&window) == Some(&pane) {
-            self.deciding.remove(&window);
-        }
-        if let Some(panes) = self.by_window.get_mut(&window) {
-            panes.remove(&pane);
-            if panes.is_empty() {
-                self.by_window.remove(&window);
-            }
-        }
     }
 }

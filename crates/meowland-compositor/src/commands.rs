@@ -4,9 +4,7 @@ use meowland_core::pixels::FrameSize;
 use meowland_protocol::{Follow, Input, PaneAction, Selector, Shortcut, Target, Transition};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 
-use super::{
-    AttachedPane, Compositor, PaneId, ServerToPane, WindowId, clipboard, input::pane_input,
-};
+use super::{AttachedPane, Compositor, PaneId, ServerToPane, WindowId, input::pane_input};
 
 /// The requested selector did not identify a mapped window to close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -33,7 +31,7 @@ pub enum Command {
         /// Pane to detach.
         pane: PaneId,
     },
-    /// Apply input, geometry, clipboard, or acknowledgement work for an
+    /// Apply input, geometry, paste, or acknowledgement work for an
     /// attached pane.
     Pane {
         /// Pane originating the action.
@@ -95,31 +93,21 @@ impl Compositor {
                     pane_input(self, pane, &event);
                 }
             }
-            PaneAction::Paste(text) => clipboard::paste(self, pane, &text),
-            PaneAction::ClipboardOffer {
-                selection,
-                offer,
-                mimes,
-                intent,
-            } => clipboard::offer(
-                self,
-                pane,
-                clipboard::TerminalOffer {
-                    selection,
-                    id: offer,
-                    mimes,
-                    intent,
-                },
-            ),
-            PaneAction::ClipboardReply { request, data } => {
-                clipboard::reply(self, pane, request, data);
+            PaneAction::Paste(text) => self.paste(pane, text),
+            PaneAction::Ack => {
+                if let Some(state) = self.attachments.state_mut(pane) {
+                    state.ack();
+                }
             }
-            PaneAction::ClipboardTransport(transport) => {
-                self.attachments.set_clipboard_transport(pane, transport);
+            PaneAction::Keyframe => {
+                if let Some(state) = self.attachments.state_mut(pane) {
+                    state.keyframe();
+                }
             }
-            PaneAction::Ack(ack) => self.attachments.ack(pane, ack),
-            PaneAction::FrameTransport(transport) => {
-                self.attachments.set_transport(pane, transport);
+            PaneAction::Inline => {
+                if let Some(state) = self.attachments.state_mut(pane) {
+                    state.shared = false;
+                }
             }
         }
     }
@@ -145,7 +133,7 @@ impl Compositor {
         let window = selector
             .map_or_else(
                 || self.windows.catalog.focused(),
-                |selector| self.windows.catalog.select(selector),
+                |selector| self.windows.catalog.select(selector, |_| true),
             )
             .and_then(|id| self.windows.by_id.get(&id))
             .ok_or(CloseWindowError)?;
@@ -153,15 +141,20 @@ impl Compositor {
         Ok(())
     }
 
-    pub(crate) fn selected_window(&self, target: &Target) -> Option<WindowId> {
+    /// The window a target selects among the `available` ones.
+    pub(crate) fn selected_window(
+        &self,
+        target: &Target,
+        available: impl Fn(WindowId) -> bool,
+    ) -> Option<WindowId> {
         match target {
-            Target::Selector(selector) => self.windows.catalog.select(selector),
+            Target::Selector(selector) => self.windows.catalog.select(selector, available),
             Target::Activation(token) => self
                 .protocols
                 .launches
                 .get(token)
                 .and_then(|launch| launch.window)
-                .filter(|&window| self.windows.catalog.drawable(window)),
+                .filter(|&window| self.windows.catalog.drawable(window) && available(window)),
         }
     }
 

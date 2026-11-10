@@ -1,11 +1,9 @@
-//! Terminal events and clipboard actions coordinated by one session owner.
+//! Terminal events forwarded to the server by one session owner.
 
-use meowland_input::{Event, Focus, keyboard};
+use meowland_input::{Event, Focus};
 use meowland_protocol::{
-    self as protocol, Input, OfferIntent, PaneAction, PaneToServer, Transition,
-    clipboard::{MAX_TEXT, Selection},
+    self as protocol, Input, PaneAction, PaneToServer, Transition, clipboard::MAX_TEXT,
 };
-use meowland_terminal_clipboard::{Action, DeferredInput, Refresh};
 
 use super::{
     TerminalSession,
@@ -30,35 +28,21 @@ impl TerminalSession {
                     if pressed && self.shortcuts.action(key, modifiers).is_some() {
                         self.keyboard.intercept(key);
                     }
-                    let defer = if pressed && keyboard::paste(key, modifiers) {
-                        self.clipboard.refresh(Selection::Clipboard, Refresh::Paste)
-                    } else {
-                        None
-                    };
-                    self.input_gate.send(input, defer, &mut self.tx)?;
+                    self.send_input(input)?;
                 }
             }
             Event::Text(text) => {
                 if text.len() <= protocol::MAX_INPUT_TEXT {
-                    self.input_gate
-                        .send(Input::Text(text), None, &mut self.tx)?;
+                    self.send_input(Input::Text(text))?;
                 }
             }
             Event::Focus(Focus::Gained) => {
-                self.clipboard.focus_gained();
-                self.input_gate
-                    .send(self.keyboard.enter(), None, &mut self.tx)?;
+                let input = self.keyboard.enter();
+                self.send_input(input)?;
             }
             Event::Focus(Focus::Lost) => {
-                let deferred = self.clipboard.focus_lost();
                 self.keyboard.reset();
-                match deferred {
-                    DeferredInput::Keep => self.input_gate.preserve_focus_loss(),
-                    DeferredInput::Discard => self.input_gate.reset(),
-                }
-                self.tx.send(&PaneToServer::Action(PaneAction::Input(
-                    Input::ResetKeyboard,
-                )))?;
+                self.send_input(Input::ResetKeyboard)?;
             }
             Event::Resize => {
                 let cells = terminal::cells();
@@ -66,7 +50,7 @@ impl TerminalSession {
                 let cell = terminal::derived_cell(pixels, cells).or(self.cell);
                 if cell != self.cell {
                     self.cell = cell;
-                    self.presentation.cell_size_changed();
+                    self.presentation.cell_size_changed(&mut self.tx)?;
                 }
                 let (width, height) =
                     terminal::pane_pixels(None, pixels, cells, self.cell.unwrap_or(FALLBACK_CELL));
@@ -74,11 +58,8 @@ impl TerminalSession {
                 self.tx
                     .send(&PaneToServer::Action(PaneAction::Resize { size }))?;
             }
-            Event::Pointer(input) => self.input_gate.send(input, None, &mut self.tx)?,
+            Event::Pointer(input) => self.send_input(input)?,
             Event::Paste(text) => {
-                self.clipboard
-                    .cancel_refresh_selection(Selection::Clipboard);
-                self.input_gate.flush(&mut self.tx)?;
                 if text.len() <= MAX_TEXT {
                     self.tx
                         .send(&PaneToServer::Action(PaneAction::Paste(text)))?;
@@ -86,48 +67,13 @@ impl TerminalSession {
                     tracing::warn!("Ignoring pasted text larger than {MAX_TEXT} bytes");
                 }
             }
-            Event::Clipboard(bytes) => self.clipboard.packet(&bytes),
-            Event::ClipboardText(bytes) => self.clipboard.text(&bytes),
         }
         Ok(())
     }
 
-    pub(super) fn send_clipboard_actions(&mut self) -> Result<()> {
-        while let Some(action) = self.clipboard.next_action() {
-            match action {
-                Action::Offer {
-                    selection,
-                    offer,
-                    mimes,
-                    intent,
-                } => {
-                    let deferred_paste = intent == OfferIntent::Paste && self.input_gate.blocked();
-                    let intent = if deferred_paste {
-                        OfferIntent::Refresh
-                    } else {
-                        intent
-                    };
-                    self.tx
-                        .send(&PaneToServer::Action(PaneAction::ClipboardOffer {
-                            selection,
-                            offer,
-                            mimes,
-                            intent,
-                        }))?;
-                    if deferred_paste {
-                        self.input_gate.flush(&mut self.tx)?;
-                    }
-                }
-                Action::Reply { request, data } => {
-                    self.tx
-                        .send(&PaneToServer::Action(PaneAction::ClipboardReply {
-                            request,
-                            data,
-                        }))?;
-                }
-                Action::Unblock => self.input_gate.flush(&mut self.tx)?,
-            }
-        }
+    fn send_input(&mut self, input: Input) -> Result<()> {
+        self.tx
+            .send(&PaneToServer::Action(PaneAction::Input(input)))?;
         Ok(())
     }
 }

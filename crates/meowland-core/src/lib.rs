@@ -1,6 +1,5 @@
-//! Validated frame dimensions, scale, refresh rate, and latency statistics.
+//! Validated frame dimensions, scale, and refresh rate.
 
-pub mod latency;
 pub mod pixels;
 pub mod scale;
 pub mod timing;

@@ -51,8 +51,4 @@ pub enum Event {
     Resize,
     /// Completed bracketed paste containing valid UTF-8.
     Paste(String),
-    /// Kitty OSC 5522 metadata and optional payload.
-    Clipboard(Vec<u8>),
-    /// Base64 payload from an OSC 52 text reply.
-    ClipboardText(Vec<u8>),
 }

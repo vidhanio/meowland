@@ -68,13 +68,13 @@ impl Renderer {
     /// Changes in surface order, placement, dimensions, viewport, scale, or
     /// transform invalidate the scene and force full composition. Otherwise
     /// only the bounding rectangle of accumulated content damage is sampled.
-    /// The callback receives the accumulated changed rectangle and the ready
-    /// image prefix, allowing sequential publication while those pixels are
-    /// hot.
+    /// After each composed strip, `ready` receives the changed rectangle so
+    /// far and the composed image prefix, so a caller can copy those pixels
+    /// while they are still in cache.
     ///
     /// # Panics
     /// Panics if clipped coordinates cannot be represented as buffer offsets,
-    /// or if the publication callback panics.
+    /// or if `ready` panics.
     pub fn update(
         &mut self,
         scene: &mut Scene,
@@ -82,7 +82,7 @@ impl Renderer {
         snapshots: &HashMap<WlSurface, Snapshot>,
         size: FrameSize,
         scale: f64,
-        mut publish: impl FnMut(Option<&Changed>, &[u8]),
+        mut ready: impl FnMut(Option<&Changed>, &[u8]),
     ) -> Option<Changed> {
         scene.pixels.resize(size.rgb_len(), 0);
         let scale = if scale.is_finite() && scale > 0.0 {
@@ -136,14 +136,14 @@ impl Renderer {
                     changed = Some(changed.map_or(row..row + 1, |changed| changed.start..row + 1));
                 }
             }
-            let ready =
+            let composed =
                 usize::try_from(bottom).expect("clipped row is nonnegative") * size.rgb_stride();
             let rect = changed.as_ref().map(|changed| Changed {
                 columns: changed_columns.clone(),
                 rows: u32::try_from(changed.start).expect("clipped row is nonnegative")
                     ..u32::try_from(changed.end).expect("clipped row is nonnegative"),
             });
-            publish(rect.as_ref(), &scene.pixels[..ready]);
+            ready(rect.as_ref(), &scene.pixels[..composed]);
         }
         changed.map(|rows| Changed {
             columns: changed_columns,

@@ -187,10 +187,6 @@ impl XdgShellHandler for Compositor {
         let (app_id, title) = metadata(&surface);
         self.windows.catalog.update(id, app_id, title);
         self.resolve_pending_panes();
-        let catalog = &self.windows.catalog;
-        self.protocols
-            .toplevels
-            .update(id, catalog.title(id), catalog.app_id(id));
         self.send_titles(id);
     }
 

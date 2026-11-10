@@ -59,7 +59,7 @@ impl Compositor {
         let waiting: Vec<_> = self
             .attachments
             .iter()
-            .filter_map(|(&pane, entry)| {
+            .filter_map(|(pane, entry)| {
                 matches!(entry.waiting(), Some(Target::Activation(pending)) if pending == token)
                     .then_some(pane)
             })

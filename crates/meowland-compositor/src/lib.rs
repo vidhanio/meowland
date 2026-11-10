@@ -352,15 +352,22 @@ impl Compositor {
         )
     }
 
-    /// Logical buffer limit: twice the size of the pane showing the window,
-    /// to allow an in-flight resize. Without a pane only the global surface
-    /// limits apply.
+    /// Logical buffer limit: twice the widest and tallest panes showing the
+    /// window, independently, to allow an in-flight resize. Without a pane
+    /// only the global surface limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
-        let size = self.shown_state(self.window_for_surface(surface)?)?.size;
-        Some((
-            self.scale.logical(size.width()).unsigned_abs() * 2,
-            self.scale.logical(size.height()).unsigned_abs() * 2,
-        ))
+        let window = self.window_for_surface(surface)?;
+        self.attachments
+            .showing(window)
+            .iter()
+            .filter_map(|&pane| self.attachments.get(pane))
+            .map(|entry| {
+                (
+                    self.scale.logical(entry.state.size.width()).unsigned_abs() * 2,
+                    self.scale.logical(entry.state.size.height()).unsigned_abs() * 2,
+                )
+            })
+            .reduce(|bound, pane| (bound.0.max(pane.0), bound.1.max(pane.1)))
     }
 
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
@@ -397,7 +404,7 @@ impl Compositor {
     }
 
     fn send_titles(&mut self, window: WindowId) {
-        if let Some(pane) = self.attachments.showing(window) {
+        for pane in self.attachments.showing(window).to_vec() {
             self.send_title(pane, window);
         }
     }
@@ -435,7 +442,7 @@ impl Compositor {
     }
 
     fn enter_output(&self, window: WindowId) {
-        if self.attachments.showing(window).is_none() {
+        if self.attachments.showing(window).is_empty() {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window)
@@ -446,7 +453,7 @@ impl Compositor {
     }
 
     fn leave_output(&self, window: WindowId) {
-        if self.attachments.showing(window).is_some() && self.windows.catalog.drawable(window) {
+        if !self.attachments.showing(window).is_empty() && self.windows.catalog.drawable(window) {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window) {

@@ -99,7 +99,7 @@ impl Compositor {
             self.refresh_popup_grab();
             input::reset_keyboard(self);
         }
-        self.unbind_following_pane(id);
+        self.unbind_following_panes(id);
         if focused {
             let next = self
                 .attachments
@@ -115,7 +115,7 @@ impl Compositor {
     pub(crate) fn remove_window(&mut self, id: WindowId) {
         self.unmap_window(id);
         self.cancel_window_activations(id);
-        if let Some(pane) = self.attachments.showing(id) {
+        for pane in self.attachments.showing(id).to_vec() {
             self.remove_pane(pane);
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }

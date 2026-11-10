@@ -248,9 +248,9 @@ impl Compositor {
         Ok(())
     }
 
-    /// The pane showing the focused window.
+    /// The pane that last routed input to the focused window.
     fn selection_pane(&self) -> Option<PaneId> {
-        self.attachments.showing(self.windows.catalog.focused()?)
+        self.attachments.owner(self.windows.catalog.focused()?)
     }
 
     fn pane_has_window(&self, pane: PaneId) -> bool {

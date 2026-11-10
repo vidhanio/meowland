@@ -34,7 +34,7 @@ impl XdgSystemBellHandler for Compositor {
         let Some(window) = window else {
             return;
         };
-        let Some(pane) = self.attachments.showing(window) else {
+        let Some(pane) = self.attachments.owner(window) else {
             return;
         };
         let now = Instant::now();

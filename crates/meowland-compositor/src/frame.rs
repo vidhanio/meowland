@@ -292,7 +292,7 @@ impl Compositor {
                 continue;
             }
             let interval =
-                if self.attachments.showing(id).is_some() && self.windows.catalog.drawable(id) {
+                if !self.attachments.showing(id).is_empty() && self.windows.catalog.drawable(id) {
                     self.refresh_rate.interval()
                 } else {
                     Duration::from_secs(1)
@@ -315,7 +315,7 @@ impl Compositor {
     }
 
     pub(crate) fn resume_callbacks(&mut self, window: super::WindowId) {
-        if self.attachments.showing(window).is_some()
+        if !self.attachments.showing(window).is_empty()
             && let Some(window) = self.windows.by_id.get_mut(&window)
         {
             window.callback_due = window

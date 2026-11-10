@@ -133,7 +133,7 @@ impl Compositor {
         let window = selector
             .map_or_else(
                 || self.windows.catalog.focused(),
-                |selector| self.windows.catalog.select(selector, |_| true),
+                |selector| self.windows.catalog.select(selector),
             )
             .and_then(|id| self.windows.by_id.get(&id))
             .ok_or(CloseWindowError)?;
@@ -141,20 +141,15 @@ impl Compositor {
         Ok(())
     }
 
-    /// The window a target selects among the `available` ones.
-    pub(crate) fn selected_window(
-        &self,
-        target: &Target,
-        available: impl Fn(WindowId) -> bool,
-    ) -> Option<WindowId> {
+    pub(crate) fn selected_window(&self, target: &Target) -> Option<WindowId> {
         match target {
-            Target::Selector(selector) => self.windows.catalog.select(selector, available),
+            Target::Selector(selector) => self.windows.catalog.select(selector),
             Target::Activation(token) => self
                 .protocols
                 .launches
                 .get(token)
                 .and_then(|launch| launch.window)
-                .filter(|&window| self.windows.catalog.drawable(window) && available(window)),
+                .filter(|&window| self.windows.catalog.drawable(window)),
         }
     }
 

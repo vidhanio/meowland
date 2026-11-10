@@ -7,40 +7,28 @@ use smithay::utils::{Logical, Size};
 use super::{AttachedPane, Compositor, PaneId, ServerToPane, WindowId, frame::PaneState, input};
 
 impl Compositor {
-    /// The size of the pane showing a window, else the output mode.
+    /// The size of the window's owning pane, else the output mode.
     pub(crate) fn pane_size(&self, window: WindowId) -> Size<i32, Logical> {
-        self.shown_state(window).map_or(self.mode, |state| {
-            self.logical_size(state.size.width(), state.size.height())
-        })
+        self.attachments
+            .owner(window)
+            .and_then(|pane| self.attachments.get(pane))
+            .map_or(self.mode, |entry| {
+                self.logical_size(entry.state.size.width(), entry.state.size.height())
+            })
     }
 
-    /// Presentation of the pane showing a window.
-    pub(crate) fn shown_state(&self, window: WindowId) -> Option<&PaneState> {
-        let pane = self.attachments.showing(window)?;
-        self.attachments.get(pane).map(|entry| &entry.state)
-    }
-
-    /// Mark the content of the pane showing a window as stale.
+    /// Mark the content of every pane showing a window as stale.
     pub(crate) fn touch(&mut self, window: WindowId) {
-        if let Some(pane) = self.attachments.showing(window)
-            && let Some(state) = self.attachments.state_mut(pane)
-        {
-            state.mark_dirty();
+        for pane in self.attachments.showing(window).to_vec() {
+            if let Some(state) = self.attachments.state_mut(pane) {
+                state.mark_dirty();
+            }
         }
     }
 
     /// Whether any pane has a frame waiting for dispatch.
     pub(crate) fn frames_due(&self) -> bool {
         self.attachments.iter().any(|(_, entry)| entry.state.due())
-    }
-
-    /// Windows a pane may select: those no other pane shows.
-    pub(crate) fn available_to(&self, pane: PaneId) -> impl Fn(WindowId) -> bool + '_ {
-        move |window| {
-            self.attachments
-                .showing(window)
-                .is_none_or(|shown| shown == pane)
-        }
     }
 
     /// Remove every pane-keyed entry, returning the window the pane showed.
@@ -71,6 +59,9 @@ impl Compositor {
         }
         if let Some(window) = removed.as_ref().and_then(AttachedPane::window) {
             self.leave_output(window);
+            if !self.attachments.showing(window).is_empty() {
+                self.apply_window_state(window);
+            }
         }
         removed
     }
@@ -87,7 +78,9 @@ impl Compositor {
         let Some(window) = self.remove_pane(pane) else {
             return;
         };
-        if self.windows.catalog.focused() == Some(window) {
+        if self.windows.catalog.focused() == Some(window)
+            && self.attachments.showing(window).is_empty()
+        {
             let next = self
                 .attachments
                 .windows()
@@ -128,14 +121,9 @@ impl Compositor {
             self.emit(pane, ServerToPane::Release("no such activation".into()));
             return;
         }
-        let window = self.selected_window(&target, self.available_to(pane));
+        let window = self.selected_window(&target);
         if window.is_none() && follow == Follow::Current {
-            let reason = if self.selected_window(&target, |_| true).is_some() {
-                "the window is shown in another pane"
-            } else {
-                "no such window"
-            };
-            self.emit(pane, ServerToPane::Release(reason.into()));
+            self.emit(pane, ServerToPane::Release("no such window".into()));
             return;
         }
         let replaced = if self.attachments.contains(pane) {
@@ -185,6 +173,9 @@ impl Compositor {
             }
             if let Some(previous) = previous {
                 self.leave_output(previous);
+                if !self.attachments.showing(previous).is_empty() {
+                    self.apply_window_state(previous);
+                }
             }
         }
         self.resume_callbacks(window);
@@ -195,45 +186,49 @@ impl Compositor {
     }
 
     pub(crate) fn resolve_pending_panes(&mut self) {
-        let waiting: Vec<_> = self
+        let ready: Vec<_> = self
             .attachments
             .iter()
-            .filter(|(_, entry)| entry.window().is_none())
-            .map(|(pane, _)| pane)
+            .filter_map(|(pane, entry)| {
+                self.selected_window(entry.waiting()?)
+                    .map(|window| (pane, window))
+            })
             .collect();
-        for pane in waiting {
-            let window = self
-                .attachments
-                .get(pane)
-                .and_then(AttachedPane::waiting)
-                .and_then(|target| self.selected_window(target, self.available_to(pane)));
-            if let Some(window) = window {
-                self.show_pane_window(pane, window);
-            }
+        for (pane, window) in ready {
+            self.show_pane_window(pane, window);
         }
     }
 
-    /// Return a pane following every match of a window that went away to
-    /// waiting, rebind it to another matching window, or tell it to wait.
-    pub(crate) fn unbind_following_pane(&mut self, window: WindowId) {
-        let Some(pane) = self.attachments.showing(window).filter(|&pane| {
-            self.attachments
-                .get(pane)
-                .is_some_and(|entry| entry.follow == Follow::Every)
-        }) else {
-            return;
-        };
-        self.attachments.unbind(pane);
-        if let Some(state) = self.attachments.state_mut(pane) {
-            state.mark_dirty();
+    /// Return panes following every match of a window that went away to
+    /// waiting, rebind them to other matching windows, and tell the rest to
+    /// wait.
+    pub(crate) fn unbind_following_panes(&mut self, window: WindowId) {
+        let following: Vec<_> = self
+            .attachments
+            .showing(window)
+            .iter()
+            .copied()
+            .filter(|&pane| {
+                self.attachments
+                    .get(pane)
+                    .is_some_and(|entry| entry.follow == Follow::Every)
+            })
+            .collect();
+        for &pane in &following {
+            self.attachments.unbind(pane);
+            if let Some(state) = self.attachments.state_mut(pane) {
+                state.mark_dirty();
+            }
         }
         self.resolve_pending_panes();
-        if self
-            .attachments
-            .get(pane)
-            .is_some_and(|entry| entry.window().is_none())
-        {
-            self.emit(pane, ServerToPane::Waiting);
+        for pane in following {
+            if self
+                .attachments
+                .get(pane)
+                .is_some_and(|entry| entry.window().is_none())
+            {
+                self.emit(pane, ServerToPane::Waiting);
+            }
         }
     }
 }
@@ -280,39 +275,50 @@ mod tests {
     }
 
     #[test]
-    fn panes_matching_the_same_app_show_distinct_windows() {
+    fn panes_share_a_window_that_takes_the_size_of_its_last_input_pane() {
         let mut fixture = Fixture::new();
-        let older = fixture.toplevel("app");
-        fixture.present(&older.surface, 4, 4, [0, 0, 0, 255]);
-        let newer = fixture.toplevel("app");
-        fixture.present(&newer.surface, 4, 4, [0, 0, 0, 255]);
+        let app = fixture.toplevel("app");
+        fixture.present(&app.surface, 4, 4, [0, 0, 0, 255]);
+        let window = fixture.window(&app);
         let target = Target::Selector(Selector::AppId("app".into()));
-        let (first, second, third) = (PaneId::from(1), PaneId::from(2), PaneId::from(3));
+        let (first, second) = (PaneId::from(1), PaneId::from(2));
+        let small = FrameSize::new(64, 64).expect("small pane");
+        let large = FrameSize::new(128, 96).expect("large pane");
+        let state = &mut fixture.state;
+        state.focus_pane(first, target.clone(), Follow::Current, small);
+        state.focus_pane(second, target, Follow::Current, large);
+        assert_eq!(shown(&fixture, first), Some(window));
+        assert_eq!(shown(&fixture, second), Some(window));
+        let small_logical = fixture.state.logical_size(64, 64);
+        let large_logical = fixture.state.logical_size(128, 96);
+        assert_eq!(fixture.state.pane_size(window), small_logical);
 
-        fixture
-            .state
-            .focus_pane(first, target.clone(), Follow::Current, size());
-        fixture
-            .state
-            .focus_pane(second, target.clone(), Follow::Current, size());
-        assert_eq!(shown(&fixture, first), Some(fixture.window(&newer)));
-        assert_eq!(shown(&fixture, second), Some(fixture.window(&older)));
-
-        fixture.state.drain_events().for_each(drop);
-        fixture
-            .state
-            .focus_pane(third, target, Follow::Current, size());
-        assert!(!fixture.state.attachments.contains(third));
-        let released: Vec<_> = fixture
+        fixture.state.dispatch_frames();
+        let framed: std::collections::HashSet<_> = fixture
             .state
             .drain_events()
-            .filter(|event| event.pane == third)
-            .map(|event| event.message)
+            .filter(|event| {
+                matches!(
+                    event.message,
+                    ServerToPane::Frame(_) | ServerToPane::SharedFrame(_)
+                )
+            })
+            .map(|event| event.pane)
             .collect();
-        assert!(
-            matches!(released.as_slice(), [ServerToPane::Release(_)]),
-            "{released:?}"
-        );
+        assert_eq!(framed, [first, second].into());
+
+        let pointer = meowland_protocol::Input::Pointer {
+            x: 1.0,
+            y: 1.0,
+            button: None,
+            scroll: meowland_protocol::Scroll::default(),
+        };
+        input::pane_input(&mut fixture.state, second, &pointer);
+        assert_eq!(fixture.state.pane_size(window), large_logical);
+
+        fixture.state.release_pane_window(second);
+        assert_eq!(fixture.state.pane_size(window), small_logical);
+        assert_eq!(shown(&fixture, first), Some(window));
     }
 
     #[test]

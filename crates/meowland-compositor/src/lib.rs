@@ -3,7 +3,7 @@
 //! Client buffers are copied on commit so later client writes cannot tear a
 //! frame in transit to a terminal.
 
-use std::{collections::HashMap, sync::Mutex, time::Instant};
+use std::{collections::HashMap, time::Instant};
 
 use meowland_core::{scale::UiScale, timing::RefreshRate};
 use meowland_protocol::{ServerToPane, Shortcuts, WindowInfo};
@@ -15,7 +15,7 @@ use smithay::{
     reexports::wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
     utils::{Logical, Size},
     wayland::{
-        compositor::{CompositorState, SurfaceData, get_parent, with_states},
+        compositor::{CompositorState, get_parent},
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufFeedbackBuilder, DmabufState},
         fractional_scale::FractionalScaleManagerState,
@@ -134,7 +134,7 @@ struct Input {
     pointer: PointerHandle<Compositor>,
     cursor: seat::CursorState,
     popup_grab: Option<PopupGrab<Compositor>>,
-    /// Most recent input source, also used to route selection exports.
+    /// Pane the most recent input came from, which shows the cursor.
     last_input_pane: Option<PaneId>,
 }
 
@@ -179,39 +179,6 @@ impl std::fmt::Debug for Compositor {
             .field("panes", &self.attachments.len())
             .field("shutdown", &self.shutdown)
             .finish_non_exhaustive()
-    }
-}
-
-/// Cached toplevel ownership of one surface, stored in its data map.
-///
-/// Surface data maps are append-only, so the value is mutable in place and
-/// can be cleared when the owning window goes away.
-#[derive(Debug, Default)]
-struct SurfaceOwner(Mutex<Option<WindowId>>);
-
-fn cached_owner(surface: &WlSurface) -> Option<WindowId> {
-    with_states(surface, |states| {
-        let owner = states.data_map.get::<SurfaceOwner>()?;
-        *owner.0.lock().expect("surface owner lock poisoned")
-    })
-}
-
-fn cache_owner(surface: &WlSurface, window: WindowId) {
-    with_states(surface, |states| {
-        *states
-            .data_map
-            .get_or_insert(SurfaceOwner::default)
-            .0
-            .lock()
-            .expect("surface owner lock poisoned") = Some(window);
-    });
-}
-
-/// Takes the surface's already-locked state, because surface-tree walks hold
-/// that lock while visiting and re-locking it would deadlock.
-fn clear_owner(states: &SurfaceData) {
-    if let Some(owner) = states.data_map.get::<SurfaceOwner>() {
-        *owner.0.lock().expect("surface owner lock poisoned") = None;
     }
 }
 
@@ -370,23 +337,12 @@ impl Compositor {
             .reduce(|bound, pane| (bound.0.max(pane.0), bound.1.max(pane.1)))
     }
 
+    /// The toplevel a surface belongs to, walking its current subsurface and
+    /// popup parents.
     fn window_for_surface(&self, surface: &WlSurface) -> Option<WindowId> {
-        if let Some(window) = self.windows.id_by_surface.get(surface) {
-            return Some(*window);
-        }
-        if let Some(window) = cached_owner(surface) {
-            return Some(window);
-        }
         let mut current = surface.clone();
         for _ in 0..64 {
-            let owner = self
-                .windows
-                .id_by_surface
-                .get(&current)
-                .copied()
-                .or_else(|| cached_owner(&current));
-            if let Some(window) = owner {
-                cache_owner(surface, window);
+            if let Some(&window) = self.windows.id_by_surface.get(&current) {
                 return Some(window);
             }
             current = match self.windows.popups.find_popup(&current) {

@@ -68,11 +68,49 @@ enum Lifecycle {
     Closed,
 }
 
+/// A change to what the terminal shows for the window besides its pixels.
+enum WindowUpdate {
+    Title(String),
+    Cursor(Option<String>),
+    Copy(Vec<u8>),
+}
+
+impl WindowUpdate {
+    fn bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Title(title) => title_bytes(title),
+            Self::Cursor(shape) => cursor_bytes(shape.as_deref()),
+            Self::Copy(text) => copy_bytes(text),
+        }
+    }
+}
+
+/// The latest window updates received while no window was presented.
 #[derive(Default)]
 struct PendingWindow {
     title: Option<String>,
     cursor: Option<String>,
     copy: Option<Vec<u8>>,
+}
+
+impl PendingWindow {
+    fn keep(&mut self, update: WindowUpdate) {
+        match update {
+            WindowUpdate::Title(title) => self.title = Some(title),
+            WindowUpdate::Cursor(shape) => self.cursor = shape,
+            WindowUpdate::Copy(text) => self.copy = Some(text),
+        }
+    }
+
+    /// Updates that bring a freshly presented window up to date. The cursor
+    /// is always applied, resetting a shape left by an earlier window.
+    fn updates(self) -> impl Iterator<Item = WindowUpdate> {
+        self.title
+            .map(WindowUpdate::Title)
+            .into_iter()
+            .chain([WindowUpdate::Cursor(self.cursor)])
+            .chain(self.copy.map(WindowUpdate::Copy))
+    }
 }
 
 enum Ready {
@@ -290,26 +328,12 @@ impl TerminalSession {
             ServerToPane::Copy(text) => {
                 if text.len() > MAX_TEXT {
                     tracing::warn!("Ignoring copied text larger than {MAX_TEXT} bytes");
-                } else if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.presentation.append(&copy_bytes(&text));
                 } else {
-                    self.window.copy = Some(text);
+                    self.update_window(WindowUpdate::Copy(text));
                 }
             }
-            ServerToPane::Title(title) => {
-                if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.presentation.append(&title_bytes(&title));
-                } else {
-                    self.window.title = Some(title);
-                }
-            }
-            ServerToPane::Cursor(shape) => {
-                if matches!(self.lifecycle, Lifecycle::Active(_)) {
-                    self.presentation.append(&cursor_bytes(shape.as_deref()));
-                } else {
-                    self.window.cursor = shape;
-                }
-            }
+            ServerToPane::Title(title) => self.update_window(WindowUpdate::Title(title)),
+            ServerToPane::Cursor(shape) => self.update_window(WindowUpdate::Cursor(shape)),
             ServerToPane::Frame(band) => {
                 self.present(|presentation, tx| presentation.draw(&band, tx))
                     .await?;
@@ -345,18 +369,18 @@ impl TerminalSession {
         Ok(())
     }
 
-    fn apply_pending_window(&mut self) {
-        let PendingWindow {
-            title,
-            cursor,
-            copy,
-        } = std::mem::take(&mut self.window);
-        if let Some(title) = title {
-            self.presentation.append(&title_bytes(&title));
+    /// Show a window update now, or keep it until presentation starts.
+    fn update_window(&mut self, update: WindowUpdate) {
+        if matches!(self.lifecycle, Lifecycle::Active(_)) {
+            self.presentation.append(&update.bytes());
+        } else {
+            self.window.keep(update);
         }
-        self.presentation.append(&cursor_bytes(cursor.as_deref()));
-        if let Some(text) = copy {
-            self.presentation.append(&copy_bytes(&text));
+    }
+
+    fn apply_pending_window(&mut self) {
+        for update in std::mem::take(&mut self.window).updates() {
+            self.presentation.append(&update.bytes());
         }
     }
 

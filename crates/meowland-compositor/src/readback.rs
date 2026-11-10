@@ -536,7 +536,7 @@ fn complete(host: &mut Compositor, id: u64, fence: impl std::os::fd::AsFd) -> Po
     if let Ok(surface) = operation.surface.upgrade()
         && let Some(gpu) = host.gpu.as_mut()
     {
-        let mut spare = host.windows.surface_cache.spares.remove(&surface);
+        let mut spare = host.windows.surface_cache.take_spare(&surface);
         match gpu.complete(readback, &mut spare) {
             Ok(snapshot) => {
                 let mut fill = operation.slot.lock();
@@ -550,7 +550,7 @@ fn complete(host: &mut Compositor, id: u64, fence: impl std::os::fd::AsFd) -> Po
             Err(error) => tracing::warn!(%error, "DMA-BUF readback failed"),
         }
         if let Some(spare) = spare {
-            host.windows.surface_cache.spares.insert(surface, spare);
+            host.windows.surface_cache.return_spare(&surface, spare);
         }
     }
     let client = operation.client.clone();

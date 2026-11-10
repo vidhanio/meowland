@@ -30,6 +30,8 @@ use wayland_client::{
         wl_seat::WlSeat,
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
+        wl_subcompositor::WlSubcompositor,
+        wl_subsurface::WlSubsurface,
         wl_surface::WlSurface,
     },
 };
@@ -188,6 +190,8 @@ delegate_noop!(App: ignore WlSeat);
 delegate_noop!(App: ignore WlShm);
 delegate_noop!(App: ignore WlSurface);
 delegate_noop!(App: ignore WlBuffer);
+delegate_noop!(App: WlSubcompositor);
+delegate_noop!(App: ignore WlSubsurface);
 delegate_noop!(App: ignore XdgToplevel);
 delegate_noop!(App: WpViewporter);
 delegate_noop!(App: WpViewport);
@@ -283,6 +287,7 @@ pub(crate) struct Fixture {
     qh: QueueHandle<App>,
     pub app: App,
     compositor: WlCompositor,
+    subcompositor: WlSubcompositor,
     shm: WlShm,
     wm_base: XdgWmBase,
     viewporter: WpViewporter,
@@ -315,6 +320,7 @@ impl Fixture {
         };
         partial.roundtrip();
         let compositor: WlCompositor = partial.bind(&registry, 6);
+        let subcompositor: WlSubcompositor = partial.bind(&registry, 1);
         let shm: WlShm = partial.bind(&registry, 1);
         let wm_base: XdgWmBase = partial.bind(&registry, 6);
         let viewporter: WpViewporter = partial.bind(&registry, 1);
@@ -347,6 +353,7 @@ impl Fixture {
             qh,
             app,
             compositor,
+            subcompositor,
             shm,
             wm_base,
             viewporter,
@@ -430,6 +437,34 @@ impl Fixture {
         self.connection
             .protocol_error()
             .expect("server sent protocol error")
+    }
+
+    /// Place `surface` as a subsurface of `parent` and present it with one
+    /// color once `parent` commits.
+    pub(crate) fn place_subsurface(
+        &mut self,
+        surface: &WlSurface,
+        parent: &WlSurface,
+        pixel: [u8; 4],
+    ) -> WlSubsurface {
+        let role = self
+            .subcompositor
+            .get_subsurface(surface, parent, &self.qh, ());
+        self.present(surface, 2, 2, pixel);
+        parent.commit();
+        self.roundtrip();
+        role
+    }
+
+    /// A new surface placed as a subsurface of `parent`.
+    pub(crate) fn subsurface(
+        &mut self,
+        parent: &WlSurface,
+        pixel: [u8; 4],
+    ) -> (WlSurface, WlSubsurface) {
+        let surface = self.compositor.create_surface(&self.qh, ());
+        let role = self.place_subsurface(&surface, parent, pixel);
+        (surface, role)
     }
 
     /// Create a toplevel with an app ID and acknowledge its initial

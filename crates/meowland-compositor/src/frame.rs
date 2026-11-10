@@ -345,7 +345,7 @@ impl Compositor {
                 .and_then(|id| windows.by_id.get(&id))
                 .map(|window| window.surface.wl_surface());
             if let Some(message) =
-                state.frame(renderer, root, &windows.surface_cache.snapshots, scale)
+                state.frame(renderer, root, windows.surface_cache.snapshots(), scale)
             {
                 events.push(Event { pane, message });
             }

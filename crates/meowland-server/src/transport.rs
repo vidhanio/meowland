@@ -207,7 +207,7 @@ impl PaneTransport {
         let Link::Open { sender, .. } = &self.link else {
             return Sent::Released;
         };
-        let Ok(size) = postcard::experimental::serialized_size(&message) else {
+        let Ok(size) = Outgoing::pane_packet_size(&message) else {
             return Sent::Rejected;
         };
         let bytes = size + std::mem::size_of::<Queued>();

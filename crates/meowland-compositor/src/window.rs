@@ -11,7 +11,7 @@ use smithay::{
     wayland::compositor::{BufferAssignment, SurfaceData},
 };
 
-use super::{Compositor, Remap, ServerToPane, Window, WindowId, WlSurface, clear_owner, input};
+use super::{Compositor, Remap, ServerToPane, Window, WindowId, WlSurface, input};
 
 impl Window {
     fn with_surface_trees(&self, mut visit: impl FnMut(&WlSurface)) {
@@ -65,7 +65,7 @@ impl Compositor {
         let Some(id) = self.windows.id_by_surface.get(surface).copied() else {
             return;
         };
-        if self.windows.surface_cache.snapshots.contains_key(surface) {
+        if self.windows.surface_cache.snapshots().contains_key(surface) {
             self.map_window(id);
         } else {
             self.unmap_window(id);
@@ -101,14 +101,26 @@ impl Compositor {
         }
         self.unbind_following_panes(id);
         if focused {
-            let next = self
-                .attachments
-                .windows()
-                .find(|&id| self.windows.catalog.drawable(id))
-                .or_else(|| self.windows.catalog.newest());
-            if let Some(next) = next {
-                self.focus_window(next);
-            }
+            self.restore_focus();
+        }
+    }
+
+    /// After the focused window stopped being shown or drawn, focus a window
+    /// a pane shows; without one, keep the focus, or take the newest window
+    /// when nothing has it.
+    pub(crate) fn restore_focus(&mut self) {
+        let next = self
+            .attachments
+            .windows()
+            .find(|&id| self.windows.catalog.drawable(id))
+            .or_else(|| {
+                self.windows
+                    .catalog
+                    .focused()
+                    .or_else(|| self.windows.catalog.newest())
+            });
+        if let Some(next) = next {
+            self.focus_window(next);
         }
     }
 
@@ -119,18 +131,12 @@ impl Compositor {
             self.remove_pane(pane);
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }
-        let surfaces: Vec<_> = self
-            .windows
-            .surface_cache
-            .surfaces()
-            .filter(|surface| self.window_for_surface(surface) == Some(id))
-            .cloned()
-            .collect();
-        for surface in surfaces {
-            self.windows.surface_cache.forget(&surface);
-        }
         if let Some(window) = self.windows.by_id.remove(&id) {
-            window.with_surfaces(|_, states| clear_owner(states));
+            let mut surfaces = Vec::new();
+            window.with_surfaces(|surface, _| surfaces.push(surface.clone()));
+            for surface in &surfaces {
+                self.windows.surface_cache.forget(surface);
+            }
             self.windows
                 .id_by_surface
                 .remove(window.surface.wl_surface());
@@ -217,11 +223,58 @@ mod tests {
         let mut fixture = Fixture::new();
         let toplevel = fixture.toplevel("app");
         fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
-        assert_ne!(fixture.state.windows.surface_cache.surfaces().count(), 0);
+        let _child = fixture.subsurface(&toplevel.surface, [255, 0, 0, 255]);
+        assert_eq!(fixture.state.windows.surface_cache.snapshots().len(), 2);
 
         toplevel.role.destroy();
         toplevel.xdg.destroy();
         fixture.roundtrip();
         assert_eq!(fixture.state.windows.surface_cache.surfaces().count(), 0);
+    }
+
+    #[test]
+    fn a_reparented_subsurface_belongs_to_its_new_window() {
+        use smithay::reexports::wayland_server::Resource as _;
+        use wayland_client::Proxy as _;
+
+        let mut fixture = Fixture::new();
+        let first = fixture.toplevel("first");
+        fixture.present(&first.surface, 4, 4, [0, 0, 0, 255]);
+        let second = fixture.toplevel("second");
+        fixture.present(&second.surface, 4, 4, [0, 0, 0, 255]);
+        let (child, role) = fixture.subsurface(&first.surface, [255, 0, 0, 255]);
+        let id = child.id().protocol_id();
+        let owner = |fixture: &Fixture| {
+            let surface = fixture
+                .state
+                .windows
+                .surface_cache
+                .snapshots()
+                .keys()
+                .find(|surface| surface.id().protocol_id() == id)
+                .expect("the child has pixels")
+                .clone();
+            fixture.state.window_for_surface(&surface)
+        };
+        assert_eq!(owner(&fixture), Some(fixture.window(&first)));
+
+        role.destroy();
+        let _role = fixture.place_subsurface(&child, &second.surface, [0, 255, 0, 255]);
+        assert_eq!(owner(&fixture), Some(fixture.window(&second)));
+    }
+
+    #[test]
+    fn a_readback_finishing_after_its_surface_was_forgotten_keeps_no_spare() {
+        let mut fixture = Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        let surface = fixture.state.windows.by_id[&fixture.window(&toplevel)]
+            .surface
+            .wl_surface()
+            .clone();
+        let cache = &mut fixture.state.windows.surface_cache;
+        cache.forget(&surface);
+        cache.return_spare(&surface, crate::Snapshot::single_pixel([0, 0, 0, 255]));
+        assert_eq!(cache.surfaces().count(), 0);
     }
 }

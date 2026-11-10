@@ -256,7 +256,7 @@ fn pointer_input(
     let hit = root.and_then(|root| {
         state
             .renderer
-            .hit_test(root, &state.windows.surface_cache.snapshots, x, y)
+            .hit_test(root, state.windows.surface_cache.snapshots(), x, y)
     });
     let location = Point::from((x, y));
     state.dispatch_pointer(|state, pointer| {

@@ -48,6 +48,7 @@ pub(crate) enum CursorDelivery {
 #[derive(Default)]
 pub(crate) struct CursorState {
     pub shape: Option<String>,
+    /// The one pane showing an application cursor, and that cursor.
     pub sent: Option<(PaneId, Option<String>)>,
     delivery: CursorDelivery,
 }
@@ -152,13 +153,21 @@ impl Compositor {
         }
     }
 
+    /// Show `shape` in `pane`, first clearing an application cursor another
+    /// pane still shows: only the pane receiving input shows one.
     fn send_cursor(&mut self, pane: PaneId, shape: Option<String>) {
-        let cursor = (pane, shape);
-        if self.input.cursor.sent.as_ref() == Some(&cursor) {
-            return;
+        match self.input.cursor.sent.take() {
+            Some(sent) if sent == (pane, shape.clone()) => {
+                self.input.cursor.sent = Some(sent);
+                return;
+            }
+            Some((previous, Some(_))) if previous != pane => {
+                self.emit(previous, ServerToPane::Cursor(None));
+            }
+            _ => {}
         }
-        self.emit(pane, ServerToPane::Cursor(cursor.1.clone()));
-        self.input.cursor.sent = Some(cursor);
+        self.emit(pane, ServerToPane::Cursor(shape.clone()));
+        self.input.cursor.sent = Some((pane, shape));
     }
 }
 

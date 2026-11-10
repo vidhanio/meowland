@@ -1,6 +1,6 @@
 //! Surface commits, copied snapshots, and buffer protocol handling.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use smithay::{
     backend::{allocator::dmabuf::Dmabuf, renderer::buffer_dimensions},
@@ -24,29 +24,86 @@ use smithay::{
 
 use super::{Compositor, Snapshot, readback, render, runtime::ClientState};
 
+/// What the compositor retains per surface: the pixels the renderer reads,
+/// and the bookkeeping that produces them. Every mutation goes through these
+/// methods, so forgetting a surface clears both together.
 #[derive(Default)]
 pub(crate) struct SurfaceCache {
-    pub snapshots: HashMap<WlSurface, Snapshot>,
-    pub spares: HashMap<WlSurface, Snapshot>,
-    missed: HashSet<WlSurface>,
-    buffer_sizes: HashMap<WlSurface, Size<i32, Buffer>>,
+    snapshots: HashMap<WlSurface, Snapshot>,
+    entries: HashMap<WlSurface, Entry>,
+}
+
+#[derive(Default)]
+struct Entry {
+    /// Pixel storage of a replaced DMA-BUF snapshot, reused by the next
+    /// readback.
+    spare: Option<Snapshot>,
+    /// The last new buffer produced no snapshot, so the next one is copied
+    /// whole.
+    missed: bool,
+    /// Size of the buffer the client last attached, which its viewport must
+    /// fit even when the compositor kept older pixels.
+    buffer_size: Option<Size<i32, Buffer>>,
 }
 
 impl SurfaceCache {
+    /// Pixels of every surface with a usable buffer.
+    pub(crate) const fn snapshots(&self) -> &HashMap<WlSurface, Snapshot> {
+        &self.snapshots
+    }
+
     pub(crate) fn forget(&mut self, surface: &WlSurface) {
         self.snapshots.remove(surface);
-        self.spares.remove(surface);
-        self.missed.remove(surface);
-        self.buffer_sizes.remove(surface);
+        self.entries.remove(surface);
+    }
+
+    /// Take the storage a readback for `surface` may fill.
+    pub(crate) fn take_spare(&mut self, surface: &WlSurface) -> Option<Snapshot> {
+        self.entries.get_mut(surface)?.spare.take()
+    }
+
+    /// Return unused readback storage, unless the surface's pixels were
+    /// forgotten while the readback ran.
+    pub(crate) fn return_spare(&mut self, surface: &WlSurface, spare: Snapshot) {
+        if self.snapshots.contains_key(surface) {
+            self.entries.entry(surface.clone()).or_default().spare = Some(spare);
+        }
+    }
+
+    /// Start replacing a surface's pixels: whether the last new buffer was
+    /// missed, and the current snapshot to patch or recycle.
+    fn begin(&mut self, surface: &WlSurface) -> (bool, Option<Snapshot>) {
+        let missed = self.entries.get(surface).is_some_and(|entry| entry.missed);
+        (missed, self.snapshots.remove(surface))
+    }
+
+    /// Adopt a new snapshot, or keep `previous` and remember the miss when
+    /// there is none. Returns whether this recovered from a miss, and the
+    /// replaced snapshot.
+    fn finish(
+        &mut self,
+        surface: &WlSurface,
+        snapshot: Option<Snapshot>,
+        previous: Option<Snapshot>,
+    ) -> (bool, Option<Snapshot>) {
+        let entry = self.entries.entry(surface.clone()).or_default();
+        let was_missed = std::mem::replace(&mut entry.missed, snapshot.is_none());
+        let recovered = snapshot.is_some() && was_missed;
+        let (current, replaced) = if snapshot.is_some() {
+            (snapshot, previous)
+        } else {
+            (previous, None)
+        };
+        if let Some(current) = current {
+            self.snapshots.insert(surface.clone(), current);
+        }
+        (recovered, replaced)
     }
 
     /// Every surface with cached state.
+    #[cfg(test)]
     pub(crate) fn surfaces(&self) -> impl Iterator<Item = &WlSurface> {
-        self.snapshots
-            .keys()
-            .chain(self.spares.keys())
-            .chain(self.missed.iter())
-            .chain(self.buffer_sizes.keys())
+        self.snapshots.keys().chain(self.entries.keys())
     }
 
     fn valid_viewport(
@@ -56,20 +113,24 @@ impl SurfaceCache {
         scale: i32,
         transform: Transform,
     ) -> bool {
-        match assignment {
+        let size = match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
-                if let Some(size) = buffer_dimensions(buffer) {
-                    self.buffer_sizes.insert(surface.clone(), size);
-                } else {
-                    self.buffer_sizes.remove(surface);
-                }
+                let size = buffer_dimensions(buffer);
+                self.entries.entry(surface.clone()).or_default().buffer_size = size;
+                size
             }
             Some(BufferAssignment::Removed) => {
-                self.buffer_sizes.remove(surface);
+                if let Some(entry) = self.entries.get_mut(surface) {
+                    entry.buffer_size = None;
+                }
+                None
             }
-            None => {}
-        }
-        self.buffer_sizes.get(surface).is_none_or(|size| {
+            None => self
+                .entries
+                .get(surface)
+                .and_then(|entry| entry.buffer_size),
+        };
+        size.is_none_or(|size| {
             scale > 0
                 && with_states(surface, |states| {
                     ensure_viewport_valid(states, size.to_logical(scale, transform))
@@ -226,8 +287,7 @@ impl CompositorHandler for Compositor {
         match assignment {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 let bound = render::source_bound(self.pane_bound(surface), scale, transform);
-                let missed = self.windows.surface_cache.missed.contains(surface);
-                let mut previous = self.windows.surface_cache.snapshots.remove(surface);
+                let (missed, mut previous) = self.windows.surface_cache.begin(surface);
                 let single_pixel = get_single_pixel_buffer(&buffer)
                     .ok()
                     .map(|pixel| Snapshot::single_pixel(pixel.rgba8888()));
@@ -258,24 +318,11 @@ impl CompositorHandler for Compositor {
                     }
                 });
                 buffer.release();
-                let snapshot = if let Some(snapshot) = snapshot {
-                    recovered = self.windows.surface_cache.missed.remove(surface);
-                    if dmabuf && let Some(previous) = previous.take() {
-                        self.windows
-                            .surface_cache
-                            .spares
-                            .insert(surface.clone(), previous);
-                    }
-                    Some(snapshot)
-                } else {
-                    self.windows.surface_cache.missed.insert(surface.clone());
-                    previous
-                };
-                if let Some(snapshot) = snapshot {
-                    self.windows
-                        .surface_cache
-                        .snapshots
-                        .insert(surface.clone(), snapshot);
+                let cache = &mut self.windows.surface_cache;
+                let replaced;
+                (recovered, replaced) = cache.finish(surface, snapshot, previous);
+                if dmabuf && let Some(replaced) = replaced {
+                    cache.return_spare(surface, replaced);
                 }
             }
             Some(BufferAssignment::Removed) => self.windows.surface_cache.forget(surface),
@@ -290,7 +337,7 @@ impl CompositorHandler for Compositor {
             let damage = self
                 .windows
                 .surface_cache
-                .snapshots
+                .snapshots()
                 .get(surface)
                 .map_or_default(|snapshot| {
                     let geometry = render::surface_geometry(surface, snapshot);
@@ -400,7 +447,7 @@ mod tests {
         renderer.update(
             &mut scene,
             Some(root),
-            &fixture.state.windows.surface_cache.snapshots,
+            fixture.state.windows.surface_cache.snapshots(),
             FrameSize::new(4, 4).expect("frame size"),
             1.0,
             |_, _| {},
@@ -429,7 +476,7 @@ mod tests {
         let mut composed = Vec::new();
         for _ in 0..500 {
             fixture.roundtrip();
-            let snapshots = &fixture.state.windows.surface_cache.snapshots;
+            let snapshots = &fixture.state.windows.surface_cache.snapshots();
             let root = snapshots
                 .keys()
                 .find(|surface| surface.id().protocol_id() == id);

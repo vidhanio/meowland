@@ -163,6 +163,15 @@ impl Outgoing {
         Ok(())
     }
 
+    /// Encoded body size of a pane message, as [`Self::send_pane`] counts it
+    /// against [`MAX_MESSAGE`].
+    ///
+    /// # Errors
+    /// Returns an error if the message cannot be serialized.
+    pub fn pane_packet_size(message: &ServerToPane) -> io::Result<usize> {
+        postcard::experimental::serialized_size(message).map_err(invalid)
+    }
+
     /// Serialize a packet header into the spare buffer left by the last write.
     fn encode_packet<T: Serialize>(
         &mut self,

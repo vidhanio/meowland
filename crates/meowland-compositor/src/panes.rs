@@ -81,13 +81,7 @@ impl Compositor {
         if self.windows.catalog.focused() == Some(window)
             && self.attachments.showing(window).is_empty()
         {
-            let next = self
-                .attachments
-                .windows()
-                .find(|&id| self.windows.catalog.drawable(id));
-            if let Some(next) = next {
-                self.focus_window(next);
-            }
+            self.restore_focus();
         }
     }
 
@@ -319,6 +313,47 @@ mod tests {
         fixture.state.release_pane_window(second);
         assert_eq!(fixture.state.pane_size(window), small_logical);
         assert_eq!(shown(&fixture, first), Some(window));
+    }
+
+    #[test]
+    fn only_the_pane_receiving_input_shows_the_application_cursor() {
+        let mut fixture = Fixture::new();
+        let app = fixture.toplevel("app");
+        fixture.present(&app.surface, 4, 4, [0, 0, 0, 255]);
+        let target = Target::Selector(Selector::AppId("app".into()));
+        let (first, second) = (PaneId::from(1), PaneId::from(2));
+        for pane in [first, second] {
+            fixture
+                .state
+                .focus_pane(pane, target.clone(), Follow::Current, size());
+        }
+        fixture.state.input.cursor.shape = Some("text".into());
+        let pointer = meowland_protocol::Input::Pointer {
+            x: 1.0,
+            y: 1.0,
+            button: None,
+            scroll: meowland_protocol::Scroll::default(),
+        };
+        let cursors = |fixture: &mut Fixture, pane: PaneId| {
+            fixture.state.drain_events().for_each(drop);
+            input::pane_input(&mut fixture.state, pane, &pointer);
+            fixture
+                .state
+                .drain_events()
+                .filter_map(|event| match event.message {
+                    ServerToPane::Cursor(shape) => Some((event.pane, shape)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            cursors(&mut fixture, first),
+            [(first, Some("text".to_owned()))]
+        );
+        assert_eq!(
+            cursors(&mut fixture, second),
+            [(first, None), (second, Some("text".to_owned()))]
+        );
     }
 
     #[test]

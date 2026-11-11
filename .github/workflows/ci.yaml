@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install libraries
         run: sudo apt-get update && sudo apt-get install --yes libegl-dev libgbm-dev libglvnd-dev libxkbcommon-dev pkg-config
@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install audit tools
         uses: taiki-e/install-action@v2
@@ -76,7 +76,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Nix
         uses: ./.github/actions/setup-nix
@@ -91,7 +91,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Nix
         uses: ./.github/actions/setup-nix

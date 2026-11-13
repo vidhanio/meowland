@@ -45,6 +45,8 @@ meowland --json launch [--] <program> [args...]
 
 Starts `<program>` under the server with the caller's environment and working directory. The server sets `WAYLAND_DISPLAY` and `XDG_ACTIVATION_TOKEN` for it. Success means the server spawned the process, not that a window mapped; poll `list` for it.
 
+From an interactive terminal, `launch` stays running as the pane that owns the app's window, and closing it asks the window to close. From a non-interactive shell the window has no owner until a user claims it with `focus`.
+
 ## `quit`
 
 ```bash

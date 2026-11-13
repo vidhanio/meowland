@@ -60,4 +60,6 @@ close_window = "alt+q"
 detach_pane = "alt+w"
 ```
 
+`close_window` asks the pane's window to close. `detach_pane` releases the pane and leaves its window open without an owner, so another pane can claim it with `meowland focus`; ending a pane any other way asks its window to close.
+
 Omitting the `[shortcuts]` table keeps both default bindings. A present table disables any binding it omits, and an empty string disables a binding. Bindings are modifiers joined to one key with `+`, such as `ctrl+shift+q`.

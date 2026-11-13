@@ -178,8 +178,8 @@ impl KeyBinding {
 pub struct Shortcuts {
     /// Ask the displayed Wayland window to close; `None` disables the binding.
     pub close_window: Option<KeyBinding>,
-    /// Release the terminal pane without closing its window; `None` disables
-    /// the binding.
+    /// Release the terminal pane and leave its window open for another pane
+    /// to claim; `None` disables the binding.
     pub detach_pane: Option<KeyBinding>,
 }
 
@@ -230,7 +230,8 @@ pub const KEY_INSERT: u32 = 57348;
 pub enum Shortcut {
     /// Ask the displayed Wayland window to close.
     CloseWindow,
-    /// Release the terminal pane without closing its window.
+    /// Release the terminal pane and leave its window open for another pane
+    /// to claim.
     DetachPane,
 }
 
@@ -245,25 +246,26 @@ pub enum Selector {
     Title(String),
 }
 
-/// Windows a pane may show.
+/// Windows a pane may own. A pane only ever claims a window no other pane
+/// owns, and asks it to close when the pane's connection ends.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Target {
-    /// Show the newest mapped window matching this selector.
+    /// Own the newest unowned mapped window matching this selector.
     Selector(Selector),
-    /// Show the window that redeems this launch's activation token.
+    /// Own the window that redeems this launch's activation token.
     Activation(String),
 }
 
 /// How long a pane keeps matching its [`Target`].
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Follow {
-    /// Show a window that matches now, and release the pane when it closes.
+    /// Own a window that matches now, and release the pane when it closes.
     Current,
     /// Wait for the first matching window, and release the pane when it
     /// closes.
     First,
-    /// Wait for matching windows, moving to another match whenever the shown
-    /// window goes away.
+    /// Wait for matching windows, moving to another unowned match whenever
+    /// the owned window goes away.
     Every,
 }
 

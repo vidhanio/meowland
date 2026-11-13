@@ -66,13 +66,13 @@ An error starting with `cannot reach the server` means no server is listening. D
 
 ## Showing a window to the user
 
-You cannot display a window yourself: a pane needs an interactive Kitty or Ghostty 1.4+ terminal. Give the user the command to run there:
+You cannot display a window yourself: a pane needs an interactive Kitty or Ghostty 1.4+ terminal. Each window is shown by at most one pane, which owns it: closing that terminal asks the window to close. Give the user the command to run there:
 
 ```bash
 meowland focus <id>
 ```
 
-or `meowland focus --app-id <app id> --follow` to keep showing the newest window of that app across restarts. Never run `focus` yourself.
+`focus` only claims a window no other pane owns; it fails with `no such window` when every match is already shown. `meowland focus --app-id <app id> --follow` instead waits for an unowned window of that app and moves to the next one whenever the shown window closes. Never run `focus` yourself.
 
 ## Safety rules
 

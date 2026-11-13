@@ -1,10 +1,10 @@
-//! Pane attachment, window rebinding, and presentation ownership.
+//! Pane attachment, window ownership, and presentation.
 
 use meowland_core::pixels::FrameSize;
 use meowland_protocol::{Follow, Selector, Target};
 use smithay::utils::{Logical, Size};
 
-use super::{AttachedPane, Compositor, PaneId, ServerToPane, WindowId, frame::PaneState, input};
+use super::{Compositor, PaneId, ServerToPane, WindowId, frame::PaneState, input};
 
 impl Compositor {
     /// The size of the window's owning pane, else the output mode.
@@ -17,12 +17,12 @@ impl Compositor {
             })
     }
 
-    /// Mark the content of every pane showing a window as stale.
+    /// Mark the content of the pane owning a window as stale.
     pub(crate) fn touch(&mut self, window: WindowId) {
-        for pane in self.attachments.showing(window).to_vec() {
-            if let Some(state) = self.attachments.state_mut(pane) {
-                state.mark_dirty();
-            }
+        if let Some(pane) = self.attachments.owner(window)
+            && let Some(state) = self.attachments.state_mut(pane)
+        {
+            state.mark_dirty();
         }
     }
 
@@ -31,20 +31,12 @@ impl Compositor {
         self.attachments.iter().any(|(_, entry)| entry.state.due())
     }
 
-    /// Remove every pane-keyed entry, returning the window the pane showed.
+    /// Remove every pane-keyed entry, returning the window the pane owned.
     pub(crate) fn remove_pane(&mut self, pane: PaneId) -> Option<WindowId> {
-        let removed = self.detach_pane(pane)?;
-        self.release_waited_activation(&removed);
-        removed.window()
-    }
-
-    /// [`Self::remove_pane`] without releasing the launch the pane waited
-    /// for, so a replacement attachment can keep waiting for it.
-    fn detach_pane(&mut self, pane: PaneId) -> Option<AttachedPane> {
         if self.input.keyboard_state.owned_by(pane) {
             input::reset_keyboard(self);
         }
-        let removed = self.attachments.remove(pane);
+        let removed = self.attachments.remove(pane)?;
         if self.input.last_input_pane == Some(pane) {
             self.input.last_input_pane = None;
         }
@@ -57,29 +49,36 @@ impl Compositor {
         {
             self.input.cursor.sent = None;
         }
-        if let Some(window) = removed.as_ref().and_then(AttachedPane::window) {
-            self.leave_output(window);
-            if !self.attachments.showing(window).is_empty() {
-                self.apply_window_state(window);
-            }
-        }
-        removed
-    }
-
-    fn release_waited_activation(&mut self, removed: &AttachedPane) {
         if let Some(Target::Activation(token)) = removed.waiting() {
             self.release_activation(token);
         }
+        let window = removed.window();
+        if let Some(window) = window {
+            self.leave_output(window);
+        }
+        window
     }
 
-    /// Move focus to another shown window when the released window had it.
-    /// Empty panes do not block focus restoration.
-    pub(crate) fn release_pane_window(&mut self, pane: PaneId) {
+    /// Remove a pane and ask the window it owned to close.
+    pub(crate) fn close_pane(&mut self, pane: PaneId) {
+        if let Some(window) = self.remove_pane(pane)
+            && let Some(entry) = self.windows.by_id.get(&window)
+        {
+            entry.surface.send_close();
+        }
+    }
+
+    /// Remove a pane, leaving its window open without an owner for a waiting
+    /// or later pane to claim. Focus moves to an owned window when the
+    /// released window had it.
+    pub(crate) fn detach_pane(&mut self, pane: PaneId) {
         let Some(window) = self.remove_pane(pane) else {
             return;
         };
+        self.apply_window_state(window);
+        self.resolve_pending_panes();
         if self.windows.catalog.focused() == Some(window)
-            && self.attachments.showing(window).is_empty()
+            && self.attachments.owner(window).is_none()
         {
             self.restore_focus();
         }
@@ -115,41 +114,42 @@ impl Compositor {
             self.emit(pane, ServerToPane::Release("no such activation".into()));
             return;
         }
-        let window = self.selected_window(&target);
-        if window.is_none() && follow == Follow::Current {
-            self.emit(pane, ServerToPane::Release("no such window".into()));
-            return;
-        }
-        let replaced = if self.attachments.contains(pane) {
-            self.detach_pane(pane)
-        } else {
-            None
-        };
         self.attachments
             .insert(pane, target, follow, PaneState::new(size));
-        if let Some(replaced) = &replaced {
-            self.release_waited_activation(replaced);
-        }
-        if let Some(window) = window {
-            self.show_pane_window(pane, window);
+        match self.selected_window(pane) {
+            Some(window) => self.show_pane_window(pane, window),
+            None if follow == Follow::Current => {
+                self.remove_pane(pane);
+                self.emit(pane, ServerToPane::Release("no such window".into()));
+            }
+            None => {}
         }
     }
 
+    /// The newest window a waiting pane's target matches that no other pane
+    /// owns.
+    fn selected_window(&self, pane: PaneId) -> Option<WindowId> {
+        let available = |window| self.attachments.claimable(pane, window);
+        match self.attachments.get(pane)?.waiting()? {
+            Target::Selector(selector) => self.windows.catalog.select_where(selector, available),
+            Target::Activation(token) => self
+                .protocols
+                .launches
+                .get(token)
+                .and_then(|launch| launch.window)
+                .filter(|&window| self.windows.catalog.drawable(window) && available(window)),
+        }
+    }
+
+    /// Make a pane own a window and focus it. A pane following every match
+    /// of a launch keeps matching the activated window's app ID afterwards.
     fn show_pane_window(&mut self, pane: PaneId, window: WindowId) {
-        self.bind_pane_window(pane, window);
-        self.focus_window(window);
-    }
-
-    /// Show a window in a pane. A pane following every match of a launch
-    /// keeps matching the activated window's app ID afterwards.
-    pub(crate) fn bind_pane_window(&mut self, pane: PaneId, window: WindowId) {
-        let Some((previous, follow)) = self
-            .attachments
-            .get(pane)
-            .map(|entry| (entry.window(), entry.follow))
-        else {
+        let Some(follow) = self.attachments.get(pane).map(|entry| entry.follow) else {
             return;
         };
+        if !self.attachments.claimable(pane, window) {
+            return;
+        }
         if let Some(token) = self.attachments.show(pane, window) {
             self.forget_activation(&token);
             if follow == Follow::Every {
@@ -161,68 +161,49 @@ impl Compositor {
         if let Some(state) = self.attachments.state_mut(pane) {
             state.mark_dirty();
         }
-        if previous != Some(window) {
-            if self.input.keyboard_state.owned_by(pane) {
-                input::reset_keyboard(self);
-            }
-            if let Some(previous) = previous {
-                self.leave_output(previous);
-                if !self.attachments.showing(previous).is_empty() {
-                    self.apply_window_state(previous);
-                }
-            }
+        if self.input.keyboard_state.owned_by(pane) {
+            input::reset_keyboard(self);
         }
         self.resume_callbacks(window);
         self.enter_output(window);
         self.send_title(pane, window);
         self.send_pane_cursor(pane);
         self.apply_window_state(window);
+        self.focus_window(window);
     }
 
+    /// Give each waiting pane the newest unowned window its target matches,
+    /// in pane-identity order.
     pub(crate) fn resolve_pending_panes(&mut self) {
-        let ready: Vec<_> = self
-            .attachments
-            .iter()
-            .filter_map(|(pane, entry)| {
-                self.selected_window(entry.waiting()?)
-                    .map(|window| (pane, window))
-            })
-            .collect();
-        for (pane, window) in ready {
-            self.show_pane_window(pane, window);
+        let waiting: Vec<_> = self.attachments.waiting().collect();
+        for pane in waiting {
+            if let Some(window) = self.selected_window(pane) {
+                self.show_pane_window(pane, window);
+            }
         }
     }
 
-    /// Return panes following every match of a window that went away to
-    /// waiting, rebind them to other matching windows, and tell the rest to
-    /// wait.
-    pub(crate) fn unbind_following_panes(&mut self, window: WindowId) {
-        let following: Vec<_> = self
-            .attachments
-            .showing(window)
-            .iter()
-            .copied()
-            .filter(|&pane| {
-                self.attachments
-                    .get(pane)
-                    .is_some_and(|entry| entry.follow == Follow::Every)
-            })
-            .collect();
-        for &pane in &following {
-            self.attachments.unbind(pane);
-            if let Some(state) = self.attachments.state_mut(pane) {
-                state.mark_dirty();
-            }
+    /// When the pane owning a window that went away follows every match,
+    /// move it to another unowned match, or tell it to wait for one.
+    pub(crate) fn unbind_following_pane(&mut self, window: WindowId) {
+        let Some(pane) = self.attachments.owner(window).filter(|&pane| {
+            self.attachments
+                .get(pane)
+                .is_some_and(|entry| entry.follow == Follow::Every)
+        }) else {
+            return;
+        };
+        self.attachments.unbind(pane);
+        if let Some(state) = self.attachments.state_mut(pane) {
+            state.mark_dirty();
         }
         self.resolve_pending_panes();
-        for pane in following {
-            if self
-                .attachments
-                .get(pane)
-                .is_some_and(|entry| entry.window().is_none())
-            {
-                self.emit(pane, ServerToPane::Waiting);
-            }
+        if self
+            .attachments
+            .get(pane)
+            .is_some_and(|entry| entry.window().is_none())
+        {
+            self.emit(pane, ServerToPane::Waiting);
         }
     }
 }
@@ -230,7 +211,8 @@ impl Compositor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::Fixture;
+    use crate::{AttachedPane, fixture::Fixture};
+    use wayland_client::Proxy as _;
 
     fn messages(fixture: &mut Fixture, pane: PaneId) -> Vec<ServerToPane> {
         fixture.state.dispatch_frames();
@@ -268,64 +250,97 @@ mod tests {
             .and_then(AttachedPane::window)
     }
 
+    fn size() -> FrameSize {
+        FrameSize::new(64, 64).expect("test size")
+    }
+
+    fn app() -> Target {
+        Target::Selector(Selector::AppId("app".into()))
+    }
+
     #[test]
-    fn panes_share_a_window_that_takes_the_size_of_its_last_input_pane() {
+    fn an_owned_window_is_claimed_by_another_pane_only_once_detached() {
         let mut fixture = Fixture::new();
-        let app = fixture.toplevel("app");
-        fixture.present(&app.surface, 4, 4, [0, 0, 0, 255]);
-        let window = fixture.window(&app);
-        let target = Target::Selector(Selector::AppId("app".into()));
-        let (first, second) = (PaneId::from(1), PaneId::from(2));
-        let small = FrameSize::new(64, 64).expect("small pane");
-        let large = FrameSize::new(128, 96).expect("large pane");
-        let state = &mut fixture.state;
-        state.focus_pane(first, target.clone(), Follow::Current, small);
-        state.focus_pane(second, target, Follow::Current, large);
-        assert_eq!(shown(&fixture, first), Some(window));
-        assert_eq!(shown(&fixture, second), Some(window));
-        let small_logical = fixture.state.logical_size(64, 64);
-        let large_logical = fixture.state.logical_size(128, 96);
-        assert_eq!(fixture.state.pane_size(window), small_logical);
-
-        fixture.state.dispatch_frames();
-        let framed: std::collections::HashSet<_> = fixture
+        let toplevel = fixture.toplevel("app");
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        let window = fixture.window(&toplevel);
+        let (owner, current, follower) = (PaneId::from(1), PaneId::from(2), PaneId::from(3));
+        fixture
             .state
-            .drain_events()
-            .filter(|event| {
-                matches!(
-                    event.message,
-                    ServerToPane::Frame(_) | ServerToPane::SharedFrame(_)
-                )
-            })
-            .map(|event| event.pane)
-            .collect();
-        assert_eq!(framed, [first, second].into());
+            .focus_pane(owner, app(), Follow::Current, size());
+        assert_eq!(shown(&fixture, owner), Some(window));
 
-        let pointer = meowland_protocol::Input::Pointer {
-            x: 1.0,
-            y: 1.0,
-            button: None,
-            scroll: meowland_protocol::Scroll::default(),
-        };
-        input::pane_input(&mut fixture.state, second, &pointer);
-        assert_eq!(fixture.state.pane_size(window), large_logical);
+        fixture.state.drain_events().for_each(drop);
+        fixture
+            .state
+            .focus_pane(current, app(), Follow::Current, size());
+        assert!(!fixture.state.attachments.contains(current));
+        assert!(
+            fixture.state.drain_events().any(|event| event.pane == current
+                && matches!(event.message, ServerToPane::Release(_)))
+        );
 
-        fixture.state.release_pane_window(second);
-        assert_eq!(fixture.state.pane_size(window), small_logical);
-        assert_eq!(shown(&fixture, first), Some(window));
+        fixture
+            .state
+            .focus_pane(follower, app(), Follow::Every, size());
+        assert_eq!(shown(&fixture, follower), None);
+
+        fixture.state.detach_pane(owner);
+        fixture.roundtrip();
+        assert_eq!(shown(&fixture, follower), Some(window));
+        assert!(fixture.app.closed.is_empty(), "detaching keeps the window");
+    }
+
+    #[test]
+    fn closing_a_pane_asks_its_window_to_close() {
+        let mut fixture = Fixture::new();
+        let toplevel = fixture.toplevel("app");
+        fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+        let pane = PaneId::from(1);
+        fixture
+            .state
+            .focus_pane(pane, app(), Follow::Current, size());
+
+        fixture.state.close_pane(pane);
+        fixture.roundtrip();
+        assert!(!fixture.state.attachments.contains(pane));
+        assert_eq!(fixture.app.closed, [toplevel.role.id()]);
+    }
+
+    #[test]
+    fn waiting_panes_claim_distinct_windows() {
+        let mut fixture = Fixture::new();
+        let (first, second) = (PaneId::from(1), PaneId::from(2));
+        for pane in [first, second] {
+            fixture.state.focus_pane(pane, app(), Follow::Every, size());
+        }
+
+        let one = fixture.toplevel("app");
+        fixture.present(&one.surface, 4, 4, [0, 0, 0, 255]);
+        let one = fixture.window(&one);
+        assert_eq!(shown(&fixture, first), Some(one));
+        assert_eq!(shown(&fixture, second), None);
+
+        let two = fixture.toplevel("app");
+        fixture.present(&two.surface, 4, 4, [0, 0, 0, 255]);
+        let two = fixture.window(&two);
+        assert_eq!(shown(&fixture, first), Some(one));
+        assert_eq!(shown(&fixture, second), Some(two));
     }
 
     #[test]
     fn only_the_pane_receiving_input_shows_the_application_cursor() {
         let mut fixture = Fixture::new();
-        let app = fixture.toplevel("app");
-        fixture.present(&app.surface, 4, 4, [0, 0, 0, 255]);
-        let target = Target::Selector(Selector::AppId("app".into()));
         let (first, second) = (PaneId::from(1), PaneId::from(2));
-        for pane in [first, second] {
-            fixture
-                .state
-                .focus_pane(pane, target.clone(), Follow::Current, size());
+        for (pane, app_id) in [(first, "first"), (second, "second")] {
+            let toplevel = fixture.toplevel(app_id);
+            fixture.present(&toplevel.surface, 4, 4, [0, 0, 0, 255]);
+            fixture.state.focus_pane(
+                pane,
+                Target::Selector(Selector::AppId(app_id.into())),
+                Follow::Current,
+                size(),
+            );
         }
         fixture.state.input.cursor.shape = Some("text".into());
         let pointer = meowland_protocol::Input::Pointer {
@@ -341,18 +356,15 @@ mod tests {
                 .state
                 .drain_events()
                 .filter_map(|event| match event.message {
-                    ServerToPane::Cursor(shape) => Some((event.pane, shape)),
+                    ServerToPane::Cursor(shape) => Some((event.pane, shape.is_some())),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            cursors(&mut fixture, first),
-            [(first, Some("text".to_owned()))]
-        );
+        assert_eq!(cursors(&mut fixture, first), [(first, true)]);
         assert_eq!(
             cursors(&mut fixture, second),
-            [(first, None), (second, Some("text".to_owned()))]
+            [(first, false), (second, true)]
         );
     }
 
@@ -362,12 +374,7 @@ mod tests {
         let first = fixture.toplevel("app");
         fixture.present(&first.surface, 4, 4, [0, 0, 0, 255]);
         let pane = PaneId::from(1);
-        fixture.state.focus_pane(
-            pane,
-            Target::Selector(Selector::AppId("app".into())),
-            Follow::Every,
-            FrameSize::new(64, 64).expect("test size"),
-        );
+        fixture.state.focus_pane(pane, app(), Follow::Every, size());
         if let Some(state) = fixture.state.attachments.state_mut(pane) {
             state.shared = false;
         }
@@ -401,8 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn release_skips_an_unmapped_attachment_before_a_drawable_one() {
-        let mut fixture = crate::fixture::Fixture::new();
+    fn detaching_skips_an_unmapped_window_when_restoring_focus() {
+        let mut fixture = Fixture::new();
         let first = fixture.toplevel("first");
         fixture.present(&first.surface, 4, 4, [0, 0, 0, 255]);
         let second = fixture.toplevel("second");
@@ -428,12 +435,8 @@ mod tests {
         first.surface.commit();
         fixture.roundtrip();
         fixture.state.focus_window(windows[2]);
-        fixture.state.release_pane_window(PaneId::from(3));
+        fixture.state.detach_pane(PaneId::from(3));
         assert_eq!(fixture.state.windows.catalog.focused(), Some(windows[1]));
-    }
-
-    fn size() -> FrameSize {
-        FrameSize::new(64, 64).expect("test size")
     }
 
     #[test]
@@ -454,50 +457,5 @@ mod tests {
         assert!(fixture.state.protocols.launches.contains_key(&token));
         fixture.state.remove_pane(second);
         assert!(!fixture.state.protocols.launches.contains_key(&token));
-    }
-
-    #[test]
-    fn refocusing_a_pane_releases_the_launch_it_waited_for() {
-        let mut fixture = Fixture::new();
-        let token = fixture.state.create_activation_token();
-        let pane = PaneId::from(1);
-        fixture.state.focus_pane(
-            pane,
-            Target::Activation(token.clone()),
-            Follow::First,
-            size(),
-        );
-
-        fixture.state.focus_pane(
-            pane,
-            Target::Selector(Selector::AppId("app".into())),
-            Follow::First,
-            size(),
-        );
-        assert!(!fixture.state.protocols.launches.contains_key(&token));
-    }
-
-    #[test]
-    fn refocusing_a_pane_on_the_same_launch_keeps_waiting_for_it() {
-        let mut fixture = Fixture::new();
-        let token = fixture.state.create_activation_token();
-        let pane = PaneId::from(1);
-        for _ in 0..2 {
-            fixture.state.focus_pane(
-                pane,
-                Target::Activation(token.clone()),
-                Follow::First,
-                size(),
-            );
-        }
-        assert!(fixture.state.protocols.launches.contains_key(&token));
-        assert_eq!(
-            fixture
-                .state
-                .attachments
-                .get(pane)
-                .and_then(AttachedPane::waiting),
-            Some(&Target::Activation(token))
-        );
     }
 }

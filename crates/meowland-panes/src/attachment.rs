@@ -20,12 +20,12 @@ pub struct AttachedPane<P> {
 }
 
 impl<P> AttachedPane<P> {
-    /// Window the pane currently shows, if any.
+    /// Window the pane currently owns, if any.
     pub const fn window(&self) -> Option<WindowId> {
         self.window
     }
 
-    /// Target this pane is waiting to resolve while showing no window.
+    /// Target this pane is waiting to resolve while owning no window.
     pub const fn waiting(&self) -> Option<&Target> {
         match self.window {
             None => Some(&self.target),
@@ -45,21 +45,20 @@ impl<P> fmt::Debug for AttachedPane<P> {
     }
 }
 
-/// Attached panes plus the index from windows to the panes showing them.
+/// Attached panes plus the index from windows to the pane owning them.
 ///
-/// Binding changes go through this type so the index cannot drift. Each
-/// window lists its panes with the owner first: the pane whose size the
-/// window takes, which is the one that most recently routed input to it.
+/// A window is owned by at most one pane and a pane owns at most one window.
+/// Binding changes go through this type so the index cannot drift.
 pub struct Attachments<P> {
     panes: BTreeMap<PaneId, AttachedPane<P>>,
-    by_window: HashMap<WindowId, Vec<PaneId>>,
+    owners: HashMap<WindowId, PaneId>,
 }
 
 impl<P> Default for Attachments<P> {
     fn default() -> Self {
         Self {
             panes: BTreeMap::new(),
-            by_window: HashMap::new(),
+            owners: HashMap::new(),
         }
     }
 }
@@ -69,7 +68,7 @@ impl<P> fmt::Debug for Attachments<P> {
         formatter
             .debug_struct("Attachments")
             .field("panes", &self.panes.len())
-            .field("windows", &self.by_window.len())
+            .field("windows", &self.owners.len())
             .finish_non_exhaustive()
     }
 }
@@ -106,11 +105,19 @@ impl<P> Attachments<P> {
     }
 
     /// Visit every attached pane's host state in pane-identity order,
-    /// together with the window it shows.
+    /// together with the window it owns.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (PaneId, Option<WindowId>, &mut P)> {
         self.panes
             .iter_mut()
             .map(|(&pane, entry)| (pane, entry.window, &mut entry.state))
+    }
+
+    /// Panes waiting for a window, in pane-identity order.
+    pub fn waiting(&self) -> impl Iterator<Item = PaneId> + '_ {
+        self.panes
+            .iter()
+            .filter(|(_, entry)| entry.window.is_none())
+            .map(|(&pane, _)| pane)
     }
 
     /// Attach a pane waiting for its target, replacing any previous
@@ -123,7 +130,7 @@ impl<P> Attachments<P> {
             state,
         };
         if let Some(window) = self.panes.insert(pane, entry).and_then(|old| old.window) {
-            self.unlink(window, pane);
+            self.owners.remove(&window);
         }
     }
 
@@ -134,80 +141,55 @@ impl<P> Attachments<P> {
         }
     }
 
-    /// Bind a pane to a window, returning the activation token it was waiting
-    /// for. A window already shown keeps its owner.
-    pub fn show(&mut self, pane: PaneId, window: WindowId) -> Option<String> {
-        let entry = self.panes.get_mut(&pane)?;
-        let previous = entry.window.replace(window);
-        let token = match (&entry.target, previous) {
-            (Target::Activation(token), None) => Some(token.clone()),
-            _ => None,
-        };
-        if previous != Some(window) {
-            if let Some(previous) = previous {
-                self.unlink(previous, pane);
-            }
-            self.by_window.entry(window).or_default().push(pane);
-        }
-        token
+    /// Whether a pane may own a window: nobody else owns it and the pane owns
+    /// no other window.
+    pub fn claimable(&self, pane: PaneId, window: WindowId) -> bool {
+        self.panes.get(&pane).is_some_and(|entry| {
+            entry.window.is_none_or(|owned| owned == window)
+                && self.owners.get(&window).is_none_or(|&owner| owner == pane)
+        })
     }
 
-    /// Leave a pane attached but showing no window, waiting on its target.
-    pub fn unbind(&mut self, pane: PaneId) {
-        if let Some(window) = self
-            .panes
-            .get_mut(&pane)
-            .and_then(|entry| entry.window.take())
-        {
-            self.unlink(window, pane);
+    /// Make a waiting pane own a window, returning the activation token it
+    /// was waiting for. Does nothing unless the window is
+    /// [claimable](Self::claimable) by the pane.
+    pub fn show(&mut self, pane: PaneId, window: WindowId) -> Option<String> {
+        if !self.claimable(pane, window) {
+            return None;
         }
+        let entry = self.panes.get_mut(&pane)?;
+        let previous = entry.window.replace(window);
+        self.owners.insert(window, pane);
+        match (&entry.target, previous) {
+            (Target::Activation(token), None) => Some(token.clone()),
+            _ => None,
+        }
+    }
+
+    /// Release a pane's window, leaving the pane attached and waiting on its
+    /// target. Returns the released window.
+    pub fn unbind(&mut self, pane: PaneId) -> Option<WindowId> {
+        let window = self.panes.get_mut(&pane)?.window.take()?;
+        self.owners.remove(&window);
+        Some(window)
     }
 
     /// Detach a pane and return its state.
     pub fn remove(&mut self, pane: PaneId) -> Option<AttachedPane<P>> {
         let removed = self.panes.remove(&pane)?;
         if let Some(window) = removed.window {
-            self.unlink(window, pane);
+            self.owners.remove(&window);
         }
         Some(removed)
     }
 
-    /// Panes showing a window, owner first.
-    pub fn showing(&self, window: WindowId) -> &[PaneId] {
-        self.by_window.get(&window).map_or(&[], Vec::as_slice)
-    }
-
-    /// Pane whose size the window takes.
+    /// Pane owning a window.
     pub fn owner(&self, window: WindowId) -> Option<PaneId> {
-        self.showing(window).first().copied()
+        self.owners.get(&window).copied()
     }
 
-    /// Make a pane showing a window its owner, returning whether the owner
-    /// changed.
-    pub fn decide(&mut self, window: WindowId, pane: PaneId) -> bool {
-        let Some(panes) = self.by_window.get_mut(&window) else {
-            return false;
-        };
-        match panes.iter().position(|&shown| shown == pane) {
-            Some(0) | None => false,
-            Some(index) => {
-                panes[..=index].rotate_right(1);
-                true
-            }
-        }
-    }
-
-    /// Windows shown by attached panes, in pane-identity order.
+    /// Windows owned by attached panes, in pane-identity order.
     pub fn windows(&self) -> impl Iterator<Item = WindowId> + '_ {
         self.panes.values().filter_map(AttachedPane::window)
-    }
-
-    fn unlink(&mut self, window: WindowId, pane: PaneId) {
-        if let Some(panes) = self.by_window.get_mut(&window) {
-            panes.retain(|&shown| shown != pane);
-            if panes.is_empty() {
-                self.by_window.remove(&window);
-            }
-        }
     }
 }

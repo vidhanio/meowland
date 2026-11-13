@@ -45,7 +45,7 @@ use wayland_protocols::{
     },
     xdg::shell::client::{
         xdg_surface::{self, XdgSurface},
-        xdg_toplevel::XdgToplevel,
+        xdg_toplevel::{self, XdgToplevel},
         xdg_wm_base::{self, XdgWmBase},
     },
 };
@@ -66,6 +66,8 @@ pub(crate) struct App {
     /// Clipboard reads the compositor requested from this client's sources,
     /// with the requested MIME type, in arrival order.
     pub sends: Vec<(WlDataSource, String, OwnedFd)>,
+    /// Toplevels the compositor asked to close, in arrival order.
+    pub closed: Vec<ObjectId>,
 }
 
 impl Dispatch<WlRegistry, ()> for App {
@@ -133,6 +135,21 @@ impl Dispatch<XdgSurface, ()> for App {
     }
 }
 
+impl Dispatch<XdgToplevel, ()> for App {
+    fn event(
+        state: &mut Self,
+        toplevel: &XdgToplevel,
+        event: xdg_toplevel::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, xdg_toplevel::Event::Close) {
+            state.closed.push(toplevel.id());
+        }
+    }
+}
+
 impl Dispatch<WlKeyboard, ()> for App {
     fn event(
         state: &mut Self,
@@ -192,7 +209,6 @@ delegate_noop!(App: ignore WlSurface);
 delegate_noop!(App: ignore WlBuffer);
 delegate_noop!(App: WlSubcompositor);
 delegate_noop!(App: ignore WlSubsurface);
-delegate_noop!(App: ignore XdgToplevel);
 delegate_noop!(App: WpViewporter);
 delegate_noop!(App: WpViewport);
 delegate_noop!(App: WlDataDeviceManager);

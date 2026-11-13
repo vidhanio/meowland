@@ -122,9 +122,6 @@ pub(crate) fn pane_input(state: &mut Compositor, pane: PaneId, event: &Input) {
         return;
     }
     state.input.last_input_pane = Some(pane);
-    if state.attachments.decide(window, pane) {
-        state.apply_window_state(window);
-    }
     match *event {
         Input::Key {
             key,

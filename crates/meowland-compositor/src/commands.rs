@@ -26,9 +26,9 @@ pub enum Command {
         /// Physical-pixel bounds, validated during deserialization.
         size: FrameSize,
     },
-    /// Remove pane state without closing its Wayland window.
-    Detach {
-        /// Pane to detach.
+    /// Remove pane state and ask the window it owned to close.
+    Close {
+        /// Pane whose connection ended.
         pane: PaneId,
     },
     /// Apply input, geometry, paste, or acknowledgement work for an
@@ -60,7 +60,7 @@ impl Compositor {
                 follow,
                 size,
             } => self.focus_pane(pane, target, follow, size),
-            Command::Detach { pane } => self.release_pane_window(pane),
+            Command::Close { pane } => self.close_pane(pane),
             Command::Pane { pane, action } => self.pane_action(pane, action),
             Command::CloseAll => {
                 for window in self.windows.by_id.values() {
@@ -85,7 +85,7 @@ impl Compositor {
                     match shortcut {
                         Shortcut::CloseWindow => self.close_shown(pane),
                         Shortcut::DetachPane => {
-                            self.release_pane_window(pane);
+                            self.detach_pane(pane);
                             self.emit(pane, ServerToPane::Release("detached".into()));
                         }
                     }
@@ -139,18 +139,6 @@ impl Compositor {
             .ok_or(CloseWindowError)?;
         window.surface.send_close();
         Ok(())
-    }
-
-    pub(crate) fn selected_window(&self, target: &Target) -> Option<WindowId> {
-        match target {
-            Target::Selector(selector) => self.windows.catalog.select(selector),
-            Target::Activation(token) => self
-                .protocols
-                .launches
-                .get(token)
-                .and_then(|launch| launch.window)
-                .filter(|&window| self.windows.catalog.drawable(window)),
-        }
     }
 
     /// Publish the tiling, activation, and size state the compositor wants

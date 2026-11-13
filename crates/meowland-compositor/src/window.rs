@@ -99,14 +99,14 @@ impl Compositor {
             self.refresh_popup_grab();
             input::reset_keyboard(self);
         }
-        self.unbind_following_panes(id);
+        self.unbind_following_pane(id);
         if focused {
             self.restore_focus();
         }
     }
 
-    /// After the focused window stopped being shown or drawn, focus a window
-    /// a pane shows; without one, keep the focus, or take the newest window
+    /// After the focused window stopped being owned or drawn, focus a window
+    /// a pane owns; without one, keep the focus, or take the newest window
     /// when nothing has it.
     pub(crate) fn restore_focus(&mut self) {
         let next = self
@@ -127,7 +127,7 @@ impl Compositor {
     pub(crate) fn remove_window(&mut self, id: WindowId) {
         self.unmap_window(id);
         self.cancel_window_activations(id);
-        for pane in self.attachments.showing(id).to_vec() {
+        if let Some(pane) = self.attachments.owner(id) {
             self.remove_pane(pane);
             self.emit(pane, ServerToPane::Release("window closed".into()));
         }

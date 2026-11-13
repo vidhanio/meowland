@@ -1,6 +1,6 @@
-//! Pane binding index tests.
+//! Pane ownership index tests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use meowland_panes::{AttachedPane, Attachments, PaneId, WindowId};
 use meowland_protocol::{Follow, Selector, Target};
@@ -22,28 +22,30 @@ fn activation(token: &str) -> Target {
     Target::Activation(token.into())
 }
 
-/// Every pane's window and the window index agree in both directions, and
-/// no window lists a pane twice.
+fn owned(attachments: &Attachments<()>, id: PaneId) -> Option<WindowId> {
+    attachments.get(id).and_then(AttachedPane::window)
+}
+
+/// Every pane's window and the owner index agree in both directions, and no
+/// window has two owners.
 fn assert_consistent(attachments: &Attachments<()>) {
-    let mut listed = 0;
-    for number in 0..8 {
-        let shown = attachments.showing(window(number));
-        let unique: HashSet<_> = shown.iter().collect();
-        assert_eq!(unique.len(), shown.len(), "{attachments:?}");
-        assert_eq!(attachments.owner(window(number)), shown.first().copied());
-        for &id in shown {
-            assert_eq!(
-                attachments.get(id).and_then(AttachedPane::window),
-                Some(window(number))
-            );
+    let mut owned_windows = HashSet::new();
+    for (id, entry) in attachments.iter() {
+        if let Some(shown) = entry.window() {
+            assert!(owned_windows.insert(shown), "{attachments:?}");
+            assert_eq!(attachments.owner(shown), Some(id));
         }
-        listed += shown.len();
     }
-    assert_eq!(attachments.windows().count(), listed);
+    for number in 0..8 {
+        if let Some(owner) = attachments.owner(window(number)) {
+            assert_eq!(owned(attachments, owner), Some(window(number)));
+        }
+    }
+    assert_eq!(attachments.windows().count(), owned_windows.len());
 }
 
 #[test]
-fn a_waiting_activation_resolves_its_token_only_on_first_show() {
+fn a_waiting_activation_resolves_its_token_on_show() {
     let mut attachments = Attachments::default();
     attachments.insert(pane(1), activation("token"), Follow::Every, ());
     assert_eq!(
@@ -54,63 +56,35 @@ fn a_waiting_activation_resolves_its_token_only_on_first_show() {
     assert_eq!(attachments.show(pane(1), window(1)), Some("token".into()));
     assert_eq!(attachments.get(pane(1)).unwrap().waiting(), None);
     assert_eq!(attachments.show(pane(1), window(2)), None);
-    assert_eq!(attachments.showing(window(1)), []);
-    assert_eq!(attachments.showing(window(2)), [pane(1)]);
-    assert_consistent(&attachments);
-}
-
-#[test]
-fn input_moves_ownership_and_a_departing_owner_hands_it_on() {
-    let mut attachments = Attachments::default();
-    for id in 1..=3 {
-        attachments.insert(pane(id), matching("app"), Follow::First, ());
-        attachments.show(pane(id), window(1));
-    }
     assert_eq!(
-        attachments.owner(window(1)),
-        Some(pane(1)),
-        "first shown owns"
-    );
-
-    assert!(attachments.decide(window(1), pane(3)));
-    assert!(!attachments.decide(window(1), pane(3)));
-    assert!(!attachments.decide(window(2), pane(3)), "not shown there");
-    assert_eq!(attachments.owner(window(1)), Some(pane(3)));
-
-    attachments.insert(pane(4), matching("app"), Follow::First, ());
-    attachments.show(pane(4), window(1));
-    assert_eq!(
-        attachments.owner(window(1)),
-        Some(pane(3)),
-        "showing never steals"
-    );
-
-    attachments.remove(pane(3));
-    assert_eq!(
-        attachments.owner(window(1)),
-        Some(pane(1)),
-        "the previous owner takes over"
+        owned(&attachments, pane(1)),
+        Some(window(1)),
+        "an owning pane cannot take a second window"
     );
     assert_consistent(&attachments);
 }
 
 #[test]
-fn unbinding_removing_and_replacing_free_the_window() {
+fn an_owned_window_is_never_taken_and_frees_with_its_owner() {
     let mut attachments = Attachments::default();
-    attachments.insert(pane(1), matching("app"), Follow::Every, ());
+    attachments.insert(pane(1), matching("app"), Follow::First, ());
+    attachments.insert(pane(2), matching("app"), Follow::First, ());
     attachments.show(pane(1), window(1));
-    attachments.unbind(pane(1));
-    assert!(attachments.contains(pane(1)));
-    assert_eq!(attachments.showing(window(1)), []);
+    assert!(!attachments.claimable(pane(2), window(1)));
+    attachments.show(pane(2), window(1));
+    assert_eq!(attachments.owner(window(1)), Some(pane(1)));
+    assert_eq!(owned(&attachments, pane(2)), None);
 
-    attachments.show(pane(1), window(2));
-    attachments.insert(pane(1), matching("other"), Follow::First, ());
-    assert_eq!(attachments.showing(window(2)), []);
+    assert_eq!(attachments.unbind(pane(1)), Some(window(1)));
+    assert_eq!(attachments.waiting().collect::<Vec<_>>(), [pane(1), pane(2)]);
+    attachments.show(pane(2), window(1));
+    assert_eq!(attachments.owner(window(1)), Some(pane(2)));
 
-    attachments.show(pane(1), window(3));
+    attachments.insert(pane(2), matching("other"), Follow::First, ());
+    assert_eq!(attachments.owner(window(1)), None, "replacing frees");
+    attachments.show(pane(1), window(1));
     assert!(attachments.remove(pane(1)).is_some());
-    assert_eq!(attachments.showing(window(3)), []);
-    assert!(attachments.is_empty());
+    assert_eq!(attachments.owner(window(1)), None, "removing frees");
     assert_consistent(&attachments);
 }
 
@@ -118,7 +92,6 @@ fn unbinding_removing_and_replacing_free_the_window() {
 enum Operation {
     Insert(u64),
     Show(u64, u64),
-    Decide(u64, u64),
     Unbind(u64),
     Remove(u64),
 }
@@ -127,7 +100,6 @@ fn operation() -> impl Strategy<Value = Operation> {
     prop_oneof![
         (0u64..4).prop_map(Operation::Insert),
         (0u64..4, 0u64..4).prop_map(|(pane, window)| Operation::Show(pane, window)),
-        (0u64..4, 0u64..4).prop_map(|(pane, window)| Operation::Decide(pane, window)),
         (0u64..4).prop_map(Operation::Unbind),
         (0u64..4).prop_map(Operation::Remove),
     ]
@@ -135,47 +107,33 @@ fn operation() -> impl Strategy<Value = Operation> {
 
 proptest! {
     #[test]
-    fn the_index_stays_consistent_and_owners_follow_input(
+    fn ownership_stays_one_to_one_and_is_never_stolen(
         operations in prop::collection::vec(operation(), 0..200)
     ) {
         let mut attachments = Attachments::default();
-        let mut claims: HashMap<WindowId, PaneId> = HashMap::new();
         for operation in operations {
-            let owners: Vec<_> = (0..4).map(|id| attachments.owner(window(id))).collect();
             match operation {
                 Operation::Insert(id) => {
                     attachments.insert(pane(id), matching("app"), Follow::Every, ());
                 }
                 Operation::Show(id, shown) => {
+                    let before = attachments.owner(window(shown));
+                    let claimable = attachments.claimable(pane(id), window(shown));
                     attachments.show(pane(id), window(shown));
-                    if let Some(owner) = owners[usize::try_from(shown).unwrap()]
-                        && owner != pane(id)
-                    {
-                        prop_assert_eq!(attachments.owner(window(shown)), Some(owner));
+                    if claimable {
+                        prop_assert_eq!(attachments.owner(window(shown)), Some(pane(id)));
+                    } else {
+                        prop_assert_eq!(attachments.owner(window(shown)), before);
                     }
                 }
-                Operation::Decide(id, shown) => {
-                    if attachments.showing(window(shown)).contains(&pane(id)) {
-                        claims.insert(window(shown), pane(id));
-                    }
-                    attachments.decide(window(shown), pane(id));
+                Operation::Unbind(id) => {
+                    attachments.unbind(pane(id));
                 }
-                Operation::Unbind(id) => attachments.unbind(pane(id)),
                 Operation::Remove(id) => {
                     attachments.remove(pane(id));
                 }
             }
             assert_consistent(&attachments);
-            claims.retain(|&claimed, &mut claimant| {
-                attachments.get(claimant).and_then(AttachedPane::window) == Some(claimed)
-            });
-            for (&claimed, &claimant) in &claims {
-                prop_assert_eq!(
-                    attachments.owner(claimed),
-                    Some(claimant),
-                    "the pane that last routed input still shows the window"
-                );
-            }
         }
     }
 }

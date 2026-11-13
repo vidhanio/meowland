@@ -62,9 +62,11 @@ impl Output {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Launch a client and show its windows in this terminal.
+    /// Launch a client and show its window in this terminal; closing the
+    /// terminal closes the window.
     Launch(LaunchArgs),
-    /// Show a window in this terminal.
+    /// Show a window no other pane shows in this terminal; closing the
+    /// terminal closes the window.
     Focus(FocusArgs),
     /// Ask a window to close.
     ///

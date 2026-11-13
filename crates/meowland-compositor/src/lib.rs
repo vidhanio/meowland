@@ -319,22 +319,16 @@ impl Compositor {
         )
     }
 
-    /// Logical buffer limit: twice the widest and tallest panes showing the
-    /// window, independently, to allow an in-flight resize. Without a pane
-    /// only the global surface limits apply.
+    /// Logical buffer limit: twice the owning pane's size in each direction,
+    /// to allow an in-flight resize. Without a pane only the global surface
+    /// limits apply.
     fn pane_bound(&self, surface: &WlSurface) -> Option<(u32, u32)> {
         let window = self.window_for_surface(surface)?;
-        self.attachments
-            .showing(window)
-            .iter()
-            .filter_map(|&pane| self.attachments.get(pane))
-            .map(|entry| {
-                (
-                    self.scale.logical(entry.state.size.width()).unsigned_abs() * 2,
-                    self.scale.logical(entry.state.size.height()).unsigned_abs() * 2,
-                )
-            })
-            .reduce(|bound, pane| (bound.0.max(pane.0), bound.1.max(pane.1)))
+        let entry = self.attachments.get(self.attachments.owner(window)?)?;
+        Some((
+            self.scale.logical(entry.state.size.width()).unsigned_abs() * 2,
+            self.scale.logical(entry.state.size.height()).unsigned_abs() * 2,
+        ))
     }
 
     /// The toplevel a surface belongs to, walking its current subsurface and
@@ -359,8 +353,8 @@ impl Compositor {
         self.emit(pane, ServerToPane::Title(title));
     }
 
-    fn send_titles(&mut self, window: WindowId) {
-        for pane in self.attachments.showing(window).to_vec() {
+    fn send_owner_title(&mut self, window: WindowId) {
+        if let Some(pane) = self.attachments.owner(window) {
             self.send_title(pane, window);
         }
     }
@@ -398,7 +392,7 @@ impl Compositor {
     }
 
     fn enter_output(&self, window: WindowId) {
-        if self.attachments.showing(window).is_empty() {
+        if self.attachments.owner(window).is_none() {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window)
@@ -409,7 +403,7 @@ impl Compositor {
     }
 
     fn leave_output(&self, window: WindowId) {
-        if !self.attachments.showing(window).is_empty() && self.windows.catalog.drawable(window) {
+        if self.attachments.owner(window).is_some() && self.windows.catalog.drawable(window) {
             return;
         }
         if let Some(entry) = self.windows.by_id.get(&window) {

@@ -330,8 +330,7 @@ impl CompositorHandler for Compositor {
         }
         self.refresh_window_mapping(surface);
         if let Some(window) = window {
-            if !self.attachments.showing(window).is_empty() && self.windows.catalog.drawable(window)
-            {
+            if self.attachments.owner(window).is_some() && self.windows.catalog.drawable(window) {
                 self.output.enter(surface);
             }
             let damage = self
@@ -347,10 +346,10 @@ impl CompositorHandler for Compositor {
                         render::SurfaceDamage::new(&damage, &geometry)
                     }
                 });
-            for pane in self.attachments.showing(window).to_vec() {
-                if let Some(state) = self.attachments.state_mut(pane) {
-                    state.damage(surface, damage);
-                }
+            if let Some(pane) = self.attachments.owner(window)
+                && let Some(state) = self.attachments.state_mut(pane)
+            {
+                state.damage(surface, damage);
             }
         }
     }

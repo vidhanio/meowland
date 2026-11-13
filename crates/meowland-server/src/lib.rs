@@ -81,7 +81,7 @@ enum Delivery {
     /// No admitted pane with that ID, or the pane was released.
     Unavailable,
     /// The pane exceeded its output budget or its writer is gone; it was
-    /// disconnected and detached.
+    /// disconnected and its window asked to close.
     Disconnected,
 }
 
@@ -211,7 +211,7 @@ impl Server {
                 if let Some(connection) = self.connections.remove(&ConnectionId::from(id)) {
                     connection.task.abort();
                 }
-                self.send_command(Command::Detach { pane: id });
+                self.send_command(Command::Close { pane: id });
                 Delivery::Disconnected
             }
         }
@@ -227,7 +227,7 @@ impl Server {
             ..
         }) = self.connections.remove(&id)
         {
-            self.send_command(Command::Detach { pane: id.into() });
+            self.send_command(Command::Close { pane: id.into() });
         }
         if let Err(error) = result {
             tracing::debug!(?id, %error, "connection ended");
